@@ -25,6 +25,21 @@ pub struct Bridge {
     media_job: Option<tokio::task::JoinHandle<Result<crate::media::Prepared>>>,
     reads: crate::reads::Reads,
     last_snapshot: Vec<Agent>,
+    reconcile_errors: BTreeMap<String, String>,
+}
+
+/// Log a session failure once per distinct error instead of on every three-second snapshot.
+fn reconcile_warning(
+    errors: &mut BTreeMap<String, String>,
+    key: &str,
+    error: &anyhow::Error,
+) -> Option<String> {
+    let detail = format!("{error:#}");
+    if errors.get(key) == Some(&detail) {
+        return None;
+    }
+    errors.insert(key.to_owned(), detail.clone());
+    Some(format!("Session {key} could not reconcile: {detail}"))
 }
 
 impl Drop for Bridge {
@@ -65,6 +80,7 @@ impl Bridge {
             media_job: None,
             reads: crate::reads::Reads::default(),
             last_snapshot: vec![],
+            reconcile_errors: BTreeMap::new(),
         };
         bridge.refresh_forwarding()?;
         Ok(bridge)
@@ -437,6 +453,8 @@ impl Bridge {
             );
         }
         self.agents = current;
+        self.reconcile_errors
+            .retain(|key, _| self.agents.contains_key(key));
         for key in self.agents.keys() {
             self.reads.set_ended(key, false);
         }
@@ -462,12 +480,19 @@ impl Bridge {
         let keys: Vec<_> = self.agents.keys().cloned().collect();
         for key in keys {
             let agent = self.agents[&key].clone();
-            if let Err(error) = self.reconcile_agent(&key, &agent).await {
-                if error.downcast_ref::<crate::reads::Pending>().is_none() {
-                    eprintln!("A session could not reconcile; other sessions remain available.");
+            match self.reconcile_agent(&key, &agent).await {
+                Ok(()) => {
+                    self.reconcile_errors.remove(&key);
+                    self.reads.finish(&key);
                 }
-            } else {
-                self.reads.finish(&key);
+                Err(error) if error.downcast_ref::<crate::reads::Pending>().is_some() => {}
+                Err(error) => {
+                    if let Some(warning) =
+                        reconcile_warning(&mut self.reconcile_errors, &key, &error)
+                    {
+                        eprintln!("{warning}");
+                    }
+                }
             }
         }
         let ended: Vec<_> = self
@@ -1571,4 +1596,29 @@ pub fn now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reconcile_warning;
+    use anyhow::anyhow;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn repeated_identical_failures_are_reported_once() {
+        let mut errors = BTreeMap::new();
+        assert_eq!(
+            reconcile_warning(&mut errors, "session-a", &anyhow!("boom")).as_deref(),
+            Some("Session session-a could not reconcile: boom")
+        );
+        assert!(reconcile_warning(&mut errors, "session-a", &anyhow!("boom")).is_none());
+        assert_eq!(
+            reconcile_warning(&mut errors, "session-a", &anyhow!("different failure")).as_deref(),
+            Some("Session session-a could not reconcile: different failure")
+        );
+        assert_eq!(
+            reconcile_warning(&mut errors, "session-b", &anyhow!("boom")).as_deref(),
+            Some("Session session-b could not reconcile: boom")
+        );
+    }
 }
