@@ -135,6 +135,8 @@ jobs:
           OS_NAME: ${{ matrix.os }}
           ARCH: ${{ matrix.arch }}
         run: |
+          # Use rust-toolchain.toml, not the action's separately installed stable.
+          rustup target add "$TARGET"
           cargo build --locked --release --target "$TARGET"
           "target/$TARGET/release/herdr-white-noise-bridge" --version
           "target/$TARGET/release/herdr-white-noise-bridge" --help > /dev/null
@@ -285,6 +287,8 @@ jobs:
           TARGET: ${{ matrix.target }}
           ARCH: ${{ matrix.arch }}
         run: |
+          # Use rust-toolchain.toml, not the action's separately installed stable.
+          rustup target add "$TARGET"
           cargo build --locked --release --target "$TARGET"
           binary="target/$TARGET/release/herdr-white-noise-bridge"
           version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
