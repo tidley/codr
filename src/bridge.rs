@@ -901,7 +901,22 @@ impl Bridge {
                 if !known.contains(&reply.id) {
                     self.state.mappings.get_mut(key).unwrap().last_received_at = now();
                     if self.config.edit_responses {
-                        self.state.complete_progress(key);
+                        if agent.agent_status == "working"
+                            && agent
+                                .agent_session
+                                .as_ref()
+                                .is_some_and(|session| session.agent == "claude")
+                        {
+                            // Retain this bubble until idle; an unchanged working poll
+                            // must not replace it after forwarding a completed reply.
+                            self.state
+                                .mappings
+                                .get_mut(key)
+                                .unwrap()
+                                .response_completion_pending = true;
+                        } else {
+                            self.state.complete_progress(key);
+                        }
                     }
                     if !self.state.mappings[key].prompt_queue.is_empty()
                         && self.state.mappings[key].queue_flight.is_none()
@@ -1247,12 +1262,20 @@ impl Bridge {
                 .unwrap()
                 .blocked_context_seq = Some(agent.state_change_seq);
         }
-        if agent.settled()
+        // Claude stays "working" while background tasks run after an end_turn reply.
+        // Its transcript only marks finished replies final, so collect them meanwhile.
+        let background_claude = agent.agent_status == "working"
+            && agent
+                .agent_session
+                .as_ref()
+                .is_some_and(|session| session.agent == "claude");
+        if (agent.settled() || background_claude)
             && (self.state.mappings[key].completion_pending
+                || background_claude
                 || now().saturating_sub(self.state.mappings[key].last_export_at) >= 30)
         {
             self.collect_finals(key, agent, &group).await?;
-            if self.config.edit_responses {
+            if self.config.edit_responses && agent.settled() {
                 // Runtime idle can precede the native final. Keep progress and its
                 // checklist intact until collect_finals completes the response.
                 if agent.agent_session.is_some() {

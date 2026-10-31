@@ -19,9 +19,9 @@ New bridge accounts introduce themselves as **Pat**, your messenger between Whit
 
 ## Install
 
-**0.10.0 targets existing accounts.** Fresh accounts use the
+**0.11.0 targets existing accounts.** Fresh accounts use the
 supported 0.9.0 setup below, then the owner-confirmed chat handover. See the
-[0.10.0 release notes](docs/releases/0.10.0.md) and
+[0.11.0 release notes](docs/releases/0.11.0.md) and
 [combined runtime/handover guide](docs/COMBINED.md).
 
 Needs Linux x86_64 or aarch64 or macOS on Apple silicon or Intel, a per-user service manager (systemd or launchd), Python 3.11+, Git, and **herdr** 0.9.1+. No Rust toolchain required.
@@ -39,7 +39,19 @@ Or give your coding agent this prompt, with your own public key:
 
 [Full installation and upgrade guide →](docs/INSTALL.md)
 
-### New in 0.10.0
+### New in 0.11.0
+
+- Completed Claude replies reach the phone while background tasks keep the
+  session working. System task notifications do not count as local typing or
+  mute forwarding, and completed same-turn replies remain available.
+- Progress keeps its existing bubble until the session settles, without leaving
+  an unfinished replacement after a completed background reply.
+- A no-update check says **No new version available. Currently running codr
+  0.11.0.** It does not claim that an installation occurred.
+- Integrates Juraj Bednar's [PR #20](https://github.com/tidley/codr/pull/20).
+  Corrected adaptations of PRs #17–19 remain from 0.9.0.
+
+### Retained from 0.10.0
 
 - One executable hosts bridge and messaging in one managed service. Chat upgrades
   keep the existing worker service name.

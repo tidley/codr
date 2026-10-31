@@ -176,8 +176,14 @@ impl Transcript {
                 || truthy(&value["teamName"]);
             let content = &value["message"]["content"];
             let blocks = content.as_array();
+            // Claude Code records background-task notifications as system-sourced user rows.
+            let system_prompt = value["promptSource"] == "system"
+                || value["origin"]["kind"]
+                    .as_str()
+                    .is_some_and(|origin| origin != "human");
             let user_prompt = kind == "user"
                 && !private
+                && !system_prompt
                 && !truthy(&value["isCompactSummary"])
                 && (content.is_string()
                     || blocks.is_some_and(|parts| {
@@ -361,7 +367,9 @@ impl Transcript {
             }
             let message = row.message.as_deref().unwrap_or(&row.id);
             if response.message.as_deref() != Some(message) {
-                // A continuation for the same user turn supersedes the earlier model response.
+                // A continuation for the same user turn supersedes an incomplete model response.
+                // A completed one stays final, e.g. a reply before a background task reports back.
+                response.finish(&mut replies, &mut recent_messages);
                 response = Response {
                     message: Some(message.into()),
                     turn: latest_turn.clone(),

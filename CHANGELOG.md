@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.11.0] - 2026-10-31
+
+### Fixed
+
+- Forward completed Claude replies while background tasks keep the session
+  working. System-sourced task notifications do not count as local typing or
+  create new turns. Completed replies survive later responses in the same turn;
+  incomplete responses remain superseded. Integrates Juraj Bednar's
+  [PR #20](https://github.com/tidley/codr/pull/20).
+- Keep the existing progress bubble until Claude settles after a background
+  reply, instead of creating a replacement that can remain unfinished.
+- Report `No new version available. Currently running codr VERSION.` after an
+  up-to-date check, rather than wording that looks like an installation receipt.
+
+### Contribution review
+
+- Retain the credited, corrected adaptations of PRs #17–19 released in 0.9.0.
+  Their old branches are superseded, not new changes in this release.
+- See [0.11.0 release notes and credits](docs/releases/0.11.0.md). One-executable
+  packaging, update confirmations, account preservation and storage-cohort gates
+  remain unchanged. The live phone handover remains unverified end-to-end.
+
 ## [0.10.0] - 2026-10-31
 
 This release targets existing MDK 0.14 accounts. The local combined rollout does

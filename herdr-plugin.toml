@@ -1,6 +1,6 @@
 id = "local.white-noise"
 name = "White Noise Remote"
-version = "0.10.0"
+version = "0.11.0"
 min_herdr_version = "0.9.1"
 description = "One encrypted White Noise group per herdr agent session"
 platforms = ["linux", "macos"]

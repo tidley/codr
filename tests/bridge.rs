@@ -10429,3 +10429,105 @@ async fn forwarding_reset_does_not_reannounce_an_unchanged_blocked_context() {
         }
     }
 }
+
+#[tokio::test]
+async fn claude_replies_reach_the_phone_while_background_tasks_keep_it_working() {
+    const ID: &str = "11111111-1111-4111-8111-111111111111";
+    let root = tempfile::tempdir().unwrap();
+    let mut config = config(root.path());
+    config.auto_forwarding = true;
+    config.edit_responses = true;
+    let mut observed = agent();
+    observed.agent = "claude".into();
+    observed.agent_session = Some(herdr_white_noise_bridge::herdr::Session {
+        source: "herdr:claude".into(),
+        agent: "claude".into(),
+        kind: "id".into(),
+        value: ID.into(),
+    });
+    let path = config
+        .claude_home
+        .join("projects/project")
+        .join(format!("{ID}.jsonl"));
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut rows = vec![
+        json!({"type":"user","uuid":"u0","sessionId":ID,"origin":{"kind":"human"},"promptSource":"typed","message":{"role":"user","content":"Old prompt"}}),
+        json!({"type":"assistant","uuid":"a0","parentUuid":"u0","sessionId":ID,"message":{"role":"assistant","id":"api-0","stop_reason":"end_turn","content":[{"type":"text","text":"Old reply"}]}}),
+    ];
+    let write = |rows: &[Value]| {
+        std::fs::write(
+            &path,
+            rows.iter()
+                .map(|row| format!("{row}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+    };
+    write(&rows);
+    let calls = Arc::new(Mutex::new(vec![]));
+    let mdk = peer(&config.wn_agent_socket, true, calls.clone()).await;
+    let herdr = peer_for_agent(&config.herdr_socket, false, calls.clone(), observed.clone()).await;
+    let mut bridge = Bridge::open(config.clone()).unwrap();
+    bridge.state.mappings.insert(
+        observed.key(),
+        activity_mapping(observed.clone(), &"bb".repeat(16)),
+    );
+    bridge.reconcile(vec![observed.clone()]).await.unwrap();
+    bridge.inbound(&inbound(HEX, "phone")).await.unwrap();
+    assert!(bridge.state.forwarding_enabled);
+    let replied = |bridge: &Bridge, text: &str| {
+        bridge.state.outbox.iter().any(|item| item.text == text)
+            || calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|call| call["text"] == text)
+    };
+    // Claude ends its turn, but a background task keeps herdr reporting "working".
+    rows.extend([
+        json!({"type":"user","uuid":"u1","parentUuid":"a0","sessionId":ID,"origin":{"kind":"human"},"promptSource":"typed","message":{"role":"user","content":"test prompt"}}),
+        json!({"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":ID,"message":{"role":"assistant","id":"api-1","stop_reason":"end_turn","content":[{"type":"text","text":"First reply"}]}}),
+    ]);
+    write(&rows);
+    observed.agent_status = "working".into();
+    observed.state_change_seq += 1;
+    bridge.reconcile(vec![observed.clone()]).await.unwrap();
+    assert!(replied(&bridge, "First reply"));
+    // A completed reply must not create a replacement working bubble on the next poll.
+    let progress = bridge.state.mappings[&observed.key()].response_id.clone();
+    assert!(progress.is_some());
+    bridge.reconcile(vec![observed.clone()]).await.unwrap();
+    assert_eq!(bridge.state.mappings[&observed.key()].response_id, progress);
+    observed.agent_status = "idle".into();
+    observed.state_change_seq += 1;
+    bridge.reconcile(vec![observed.clone()]).await.unwrap();
+    assert!(bridge.state.mappings[&observed.key()].response_id.is_none());
+    assert!(!bridge.state.outbox.iter().any(|item| {
+        item.response
+            .as_ref()
+            .is_some_and(|response| !response.finished)
+    }));
+    // The task's notification is not local typing and does not mute forwarding.
+    rows.extend([
+        json!({"type":"user","uuid":"n1","parentUuid":"a1","sessionId":ID,"origin":{"kind":"task-notification"},"promptSource":"system","message":{"role":"user","content":"<task-notification>done</task-notification>"}}),
+        json!({"type":"assistant","uuid":"a2","parentUuid":"n1","sessionId":ID,"message":{"role":"assistant","id":"api-2","stop_reason":"end_turn","content":[{"type":"text","text":"Background result"}]}}),
+    ]);
+    write(&rows);
+    observed.agent_status = "idle".into();
+    observed.state_change_seq += 1;
+    bridge.reconcile(vec![observed.clone()]).await.unwrap();
+    assert!(bridge.state.forwarding_enabled);
+    assert!(replied(&bridge, "Background result"));
+    bridge.flush().await.unwrap();
+    assert_eq!(
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call["text"] == "First reply")
+            .count(),
+        1
+    );
+    mdk.abort();
+    herdr.abort();
+}

@@ -190,3 +190,57 @@ async fn claude_turn_identity_uses_the_main_user_prompt_before_the_final() {
     assert_eq!(history.latest_turn.as_deref(), Some("claude:u2"));
     assert_eq!(history.turns, ["claude:u1", "claude:u2"]);
 }
+
+#[tokio::test]
+async fn claude_background_task_notifications_stay_in_the_phone_turn() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = config(directory.path());
+    let id = "11111111-1111-4111-8111-111111111111";
+    let path = config
+        .claude_home
+        .join("projects/project")
+        .join(format!("{id}.jsonl"));
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let session = Session {
+        agent: "claude".into(),
+        kind: "id".into(),
+        source: "herdr:claude".into(),
+        value: id.into(),
+    };
+    let rows = [
+        json!({"uuid":"u1","type":"user","sessionId":id,"origin":{"kind":"human"},"promptSource":"typed","message":{"role":"user","content":"Phone request"}}),
+        json!({"uuid":"a1","parentUuid":"u1","type":"assistant","sessionId":id,"message":{"id":"api-1","role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"First reply"}]}}),
+        json!({"uuid":"n1","parentUuid":"a1","type":"user","sessionId":id,"origin":{"kind":"task-notification"},"promptSource":"system","message":{"role":"user","content":"<task-notification>done</task-notification>"}}),
+        json!({"uuid":"a2","parentUuid":"n1","type":"assistant","sessionId":id,"message":{"id":"api-2","role":"assistant","stop_reason":"end_turn","content":[{"type":"text","text":"Background result"}]}}),
+    ];
+    std::fs::write(
+        &path,
+        rows.iter()
+            .map(|row| format!("{row}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+    let history = herdr_white_noise_bridge::output::read_history(&config, &session)
+        .await
+        .unwrap();
+    assert_eq!(
+        history
+            .user_inputs
+            .iter()
+            .map(|input| input.id.as_str())
+            .collect::<Vec<_>>(),
+        ["claude:u1"]
+    );
+    assert_eq!(history.turns, ["claude:u1"]);
+    assert_eq!(
+        history
+            .finals
+            .iter()
+            .map(|reply| (reply.text.as_str(), reply.turn.as_deref()))
+            .collect::<Vec<_>>(),
+        [
+            ("First reply", Some("claude:u1")),
+            ("Background result", Some("claude:u1"))
+        ]
+    );
+}

@@ -540,7 +540,7 @@ pub async fn poll(bridge: &mut Bridge) -> Result<()> {
                 &check.id,
                 "current",
                 &format!(
-                    "Installed codr {}. No newer stable release is available from the pinned ngit maintainer for this check.",
+                    "No new version available. Currently running codr {}.",
                     env!("CARGO_PKG_VERSION")
                 ),
             )?,
@@ -594,4 +594,49 @@ pub async fn poll(bridge: &mut Bridge) -> Result<()> {
         return Err(error);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bech32::ToBase32;
+
+    #[tokio::test]
+    async fn no_new_version_reports_the_running_version_without_claiming_installation() {
+        let root = tempfile::tempdir().unwrap();
+        let config = serde_json::from_value(json!({
+            "phone_npub": bech32::encode("npub", [0x11u8; 32].to_base32(), bech32::Variant::Bech32).unwrap(),
+            "account_id_hex": "aa".repeat(32),
+            "herdr_socket": root.path().join("herdr.sock"),
+            "wn_agent_socket": root.path().join("messaging.sock"),
+            "state_path": root.path().join("state.json")
+        })).unwrap();
+        let mut bridge = Bridge::open(config).unwrap();
+        bridge
+            .state
+            .mappings
+            .insert("one".into(), state::Mapping::default());
+        let task = tokio::spawn(async { Ok(None) });
+        while !task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        bridge.update_check = Some(Check {
+            key: "one".into(),
+            group: "bb".repeat(16),
+            id: "check".into(),
+            task,
+        });
+
+        poll(&mut bridge).await.unwrap();
+
+        assert_eq!(
+            bridge.state.outbox.last().unwrap().text,
+            format!(
+                "No new version available. Currently running codr {}.",
+                env!("CARGO_PKG_VERSION")
+            )
+        );
+        assert!(bridge.state.update_job.is_none());
+        assert!(bridge.state.mappings["one"].update_offer.is_none());
+    }
 }
