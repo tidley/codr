@@ -158,17 +158,59 @@ fn fixture(responses: Vec<(u16, String)>) -> (String, std::thread::JoinHandle<Ve
                     .unwrap()
                     .to_string(),
             );
-            write!(
+            if let Err(error) = write!(
                 socket,
                 "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
                 body
-            )
-            .unwrap();
+            ) {
+                // Header checks can reject a response before its body is sent.
+                assert!(
+                    matches!(
+                        error.kind(),
+                        std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                    ),
+                    "Fixture response failed: {error}"
+                );
+            }
         }
         paths
     });
     (url, server)
+}
+
+#[test]
+fn fixture_keeps_serving_after_a_client_rejects_an_oversized_response() {
+    let (url, server) = fixture(vec![
+        (200, "x".repeat(8 * 1024 * 1024)),
+        (200, "next response".into()),
+    ]);
+    let address = url.strip_prefix("http://").unwrap();
+    let request = b"GET /fixture HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    let mut client = std::net::TcpStream::connect(address).unwrap();
+    client
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+    client.write_all(request).unwrap();
+    let mut headers = Vec::new();
+    while !headers.ends_with(b"\r\n\r\n") {
+        let mut byte = [0];
+        client.read_exact(&mut byte).unwrap();
+        headers.push(byte[0]);
+        assert!(headers.len() < 1024);
+    }
+    // Match the reader's header-only rejection without draining the large body.
+    client.shutdown(std::net::Shutdown::Both).unwrap();
+    drop(client);
+    let mut client = std::net::TcpStream::connect(address).unwrap();
+    client
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+    client.write_all(request).unwrap();
+    let mut response = String::new();
+    client.read_to_string(&mut response).unwrap();
+    assert!(response.ends_with("\r\n\r\nnext response"));
+    assert_eq!(server.join().unwrap(), ["/fixture", "/fixture"]);
 }
 
 fn log(seq: u64) -> String {
