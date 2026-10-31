@@ -1,0 +1,8613 @@
+//! White-box tests for the connector exercising private/`pub(crate)` internals across modules.
+
+use agent_control::{
+    AGENT_CONTROL_STREAM_STATUS_STARTED, AgentControlAccountSelection, AgentControlEnvelope,
+    AgentControlEvent, AgentControlInvitePolicy, AgentControlProfileLookupStatus,
+    AgentControlRequest, AgentControlResponse, AgentControlSendMaintenanceDisposition,
+    decode_frame, encode_frame, read_envelope, write_frame,
+};
+use cgka_traits::agent_text_stream::{
+    AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN, AGENT_TEXT_STREAM_RECORD_STATUS,
+    AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, AgentTextStreamTranscriptV1,
+};
+use cgka_traits::app_event::{
+    MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_CHAT,
+    MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_EDIT, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
+    MARMOT_APP_EVENT_KIND_REACTION, MarmotAppEvent as MarmotInnerEvent, STREAM_PARENT_TAG,
+    STREAM_TAG,
+};
+use cgka_traits::engine::{GroupEvent, GroupStateChange};
+use cgka_traits::{EpochId, GroupId, MessageId};
+use marmot_account::AccountHome;
+use marmot_app::{
+    AccountRelayListBootstrap, AccountSetupRequest, AppError, MarmotApp, MarmotAppEvent,
+    MarmotAppRuntime, ReceivedMessage, RuntimeAgentStreamMessage, RuntimeMessageReceived,
+    UserProfileMetadata,
+};
+use nostr_relay_builder::MockRelay;
+use std::collections::HashSet;
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+use std::sync::atomic::Ordering;
+use tokio::io::BufReader;
+use tokio::net::UnixStream;
+use tokio::time::{Duration, sleep, timeout};
+
+use crate::account::ProfileUpdateFields;
+use crate::allowlist::{AllowlistRecord, AllowlistStore};
+use crate::event_projection::{
+    DeliveredInboundCursor, InboundCatchUpDriver, control_event_from_debug_event,
+    control_event_from_runtime_event_with_runtime, inbound_message_event_from_record_with_runtime,
+    media_refs_from_tags, message_mentions_account, reply_target_from_tags,
+    runtime_replay_dedup_key,
+};
+use crate::{
+    AgentConnector, AgentConnectorConfig, bind_connector_socket, bind_connector_socket_with_mode,
+    serve_socket,
+};
+use marmot_app::AppMessageRecord;
+
+#[test]
+fn connector_media_limits_follow_the_marmot_app_blob_limit() {
+    assert_eq!(
+        crate::MAX_MEDIA_UPLOAD_ATTACHMENT_BYTES + 16,
+        marmot_app::MAX_ENCRYPTED_MEDIA_BLOB_BYTES
+    );
+    assert_eq!(
+        crate::MAX_MEDIA_UPLOAD_BATCH_BYTES,
+        crate::MAX_MEDIA_UPLOAD_ATTACHMENT_BYTES
+    );
+}
+
+const CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(120);
+
+async fn accept_group_invite_retrying_busy(
+    runtime: &MarmotAppRuntime,
+    account_ref: &str,
+    group_id: &GroupId,
+) {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            match runtime.accept_group_invite(account_ref, group_id).await {
+                Ok(_) => return,
+                Err(AppError::AccountWorkerBusy | AppError::UnknownGroup(_)) => {
+                    sleep(Duration::from_millis(10)).await
+                }
+                Err(error) => panic!("invite acceptance failed: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("invite acceptance should outlive the startup catch-up window");
+}
+
+#[tokio::test]
+async fn control_operation_timeout_bounds_a_stalled_whole_operation() {
+    let started = tokio::time::Instant::now();
+    let error = crate::with_control_operation_timeout_after(
+        "test_stalled_operation",
+        Duration::from_millis(10),
+        std::future::pending::<()>(),
+    )
+    .await
+    .expect_err("a stalled operation must time out");
+
+    assert!(matches!(
+        error,
+        crate::ConnectorError::OperationTimedOut("test_stalled_operation")
+    ));
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[test]
+fn send_in_progress_has_a_distinct_retry_contract() {
+    let error = crate::ConnectorError::SendInProgress;
+    assert_eq!(error.code(), "send_in_progress");
+    assert_eq!(
+        error.client_message(),
+        "matching send is still in progress; retry with the same idempotency key"
+    );
+    assert!(error.retryable());
+}
+
+#[test]
+fn send_media_timeout_is_retryable_before_publication() {
+    let error = crate::ConnectorError::App(marmot_app::AppError::MediaUploadTimedOut);
+    assert_eq!(error.code(), "media_upload_timeout");
+    assert_eq!(
+        error.client_message(),
+        "media upload timed out before publication"
+    );
+    assert!(error.retryable());
+}
+
+#[test]
+fn reaction_not_found_has_a_distinct_idempotency_contract() {
+    let error = crate::ConnectorError::App(marmot_app::AppError::ReactionNotFound);
+    assert_eq!(error.code(), "reaction_not_found");
+    assert_eq!(error.client_message(), "no matching reaction to remove");
+}
+
+#[tokio::test]
+async fn control_frame_write_timeout_includes_flush() {
+    struct FlushStallingWriter;
+
+    impl tokio::io::AsyncWrite for FlushStallingWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            bytes: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    let response = AgentControlEnvelope::new(None, AgentControlResponse::Ack);
+    let error = crate::connection::write_control_frame_with_timeout(
+        &mut FlushStallingWriter,
+        &response,
+        Duration::from_millis(10),
+    )
+    .await
+    .expect_err("a stalled flush must time out");
+
+    assert!(matches!(
+        error,
+        crate::ConnectorError::OperationTimedOut("control_frame_write")
+    ));
+}
+
+#[test]
+fn inbound_subscription_quota_preserves_one_shot_capacity() {
+    let limiter = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+    let subscription = AgentControlRequest::SubscribeInbound {
+        account_id_hex: None,
+        group_id_hex: None,
+    };
+
+    let first = crate::connection::try_acquire_inbound_subscription(&subscription, &limiter)
+        .expect("first subscription should be admitted")
+        .expect("subscription should hold a permit");
+    assert!(
+        crate::connection::try_acquire_inbound_subscription(&subscription, &limiter).is_err(),
+        "a second subscription must hit the dedicated cap"
+    );
+    assert!(
+        crate::connection::try_acquire_inbound_subscription(
+            &AgentControlRequest::AccountList,
+            &limiter,
+        )
+        .expect("one-shot requests bypass the subscription cap")
+        .is_none()
+    );
+
+    drop(first);
+    assert!(
+        crate::connection::try_acquire_inbound_subscription(&subscription, &limiter)
+            .expect("released subscription capacity should be reusable")
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn subscription_capacity_error_echoes_request_id_and_is_retryable() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("dev").join("wn-agent.sock");
+    let mut connector = AgentConnector::open(test_config(
+        dir.path(),
+        socket.clone(),
+        Vec::new(),
+        false,
+        false,
+    ))
+    .unwrap();
+    connector.subscription_limiter = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let listener = bind_connector_socket(&socket).unwrap();
+    let server = tokio::spawn(async move { connector.serve_once(&listener).await });
+
+    let client = UnixStream::connect(&socket).await.unwrap();
+    let (client_read, mut client_write) = tokio::io::split(client);
+    let mut client_read = BufReader::new(client_read);
+    let request = AgentControlEnvelope::request(
+        Some("req-subscription-busy".to_owned()),
+        AgentControlRequest::SubscribeInbound {
+            account_id_hex: None,
+            group_id_hex: None,
+        },
+    );
+    write_frame(&mut client_write, &request).await.unwrap();
+
+    let response: AgentControlEnvelope<AgentControlResponse> =
+        read_envelope(&mut client_read).await.unwrap().unwrap();
+    assert_eq!(response.id.as_deref(), Some("req-subscription-busy"));
+    assert!(matches!(
+        response.payload,
+        AgentControlResponse::Error {
+            ref code,
+            retryable: true,
+            ..
+        } if code == "server_busy"
+    ));
+    server.await.unwrap().unwrap();
+}
+
+#[test]
+fn poisoned_connector_store_mutex_recovers_inner_state() {
+    let mutex = std::sync::Arc::new(std::sync::Mutex::new(vec![1]));
+    let panic_mutex = std::sync::Arc::clone(&mutex);
+
+    let panic_result = std::thread::spawn(move || {
+        let mut values = panic_mutex.lock().expect("initial lock should succeed");
+        values.push(2);
+        panic!("poison test mutex");
+    })
+    .join();
+    assert!(panic_result.is_err());
+
+    crate::lock_recover(&mutex).push(3);
+    assert_eq!(*crate::lock_recover(&mutex), vec![1, 2, 3]);
+}
+
+#[test]
+fn profile_name_validation_rejects_non_whitespace_control_characters() {
+    use crate::validation::validate_profile_name;
+
+    assert_eq!(
+        validate_profile_name("  Alice\nAgent  ".to_owned()).unwrap(),
+        "Alice Agent"
+    );
+    for name in ["Alice\u{1b}[2J", "Alice\0Agent", "Alice\u{7}Agent"] {
+        assert!(matches!(
+            validate_profile_name(name.to_owned()),
+            Err(crate::ConnectorError::InvalidProfileName(
+                "control_characters"
+            ))
+        ));
+    }
+}
+
+#[test]
+fn profile_field_validation_bounds_free_text_and_rejects_control_characters() {
+    use crate::validation::validate_profile_field;
+
+    // An omitted field keeps the published value; an empty one clears it.
+    assert_eq!(validate_profile_field("about", None).unwrap(), None);
+    assert_eq!(
+        validate_profile_field("about", Some(String::new())).unwrap(),
+        Some(String::new())
+    );
+    assert_eq!(
+        validate_profile_field("about", Some("Day family assistant.".to_owned())).unwrap(),
+        Some("Day family assistant.".to_owned())
+    );
+
+    let longest = "a".repeat(crate::MAX_PROFILE_FIELD_CHARS);
+    assert!(validate_profile_field("about", Some(longest)).is_ok());
+    assert!(matches!(
+        validate_profile_field(
+            "about",
+            Some("a".repeat(crate::MAX_PROFILE_FIELD_CHARS + 1))
+        ),
+        Err(crate::ConnectorError::InvalidProfileField(
+            "about", "too_long"
+        ))
+    ));
+
+    for (field, value) in [
+        ("about", "Day\u{1b}[2Jfamily".to_owned()),
+        ("picture", "https://example.com/\u{7}avatar.png".to_owned()),
+        ("nip05", "holly\u{0}@example.com".to_owned()),
+        ("lud16", "holly@example.com\u{b}".to_owned()),
+    ] {
+        assert!(matches!(
+            validate_profile_field(field, Some(value)),
+            Err(crate::ConnectorError::InvalidProfileField(
+                _,
+                "control_characters"
+            ))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn connector_profile_publish_rejects_hostile_optional_fields_without_publishing() {
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+    let account_home = AccountHome::open(dir.path());
+    let account = account_home.create_account("agent").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), relay_url.clone());
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        dir.path().join("dev").join("wn-agent.sock"),
+        vec![relay_url.clone()],
+        false,
+        false,
+    ))
+    .unwrap();
+
+    // The name has its own validation; these four arrive straight from the socket
+    // and would otherwise reach kind:0 unchecked.
+    for fields in [
+        ProfileUpdateFields {
+            about: Some("a".repeat(crate::MAX_PROFILE_FIELD_CHARS + 1)),
+            ..ProfileUpdateFields::default()
+        },
+        ProfileUpdateFields {
+            picture: Some("https://example.com/\u{1b}avatar.png".to_owned()),
+            ..ProfileUpdateFields::default()
+        },
+    ] {
+        let error = connector
+            .publish_profile_response(
+                &account.account_id_hex,
+                "Hermes Agent".to_owned(),
+                Some("Hermes Agent".to_owned()),
+                fields,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "invalid_profile_field");
+    }
+
+    // A rejected publish must not leave a half-written profile on the relay.
+    app.directory()
+        .refresh_profile_for_account_id(
+            &account.account_id_hex,
+            vec![crate::validation::endpoint(&relay_url)],
+        )
+        .await
+        .unwrap();
+    assert!(
+        app.directory()
+            .directory_entry_for_account_id(&account.account_id_hex)
+            .unwrap()
+            .and_then(|entry| entry.profile)
+            .is_none(),
+        "a rejected profile must not publish anything"
+    );
+}
+
+fn test_config(
+    home: &Path,
+    socket: impl Into<std::path::PathBuf>,
+    relays: Vec<String>,
+    dev_allow_any_invites: bool,
+    debug_controls: bool,
+) -> AgentConnectorConfig {
+    let mut config = AgentConnectorConfig::new(home);
+    config.socket = socket.into();
+    config.relays = relays;
+    config.dev_allow_any_invites = dev_allow_any_invites;
+    config.debug_controls = debug_controls;
+    config.media_allowed_roots = Vec::new();
+    // The white-box suite drives streams at loopback brokers and connects to an
+    // in-process `MockRelay` at loopback; production defaults keep both off (see
+    // `allow_insecure_local_broker` / `allow_loopback_relays`).
+    config.allow_insecure_local_broker = true;
+    config.allow_loopback_relays = true;
+    config
+}
+
+fn received_message(
+    kind: u64,
+    plaintext: impl Into<String>,
+    tags: Vec<Vec<String>>,
+) -> ReceivedMessage {
+    ReceivedMessage {
+        authority: None,
+        message_id_hex: "33".repeat(32),
+        source_message_id_hex: "44".repeat(32),
+        sender: "bb".repeat(32),
+        sender_display_name: None,
+        group_id: cgka_traits::GroupId::new(vec![0x22; 32]),
+        source_epoch: 7,
+        retention: None,
+        plaintext: plaintext.into(),
+        kind,
+        tags,
+        recorded_at: 42,
+        received_at: 84,
+    }
+}
+
+#[tokio::test]
+async fn control_event_requires_a_durable_row_for_received_messages() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("agent")
+        .unwrap();
+    let runtime = MarmotAppRuntime::new(MarmotApp::with_relays(dir.path(), Vec::new()));
+    let agent_account_id_hex = "aa".repeat(32);
+    for kind in [
+        MARMOT_APP_EVENT_KIND_CHAT,
+        MARMOT_APP_EVENT_KIND_DELETE,
+        MARMOT_APP_EVENT_KIND_REACTION,
+        MARMOT_APP_EVENT_KIND_EDIT,
+    ] {
+        let event = MarmotAppEvent::MessageReceived(RuntimeMessageReceived {
+            account_id_hex: agent_account_id_hex.clone(),
+            account_label: "agent".to_owned(),
+            message: received_message(kind, "untrusted live plaintext", Vec::new()),
+        });
+
+        assert_eq!(
+            control_event_from_runtime_event_with_runtime(&runtime, event, None, None).unwrap(),
+            None,
+            "kind {kind} without a durable row must not fall back to live plaintext"
+        );
+    }
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn control_event_projects_group_rename_as_group_state_changed() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = MarmotAppRuntime::new(MarmotApp::with_relays(dir.path(), Vec::new()));
+    // A GroupRenamed change projects to a coarse `group_renamed` control event
+    // carrying the new group display name in `detail`. Privacy: member/admin
+    // changes carry NO detail (the subject member's pubkey is never surfaced).
+    let agent_account_id_hex = "aa".repeat(32);
+    let event = MarmotAppEvent::GroupEvent(marmot_app::RuntimeGroupEvent {
+        account_id_hex: agent_account_id_hex.clone(),
+        account_label: "agent".to_owned(),
+        event: GroupEvent::GroupStateChanged {
+            group_id: GroupId::new(vec![0x22; 32]),
+            epoch: EpochId(3),
+            actor: None,
+            change: GroupStateChange::GroupRenamed {
+                name: "Team".to_owned(),
+                previous_name: None,
+            },
+            origin_commit_id: None,
+        },
+    });
+
+    let expected_occurrence = runtime_replay_dedup_key(&event);
+    let Some(AgentControlEvent::GroupStateChanged {
+        account_id_hex,
+        group_id_hex,
+        event_id_hex,
+        change,
+        detail,
+    }) = control_event_from_runtime_event_with_runtime(&runtime, event, None, None).unwrap()
+    else {
+        panic!("expected a group state change to project to GroupStateChanged");
+    };
+    assert_eq!(account_id_hex, agent_account_id_hex);
+    assert_eq!(group_id_hex, "22".repeat(32));
+    assert_eq!(change, "group_renamed");
+    assert_eq!(detail, Some("Team".to_owned()));
+    assert_eq!(event_id_hex.as_ref().map(String::len), Some(64));
+    assert_eq!(event_id_hex, expected_occurrence);
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn control_event_group_state_change_member_add_carries_no_member_detail() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = MarmotAppRuntime::new(MarmotApp::with_relays(dir.path(), Vec::new()));
+    // A member add must NOT surface the subject member's pubkey: the projection
+    // collapses to a coarse change kind with `detail == None`.
+    let agent_account_id_hex = "aa".repeat(32);
+    let member = cgka_traits::MemberId::new(vec![0x99; 32]);
+    let event = MarmotAppEvent::GroupEvent(marmot_app::RuntimeGroupEvent {
+        account_id_hex: agent_account_id_hex,
+        account_label: "agent".to_owned(),
+        event: GroupEvent::GroupStateChanged {
+            group_id: GroupId::new(vec![0x22; 32]),
+            epoch: EpochId(4),
+            actor: None,
+            change: GroupStateChange::MemberAdded { member },
+            origin_commit_id: None,
+        },
+    });
+
+    let Some(AgentControlEvent::GroupStateChanged { change, detail, .. }) =
+        control_event_from_runtime_event_with_runtime(&runtime, event, None, None).unwrap()
+    else {
+        panic!("expected a member add to project to GroupStateChanged");
+    };
+    assert_eq!(change, "member_added");
+    assert_eq!(detail, None, "member pubkey must never be surfaced");
+    runtime.shutdown().await;
+}
+
+#[test]
+fn control_event_projects_imeta_tag_into_inbound_media_ref() {
+    // A kind-9 chat carrying a structurally valid `imeta` tag must project a
+    // single media reference onto the InboundMessage (the non-secret mirror: no
+    // content key, just fetch + authentication metadata for download_media).
+    // A blossom-v1 locator URL MUST carry the ciphertext hash so the fetched blob
+    // matches the reference; the parser enforces this binding.
+    let ciphertext_sha256 = "cd".repeat(32);
+    let plaintext_sha256 = "ab".repeat(32);
+    let nonce_hex = "0".repeat(24); // 12 bytes
+    let locator_url = format!("https://blossom.example.com/{ciphertext_sha256}.bin");
+    let imeta = vec![
+        "imeta".to_owned(),
+        "v encrypted-media-v1".to_owned(),
+        format!("locator blossom-v1 {locator_url}"),
+        format!("ciphertext_sha256 {ciphertext_sha256}"),
+        format!("plaintext_sha256 {plaintext_sha256}"),
+        format!("nonce {nonce_hex}"),
+        "m image/png".to_owned(),
+        "filename a.png".to_owned(),
+    ];
+    let media = media_refs_from_tags(&[imeta], 7);
+    assert_eq!(media.len(), 1, "one imeta tag should project one media ref");
+    let attachment = &media[0];
+    assert_eq!(attachment.media_type, "image/png");
+    assert_eq!(attachment.file_name, "a.png");
+    assert_eq!(attachment.ciphertext_sha256, ciphertext_sha256);
+    assert_eq!(attachment.source_epoch, 7); // received_message uses source_epoch 7
+    assert_eq!(attachment.locators.len(), 1);
+    assert_eq!(attachment.locators[0].kind, "blossom-v1");
+    assert_eq!(attachment.locators[0].value, locator_url);
+}
+
+#[tokio::test]
+async fn control_event_emits_stream_update_for_agent_stream_started() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = MarmotAppRuntime::new(MarmotApp::with_relays(dir.path(), Vec::new()));
+    let agent_account_id_hex = "aa".repeat(32);
+    let stream_id_hex = "55".repeat(32);
+    let event = MarmotAppEvent::AgentStreamStarted(RuntimeAgentStreamMessage {
+        account_id_hex: agent_account_id_hex.clone(),
+        account_label: "agent".to_owned(),
+        message: received_message(
+            MARMOT_APP_EVENT_KIND_AGENT_STREAM_START,
+            "",
+            vec![vec![STREAM_TAG.to_owned(), stream_id_hex.clone()]],
+        ),
+    });
+
+    let Some(AgentControlEvent::StreamUpdate {
+        account_id_hex,
+        group_id_hex,
+        stream_id_hex: event_stream_id_hex,
+        status,
+    }) = control_event_from_runtime_event_with_runtime(&runtime, event, None, None).unwrap()
+    else {
+        panic!("expected agent stream start to become a stream update");
+    };
+
+    assert_eq!(account_id_hex, agent_account_id_hex);
+    assert_eq!(group_id_hex, "22".repeat(32));
+    assert_eq!(event_stream_id_hex, stream_id_hex);
+    assert_eq!(status, AGENT_CONTROL_STREAM_STATUS_STARTED);
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn inbound_catch_up_driver_tracks_active_subscriptions() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = MarmotAppRuntime::new(MarmotApp::with_relays(dir.path(), Vec::new()));
+    let driver = InboundCatchUpDriver::new(
+        runtime.clone(),
+        std::sync::Arc::new(crate::reconcile_telemetry::ReconcileTelemetry::default()),
+    );
+
+    let (_first_events, first_subscription) = driver.subscribe();
+    assert_eq!(driver.active.load(Ordering::Acquire), 1);
+    assert!(driver.started.load(Ordering::Acquire));
+
+    let (_second_events, second_subscription) = driver.subscribe();
+    assert_eq!(driver.active.load(Ordering::Acquire), 2);
+
+    drop(first_subscription);
+    assert_eq!(driver.active.load(Ordering::Acquire), 1);
+
+    drop(second_subscription);
+    assert_eq!(driver.active.load(Ordering::Acquire), 0);
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn inbound_catch_up_driver_failure_does_not_close_subscribers() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = MarmotAppRuntime::new(MarmotApp::with_relays(dir.path(), Vec::new()));
+    runtime.shutdown().await;
+    let driver = InboundCatchUpDriver::new(
+        runtime,
+        std::sync::Arc::new(crate::reconcile_telemetry::ReconcileTelemetry::default()),
+    );
+    let (mut events, _subscription) = driver.subscribe();
+
+    assert!(driver.request().await.is_err());
+    assert!(matches!(
+        events.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+    assert_eq!(driver.active.load(Ordering::Acquire), 1);
+}
+
+// ---- mdk#1380 regression harness: adaptive reconciliation scheduling ----
+//
+// These tests drive the shared catch-up driver and the invite-policy worker at
+// compressed intervals and assert *deterministic operation counters* (passes,
+// enumerations, candidate rows read) instead of wall-clock CPU. The window in
+// every test spans many "former intervals" (the whole fixed 5s cadence the
+// loops used to run at, compressed to milliseconds), so a regression to
+// fixed-rate polling overshoots the asserted bounds by a wide margin.
+
+const TEST_CATCH_UP_BASE: Duration = Duration::from_millis(150);
+const TEST_CATCH_UP_MAX: Duration = Duration::from_millis(600);
+const TEST_INVITE_BASE: Duration = Duration::from_millis(100);
+const TEST_INVITE_MAX: Duration = Duration::from_millis(400);
+
+fn adaptive_test_driver(
+    runtime: MarmotAppRuntime,
+) -> (
+    std::sync::Arc<crate::reconcile_telemetry::ReconcileTelemetry>,
+    InboundCatchUpDriver,
+    tokio::sync::broadcast::Sender<MarmotAppEvent>,
+) {
+    let telemetry = std::sync::Arc::new(crate::reconcile_telemetry::ReconcileTelemetry::default());
+    let (activity, _) = tokio::sync::broadcast::channel(16);
+    let driver = crate::event_projection::InboundCatchUpDriver::with_schedule(
+        runtime,
+        telemetry.clone(),
+        crate::event_projection::InboundCatchUpSchedule {
+            base: TEST_CATCH_UP_BASE,
+            max: TEST_CATCH_UP_MAX,
+        },
+    )
+    .override_activity_for_test(activity.clone());
+    (telemetry, driver, activity)
+}
+
+async fn wait_for_counter(counts: impl Fn() -> u64, expected: u64, within: Duration) {
+    timeout(within, async move {
+        loop {
+            if counts() >= expected {
+                return;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("counter should reach {expected} within {within:?}"));
+}
+
+#[tokio::test]
+async fn inbound_catch_up_driver_backs_off_while_idle() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = MarmotAppRuntime::new(MarmotApp::with_relays(dir.path(), Vec::new()));
+    runtime.start().await.unwrap();
+    let (telemetry, driver, _activity) = adaptive_test_driver(runtime.clone());
+    let (mut events, subscription) = driver.subscribe();
+
+    // A subscription's initial catch-up still runs promptly and out-of-band.
+    driver.request().await.unwrap();
+    assert_eq!(telemetry.snapshot().catch_up_explicit_requests, 1);
+
+    // Span many former fixed intervals: at the old cadence this window would
+    // see one pass per base interval (~16); the adaptive net must stay far
+    // below that while still running periodically.
+    sleep(Duration::from_millis(2_400)).await;
+    let snapshot = telemetry.snapshot();
+    assert!(
+        snapshot.catch_up_passes_started >= 3,
+        "the safety net must still run while quiet: {} passes",
+        snapshot.catch_up_passes_started
+    );
+    assert!(
+        snapshot.catch_up_passes_started <= 8,
+        "idle safety net must back off: {} passes over ~16 base intervals",
+        snapshot.catch_up_passes_started
+    );
+    assert_eq!(snapshot.catch_up_passes_failed, 0);
+    // No accounts: passes ran but considered zero workers.
+    assert_eq!(snapshot.catch_up_accounts_considered, 0);
+    assert_eq!(snapshot.catch_up_passes_with_activity, 0);
+    assert!(matches!(
+        events.try_recv(),
+        Ok(crate::event_projection::InboundCatchUpEvent::Completed)
+    ));
+
+    // Dropping the last subscription still quiesces the driver (mdk#574).
+    drop(subscription);
+    sleep(2 * TEST_CATCH_UP_MAX).await;
+    let settled = telemetry.snapshot().catch_up_passes_started;
+    sleep(3 * TEST_CATCH_UP_MAX).await;
+    assert_eq!(
+        telemetry.snapshot().catch_up_passes_started,
+        settled,
+        "driver must quiesce once no subscription remains"
+    );
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn inbound_catch_up_driver_resets_promptly_on_runtime_activity() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = MarmotAppRuntime::new(MarmotApp::with_relays(dir.path(), Vec::new()));
+    runtime.start().await.unwrap();
+    let (telemetry, driver, activity) = adaptive_test_driver(runtime.clone());
+    let (_events, _subscription) = driver.subscribe();
+
+    // Let the schedule back off past the base interval (passes at ~150ms,
+    // ~450ms, then the capped 600ms, ...).
+    wait_for_counter(
+        || telemetry.snapshot().catch_up_passes_started,
+        2,
+        Duration::from_secs(2),
+    )
+    .await;
+
+    // AccountError events must NOT wake the net: they can be produced by the
+    // driver's own failing passes and would pin the cadence during an outage.
+    let filtered_base = telemetry.snapshot().catch_up_passes_started;
+    let _ = activity.send(MarmotAppEvent::AccountError(
+        marmot_app::RuntimeAccountError {
+            account_id_hex: "self".repeat(16),
+            account_label: "self".to_owned(),
+            message: "synthetic outage marker".to_owned(),
+        },
+    ));
+    sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        telemetry.snapshot().catch_up_passes_started,
+        filtered_base,
+        "account errors must not count as qualifying activity"
+    );
+
+    // Qualifying runtime activity wakes a pass promptly even though the net is
+    // backed off to several base intervals.
+    let _ = activity.send(MarmotAppEvent::GroupStateUpdated {
+        account_id_hex: "ab".repeat(32),
+        account_label: "agent".to_owned(),
+        group_id: GroupId::new(vec![0x11; 32]),
+    });
+    let observed = telemetry.snapshot().catch_up_passes_started;
+    wait_for_counter(
+        || telemetry.snapshot().catch_up_passes_started,
+        observed + 1,
+        Duration::from_millis(250),
+    )
+    .await;
+    wait_for_counter(
+        || telemetry.snapshot().catch_up_passes_with_activity,
+        1,
+        Duration::from_millis(250),
+    )
+    .await;
+
+    // With activity observed, the cadence resets toward the base interval:
+    // another pass lands within roughly two base intervals.
+    let after_reset = telemetry.snapshot().catch_up_passes_started;
+    wait_for_counter(
+        || telemetry.snapshot().catch_up_passes_started,
+        after_reset + 1,
+        3 * TEST_CATCH_UP_BASE,
+    )
+    .await;
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn invite_policy_worker_backs_off_with_zero_candidates() {
+    let dir = tempfile::tempdir().unwrap();
+    let account_home = AccountHome::open(dir.path());
+    account_home.create_account("agent").unwrap();
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        dir.path().join("dev").join("wn-agent.sock"),
+        Vec::new(),
+        false,
+        false,
+    ))
+    .unwrap();
+    // The runtime only needs to be alive enough to broadcast events; no relays.
+    connector.runtime.start().await.unwrap();
+    let connector_worker = connector.clone();
+    tokio::spawn(async move {
+        connector_worker
+            .run_invite_policy_worker(crate::invite_policy::InvitePolicySchedule {
+                base: TEST_INVITE_BASE,
+                max: TEST_INVITE_MAX,
+                retry_base: TEST_INVITE_BASE,
+                retry_max: TEST_INVITE_MAX,
+            })
+            .await;
+    });
+
+    // The startup enumeration always runs.
+    wait_for_counter(
+        || {
+            connector
+                .reconcile_telemetry
+                .snapshot()
+                .invite_enumerations_completed
+        },
+        1,
+        Duration::from_secs(2),
+    )
+    .await;
+
+    // The fixture has an account but zero pending invites. Over many former
+    // fixed intervals the enumeration count must stay logarithmic, and the
+    // read-amplification counter (candidate rows) must stay exactly zero
+    // because no group is pending — even though the account has a projection.
+    sleep(Duration::from_millis(2_000)).await;
+    let snapshot = connector.reconcile_telemetry.snapshot();
+    assert_eq!(
+        snapshot.invite_enumerations_failed, 0,
+        "idle enumerations must succeed"
+    );
+    assert!(
+        snapshot.invite_enumerations_completed >= 2,
+        "the safety net must still enumerate periodically: {}",
+        snapshot.invite_enumerations_completed
+    );
+    assert!(
+        snapshot.invite_enumerations_completed <= 7,
+        "idle enumerations must back off: {} over ~20 base intervals",
+        snapshot.invite_enumerations_completed
+    );
+    assert_eq!(
+        snapshot.invite_candidate_rows_considered, 0,
+        "an idle session must not surface candidate rows"
+    );
+    assert_eq!(snapshot.invite_policy_apply_failures, 0);
+    assert!(
+        snapshot.invite_accounts_considered >= snapshot.invite_enumerations_completed,
+        "each enumeration accounted the single local account"
+    );
+    connector.runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn inbound_catch_up_driver_preserves_delayed_cadence_after_a_slow_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = MarmotAppRuntime::new(MarmotApp::with_relays(dir.path(), Vec::new()));
+    runtime.start().await.unwrap();
+    let (telemetry, driver, _activity) = adaptive_test_driver(runtime.clone());
+
+    // Hold the serialization lock well past the first scheduled pass's
+    // deadline — long enough that even the doubled follow-up interval would
+    // already be in the past if the deadline anchored at pass START. An
+    // explicit subscription request queues the same way in production.
+    let guard = driver.lock.lock().await;
+    let (_events, _subscription) = driver.subscribe();
+    sleep(4 * TEST_CATCH_UP_BASE).await;
+    assert_eq!(
+        telemetry.snapshot().catch_up_passes_started,
+        0,
+        "the queued pass must wait for the lock"
+    );
+    drop(guard);
+
+    // The queued pass runs. With delayed cadence the next deadline is one
+    // interval AFTER completion — not already-past — so there is no
+    // back-to-back rerun of a full catch-up (mdk#1380 review).
+    wait_for_counter(
+        || telemetry.snapshot().catch_up_passes_started,
+        1,
+        Duration::from_millis(500),
+    )
+    .await;
+    sleep(TEST_CATCH_UP_BASE / 2).await;
+    assert_eq!(
+        telemetry.snapshot().catch_up_passes_started,
+        1,
+        "a slow/queued pass must not trigger an immediate rerun"
+    );
+    // And the cadence resumes normally afterwards.
+    wait_for_counter(
+        || telemetry.snapshot().catch_up_passes_started,
+        2,
+        2 * TEST_CATCH_UP_BASE,
+    )
+    .await;
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn invite_policy_worker_does_not_spin_when_enumeration_fails_with_a_due_retry() {
+    let setup = setup_existing_pending_invite("retry enumeration failure").await;
+    let connector = AgentConnector::open(test_config(
+        setup.dir.path(),
+        setup.dir.path().join("dev").join("wn-agent.sock"),
+        vec![setup.relay_url.clone()],
+        false,
+        false,
+    ))
+    .unwrap();
+    // Exactly one enumeration may succeed, then every later one fails (a
+    // locked/closed account database in production).
+    connector
+        .test_hooks
+        .invite_enumeration_successes_before_failure
+        .store(1, Ordering::Relaxed);
+    // Stop the runtime so the one successful enumeration's apply fails
+    // deterministically and arms a retry that matures quickly.
+    connector.runtime.shutdown().await;
+    let worker = connector.clone();
+    let handle = tokio::spawn(async move {
+        worker
+            .run_invite_policy_worker(crate::invite_policy::InvitePolicySchedule {
+                base: TEST_INVITE_BASE,
+                max: TEST_INVITE_MAX,
+                retry_base: TEST_INVITE_BASE,
+                retry_max: TEST_INVITE_MAX,
+            })
+            .await;
+    });
+
+    // Establish the causal preconditions before measuring the no-spin window.
+    // On a saturated full-CI host, a fixed sleep can expire after the startup
+    // apply failure but before Tokio schedules the first retry enumeration.
+    wait_for_counter(
+        || {
+            connector
+                .reconcile_telemetry
+                .snapshot()
+                .invite_policy_apply_failures
+        },
+        1,
+        Duration::from_secs(4),
+    )
+    .await;
+    wait_for_counter(
+        || {
+            connector
+                .reconcile_telemetry
+                .snapshot()
+                .invite_enumerations_failed
+        },
+        1,
+        Duration::from_secs(4),
+    )
+    .await;
+
+    // Wait for the retry to remain matured several times over. Without the
+    // enumeration-failure floor, its deadline stays in the past and the worker
+    // would spin thousands of failing enumerations in this observation window.
+    let baseline = connector
+        .reconcile_telemetry
+        .snapshot()
+        .invite_enumerations_started;
+    sleep(Duration::from_millis(1_600)).await;
+    let attempts = connector
+        .reconcile_telemetry
+        .snapshot()
+        .invite_enumerations_started
+        .saturating_sub(baseline);
+    assert!(
+        attempts <= 14,
+        "a failing enumeration with a matured retry must back off, not spin: {attempts} attempts"
+    );
+    handle.abort();
+}
+
+#[tokio::test]
+async fn invite_policy_retry_delay_starts_after_the_failed_attempt_returns() {
+    let setup = setup_existing_pending_invite("retry delay after completion").await;
+    let connector = AgentConnector::open(test_config(
+        setup.dir.path(),
+        setup.dir.path().join("dev").join("wn-agent.sock"),
+        vec![setup.relay_url.clone()],
+        false,
+        false,
+    ))
+    .unwrap();
+    // Apply fails deterministically (stopped runtime), but only AFTER an
+    // 800ms attempt — far longer than the 200ms initial retry delay. Only the
+    // first attempt is stretched so the retry itself returns quickly.
+    connector
+        .test_hooks
+        .invite_apply_delay_ms
+        .store(800, Ordering::Relaxed);
+    connector
+        .test_hooks
+        .invite_apply_delays_remaining
+        .store(1, Ordering::Relaxed);
+    connector.runtime.shutdown().await;
+    let worker = connector.clone();
+    let handle = tokio::spawn(async move {
+        worker
+            .run_invite_policy_worker(crate::invite_policy::InvitePolicySchedule {
+                base: TEST_INVITE_BASE,
+                max: TEST_INVITE_MAX,
+                retry_base: Duration::from_millis(200),
+                retry_max: TEST_INVITE_MAX,
+            })
+            .await;
+    });
+
+    wait_for_counter(
+        || {
+            connector
+                .reconcile_telemetry
+                .snapshot()
+                .invite_policy_apply_failures
+        },
+        1,
+        Duration::from_secs(4),
+    )
+    .await;
+    let first_failure_at = std::time::Instant::now();
+    wait_for_counter(
+        || {
+            connector
+                .reconcile_telemetry
+                .snapshot()
+                .invite_policy_apply_failures
+        },
+        2,
+        Duration::from_secs(4),
+    )
+    .await;
+    let gap = first_failure_at.elapsed();
+    assert!(
+        gap >= Duration::from_millis(150),
+        "the retry must wait the full delay after the attempt returns, gap was {gap:?} \
+         (an attempt-start-anchored backoff would already have been in the past)"
+    );
+    handle.abort();
+}
+
+#[tokio::test]
+async fn stream_store_evicts_idle() {
+    use crate::stream_session::{ActiveStreamSession, StreamSessionStore};
+    use marmot_app::{AgentPublisherOptions, AgentPublisherRouting};
+    use std::time::Instant;
+
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let runtime = MarmotApp::with_relay(dir.path(), url.clone()).runtime();
+    let account = runtime
+        .create_identity(
+            AccountSetupRequest {
+                default_relays: vec![crate::validation::endpoint(&url)],
+                bootstrap_relays: vec![crate::validation::endpoint(&url)],
+                ..Default::default()
+            }
+            .relay_options_only(),
+        )
+        .await
+        .unwrap();
+    let group = runtime
+        .create_group(&account.account.account_id_hex, "idle streams", &[], None)
+        .await
+        .unwrap();
+    let store = StreamSessionStore::default();
+    for (id, age) in [(0xaa, 3600), (0xbb, 0)] {
+        let publisher = runtime
+            .open_agent_publisher(
+                account.account.account_id_hex.clone(),
+                group.clone(),
+                vec![id; 32],
+                AgentPublisherOptions {
+                    candidates: Vec::new(),
+                    routing: AgentPublisherRouting::BestEffort,
+                    parent_message_id: None,
+                    chunk_bytes: 1024,
+                    server_cert_der: None,
+                    insecure_local: false,
+                },
+            )
+            .await
+            .unwrap();
+        store.insert(
+            hex::encode([id; 32]),
+            ActiveStreamSession {
+                publisher,
+                stream_capability: [0x77; 32],
+                last_activity: Instant::now() - Duration::from_secs(age),
+            },
+        );
+    }
+    assert_eq!(store.sweep_idle(Duration::from_secs(300)).await, 1);
+    assert!(store.get(&"AA".repeat(32)).is_err());
+    assert!(
+        store
+            .get_authorized(&"BB".repeat(32), &"77".repeat(32))
+            .is_ok()
+    );
+    let active = store.remove(&"BB".repeat(32)).unwrap();
+    active.publisher.cancel().await;
+    assert!(!active.publisher.is_idle_evictable());
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+/// #366: a sealed transcript whose durable send failed is the only retry
+/// handle, so the idle sweeper must never evict it.
+#[tokio::test]
+async fn stream_store_sweep_spares_sealed_session() {
+    use crate::stream_session::{ActiveStreamSession, StreamSessionStore};
+    use marmot_app::{AgentPublisherOptions, AgentPublisherRouting};
+    use std::time::Instant;
+
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let runtime = MarmotApp::with_relay(dir.path(), url.clone()).runtime();
+    let account = runtime
+        .create_identity(
+            AccountSetupRequest {
+                default_relays: vec![crate::validation::endpoint(&url)],
+                bootstrap_relays: vec![crate::validation::endpoint(&url)],
+                ..Default::default()
+            }
+            .relay_options_only(),
+        )
+        .await
+        .unwrap();
+    let group = runtime
+        .create_group(&account.account.account_id_hex, "sealed streams", &[], None)
+        .await
+        .unwrap();
+    let publisher = runtime
+        .open_agent_publisher(
+            account.account.account_id_hex.clone(),
+            group.clone(),
+            vec![0xcc; 32],
+            AgentPublisherOptions {
+                candidates: Vec::new(),
+                routing: AgentPublisherRouting::BestEffort,
+                parent_message_id: None,
+                chunk_bytes: 1024,
+                server_cert_der: None,
+                insecure_local: false,
+            },
+        )
+        .await
+        .unwrap();
+    // Dropping the group makes the durable final fail after sealing.
+    runtime
+        .delete_group_local(&account.account.account_id_hex, &group)
+        .await
+        .unwrap();
+    assert!(matches!(
+        publisher.finish(None).await,
+        Err(marmot_app::AppError::AgentStreamSendFailed(_))
+    ));
+    let store = StreamSessionStore::default();
+    store.insert(
+        hex::encode([0xcc; 32]),
+        ActiveStreamSession {
+            publisher,
+            stream_capability: [0x77; 32],
+            last_activity: Instant::now() - Duration::from_secs(3600),
+        },
+    );
+    assert_eq!(store.sweep_idle(Duration::from_secs(300)).await, 0);
+    let sealed = store.remove(&"CC".repeat(32)).unwrap();
+    assert!(!sealed.publisher.is_idle_evictable());
+    sealed.publisher.cancel().await;
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test]
+async fn connector_socket_bind_removes_stale_socket() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("dev").join("wn-agent.sock");
+    let listener = bind_connector_socket(&socket).unwrap();
+    drop(listener);
+
+    let listener = bind_connector_socket(&socket).unwrap();
+
+    assert!(
+        listener.local_addr().is_ok(),
+        "expected connector socket to rebind after stale socket cleanup"
+    );
+}
+
+#[tokio::test]
+async fn connector_socket_bind_preserves_existing_non_socket_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("dev").join("wn-agent.sock");
+    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    std::fs::write(&socket, b"not a socket").unwrap();
+
+    let error = bind_connector_socket(&socket).unwrap_err();
+
+    assert_eq!(error.code(), "io_error");
+    assert_eq!(std::fs::read(&socket).unwrap(), b"not a socket");
+}
+
+#[tokio::test]
+async fn connector_socket_bind_reports_overlong_staging_path_before_creating_parent() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = tempfile::tempdir_in("/tmp").unwrap();
+    let probe = dir.path().join("x").join("wn-agent.sock");
+    let limit = (1..=256)
+        .take_while(|bytes| {
+            std::os::unix::net::SocketAddr::from_pathname("x".repeat(*bytes)).is_ok()
+        })
+        .last()
+        .unwrap();
+    let parent_len = 1 + limit - probe.as_os_str().as_bytes().len();
+    let socket = dir
+        .path()
+        .join("x".repeat(parent_len))
+        .join("wn-agent.sock");
+    assert_eq!(socket.as_os_str().as_bytes().len(), limit);
+    assert!(fs_private::validate_private_unix_socket_path(&socket).is_err());
+    let error = bind_connector_socket(&socket).unwrap_err();
+    assert_eq!(error.code(), "socket_path_too_long");
+    assert!(!error.retryable());
+    assert!(
+        error
+            .client_message()
+            .contains("shorten --home or --socket")
+    );
+    assert!(!error.to_string().contains(dir.path().to_str().unwrap()));
+    assert!(!socket.parent().unwrap().exists());
+    assert!(!fs_private::socket_staging_dir(&socket).exists());
+}
+
+#[tokio::test]
+async fn management_socket_can_exceed_the_budget_while_regular_control_still_fits() {
+    use std::os::unix::ffi::OsStrExt;
+
+    // macOS spells /tmp through a symlink to world-writable /private/tmp.
+    // Use the real short base so the control bind tests socket length rather
+    // than the production rejection of an untrusted directory alias.
+    let short_temp_base = std::fs::canonicalize("/tmp").unwrap();
+    let dir = tempfile::tempdir_in(short_temp_base).unwrap();
+    let probe = dir
+        .path()
+        .join("x")
+        .join("dev")
+        .join("usage-diagnostics.sock");
+    let limit = (1..=256)
+        .take_while(|bytes| {
+            std::os::unix::net::SocketAddr::from_pathname("x".repeat(*bytes)).is_ok()
+        })
+        .last()
+        .unwrap();
+    let staged_len = fs_private::socket_staging_dir(&probe)
+        .join("usage-diagnostics.sock")
+        .as_os_str()
+        .as_bytes()
+        .len();
+    let home = dir.path().join("x".repeat(2 + limit - staged_len));
+    let control = home.join("dev").join("wn-agent.sock");
+    let management = home.join("dev").join("usage-diagnostics.sock");
+    assert!(fs_private::validate_private_unix_socket_path(&control).is_ok());
+    assert!(management.as_os_str().as_bytes().len() <= limit);
+    let error = crate::usage_diagnostics::bind(&home).unwrap_err();
+    assert_eq!(error.code(), "socket_path_too_long");
+    assert!(!home.exists());
+    let listener = bind_connector_socket(&control).unwrap();
+    assert!(listener.local_addr().is_ok());
+}
+
+#[tokio::test]
+async fn connector_socket_bind_applies_configured_group_modes() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("dev").join("wn-agent.sock");
+
+    let listener = bind_connector_socket_with_mode(&socket, 0o770, 0o660).unwrap();
+
+    assert!(
+        listener.local_addr().is_ok(),
+        "expected connector socket to bind with configured permissions"
+    );
+    assert_eq!(
+        socket
+            .parent()
+            .unwrap()
+            .metadata()
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o770
+    );
+    assert_eq!(
+        socket.metadata().unwrap().permissions().mode() & 0o777,
+        0o660
+    );
+    assert!(
+        !fs_private::socket_staging_dir(&socket).exists(),
+        "staging dir should be removed after bind"
+    );
+}
+
+#[tokio::test]
+async fn connector_socket_bind_preserves_preexisting_custom_parent_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let shared_parent = dir.path().join("s");
+    std::fs::create_dir(&shared_parent).unwrap();
+    std::fs::set_permissions(&shared_parent, std::fs::Permissions::from_mode(0o750)).unwrap();
+    let socket = shared_parent.join("a");
+
+    let listener = bind_connector_socket_with_mode(&socket, 0o700, 0o600).unwrap();
+
+    assert!(listener.local_addr().is_ok());
+    assert_eq!(
+        shared_parent.metadata().unwrap().permissions().mode() & 0o777,
+        0o750
+    );
+}
+
+#[tokio::test]
+async fn connector_socket_bind_rejects_symlinked_parent_without_chmodding_target() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("target");
+    let link = dir.path().join("dev");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+    symlink(&target, &link).unwrap();
+
+    let error = bind_connector_socket_with_mode(&link.join("wn-agent.sock"), 0o700, 0o600)
+        .expect_err("symlinked socket parent must be rejected");
+
+    assert_eq!(error.code(), "io_error");
+    assert_eq!(
+        target.metadata().unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+    assert!(!target.join("wn-agent.sock").exists());
+}
+
+#[tokio::test]
+async fn connector_socket_bind_rejects_unconfigured_group_writable_parent() {
+    let dir = tempfile::tempdir().unwrap();
+    let shared_parent = dir.path().join("shared");
+    std::fs::create_dir(&shared_parent).unwrap();
+    std::fs::set_permissions(&shared_parent, std::fs::Permissions::from_mode(0o770)).unwrap();
+
+    let error = bind_connector_socket_with_mode(&shared_parent.join("wn-agent.sock"), 0o700, 0o600)
+        .expect_err("unexpected group write access must be rejected");
+
+    assert_eq!(error.code(), "io_error");
+    assert!(!shared_parent.join("wn-agent.sock").exists());
+}
+
+#[tokio::test]
+async fn connector_serve_fails_fast_when_control_socket_link_removed() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("dev").join("wn-agent.sock");
+    let config = test_config(dir.path(), socket.clone(), Vec::new(), false, false);
+    let server = tokio::spawn(serve_socket(config));
+    let response = send_control_request(
+        &socket,
+        "steady-state-before-unlink",
+        AgentControlRequest::AccountList,
+    )
+    .await;
+    assert!(matches!(
+        response.payload,
+        AgentControlResponse::AccountList { .. }
+    ));
+    std::fs::remove_file(&socket).expect("unlink final control socket path");
+    let err = tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .expect("serve must fail fast after the control socket link is removed")
+        .expect("serve task must not panic")
+        .expect_err("serve must exit with an error");
+    let crate::ConnectorError::Io(err) = err else {
+        panic!("expected control-socket I/O error");
+    };
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+}
+
+#[tokio::test]
+async fn connector_serve_fails_fast_when_control_socket_link_replaced() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("dev").join("wn-agent.sock");
+    let replacement_path = dir.path().join("dev").join("replacement.sock");
+    let config = test_config(dir.path(), socket.clone(), Vec::new(), false, false);
+    let server = tokio::spawn(serve_socket(config));
+    let response = send_control_request(
+        &socket,
+        "steady-state-before-replacement",
+        AgentControlRequest::AccountList,
+    )
+    .await;
+    assert!(matches!(
+        response.payload,
+        AgentControlResponse::AccountList { .. }
+    ));
+
+    let _replacement = std::os::unix::net::UnixListener::bind(&replacement_path)
+        .expect("bind replacement control socket");
+    std::fs::rename(&replacement_path, &socket)
+        .expect("atomically replace final control socket path");
+    let err = tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .expect("serve must fail fast after the control socket link is replaced")
+        .expect("serve task must not panic")
+        .expect_err("serve must exit with an error");
+    let crate::ConnectorError::Io(err) = err else {
+        panic!("expected control-socket I/O error");
+    };
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+}
+
+#[tokio::test]
+async fn connector_control_plane_requires_token_for_group_shared_modes() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("dev").join("wn-agent.sock");
+    let mut config = test_config(dir.path(), socket, Vec::new(), false, false);
+    config.socket_dir_mode = 0o770;
+    config.socket_mode = 0o660;
+
+    let error = serve_socket(config).await.unwrap_err();
+
+    assert_eq!(error.code(), "unsafe_control_plane_config");
+}
+
+#[tokio::test]
+async fn connector_control_plane_rejects_world_accessible_modes() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("dev").join("wn-agent.sock");
+    let mut config = test_config(dir.path(), socket, Vec::new(), false, false);
+    config.auth_token = Some("shared-secret".to_owned());
+    config.socket_mode = 0o666;
+
+    let error = serve_socket(config).await.unwrap_err();
+
+    assert_eq!(error.code(), "unsafe_control_plane_config");
+}
+
+#[tokio::test]
+async fn connector_socket_serves_account_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let account_home = AccountHome::open(dir.path());
+    let account = account_home.create_account("agent").unwrap();
+    let socket = dir.path().join("dev").join("wn-agent.sock");
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        socket.clone(),
+        Vec::new(),
+        false,
+        false,
+    ))
+    .unwrap();
+    let listener = bind_connector_socket(&socket).unwrap();
+    assert_eq!(
+        socket
+            .parent()
+            .unwrap()
+            .metadata()
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert_eq!(
+        socket.metadata().unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let server = tokio::spawn(async move { connector.serve_once(&listener).await });
+
+    let client = UnixStream::connect(&socket).await.unwrap();
+    let (client_read, mut client_write) = tokio::io::split(client);
+    let mut client_read = BufReader::new(client_read);
+    let request = AgentControlEnvelope::request(
+        Some("req-accounts".to_owned()),
+        AgentControlRequest::AccountList,
+    );
+    write_frame(&mut client_write, &request).await.unwrap();
+
+    let response: AgentControlEnvelope<AgentControlResponse> =
+        read_envelope(&mut client_read).await.unwrap().unwrap();
+    assert_eq!(response.id.as_deref(), Some("req-accounts"));
+    let AgentControlResponse::AccountList { accounts } = response.payload else {
+        panic!("expected account list response");
+    };
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts[0].account_id_hex, account.account_id_hex);
+    assert_eq!(accounts[0].label, "agent");
+    assert!(accounts[0].local_signing);
+
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn diagnostic_status_reports_selection_and_omits_identifiers() {
+    let empty_dir = tempfile::tempdir().unwrap();
+    let empty = AgentConnector::open(test_config(
+        empty_dir.path(),
+        empty_dir.path().join("dev").join("wn-agent.sock"),
+        Vec::new(),
+        false,
+        false,
+    ))
+    .unwrap();
+    let AgentControlResponse::DiagnosticStatus { report } =
+        empty.diagnostic_status_response(None, None).await.unwrap()
+    else {
+        panic!("expected diagnostic_status");
+    };
+    assert_eq!(report.selection, AgentControlAccountSelection::None);
+    assert_eq!(report.account_count, 0);
+    assert_eq!(report.local_signing_account_count, 0);
+    assert_eq!(
+        report.key_package.availability,
+        agent_control::AgentControlKeyPackageAvailability::Unavailable
+    );
+    assert_eq!(
+        report.replay.state,
+        agent_control::AgentControlReplayState::Idle
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let first = home.create_account("agent-a").unwrap();
+    let second = home.create_account("agent-b").unwrap();
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        dir.path().join("dev").join("wn-agent.sock"),
+        vec!["wss://relay.example".to_owned()],
+        true,
+        true,
+    ))
+    .unwrap();
+    connector
+        .allowlists
+        .add(&first.account_id_hex, &"cc".repeat(32))
+        .unwrap();
+
+    let AgentControlResponse::DiagnosticStatus { report } = connector
+        .diagnostic_status_response(None, None)
+        .await
+        .unwrap()
+    else {
+        panic!("expected diagnostic_status");
+    };
+    assert_eq!(report.selection, AgentControlAccountSelection::Ambiguous);
+    assert_eq!(report.local_signing_account_count, 2);
+    assert!(report.allow_any);
+    assert_eq!(report.relays.configured, 1);
+    assert_eq!(report.welcomer_count, 0);
+
+    let AgentControlResponse::DiagnosticStatus { report } = connector
+        .diagnostic_status_response(Some(&first.account_id_hex), None)
+        .await
+        .unwrap()
+    else {
+        panic!("expected diagnostic_status");
+    };
+    assert_eq!(report.selection, AgentControlAccountSelection::Selected);
+    assert_eq!(report.welcomer_count, 1);
+    assert_eq!(
+        report.key_package.availability,
+        agent_control::AgentControlKeyPackageAvailability::Unavailable
+    );
+    assert!(!report.home.requested);
+
+    let AgentControlResponse::DiagnosticStatus { report } = connector
+        .diagnostic_status_response(Some(&"dd".repeat(32)), None)
+        .await
+        .unwrap()
+    else {
+        panic!("expected diagnostic_status");
+    };
+    assert_eq!(
+        report.selection,
+        AgentControlAccountSelection::ExplicitUnavailable
+    );
+
+    let AgentControlResponse::DiagnosticStatus { report } = connector
+        .diagnostic_status_response(Some(&second.account_id_hex), Some(&"22".repeat(16)))
+        .await
+        .unwrap()
+    else {
+        panic!("expected diagnostic_status");
+    };
+    assert!(report.home.requested);
+    assert!(!report.home.resolved);
+    let encoded =
+        serde_json::to_string(&AgentControlResponse::DiagnosticStatus { report }).unwrap();
+    for forbidden in [
+        &first.account_id_hex,
+        &second.account_id_hex,
+        "wss://relay.example",
+        "agent-a",
+        "agent-b",
+    ] {
+        assert!(
+            !encoded.contains(forbidden),
+            "diagnostic report leaked {forbidden}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn connector_socket_caps_concurrent_connections() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("dev").join("wn-agent.sock");
+    let mut config = test_config(dir.path(), socket.clone(), Vec::new(), false, false);
+    config.max_connections = 1;
+    let server = tokio::spawn(serve_socket(config));
+
+    // A long-lived subscription holds the only permit for its whole session;
+    // the ack proves it is accepted and served before the second connection.
+    let held = connect_with_retry(&socket).await;
+    let (held_read, mut held_write) = tokio::io::split(held);
+    let mut held_read = BufReader::new(held_read);
+    let request = AgentControlEnvelope::request(
+        Some("req-held".to_owned()),
+        AgentControlRequest::SubscribeInbound {
+            account_id_hex: None,
+            group_id_hex: None,
+        },
+    );
+    write_frame(&mut held_write, &request).await.unwrap();
+    let response: AgentControlEnvelope<AgentControlResponse> =
+        timeout(CONTROL_RESPONSE_TIMEOUT, read_envelope(&mut held_read))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    assert_eq!(response.id.as_deref(), Some("req-held"));
+    assert_eq!(response.payload, AgentControlResponse::Ack);
+
+    // A second concurrent connection is over the global cap and receives a
+    // typed busy response rather than an ambiguous empty close.
+    let refused = UnixStream::connect(&socket).await.unwrap();
+    let (refused_read, mut refused_write) = tokio::io::split(refused);
+    let mut refused_read = BufReader::new(refused_read);
+    let request = AgentControlEnvelope::request(
+        Some("req-refused".to_owned()),
+        AgentControlRequest::AccountList,
+    );
+    let _ = write_frame(&mut refused_write, &request).await;
+    let refused_response: AgentControlEnvelope<AgentControlResponse> =
+        timeout(CONTROL_RESPONSE_TIMEOUT, read_envelope(&mut refused_read))
+            .await
+            .expect("busy response should not time out")
+            .expect("busy response should be a valid frame")
+            .expect("busy response should not be empty");
+    assert_eq!(refused_response.id, None);
+    assert!(matches!(
+        refused_response.payload,
+        AgentControlResponse::Error {
+            ref code,
+            retryable: false,
+            ..
+        } if code == "server_busy"
+    ));
+
+    // Dropping the held connection frees the permit for a new connection.
+    drop(held_read);
+    drop(held_write);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let client = connect_with_retry(&socket).await;
+        let (client_read, mut client_write) = tokio::io::split(client);
+        let mut client_read = BufReader::new(client_read);
+        let request = AgentControlEnvelope::request(
+            Some("req-after-release".to_owned()),
+            AgentControlRequest::AccountList,
+        );
+        if write_frame(&mut client_write, &request).await.is_ok()
+            && let Ok(Ok(Some(response))) = timeout(
+                Duration::from_secs(2),
+                read_envelope::<_, AgentControlResponse>(&mut client_read),
+            )
+            .await
+        {
+            assert_eq!(response.id.as_deref(), Some("req-after-release"));
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "released permit must allow a new connection to be served"
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn connector_control_plane_rejects_zero_connection_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("dev").join("wn-agent.sock");
+    let mut config = test_config(dir.path(), socket, Vec::new(), false, false);
+    config.max_connections = 0;
+
+    let error = serve_socket(config).await.unwrap_err();
+
+    assert_eq!(error.code(), "unsafe_control_plane_config");
+}
+
+#[tokio::test]
+async fn connector_socket_requires_configured_auth_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let account_home = AccountHome::open(dir.path());
+    let account = account_home.create_account("agent").unwrap();
+    let socket = dir.path().join("dev").join("wn-agent.sock");
+    let mut config = test_config(dir.path(), socket.clone(), Vec::new(), false, false);
+    config.auth_token = Some("test-token".to_owned());
+    let connector = AgentConnector::open(config).unwrap();
+    let listener = bind_connector_socket(&socket).unwrap();
+
+    let denied = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "req-no-token",
+        AgentControlRequest::AccountList,
+    )
+    .await;
+
+    let AgentControlResponse::Error { code, .. } = denied.payload else {
+        panic!("expected unauthorized response without token");
+    };
+    assert_eq!(denied.id.as_deref(), Some("req-no-token"));
+    assert_eq!(code, "unauthorized");
+
+    let wrong = serve_control_request_once_with_auth(
+        &connector,
+        &listener,
+        &socket,
+        "req-wrong-token",
+        AgentControlRequest::AccountList,
+        Some("wrong-token"),
+    )
+    .await;
+
+    let AgentControlResponse::Error { code, .. } = wrong.payload else {
+        panic!("expected unauthorized response with wrong token");
+    };
+    assert_eq!(wrong.id.as_deref(), Some("req-wrong-token"));
+    assert_eq!(code, "unauthorized");
+
+    let allowed = serve_control_request_once_with_auth(
+        &connector,
+        &listener,
+        &socket,
+        "req-token",
+        AgentControlRequest::AccountList,
+        Some("test-token"),
+    )
+    .await;
+
+    assert_eq!(allowed.id.as_deref(), Some("req-token"));
+    let AgentControlResponse::AccountList { accounts } = allowed.payload else {
+        panic!("expected account list response with correct token");
+    };
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(accounts[0].account_id_hex, account.account_id_hex);
+}
+
+#[tokio::test]
+async fn connector_edit_message_replaces_own_text_and_reports_refusals() {
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+    let setup_runtime = MarmotAppRuntime::new(MarmotApp::with_relay(dir.path(), relay_url.clone()));
+    let agent = setup_runtime
+        .create_identity(AccountSetupRequest {
+            default_relays: vec![crate::validation::endpoint(&relay_url)],
+            bootstrap_relays: vec![crate::validation::endpoint(&relay_url)],
+            ..AccountSetupRequest::default()
+        })
+        .await
+        .unwrap();
+    let group_id = setup_runtime
+        .create_group(&agent.account.account_id_hex, "agent status", &[], None)
+        .await
+        .unwrap();
+    setup_runtime.shutdown().await;
+
+    let account_id_hex = agent.account.account_id_hex.clone();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let socket = dir.path().join("dev").join("wn-agent.sock");
+    let server = tokio::spawn(serve_socket(test_config(
+        dir.path(),
+        socket.clone(),
+        vec![relay_url],
+        false,
+        false,
+    )));
+    let edit = |target: &str, text: &str| AgentControlRequest::EditMessage {
+        account_id_hex: account_id_hex.clone(),
+        group_id_hex: group_id_hex.clone(),
+        target_message_id_hex: target.to_owned(),
+        text: text.to_owned(),
+    };
+
+    connect_with_retry(&socket).await;
+    let status = send_control_request(
+        &socket,
+        "req-status",
+        AgentControlRequest::SendFinal {
+            account_id_hex: account_id_hex.clone(),
+            group_id_hex: group_id_hex.clone(),
+            text: "status: starting".to_owned(),
+            reply_to_message_id_hex: None,
+            idempotency_key: None,
+        },
+    )
+    .await;
+    let AgentControlResponse::FinalSent {
+        message_ids_hex, ..
+    } = status.payload
+    else {
+        panic!("expected status send, got {:?}", status.payload);
+    };
+    let status_id = message_ids_hex[0].clone();
+
+    let edited = send_control_request(&socket, "req-edit", edit(&status_id, "status: done")).await;
+    let AgentControlResponse::FinalSent {
+        message_ids_hex, ..
+    } = edited.payload
+    else {
+        panic!("expected edit to publish, got {:?}", edited.payload);
+    };
+    assert_eq!(message_ids_hex.len(), 1);
+    assert_ne!(message_ids_hex[0], status_id, "an edit is its own event");
+    let read = send_control_request(
+        &socket,
+        "req-read",
+        AgentControlRequest::TimelineMessageGet {
+            account_id_hex: account_id_hex.clone(),
+            group_id_hex: group_id_hex.clone(),
+            message_id_hex: status_id.clone(),
+            include_media: None,
+        },
+    )
+    .await;
+    let AgentControlResponse::TimelineMessage {
+        message: Some(message),
+        ..
+    } = read.payload
+    else {
+        panic!("expected the status row, got {:?}", read.payload);
+    };
+    assert_eq!(message.text.as_deref(), Some("status: done"));
+
+    let refused = send_control_request(
+        &socket,
+        "req-edit-unknown",
+        edit(&"ab".repeat(32), "rewritten"),
+    )
+    .await;
+    let AgentControlResponse::Error {
+        code, retryable, ..
+    } = refused.payload
+    else {
+        panic!("expected an edit refusal, got {:?}", refused.payload);
+    };
+    assert_eq!(code, "invalid_edit_target");
+    assert!(!retryable);
+
+    let malformed =
+        send_control_request(&socket, "req-edit-bad-hex", edit("not-hex", "rewritten")).await;
+    let AgentControlResponse::Error { code, .. } = malformed.payload else {
+        panic!("expected a hex refusal, got {:?}", malformed.payload);
+    };
+    assert_eq!(code, "invalid_hex");
+    server.abort();
+}
+
+#[test]
+fn invalid_edit_target_is_a_final_connector_error() {
+    let error = crate::ConnectorError::App(AppError::InvalidEditTarget);
+    assert_eq!(error.code(), "invalid_edit_target");
+    assert!(!error.retryable());
+}
+
+#[tokio::test]
+async fn connector_socket_subscribes_to_inbound_messages() {
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+    let app = MarmotApp::with_relay(dir.path(), relay_url.clone());
+    let setup_runtime = MarmotAppRuntime::new(app);
+    let setup = AccountSetupRequest {
+        default_relays: vec![crate::validation::endpoint(&relay_url)],
+        bootstrap_relays: vec![crate::validation::endpoint(&relay_url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let agent = setup_runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
+    let human = setup_runtime.create_identity(setup).await.unwrap();
+    let group_id = setup_runtime
+        .create_group(
+            &agent.account.account_id_hex,
+            "agent inbound",
+            std::slice::from_ref(&human.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    accept_group_invite_retrying_busy(&setup_runtime, &human.account.account_id_hex, &group_id)
+        .await;
+    setup_runtime.shutdown().await;
+
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let socket = dir.path().join("dev").join("wn-agent.sock");
+    let server = tokio::spawn(serve_socket(test_config(
+        dir.path(),
+        socket.clone(),
+        vec![relay_url],
+        false,
+        false,
+    )));
+
+    let subscriber = connect_with_retry(&socket).await;
+    let (subscriber_read, mut subscriber_write) = tokio::io::split(subscriber);
+    let mut subscriber_read = BufReader::new(subscriber_read);
+    let subscribe = AgentControlEnvelope::request(
+        Some("req-subscribe".to_owned()),
+        AgentControlRequest::SubscribeInbound {
+            account_id_hex: Some(agent.account.account_id_hex.clone()),
+            group_id_hex: Some(group_id_hex.clone()),
+        },
+    );
+    write_frame(&mut subscriber_write, &subscribe)
+        .await
+        .unwrap();
+    let ack: AgentControlEnvelope<AgentControlResponse> = timeout(
+        CONTROL_RESPONSE_TIMEOUT,
+        read_envelope(&mut subscriber_read),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    assert_eq!(ack.id.as_deref(), Some("req-subscribe"));
+    assert_eq!(ack.payload, AgentControlResponse::Ack);
+
+    let sender = connect_with_retry(&socket).await;
+    let (sender_read, mut sender_write) = tokio::io::split(sender);
+    let mut sender_read = BufReader::new(sender_read);
+    let send = AgentControlEnvelope::request(
+        Some("req-human-final".to_owned()),
+        AgentControlRequest::SendFinal {
+            account_id_hex: human.account.account_id_hex.clone(),
+            group_id_hex: group_id_hex.clone(),
+            text: "hello agent".to_owned(),
+            reply_to_message_id_hex: None,
+            idempotency_key: None,
+        },
+    );
+    write_frame(&mut sender_write, &send).await.unwrap();
+    let sent: AgentControlEnvelope<AgentControlResponse> =
+        timeout(CONTROL_RESPONSE_TIMEOUT, read_envelope(&mut sender_read))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    let AgentControlResponse::FinalSent {
+        message_ids_hex, ..
+    } = sent.payload
+    else {
+        panic!("expected human final send");
+    };
+    let human_message_id_hex = message_ids_hex[0].clone();
+
+    let inbound = read_matching_inbound_message(&mut subscriber_read, "hello agent").await;
+    assert_eq!(inbound.id.as_deref(), Some("req-subscribe"));
+    let AgentControlEvent::InboundMessage {
+        account_id_hex,
+        group_id_hex: event_group_id_hex,
+        message,
+        ..
+    } = inbound.payload
+    else {
+        panic!("expected inbound message event");
+    };
+    assert_eq!(account_id_hex, agent.account.account_id_hex);
+    assert_eq!(event_group_id_hex, group_id_hex);
+    assert_eq!(message.sender.account_id_hex, human.account.account_id_hex);
+    assert_eq!(message.text, "hello agent");
+    assert!(message.recorded_at > 0);
+
+    // Let the agent reply, then have the human reply to that agent-authored
+    // message. The next inbound event must hydrate the reference from durable
+    // rows and attribute it as the subscribed account's own message.
+    let agent_reply_sent = send_control_request(
+        &socket,
+        "req-agent-reply",
+        AgentControlRequest::SendFinal {
+            account_id_hex: agent.account.account_id_hex.clone(),
+            group_id_hex: group_id_hex.clone(),
+            text: "agent answer".to_owned(),
+            reply_to_message_id_hex: Some(human_message_id_hex.clone()),
+            idempotency_key: None,
+        },
+    )
+    .await;
+    let AgentControlResponse::FinalSent {
+        message_ids_hex, ..
+    } = agent_reply_sent.payload
+    else {
+        panic!("expected agent reply send");
+    };
+    let agent_reply_message_id_hex = message_ids_hex[0].clone();
+
+    let human_reply_sent = send_control_request(
+        &socket,
+        "req-human-reply",
+        AgentControlRequest::SendFinal {
+            account_id_hex: human.account.account_id_hex.clone(),
+            group_id_hex: group_id_hex.clone(),
+            text: "reply with context".to_owned(),
+            reply_to_message_id_hex: Some(agent_reply_message_id_hex.clone()),
+            idempotency_key: None,
+        },
+    )
+    .await;
+    assert!(matches!(
+        human_reply_sent.payload,
+        AgentControlResponse::FinalSent { .. }
+    ));
+
+    let reply_inbound =
+        read_matching_inbound_message(&mut subscriber_read, "reply with context").await;
+    let AgentControlEvent::InboundMessage {
+        message, reply_to, ..
+    } = reply_inbound.payload
+    else {
+        panic!("expected rich inbound reply");
+    };
+    assert_eq!(message.sender.account_id_hex, human.account.account_id_hex);
+    let reply_to = reply_to.expect("reply context");
+    assert_eq!(reply_to.message_id_hex, agent_reply_message_id_hex);
+    assert_eq!(
+        reply_to.availability,
+        agent_control::AgentControlReferencedMessageAvailability::Available
+    );
+    assert_eq!(
+        reply_to
+            .sender
+            .as_ref()
+            .map(|actor| actor.account_id_hex.as_str()),
+        Some(agent.account.account_id_hex.as_str())
+    );
+    assert_eq!(
+        reply_to.sender.as_ref().map(|actor| actor.is_self),
+        Some(true)
+    );
+    assert_eq!(reply_to.text_excerpt.as_deref(), Some("agent answer"));
+    assert!(!reply_to.text_truncated);
+    assert!(reply_to.recorded_at.is_some());
+
+    let reaction_added = send_control_request(
+        &socket,
+        "req-agent-reaction-add",
+        AgentControlRequest::SendReaction {
+            account_id_hex: agent.account.account_id_hex.clone(),
+            group_id_hex: group_id_hex.clone(),
+            target_message_id_hex: human_message_id_hex.clone(),
+            emoji: "👀".to_owned(),
+        },
+    )
+    .await;
+    let AgentControlResponse::AppEventSent {
+        message_ids_hex: reaction_message_ids,
+        ..
+    } = reaction_added.payload
+    else {
+        panic!("expected reaction add response");
+    };
+    assert_eq!(reaction_message_ids.len(), 1);
+    assert!(!reaction_message_ids[0].is_empty());
+
+    let repeated_add = send_control_request(
+        &socket,
+        "req-agent-reaction-add-retry",
+        AgentControlRequest::SendReaction {
+            account_id_hex: agent.account.account_id_hex.clone(),
+            group_id_hex: group_id_hex.clone(),
+            target_message_id_hex: human_message_id_hex.clone(),
+            emoji: "👀".to_owned(),
+        },
+    )
+    .await;
+    let AgentControlResponse::AppEventSent {
+        message_ids_hex: repeated_message_ids,
+        ..
+    } = repeated_add.payload
+    else {
+        panic!("expected idempotent reaction add response");
+    };
+    assert_eq!(repeated_message_ids, reaction_message_ids);
+
+    let completion_added = send_control_request(
+        &socket,
+        "req-agent-reaction-add-completion",
+        AgentControlRequest::SendReaction {
+            account_id_hex: agent.account.account_id_hex.clone(),
+            group_id_hex: group_id_hex.clone(),
+            target_message_id_hex: human_message_id_hex.clone(),
+            emoji: "✅".to_owned(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        completion_added.payload,
+        AgentControlResponse::AppEventSent { .. }
+    ));
+
+    let reaction_removed = send_control_request(
+        &socket,
+        "req-agent-reaction-remove-matching",
+        AgentControlRequest::RemoveReaction {
+            account_id_hex: agent.account.account_id_hex.clone(),
+            group_id_hex: group_id_hex.clone(),
+            target_message_id_hex: human_message_id_hex.clone(),
+            emoji: Some("👀".to_owned()),
+        },
+    )
+    .await;
+    let AgentControlResponse::AppEventSent {
+        message_ids_hex: removal_message_ids,
+        ..
+    } = reaction_removed.payload
+    else {
+        panic!("expected reaction remove response");
+    };
+    assert_eq!(removal_message_ids.len(), 1);
+    assert!(!removal_message_ids[0].is_empty());
+
+    let repeated_removal = send_control_request(
+        &socket,
+        "req-agent-reaction-remove-matching-repeat",
+        AgentControlRequest::RemoveReaction {
+            account_id_hex: agent.account.account_id_hex.clone(),
+            group_id_hex: group_id_hex.clone(),
+            target_message_id_hex: human_message_id_hex.clone(),
+            emoji: Some("👀".to_owned()),
+        },
+    )
+    .await;
+    let AgentControlResponse::Error { code, .. } = repeated_removal.payload else {
+        panic!("expected missing-reaction error on repeated removal");
+    };
+    assert_eq!(code, "reaction_not_found");
+
+    let remaining_removed = send_control_request(
+        &socket,
+        "req-agent-reaction-remove-all",
+        AgentControlRequest::RemoveReaction {
+            account_id_hex: agent.account.account_id_hex.clone(),
+            group_id_hex: group_id_hex.clone(),
+            target_message_id_hex: human_message_id_hex.clone(),
+            emoji: None,
+        },
+    )
+    .await;
+    assert!(matches!(
+        remaining_removed.payload,
+        AgentControlResponse::AppEventSent { .. }
+    ));
+
+    let repeated_remove_all = send_control_request(
+        &socket,
+        "req-agent-reaction-remove-all-repeat",
+        AgentControlRequest::RemoveReaction {
+            account_id_hex: agent.account.account_id_hex.clone(),
+            group_id_hex: group_id_hex.clone(),
+            target_message_id_hex: human_message_id_hex.clone(),
+            emoji: None,
+        },
+    )
+    .await;
+    let AgentControlResponse::Error { code, .. } = repeated_remove_all.payload else {
+        panic!("expected missing-reaction error after removing all reactions");
+    };
+    assert_eq!(code, "reaction_not_found");
+
+    let deleted = send_control_request(
+        &socket,
+        "req-human-delete",
+        AgentControlRequest::DeleteMessage {
+            account_id_hex: human.account.account_id_hex.clone(),
+            group_id_hex: group_id_hex.clone(),
+            target_message_id_hex: human_message_id_hex.clone(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        deleted.payload,
+        AgentControlResponse::FinalSent { .. }
+    ));
+
+    let deletion_event = loop {
+        let event: AgentControlEnvelope<AgentControlEvent> = timeout(
+            CONTROL_RESPONSE_TIMEOUT,
+            read_envelope(&mut subscriber_read),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        if matches!(event.payload, AgentControlEvent::MessageDeleted { .. }) {
+            break event;
+        }
+    };
+    let AgentControlEvent::MessageDeleted {
+        event_id_hex,
+        target_message_id_hex,
+        actor,
+        recorded_at,
+        target,
+        ..
+    } = deletion_event.payload
+    else {
+        unreachable!();
+    };
+    assert!(!event_id_hex.is_empty());
+    assert_eq!(target_message_id_hex, human_message_id_hex);
+    assert_eq!(actor.account_id_hex, human.account.account_id_hex);
+    assert!(!actor.is_self);
+    assert!(recorded_at > 0);
+    assert_eq!(
+        target.availability,
+        agent_control::AgentControlReferencedMessageAvailability::Deleted
+    );
+    assert!(target.text_excerpt.is_none());
+    assert!(target.attachments.is_empty());
+
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn connector_socket_subscribe_terminates_when_client_disconnects() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("dev").join("wn-agent.sock");
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        socket.clone(),
+        Vec::new(),
+        false,
+        false,
+    ))
+    .unwrap();
+    let listener = bind_connector_socket(&socket).unwrap();
+    let server = tokio::spawn(async move { connector.serve_once(&listener).await });
+
+    let subscriber = UnixStream::connect(&socket).await.unwrap();
+    let (subscriber_read, mut subscriber_write) = tokio::io::split(subscriber);
+    let mut subscriber_read = BufReader::new(subscriber_read);
+    let subscribe = AgentControlEnvelope::request(
+        Some("req-disconnect-subscribe".to_owned()),
+        AgentControlRequest::SubscribeInbound {
+            account_id_hex: None,
+            group_id_hex: None,
+        },
+    );
+    write_frame(&mut subscriber_write, &subscribe)
+        .await
+        .unwrap();
+    let ack: AgentControlEnvelope<AgentControlResponse> = timeout(
+        CONTROL_RESPONSE_TIMEOUT,
+        read_envelope(&mut subscriber_read),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    assert_eq!(ack.payload, AgentControlResponse::Ack);
+
+    drop(subscriber_write);
+    drop(subscriber_read);
+
+    timeout(Duration::from_secs(1), server)
+        .await
+        .expect("subscribe connection should terminate promptly after client disconnect")
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn connector_debug_controls_inject_inbound_and_record_final_sends() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("dev").join("wn-agent.sock");
+    let account_id_hex = "11".repeat(32);
+    let group_id_hex = "22".repeat(32);
+    let message_id_hex = "33".repeat(32);
+    let sender_account_id_hex = "44".repeat(32);
+    let server = tokio::spawn(serve_socket(test_config(
+        dir.path(),
+        socket.clone(),
+        Vec::new(),
+        false,
+        true,
+    )));
+
+    let subscriber = connect_with_retry(&socket).await;
+    let (subscriber_read, mut subscriber_write) = tokio::io::split(subscriber);
+    let mut subscriber_read = BufReader::new(subscriber_read);
+    let subscribe = AgentControlEnvelope::request(
+        Some("req-debug-subscribe".to_owned()),
+        AgentControlRequest::SubscribeInbound {
+            account_id_hex: Some(account_id_hex.clone()),
+            group_id_hex: Some(group_id_hex.clone()),
+        },
+    );
+    write_frame(&mut subscriber_write, &subscribe)
+        .await
+        .unwrap();
+    let ack: AgentControlEnvelope<AgentControlResponse> = timeout(
+        CONTROL_RESPONSE_TIMEOUT,
+        read_envelope(&mut subscriber_read),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    assert_eq!(ack.payload, AgentControlResponse::Ack);
+
+    let injected = send_control_request(
+        &socket,
+        "req-debug-inject",
+        AgentControlRequest::DebugInjectInbound {
+            account_id_hex: account_id_hex.clone(),
+            group_id_hex: group_id_hex.clone(),
+            message_id_hex: message_id_hex.clone(),
+            sender_account_id_hex: sender_account_id_hex.clone(),
+            text: "ping from connector".to_owned(),
+        },
+    )
+    .await;
+    assert_eq!(injected.payload, AgentControlResponse::Ack);
+
+    let inbound = read_matching_inbound_message(&mut subscriber_read, "ping from connector").await;
+    let AgentControlEvent::InboundMessage {
+        account_id_hex: event_account_id_hex,
+        group_id_hex: event_group_id_hex,
+        message,
+        ..
+    } = inbound.payload
+    else {
+        panic!("expected debug inbound message event");
+    };
+    assert_eq!(event_account_id_hex, account_id_hex);
+    assert_eq!(event_group_id_hex, group_id_hex);
+    assert_eq!(message.message_id_hex, message_id_hex);
+    assert_eq!(message.sender.account_id_hex, sender_account_id_hex);
+    assert_eq!(message.text, "ping from connector");
+
+    let sent = send_control_request(
+        &socket,
+        "req-debug-final",
+        AgentControlRequest::SendFinal {
+            account_id_hex: account_id_hex.clone(),
+            group_id_hex: group_id_hex.clone(),
+            text: "marmot-e2e-ok: ping from connector".to_owned(),
+            reply_to_message_id_hex: Some(message_id_hex.clone()),
+            idempotency_key: None,
+        },
+    )
+    .await;
+    let AgentControlResponse::FinalSent {
+        message_ids_hex, ..
+    } = sent.payload
+    else {
+        panic!("expected debug final sent response");
+    };
+    assert_eq!(message_ids_hex, vec![format!("{:064x}", 1)]);
+
+    let recorded = send_control_request(
+        &socket,
+        "req-debug-finals",
+        AgentControlRequest::DebugRecordedFinals,
+    )
+    .await;
+    let AgentControlResponse::DebugRecordedFinals { sends } = recorded.payload else {
+        panic!("expected recorded debug finals");
+    };
+    assert_eq!(sends.len(), 1);
+    assert_eq!(sends[0].account_id_hex, account_id_hex);
+    assert_eq!(sends[0].group_id_hex, group_id_hex);
+    assert_eq!(
+        sends[0].text,
+        "marmot-e2e-ok: ping from connector".to_owned()
+    );
+    assert_eq!(
+        sends[0].reply_to_message_id_hex.as_deref(),
+        Some(message_id_hex.as_str())
+    );
+    assert_eq!(sends[0].message_ids_hex, vec![format!("{:064x}", 1)]);
+
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn connector_debug_controls_are_disabled_by_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("dev").join("wn-agent.sock");
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        socket.clone(),
+        Vec::new(),
+        false,
+        false,
+    ))
+    .unwrap();
+    let listener = bind_connector_socket(&socket).unwrap();
+
+    let response = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "req-debug-disabled",
+        AgentControlRequest::DebugRecordedFinals,
+    )
+    .await;
+    let AgentControlResponse::Error { code, .. } = response.payload else {
+        panic!("expected debug controls disabled error");
+    };
+    assert_eq!(code, "debug_controls_disabled");
+}
+
+#[tokio::test]
+async fn connector_socket_updates_allowlist() {
+    let dir = tempfile::tempdir().unwrap();
+    let account_home = AccountHome::open(dir.path());
+    let agent = account_home.create_account("agent").unwrap();
+    let welcomer = account_home.create_account("welcomer").unwrap();
+    let socket = dir.path().join("dev").join("wn-agent.sock");
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        socket.clone(),
+        Vec::new(),
+        false,
+        false,
+    ))
+    .unwrap();
+    let listener = bind_connector_socket(&socket).unwrap();
+
+    let added = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "req-allow-add",
+        AgentControlRequest::AllowlistAdd {
+            account_id_hex: agent.account_id_hex.clone(),
+            welcomer_account_id_hex: welcomer.account_id_hex.clone(),
+        },
+    )
+    .await;
+    assert_allowlist(
+        added,
+        "req-allow-add",
+        &agent.account_id_hex,
+        &[welcomer.account_id_hex.as_str()],
+    );
+
+    let listed = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "req-allow-list",
+        AgentControlRequest::AllowlistList {
+            account_id_hex: agent.account_id_hex.clone(),
+        },
+    )
+    .await;
+    assert_allowlist(
+        listed,
+        "req-allow-list",
+        &agent.account_id_hex,
+        &[welcomer.account_id_hex.as_str()],
+    );
+
+    let removed = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "req-allow-remove",
+        AgentControlRequest::AllowlistRemove {
+            account_id_hex: agent.account_id_hex.clone(),
+            welcomer_account_id_hex: welcomer.account_id_hex.clone(),
+        },
+    )
+    .await;
+    assert_allowlist(removed, "req-allow-remove", &agent.account_id_hex, &[]);
+}
+
+#[test]
+fn allowlist_store_treats_corrupt_record_as_empty_and_recovers_on_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = AllowlistStore::new(dir.path());
+    let account_id_hex = format!("{:064x}", 1);
+    let welcomer_account_id_hex = format!("{:064x}", 2);
+    std::fs::create_dir_all(&store.dir).unwrap();
+    std::fs::write(store.record_path(&account_id_hex), b"{not valid json").unwrap();
+
+    assert_eq!(store.list(&account_id_hex).unwrap(), Vec::<String>::new());
+    assert!(
+        !store
+            .contains(&account_id_hex, &welcomer_account_id_hex)
+            .unwrap()
+    );
+
+    assert_eq!(
+        store
+            .add(&account_id_hex, &welcomer_account_id_hex)
+            .unwrap(),
+        vec![welcomer_account_id_hex.clone()]
+    );
+    assert_eq!(
+        store
+            .read_record(&account_id_hex)
+            .unwrap()
+            .welcomer_account_ids_hex,
+        vec![welcomer_account_id_hex]
+    );
+}
+
+#[test]
+fn allowlist_store_atomic_write_replaces_stale_temp_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = AllowlistStore::new(dir.path());
+    let account_id_hex = format!("{:064x}", 1);
+    let welcomer_account_id_hex = format!("{:064x}", 2);
+    let temp_path = store.temp_record_path(&account_id_hex);
+    std::fs::create_dir_all(&store.dir).unwrap();
+    std::fs::write(&temp_path, b"partial write from crashed writer").unwrap();
+
+    store
+        .write_record(&AllowlistRecord {
+            account_id_hex: account_id_hex.clone(),
+            invite_policy: AgentControlInvitePolicy::Allowlist,
+            welcomer_account_ids_hex: vec![welcomer_account_id_hex.clone()],
+        })
+        .unwrap();
+
+    assert!(!temp_path.exists());
+    assert_eq!(
+        store
+            .read_record(&account_id_hex)
+            .unwrap()
+            .welcomer_account_ids_hex,
+        vec![welcomer_account_id_hex]
+    );
+    assert_eq!(
+        store
+            .record_path(&account_id_hex)
+            .metadata()
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+}
+
+#[test]
+fn allowlist_store_ignores_record_whose_account_id_does_not_match_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = AllowlistStore::new(dir.path());
+    let requested_account_id_hex = format!("{:064x}", 1);
+    let other_account_id_hex = format!("{:064x}", 99);
+    let welcomer_account_id_hex = format!("{:064x}", 2);
+    std::fs::create_dir_all(&store.dir).unwrap();
+
+    // A well-formed record placed at account #1's path, but whose embedded
+    // `account_id_hex` claims to belong to account #99 (tampered/relocated file).
+    let forged = serde_json::to_vec(&AllowlistRecord {
+        account_id_hex: other_account_id_hex.clone(),
+        invite_policy: AgentControlInvitePolicy::Allowlist,
+        welcomer_account_ids_hex: vec![welcomer_account_id_hex.clone()],
+    })
+    .unwrap();
+    std::fs::write(store.record_path(&requested_account_id_hex), &forged).unwrap();
+
+    // The mismatched record must not be served as account #1's allowlist: its
+    // forged welcomer must not appear and the record reads back as empty.
+    let record = store.read_record(&requested_account_id_hex).unwrap();
+    assert_eq!(record.account_id_hex, requested_account_id_hex);
+    assert_eq!(record.welcomer_account_ids_hex, Vec::<String>::new());
+    assert_eq!(
+        store.list(&requested_account_id_hex).unwrap(),
+        Vec::<String>::new()
+    );
+    assert!(
+        !store
+            .contains(&requested_account_id_hex, &welcomer_account_id_hex)
+            .unwrap()
+    );
+
+    // A subsequent write for account #1 must land at account #1's own path and
+    // leave account #99's file untouched (no redirected write).
+    store
+        .add(&requested_account_id_hex, &welcomer_account_id_hex)
+        .unwrap();
+    assert_eq!(
+        store
+            .read_record(&requested_account_id_hex)
+            .unwrap()
+            .welcomer_account_ids_hex,
+        vec![welcomer_account_id_hex]
+    );
+    assert!(!store.record_path(&other_account_id_hex).exists());
+}
+
+#[test]
+fn invite_policy_defaults_to_allowlist_for_legacy_records_and_preserves_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = AllowlistStore::new(dir.path());
+    let account_id_hex = format!("{:064x}", 1);
+    let welcomer_account_id_hex = format!("{:064x}", 2);
+    std::fs::create_dir_all(&store.dir).unwrap();
+    std::fs::write(
+        store.record_path(&account_id_hex),
+        serde_json::to_vec(&serde_json::json!({
+            "account_id_hex": account_id_hex.clone(),
+            "welcomer_account_ids_hex": [welcomer_account_id_hex.clone()]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        store.policy(&account_id_hex).unwrap(),
+        AgentControlInvitePolicy::Allowlist
+    );
+    assert_eq!(
+        store
+            .set_policy(&account_id_hex, AgentControlInvitePolicy::Deny)
+            .unwrap(),
+        AgentControlInvitePolicy::Deny
+    );
+    let record = store.read_record(&account_id_hex).unwrap();
+    assert_eq!(record.invite_policy, AgentControlInvitePolicy::Deny);
+    assert_eq!(
+        record.welcomer_account_ids_hex,
+        vec![welcomer_account_id_hex]
+    );
+}
+
+#[tokio::test]
+async fn stream_begin_reservations_do_not_serialize_unrelated_requests() {
+    use crate::stream_session::{StreamBeginReceipt, StreamBeginReservation, StreamSessionStore};
+
+    let store = StreamSessionStore::default();
+    let first_stream_id = hex::encode([0x11; 32]);
+    let second_stream_id = hex::encode([0x22; 32]);
+
+    let first_guard = match store
+        .reserve_stream_begin(
+            "request-a".to_owned(),
+            "fingerprint-a".to_owned(),
+            Some(first_stream_id.clone()),
+        )
+        .unwrap()
+    {
+        StreamBeginReservation::Leader { guard, .. } => guard,
+        _ => panic!("first request must lead its reservation"),
+    };
+
+    let mut follower = match store
+        .reserve_stream_begin(
+            "request-a".to_owned(),
+            "fingerprint-a".to_owned(),
+            Some(first_stream_id.clone()),
+        )
+        .unwrap()
+    {
+        StreamBeginReservation::Wait(completion) => completion,
+        _ => panic!("same-request retry must wait for the leader"),
+    };
+    assert!(matches!(
+        store.reserve_stream_begin(
+            "request-a".to_owned(),
+            "different-fingerprint".to_owned(),
+            Some(first_stream_id.clone()),
+        ),
+        Err(crate::ConnectorError::StreamBeginRequestConflict)
+    ));
+    assert!(matches!(
+        store.reserve_stream_begin(
+            "request-b".to_owned(),
+            "fingerprint-b".to_owned(),
+            Some(first_stream_id.clone()),
+        ),
+        Err(crate::ConnectorError::StreamIdInUse)
+    ));
+
+    // A distinct request and stream id becomes a leader immediately while A
+    // is still in flight. Its DNS/runtime work can therefore run concurrently.
+    let second_guard = match store
+        .reserve_stream_begin(
+            "request-b".to_owned(),
+            "fingerprint-b".to_owned(),
+            Some(second_stream_id),
+        )
+        .unwrap()
+    {
+        StreamBeginReservation::Leader { guard, .. } => guard,
+        _ => panic!("unrelated request must not wait behind request A"),
+    };
+    drop(second_guard);
+
+    // Cancelling/failing the leader releases its stream id and wakes followers
+    // so one can retry as the new leader.
+    drop(first_guard);
+    timeout(Duration::from_secs(1), follower.changed())
+        .await
+        .expect("cancelled leader must wake followers")
+        .expect("reservation watch remains valid through wakeup");
+
+    let retry_guard = match store
+        .reserve_stream_begin(
+            "request-a".to_owned(),
+            "fingerprint-a".to_owned(),
+            Some(first_stream_id.clone()),
+        )
+        .unwrap()
+    {
+        StreamBeginReservation::Leader { guard, .. } => guard,
+        _ => panic!("retry must lead after the cancelled reservation is released"),
+    };
+    let receipt = StreamBeginReceipt {
+        fingerprint: "fingerprint-a".to_owned(),
+        stream_id_hex: first_stream_id,
+        stream_capability: hex::encode([0x33; 32]),
+        start_message_id_hex: hex::encode([0x44; 32]),
+        quic_candidates: vec!["quic://broker.example:443".to_owned()],
+        policy_max_plaintext_frame_len: Some(1024),
+    };
+    retry_guard.complete(receipt.clone());
+    assert!(matches!(
+        store.reserve_stream_begin(
+            "request-a".to_owned(),
+            "fingerprint-a".to_owned(),
+            None,
+        ),
+        Ok(StreamBeginReservation::Completed(completed))
+            if completed.stream_id_hex == receipt.stream_id_hex
+                && completed.stream_capability == receipt.stream_capability
+    ));
+}
+
+#[tokio::test]
+async fn connector_policy_accepts_allowed_welcomer() {
+    let agent_dir = tempfile::tempdir().unwrap();
+    let human_dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+    let agent_app = MarmotApp::with_relay(agent_dir.path(), relay_url.clone());
+    let human_app = MarmotApp::with_relay(human_dir.path(), relay_url.clone());
+    let agent_setup_runtime = MarmotAppRuntime::new(agent_app.clone());
+    let human_runtime = MarmotAppRuntime::new(human_app);
+    let setup = AccountSetupRequest {
+        default_relays: vec![crate::validation::endpoint(&relay_url)],
+        bootstrap_relays: vec![crate::validation::endpoint(&relay_url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let agent = agent_setup_runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
+    let human = human_runtime.create_identity(setup).await.unwrap();
+    agent_setup_runtime.shutdown().await;
+
+    let socket = agent_dir.path().join("dev").join("wn-agent.sock");
+    let server = tokio::spawn(serve_socket(test_config(
+        agent_dir.path(),
+        socket.clone(),
+        vec![relay_url],
+        false,
+        false,
+    )));
+    let added = send_control_request(
+        &socket,
+        "req-allow-human",
+        AgentControlRequest::AllowlistAdd {
+            account_id_hex: agent.account.account_id_hex.clone(),
+            welcomer_account_id_hex: human.account.account_id_hex.clone(),
+        },
+    )
+    .await;
+    assert_allowlist(
+        added,
+        "req-allow-human",
+        &agent.account.account_id_hex,
+        &[human.account.account_id_hex.as_str()],
+    );
+
+    let group_id = human_runtime
+        .create_group(
+            &human.account.account_id_hex,
+            "allowed invite",
+            std::slice::from_ref(&agent.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    wait_for_group_state(&agent_app, &agent.account.label, &group_id_hex, |group| {
+        !group.pending_confirmation && !group.archived
+    })
+    .await;
+
+    human_runtime.shutdown().await;
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn connector_policy_declines_unlisted_welcomer() {
+    let agent_dir = tempfile::tempdir().unwrap();
+    let human_dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+    let agent_app = MarmotApp::with_relay(agent_dir.path(), relay_url.clone());
+    let human_app = MarmotApp::with_relay(human_dir.path(), relay_url.clone());
+    let agent_setup_runtime = MarmotAppRuntime::new(agent_app.clone());
+    let human_runtime = MarmotAppRuntime::new(human_app);
+    let setup = AccountSetupRequest {
+        default_relays: vec![crate::validation::endpoint(&relay_url)],
+        bootstrap_relays: vec![crate::validation::endpoint(&relay_url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let agent = agent_setup_runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
+    let human = human_runtime.create_identity(setup).await.unwrap();
+    agent_setup_runtime.shutdown().await;
+
+    let socket = agent_dir.path().join("dev").join("wn-agent.sock");
+    let server = tokio::spawn(serve_socket(test_config(
+        agent_dir.path(),
+        socket.clone(),
+        vec![relay_url],
+        false,
+        false,
+    )));
+    assert!(matches!(
+        send_control_request(&socket, "req-ready", AgentControlRequest::AccountList)
+            .await
+            .payload,
+        AgentControlResponse::AccountList { .. }
+    ));
+
+    let group_id = human_runtime
+        .create_group(
+            &human.account.account_id_hex,
+            "unlisted invite",
+            std::slice::from_ref(&agent.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    wait_for_group_state(&agent_app, &agent.account.label, &group_id_hex, |group| {
+        !group.pending_confirmation && group.archived
+    })
+    .await;
+
+    human_runtime.shutdown().await;
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn connector_policy_any_authenticated_direct_accepts_unlisted_direct_welcomer() {
+    let agent_dir = tempfile::tempdir().unwrap();
+    let human_dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+    let agent_app = MarmotApp::with_relay(agent_dir.path(), relay_url.clone());
+    let human_app = MarmotApp::with_relay(human_dir.path(), relay_url.clone());
+    let agent_setup_runtime = MarmotAppRuntime::new(agent_app.clone());
+    let human_runtime = MarmotAppRuntime::new(human_app);
+    let setup = AccountSetupRequest {
+        default_relays: vec![crate::validation::endpoint(&relay_url)],
+        bootstrap_relays: vec![crate::validation::endpoint(&relay_url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let agent = agent_setup_runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
+    let human = human_runtime.create_identity(setup).await.unwrap();
+    agent_setup_runtime.shutdown().await;
+
+    let socket = agent_dir.path().join("dev").join("wn-agent.sock");
+    let server = tokio::spawn(serve_socket(test_config(
+        agent_dir.path(),
+        socket.clone(),
+        vec![relay_url],
+        false,
+        false,
+    )));
+    let policy_response = send_control_request(
+        &socket,
+        "req-direct-policy",
+        AgentControlRequest::InvitePolicySet {
+            account_id_hex: agent.account.account_id_hex.clone(),
+            policy: AgentControlInvitePolicy::AnyAuthenticatedDirect,
+        },
+    )
+    .await;
+    assert!(matches!(
+        policy_response.payload,
+        AgentControlResponse::InvitePolicy {
+            policy: AgentControlInvitePolicy::AnyAuthenticatedDirect,
+            ..
+        }
+    ));
+
+    let group_id = human_runtime
+        .create_group(
+            &human.account.account_id_hex,
+            "allow authenticated direct invite",
+            std::slice::from_ref(&agent.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    wait_for_group_state(&agent_app, &agent.account.label, &group_id_hex, |group| {
+        !group.pending_confirmation && !group.archived
+    })
+    .await;
+
+    human_runtime.shutdown().await;
+    server.abort();
+    let _ = server.await;
+}
+
+async fn assert_multiparty_invite_policy(policy: AgentControlInvitePolicy, expect_archived: bool) {
+    let agent_dir = tempfile::tempdir().unwrap();
+    let human_dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+    let agent_app = MarmotApp::with_relay(agent_dir.path(), relay_url.clone());
+    let human_app = MarmotApp::with_relay(human_dir.path(), relay_url.clone());
+    let agent_setup_runtime = MarmotAppRuntime::new(agent_app.clone());
+    let human_runtime = MarmotAppRuntime::new(human_app);
+    let setup = AccountSetupRequest {
+        default_relays: vec![crate::validation::endpoint(&relay_url)],
+        bootstrap_relays: vec![crate::validation::endpoint(&relay_url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let third_setup = AccountSetupRequest {
+        default_relays: vec![crate::validation::endpoint(&relay_url)],
+        bootstrap_relays: vec![crate::validation::endpoint(&relay_url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let agent = agent_setup_runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
+    let human = human_runtime.create_identity(setup).await.unwrap();
+    let third = human_runtime.create_identity(third_setup).await.unwrap();
+    agent_setup_runtime.shutdown().await;
+
+    let socket = agent_dir.path().join("dev").join("wn-agent.sock");
+    let server = tokio::spawn(serve_socket(test_config(
+        agent_dir.path(),
+        socket.clone(),
+        vec![relay_url],
+        false,
+        false,
+    )));
+    let policy_response = send_control_request(
+        &socket,
+        "req-multiparty-policy",
+        AgentControlRequest::InvitePolicySet {
+            account_id_hex: agent.account.account_id_hex.clone(),
+            policy,
+        },
+    )
+    .await;
+    assert!(matches!(
+        policy_response.payload,
+        AgentControlResponse::InvitePolicy {
+            policy: applied_policy,
+            ..
+        } if applied_policy == policy
+    ));
+
+    let group_id = human_runtime
+        .create_group(
+            &human.account.account_id_hex,
+            "authenticated multiparty invite",
+            &[
+                agent.account.account_id_hex.clone(),
+                third.account.account_id_hex.clone(),
+            ],
+            None,
+        )
+        .await
+        .unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    wait_for_group_state(&agent_app, &agent.account.label, &group_id_hex, |group| {
+        !group.pending_confirmation && group.archived == expect_archived
+    })
+    .await;
+
+    human_runtime.shutdown().await;
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn connector_policy_any_authenticated_direct_declines_multiparty_invite() {
+    assert_multiparty_invite_policy(AgentControlInvitePolicy::AnyAuthenticatedDirect, true).await;
+}
+
+#[tokio::test]
+async fn connector_policy_any_authenticated_accepts_multiparty_invite() {
+    assert_multiparty_invite_policy(AgentControlInvitePolicy::AnyAuthenticated, false).await;
+}
+
+#[test]
+fn invite_policies_require_an_authenticated_welcomer_and_enforce_scope() {
+    assert!(crate::invite_policy::invite_policy_allows(
+        AgentControlInvitePolicy::AnyAuthenticated,
+        true,
+        false,
+        false,
+    ));
+    assert!(!crate::invite_policy::invite_policy_allows(
+        AgentControlInvitePolicy::AnyAuthenticated,
+        false,
+        false,
+        false,
+    ));
+    assert!(crate::invite_policy::invite_policy_allows(
+        AgentControlInvitePolicy::AnyAuthenticatedDirect,
+        true,
+        false,
+        true,
+    ));
+    assert!(!crate::invite_policy::invite_policy_allows(
+        AgentControlInvitePolicy::AnyAuthenticatedDirect,
+        true,
+        false,
+        false,
+    ));
+    assert!(crate::invite_policy::invite_policy_allows(
+        AgentControlInvitePolicy::Allowlist,
+        true,
+        true,
+        false,
+    ));
+    assert!(!crate::invite_policy::invite_policy_allows(
+        AgentControlInvitePolicy::Deny,
+        true,
+        true,
+        true,
+    ));
+}
+
+#[test]
+fn dev_allow_any_invites_requires_debug_controls() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = test_config(
+        dir.path(),
+        dir.path().join("dev").join("wn-agent.sock"),
+        Vec::new(),
+        true,
+        false,
+    );
+    config.debug_controls = false;
+
+    let error = crate::validation::validate_control_plane_config(&config)
+        .expect_err("dev allow-any must require debug controls");
+    assert_eq!(error.code(), "unsafe_control_plane_config");
+}
+
+#[tokio::test]
+async fn connector_start_reconciles_existing_allowed_pending_invite() {
+    let setup = setup_existing_pending_invite("existing pending invite").await;
+    let connector = AgentConnector::open(test_config(
+        setup.dir.path(),
+        setup.dir.path().join("dev").join("wn-agent.sock"),
+        vec![setup.relay_url.clone()],
+        false,
+        false,
+    ))
+    .unwrap();
+    connector
+        .allowlist_add_response(&setup.agent_account_id_hex, &setup.human_account_id_hex)
+        .unwrap();
+
+    connector.start().await.unwrap();
+
+    wait_for_group_state(
+        &setup.app,
+        &setup.agent_label,
+        &setup.group_id_hex,
+        |group| !group.pending_confirmation && !group.archived,
+    )
+    .await;
+
+    connector.runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn connector_start_reconciles_existing_unlisted_pending_invite_by_declining() {
+    let setup = setup_existing_pending_invite("existing unlisted pending invite").await;
+    let connector = AgentConnector::open(test_config(
+        setup.dir.path(),
+        setup.dir.path().join("dev").join("wn-agent.sock"),
+        vec![setup.relay_url.clone()],
+        false,
+        false,
+    ))
+    .unwrap();
+
+    connector.start().await.unwrap();
+
+    wait_for_group_state(
+        &setup.app,
+        &setup.agent_label,
+        &setup.group_id_hex,
+        |group| !group.pending_confirmation && group.archived,
+    )
+    .await;
+
+    connector.runtime.shutdown().await;
+}
+
+#[test]
+fn invite_policy_retry_state_uses_capped_backoff_and_prunes_non_pending() {
+    let mut retry_state = crate::validation::InvitePolicyRetryState::default();
+    let key = crate::validation::InvitePolicyKey::new("aa", "bb");
+    let other_key = crate::validation::InvitePolicyKey::new("cc", "dd");
+    let now = tokio::time::Instant::now();
+
+    assert!(retry_state.is_due(&key, now));
+    let (attempts, delay) = retry_state.record_failure(key.clone(), now);
+    assert_eq!(attempts, 1);
+    assert_eq!(delay, crate::INVITE_POLICY_RETRY_BASE);
+    assert!(!retry_state.is_due(&key, now + delay - Duration::from_millis(1)));
+    assert!(retry_state.is_due(&key, now + delay));
+
+    let (attempts, delay) = retry_state.record_failure(key.clone(), now + delay);
+    assert_eq!(attempts, 2);
+    assert_eq!(delay, crate::INVITE_POLICY_RETRY_BASE * 2);
+
+    let mut current = now;
+    let mut capped_delay = delay;
+    for expected_attempt in 3..=20 {
+        current += capped_delay;
+        let (attempts, delay) = retry_state.record_failure(key.clone(), current);
+        assert_eq!(attempts, expected_attempt);
+        assert!(delay <= crate::INVITE_POLICY_RETRY_MAX);
+        capped_delay = delay;
+    }
+    assert_eq!(capped_delay, crate::INVITE_POLICY_RETRY_MAX);
+
+    retry_state.record_failure(other_key.clone(), now);
+    retry_state.retain_pending(&HashSet::from([key.clone()]));
+    assert!(retry_state.failures.contains_key(&key));
+    assert!(!retry_state.failures.contains_key(&other_key));
+
+    retry_state.clear(&key);
+    assert!(retry_state.is_due(&key, now));
+}
+
+#[test]
+fn invite_policy_retry_state_reports_next_due_wake() {
+    let mut retry_state = crate::validation::InvitePolicyRetryState::default();
+    let key_a = crate::validation::InvitePolicyKey::new("aa", "11");
+    let key_b = crate::validation::InvitePolicyKey::new("bb", "22");
+    let now = tokio::time::Instant::now();
+
+    assert!(!retry_state.has_pending());
+    assert_eq!(retry_state.next_due(), None);
+
+    retry_state.record_failure(key_a.clone(), now);
+    assert!(retry_state.has_pending());
+    assert_eq!(
+        retry_state.next_due(),
+        Some(now + crate::INVITE_POLICY_RETRY_BASE)
+    );
+
+    // A second, later failure must not move the earliest wake earlier.
+    retry_state.record_failure(key_b.clone(), now + Duration::from_millis(500));
+    assert_eq!(
+        retry_state.next_due(),
+        Some(now + crate::INVITE_POLICY_RETRY_BASE)
+    );
+
+    retry_state.record_failure(key_a.clone(), now + Duration::from_millis(500));
+    assert_eq!(
+        retry_state.next_due(),
+        Some(now + Duration::from_millis(500) + crate::INVITE_POLICY_RETRY_BASE)
+    );
+
+    retry_state.clear(&key_b);
+    // key_a's second failure carries the doubled backoff.
+    assert_eq!(
+        retry_state.next_due(),
+        Some(now + Duration::from_millis(500) + crate::INVITE_POLICY_RETRY_BASE * 2)
+    );
+    retry_state.clear(&key_a);
+    assert!(!retry_state.has_pending());
+    assert_eq!(retry_state.next_due(), None);
+}
+
+#[tokio::test]
+async fn connector_socket_creates_local_account() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("dev").join("wn-agent.sock");
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        socket.clone(),
+        Vec::new(),
+        false,
+        false,
+    ))
+    .unwrap();
+    let listener = bind_connector_socket(&socket).unwrap();
+    let server = tokio::spawn(async move { connector.serve_once(&listener).await });
+
+    let client = UnixStream::connect(&socket).await.unwrap();
+    let (client_read, mut client_write) = tokio::io::split(client);
+    let mut client_read = BufReader::new(client_read);
+    let request = AgentControlEnvelope::request(
+        Some("req-create".to_owned()),
+        AgentControlRequest::AccountCreate {
+            label: Some("agent".to_owned()),
+            publish_key_package: false,
+        },
+    );
+    write_frame(&mut client_write, &request).await.unwrap();
+
+    let response: AgentControlEnvelope<AgentControlResponse> =
+        read_envelope(&mut client_read).await.unwrap().unwrap();
+    assert_eq!(response.id.as_deref(), Some("req-create"));
+    let AgentControlResponse::AccountCreated { account } = response.payload else {
+        panic!("expected account created response");
+    };
+    assert_eq!(account.label, "agent");
+    assert!(account.local_signing);
+
+    let stored = AccountHome::open(dir.path()).account("agent").unwrap();
+    assert_eq!(stored.account_id_hex, account.account_id_hex);
+
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn connector_socket_publishes_key_package() {
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+    let account_home = AccountHome::open(dir.path());
+    let account = account_home.create_account("agent").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), relay_url.clone());
+    let socket = dir.path().join("dev").join("wn-agent.sock");
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        socket.clone(),
+        vec![relay_url.clone()],
+        false,
+        false,
+    ))
+    .unwrap();
+    let listener = bind_connector_socket(&socket).unwrap();
+    let server = tokio::spawn(async move { connector.serve_once(&listener).await });
+
+    let client = UnixStream::connect(&socket).await.unwrap();
+    let (client_read, mut client_write) = tokio::io::split(client);
+    let mut client_read = BufReader::new(client_read);
+    let request = AgentControlEnvelope::request(
+        Some("req-publish".to_owned()),
+        AgentControlRequest::AccountPublishKeyPackage {
+            account_id_hex: account.account_id_hex.clone(),
+        },
+    );
+    write_frame(&mut client_write, &request).await.unwrap();
+
+    let response: AgentControlEnvelope<AgentControlResponse> =
+        read_envelope(&mut client_read).await.unwrap().unwrap();
+    assert_eq!(response.id.as_deref(), Some("req-publish"));
+    let AgentControlResponse::KeyPackagePublished {
+        account_id_hex,
+        key_package_bytes,
+    } = response.payload.clone()
+    else {
+        panic!(
+            "expected key package published response, got {:?}",
+            response.payload
+        );
+    };
+    assert_eq!(account_id_hex, account.account_id_hex);
+    assert!(key_package_bytes > 0);
+    let fetched = app
+        .directory()
+        .fetch_latest_key_package_for_account_id(
+            &account.account_id_hex,
+            vec![crate::validation::endpoint(&relay_url)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(key_package_bytes, fetched.key_package.bytes().len());
+
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn connector_socket_publishes_profile_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+    let account_home = AccountHome::open(dir.path());
+    let account = account_home.create_account("agent").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), relay_url.clone());
+    let socket = dir.path().join("dev").join("wn-agent.sock");
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        socket.clone(),
+        vec![relay_url.clone()],
+        false,
+        false,
+    ))
+    .unwrap();
+    let listener = bind_connector_socket(&socket).unwrap();
+    let server = tokio::spawn(async move { connector.serve_once(&listener).await });
+
+    let client = UnixStream::connect(&socket).await.unwrap();
+    let (client_read, mut client_write) = tokio::io::split(client);
+    let mut client_read = BufReader::new(client_read);
+    let request = AgentControlEnvelope::request(
+        Some("req-profile".to_owned()),
+        AgentControlRequest::AccountPublishProfile {
+            account_id_hex: account.account_id_hex.clone(),
+            name: "  Hermes Agent  ".to_owned(),
+            display_name: None,
+            about: None,
+            picture: None,
+            nip05: None,
+            lud16: None,
+        },
+    );
+    write_frame(&mut client_write, &request).await.unwrap();
+
+    let response: AgentControlEnvelope<AgentControlResponse> =
+        read_envelope(&mut client_read).await.unwrap().unwrap();
+    assert_eq!(response.id.as_deref(), Some("req-profile"));
+    let AgentControlResponse::ProfilePublished {
+        account_id_hex,
+        name,
+        display_name,
+    } = response.payload.clone()
+    else {
+        panic!(
+            "expected profile published response, got {:?}",
+            response.payload
+        );
+    };
+    assert_eq!(account_id_hex, account.account_id_hex);
+    assert_eq!(name, "Hermes Agent");
+    assert_eq!(display_name.as_deref(), Some("Hermes Agent"));
+
+    app.directory()
+        .refresh_profile_for_account_id(
+            &account.account_id_hex,
+            vec![crate::validation::endpoint(&relay_url)],
+        )
+        .await
+        .unwrap();
+    let profile = app
+        .directory()
+        .directory_entry_for_account_id(&account.account_id_hex)
+        .unwrap()
+        .and_then(|entry| entry.profile)
+        .expect("published profile");
+    assert_eq!(profile.name.as_deref(), Some("Hermes Agent"));
+    assert_eq!(profile.display_name.as_deref(), Some("Hermes Agent"));
+
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn connector_profile_publish_preserves_fields_the_request_did_not_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+    let account_home = AccountHome::open(dir.path());
+    let account = account_home.create_account("agent").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), relay_url.clone());
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        dir.path().join("dev").join("wn-agent.sock"),
+        vec![relay_url.clone()],
+        false,
+        false,
+    ))
+    .unwrap();
+
+    connector
+        .publish_profile_response(
+            &account.account_id_hex,
+            "Hermes Agent".to_owned(),
+            Some("Hermes Agent".to_owned()),
+            ProfileUpdateFields {
+                about: Some("Day family assistant.".to_owned()),
+                picture: Some("https://example.com/avatar.png".to_owned()),
+                nip05: Some("holly@example.com".to_owned()),
+                lud16: Some("holly@example.com".to_owned()),
+            },
+        )
+        .await
+        .unwrap();
+
+    // kind:0 is replaceable, so a publish that names only the display name must
+    // leave every other published field alone.
+    connector
+        .publish_profile_response(
+            &account.account_id_hex,
+            "Holly Day".to_owned(),
+            Some("Holly Day".to_owned()),
+            ProfileUpdateFields::default(),
+        )
+        .await
+        .unwrap();
+
+    app.directory()
+        .refresh_profile_for_account_id(
+            &account.account_id_hex,
+            vec![crate::validation::endpoint(&relay_url)],
+        )
+        .await
+        .unwrap();
+    let profile = app
+        .directory()
+        .directory_entry_for_account_id(&account.account_id_hex)
+        .unwrap()
+        .and_then(|entry| entry.profile)
+        .expect("published profile");
+    assert_eq!(profile.name.as_deref(), Some("Holly Day"));
+    assert_eq!(profile.display_name.as_deref(), Some("Holly Day"));
+    assert_eq!(profile.about.as_deref(), Some("Day family assistant."));
+    assert_eq!(
+        profile.picture.as_deref(),
+        Some("https://example.com/avatar.png")
+    );
+    assert_eq!(profile.nip05.as_deref(), Some("holly@example.com"));
+    assert_eq!(profile.lud16.as_deref(), Some("holly@example.com"));
+}
+
+#[tokio::test]
+async fn connector_profile_publish_falls_back_to_the_cached_profile_when_the_read_relays_hold_none()
+{
+    let dir = tempfile::tempdir().unwrap();
+    // The account published through one relay; a later connector reads and
+    // publishes through another. Re-bootstrapping with new `--relay` values is
+    // exactly this shape (#1966): the profile exists, just not on the relays this
+    // request reads.
+    let published_relay = MockRelay::run().await.unwrap();
+    let published_url = published_relay.url().await.to_string();
+    let read_relay = MockRelay::run().await.unwrap();
+    let read_url = read_relay.url().await.to_string();
+    let account_home = AccountHome::open(dir.path());
+    let account = account_home.create_account("agent").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), published_url.clone());
+    let published_endpoint = crate::validation::endpoint(&published_url);
+
+    app.publish_user_profile(
+        &account.label,
+        UserProfileMetadata {
+            name: Some("Hermes Agent".to_owned()),
+            display_name: Some("Hermes Agent".to_owned()),
+            about: Some("Day family assistant.".to_owned()),
+            picture: Some("https://example.com/avatar.png".to_owned()),
+            created_at: 42,
+            ..UserProfileMetadata::default()
+        },
+        AccountRelayListBootstrap::new(
+            vec![published_endpoint.clone()],
+            vec![published_endpoint.clone()],
+        ),
+    )
+    .await
+    .unwrap();
+    // The published profile reaches the local cache the way it does on a real
+    // device: a directory refresh remembers what the relay holds.
+    app.directory()
+        .refresh_profile_for_account_id(&account.account_id_hex, vec![published_endpoint.clone()])
+        .await
+        .unwrap();
+    assert_eq!(
+        app.directory()
+            .directory_entry_for_account_id(&account.account_id_hex)
+            .unwrap()
+            .and_then(|entry| entry.profile)
+            .and_then(|profile| profile.about),
+        Some("Day family assistant.".to_owned()),
+        "cached profile before the read that finds nothing"
+    );
+
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        dir.path().join("dev").join("wn-agent.sock"),
+        vec![read_url.clone()],
+        false,
+        false,
+    ))
+    .unwrap();
+
+    // The read through the connector's relays finds no kind:0 for the account, so
+    // the locally cached profile is the only thing that can keep `about` and
+    // `picture` from being wiped by this publish.
+    connector
+        .publish_profile_response(
+            &account.account_id_hex,
+            "Holly Day".to_owned(),
+            Some("Holly Day".to_owned()),
+            ProfileUpdateFields::default(),
+        )
+        .await
+        .unwrap();
+
+    app.directory()
+        .refresh_profile_for_account_id(
+            &account.account_id_hex,
+            vec![crate::validation::endpoint(&read_url)],
+        )
+        .await
+        .unwrap();
+    let profile = app
+        .directory()
+        .directory_entry_for_account_id(&account.account_id_hex)
+        .unwrap()
+        .and_then(|entry| entry.profile)
+        .expect("published profile");
+    assert_eq!(profile.name.as_deref(), Some("Holly Day"));
+    assert_eq!(profile.display_name.as_deref(), Some("Holly Day"));
+    assert_eq!(profile.about.as_deref(), Some("Day family assistant."));
+    assert_eq!(
+        profile.picture.as_deref(),
+        Some("https://example.com/avatar.png")
+    );
+    // The values above come from the second publish, not from the seeded one.
+    assert!(profile.created_at > 42);
+}
+
+#[tokio::test]
+async fn connector_profile_publish_prefers_the_newer_cached_profile_over_a_lagging_relay() {
+    let dir = tempfile::tempdir().unwrap();
+    // A read relay can be *stale* rather than empty: it keeps serving the
+    // pre-edit kind:0 while the newer edit is already in the local directory
+    // cache. Starting from the relay's older copy republishes the fields it
+    // holds over the local edit, which is the same erasure from the other side.
+    let lagging_relay = MockRelay::run().await.unwrap();
+    let lagging_url = lagging_relay.url().await.to_string();
+    let current_relay = MockRelay::run().await.unwrap();
+    let current_url = current_relay.url().await.to_string();
+    let account_home = AccountHome::open(dir.path());
+    let account = account_home.create_account("agent").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), lagging_url.clone());
+    let lagging_endpoint = crate::validation::endpoint(&lagging_url);
+    let current_endpoint = crate::validation::endpoint(&current_url);
+
+    // What the lagging relay holds and will keep returning to the read below.
+    app.publish_user_profile(
+        &account.label,
+        UserProfileMetadata {
+            name: Some("Hermes Agent".to_owned()),
+            display_name: Some("Hermes Agent".to_owned()),
+            about: Some("Old about.".to_owned()),
+            picture: Some("https://example.com/old.png".to_owned()),
+            created_at: 42,
+            ..UserProfileMetadata::default()
+        },
+        AccountRelayListBootstrap::new(
+            vec![lagging_endpoint.clone()],
+            vec![lagging_endpoint.clone()],
+        ),
+    )
+    .await
+    .unwrap();
+    // The newer edit, published where the lagging relay cannot see it. A
+    // profile's `created_at` is the event timestamp the relay hands back, so
+    // the lagging copy is at best same-second and never strictly newer.
+    app.publish_user_profile(
+        &account.label,
+        UserProfileMetadata {
+            name: Some("Hermes Agent".to_owned()),
+            display_name: Some("Hermes Agent".to_owned()),
+            about: Some("Day family assistant.".to_owned()),
+            picture: Some("https://example.com/new.png".to_owned()),
+            created_at: 4242,
+            ..UserProfileMetadata::default()
+        },
+        AccountRelayListBootstrap::new(
+            vec![current_endpoint.clone()],
+            vec![current_endpoint.clone()],
+        ),
+    )
+    .await
+    .unwrap();
+    // The newer edit reaches the cache the way it does on a real device: a
+    // directory refresh remembers what the current relay holds.
+    app.directory()
+        .refresh_profile_for_account_id(&account.account_id_hex, vec![current_endpoint.clone()])
+        .await
+        .unwrap();
+    let cached = app
+        .directory()
+        .directory_entry_for_account_id(&account.account_id_hex)
+        .unwrap()
+        .and_then(|entry| entry.profile)
+        .expect("cached profile before the stale read");
+    assert_eq!(cached.about.as_deref(), Some("Day family assistant."));
+    assert_eq!(
+        cached.picture.as_deref(),
+        Some("https://example.com/new.png"),
+        "cached profile before the stale read"
+    );
+
+    // Pin the premise: the copy this publish reads is the older one, and the
+    // cache is not older than it.
+    let read_copy = app
+        .directory()
+        .fetch_current_user_profile_for_account_id(
+            &account.account_id_hex,
+            vec![lagging_endpoint.clone()],
+        )
+        .await
+        .unwrap()
+        .expect("lagging relay copy");
+    assert_eq!(read_copy.about.as_deref(), Some("Old about."));
+    assert_eq!(
+        read_copy.picture.as_deref(),
+        Some("https://example.com/old.png")
+    );
+    assert!(cached.created_at >= read_copy.created_at);
+
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        dir.path().join("dev").join("wn-agent.sock"),
+        vec![lagging_url.clone()],
+        false,
+        false,
+    ))
+    .unwrap();
+
+    // This publish names no optional field, so everything it does not name must
+    // come from the newer cached edit and not from the older copy the read
+    // relay returns.
+    connector
+        .publish_profile_response(
+            &account.account_id_hex,
+            "Holly Day".to_owned(),
+            Some("Holly Day".to_owned()),
+            ProfileUpdateFields::default(),
+        )
+        .await
+        .unwrap();
+
+    // Read what the lagging relay now holds, straight from the relay.
+    let published = app
+        .directory()
+        .fetch_current_user_profile_for_account_id(
+            &account.account_id_hex,
+            vec![lagging_endpoint.clone()],
+        )
+        .await
+        .unwrap()
+        .expect("published profile");
+    assert_eq!(published.name.as_deref(), Some("Holly Day"));
+    assert_eq!(published.display_name.as_deref(), Some("Holly Day"));
+    assert_eq!(published.about.as_deref(), Some("Day family assistant."));
+    assert_eq!(
+        published.picture.as_deref(),
+        Some("https://example.com/new.png")
+    );
+    assert!(published.created_at >= read_copy.created_at);
+}
+
+#[tokio::test]
+async fn connector_profile_lookup_distinguishes_existing_and_absent_profiles() {
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+    let account_home = AccountHome::open(dir.path());
+    let account = account_home.create_account("agent").unwrap();
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        dir.path().join("dev").join("wn-agent.sock"),
+        vec![relay_url],
+        false,
+        false,
+    ))
+    .unwrap();
+
+    let absent = connector
+        .profile_lookup_response(&account.account_id_hex)
+        .await
+        .unwrap();
+    assert!(matches!(
+        absent,
+        AgentControlResponse::ProfileLookup {
+            status: AgentControlProfileLookupStatus::ProfileNotFound,
+            retryable: false,
+            ..
+        }
+    ));
+
+    connector
+        .publish_profile_response(
+            &account.account_id_hex,
+            "Existing Agent".to_owned(),
+            Some("Existing Agent".to_owned()),
+            ProfileUpdateFields::default(),
+        )
+        .await
+        .unwrap();
+
+    let found = connector
+        .profile_lookup_response(&account.account_id_hex)
+        .await
+        .unwrap();
+    assert!(matches!(
+        found,
+        AgentControlResponse::ProfileLookup {
+            status: AgentControlProfileLookupStatus::ProfileFound,
+            retryable: false,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn connector_profile_lookup_without_relays_is_indeterminate() {
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("agent")
+        .unwrap();
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        dir.path().join("dev").join("wn-agent.sock"),
+        Vec::new(),
+        false,
+        false,
+    ))
+    .unwrap();
+
+    let response = connector
+        .profile_lookup_response(&account.account_id_hex)
+        .await
+        .unwrap();
+    assert!(matches!(
+        response,
+        AgentControlResponse::ProfileLookup {
+            status: AgentControlProfileLookupStatus::Indeterminate,
+            retryable: true,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn connector_start_publishes_key_package_for_existing_local_account() {
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+    let account_home = AccountHome::open(dir.path());
+    let account = account_home.create_account("agent").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), relay_url.clone());
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        dir.path().join("dev").join("wn-agent.sock"),
+        vec![relay_url.clone()],
+        false,
+        false,
+    ))
+    .unwrap();
+
+    connector.start().await.unwrap();
+
+    let fetched = app
+        .directory()
+        .fetch_latest_key_package_for_account_id(
+            &account.account_id_hex,
+            vec![crate::validation::endpoint(&relay_url)],
+        )
+        .await
+        .unwrap();
+    assert!(!fetched.key_package.bytes().is_empty());
+
+    connector.runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn connector_socket_sends_final_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+    let app = MarmotApp::with_relay(dir.path(), relay_url.clone());
+    let setup_runtime = MarmotAppRuntime::new(app);
+    let setup = AccountSetupRequest {
+        default_relays: vec![crate::validation::endpoint(&relay_url)],
+        bootstrap_relays: vec![crate::validation::endpoint(&relay_url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let agent = setup_runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
+    let human = setup_runtime.create_identity(setup).await.unwrap();
+    let group_id = setup_runtime
+        .create_group(
+            &agent.account.account_id_hex,
+            "agent final",
+            std::slice::from_ref(&human.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    setup_runtime.shutdown().await;
+
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let socket = dir.path().join("dev").join("wn-agent.sock");
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        socket.clone(),
+        vec![relay_url],
+        false,
+        false,
+    ))
+    .unwrap();
+    let listener = bind_connector_socket(&socket).unwrap();
+    let server = tokio::spawn(async move { connector.serve_once(&listener).await });
+
+    let client = UnixStream::connect(&socket).await.unwrap();
+    let (client_read, mut client_write) = tokio::io::split(client);
+    let mut client_read = BufReader::new(client_read);
+    let request = AgentControlEnvelope::request(
+        Some("req-final".to_owned()),
+        AgentControlRequest::SendFinal {
+            account_id_hex: agent.account.account_id_hex,
+            group_id_hex,
+            text: "final answer".to_owned(),
+            reply_to_message_id_hex: None,
+            idempotency_key: None,
+        },
+    );
+    write_frame(&mut client_write, &request).await.unwrap();
+
+    let response: AgentControlEnvelope<AgentControlResponse> =
+        read_envelope(&mut client_read).await.unwrap().unwrap();
+    assert_eq!(response.id.as_deref(), Some("req-final"));
+    let AgentControlResponse::FinalSent {
+        message_ids_hex, ..
+    } = response.payload
+    else {
+        panic!("expected final sent response");
+    };
+    assert_eq!(message_ids_hex.len(), 1);
+    assert!(!message_ids_hex[0].is_empty());
+
+    server.await.unwrap().unwrap();
+}
+
+fn assert_group_info(
+    response: AgentControlResponse,
+    account_id_hex: &str,
+    group_id_hex: &str,
+    member_count: u32,
+    is_direct: bool,
+    subject: Option<&str>,
+) {
+    let AgentControlResponse::GroupInfo {
+        account_id_hex: got_account,
+        group_id_hex: got_group,
+        member_count: got_members,
+        is_direct: got_direct,
+        subject: got_subject,
+        ..
+    } = response
+    else {
+        panic!("expected group_info response, got {response:?}");
+    };
+    assert_eq!(got_account, account_id_hex);
+    assert_eq!(got_group, group_id_hex);
+    assert_eq!(got_members, member_count);
+    assert_eq!(got_direct, is_direct);
+    assert_eq!(got_subject.as_deref(), subject);
+}
+
+fn round_trip_group_info(response: AgentControlResponse) -> AgentControlResponse {
+    let encoded = encode_frame(&response).unwrap();
+    decode_frame(&encoded).unwrap()
+}
+
+#[test]
+fn group_info_subject_mapping_ignores_missing_blank_and_projection_errors() {
+    assert_eq!(
+        crate::messaging::group_info_subject_from_projection::<AppError>(Ok(Some("  Café ☕  "))),
+        Some("Café ☕".to_owned())
+    );
+    assert_eq!(
+        crate::messaging::group_info_subject_from_projection::<AppError>(Ok(Some("   \t"))),
+        None
+    );
+    assert_eq!(
+        crate::messaging::group_info_subject_from_projection::<AppError>(Ok(Some(""))),
+        None
+    );
+    assert_eq!(
+        crate::messaging::group_info_subject_from_projection::<AppError>(Ok(None::<String>)),
+        None
+    );
+    assert_eq!(
+        crate::messaging::group_info_subject_from_projection(Err::<Option<&str>, _>(
+            AppError::UnknownGroup("missing-row".to_owned())
+        )),
+        None
+    );
+}
+
+#[test]
+fn group_info_framing_preserves_named_subject_and_omits_absent_subject() {
+    let named = AgentControlResponse::GroupInfo {
+        account_id_hex: "aa".repeat(32),
+        group_id_hex: "bb".repeat(16),
+        member_count: 3,
+        is_direct: false,
+        subject: Some("Café ☕".to_owned()),
+        agent_created: false,
+    };
+    let decoded = round_trip_group_info(named.clone());
+    assert_eq!(decoded, named);
+    let named_json = String::from_utf8(encode_frame(&named).unwrap()).unwrap();
+    assert!(named_json.contains("\"subject\":\"Café ☕\""));
+
+    let absent = AgentControlResponse::GroupInfo {
+        account_id_hex: "aa".repeat(32),
+        group_id_hex: "bb".repeat(16),
+        member_count: 2,
+        is_direct: true,
+        subject: None,
+        agent_created: false,
+    };
+    let absent_json = String::from_utf8(encode_frame(&absent).unwrap()).unwrap();
+    assert!(
+        !absent_json.contains("subject"),
+        "absent subject must stay omitted for backward compatibility: {absent_json}"
+    );
+    assert_eq!(round_trip_group_info(absent.clone()), absent);
+
+    let legacy = format!(
+        r#"{{"type":"group_info","account_id_hex":"{}","group_id_hex":"{}","member_count":2,"is_direct":true}}"#,
+        "aa".repeat(32),
+        "bb".repeat(16)
+    );
+    let decoded: AgentControlResponse = decode_frame(legacy.as_bytes()).unwrap();
+    assert_group_info(decoded, &"aa".repeat(32), &"bb".repeat(16), 2, true, None);
+}
+
+#[tokio::test]
+async fn group_info_reads_current_chat_list_group_name_without_using_title() {
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+    let app = MarmotApp::with_relay(dir.path(), relay_url.clone());
+    let setup_runtime = MarmotAppRuntime::new(app);
+    let setup = AccountSetupRequest {
+        default_relays: vec![crate::validation::endpoint(&relay_url)],
+        bootstrap_relays: vec![crate::validation::endpoint(&relay_url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let agent = setup_runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
+    let human = setup_runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
+    let other_agent = setup_runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
+    let other_human = setup_runtime.create_identity(setup).await.unwrap();
+    let named_group = setup_runtime
+        .create_group(
+            &agent.account.account_id_hex,
+            "  Café ☕  ",
+            std::slice::from_ref(&human.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    let unnamed_group = setup_runtime
+        .create_group(
+            &agent.account.account_id_hex,
+            "   ",
+            std::slice::from_ref(&human.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    let other_group = setup_runtime
+        .create_group(
+            &other_agent.account.account_id_hex,
+            "Other Room",
+            std::slice::from_ref(&other_human.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    setup_runtime.shutdown().await;
+
+    let named_group_hex = hex::encode(named_group.as_slice());
+    let unnamed_group_hex = hex::encode(unnamed_group.as_slice());
+    let other_group_hex = hex::encode(other_group.as_slice());
+    let socket = dir.path().join("dev").join("wn-agent.sock");
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        socket,
+        vec![relay_url],
+        false,
+        false,
+    ))
+    .unwrap();
+
+    let named = connector
+        .group_info_response(&agent.account.account_id_hex, &named_group_hex)
+        .await
+        .unwrap();
+    assert_group_info(
+        named.clone(),
+        &agent.account.account_id_hex,
+        &named_group_hex,
+        2,
+        true,
+        Some("Café ☕"),
+    );
+    assert_eq!(round_trip_group_info(named.clone()), named);
+
+    let unnamed = connector
+        .group_info_response(&agent.account.account_id_hex, &unnamed_group_hex)
+        .await
+        .unwrap();
+    let unnamed_row = connector
+        .runtime
+        .chat_list_row(&agent.account.label, &unnamed_group_hex)
+        .unwrap()
+        .expect("unnamed chat-list row");
+    assert_eq!(unnamed_row.title, unnamed_group_hex);
+    assert!(unnamed_row.group_name.trim().is_empty());
+    assert_group_info(
+        unnamed.clone(),
+        &agent.account.account_id_hex,
+        &unnamed_group_hex,
+        2,
+        true,
+        None,
+    );
+    assert_eq!(round_trip_group_info(unnamed.clone()), unnamed);
+
+    let other = connector
+        .group_info_response(&other_agent.account.account_id_hex, &other_group_hex)
+        .await
+        .unwrap();
+    assert_group_info(
+        other,
+        &other_agent.account.account_id_hex,
+        &other_group_hex,
+        2,
+        true,
+        Some("Other Room"),
+    );
+
+    connector
+        .runtime
+        .update_group_profile(
+            &agent.account.account_id_hex,
+            &named_group,
+            Some("Bridge".to_owned()),
+            None,
+        )
+        .await
+        .unwrap();
+    let renamed = connector
+        .group_info_response(&agent.account.account_id_hex, &named_group_hex)
+        .await
+        .unwrap();
+    assert_group_info(
+        renamed,
+        &agent.account.account_id_hex,
+        &named_group_hex,
+        2,
+        true,
+        Some("Bridge"),
+    );
+
+    connector
+        .runtime
+        .update_group_profile(
+            &agent.account.account_id_hex,
+            &named_group,
+            Some(String::new()),
+            None,
+        )
+        .await
+        .unwrap();
+    let cleared = connector
+        .group_info_response(&agent.account.account_id_hex, &named_group_hex)
+        .await
+        .unwrap();
+    let cleared_row = connector
+        .runtime
+        .chat_list_row(&agent.account.label, &named_group_hex)
+        .unwrap()
+        .expect("cleared chat-list row");
+    assert_eq!(cleared_row.title, named_group_hex);
+    assert_group_info(
+        cleared,
+        &agent.account.account_id_hex,
+        &named_group_hex,
+        2,
+        true,
+        None,
+    );
+
+    let missing_group = hex::encode([0xab; 16]);
+    let missing = connector
+        .group_info_response(&agent.account.account_id_hex, &missing_group)
+        .await;
+    assert!(
+        missing.is_err(),
+        "unknown group must keep failing as a membership error"
+    );
+}
+
+#[tokio::test]
+async fn connector_socket_composes_and_finalizes_stream_without_quic_candidates() {
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+    let app = MarmotApp::with_relay(dir.path(), relay_url.clone());
+    let setup_runtime = MarmotAppRuntime::new(app);
+    let setup = AccountSetupRequest {
+        default_relays: vec![crate::validation::endpoint(&relay_url)],
+        bootstrap_relays: vec![crate::validation::endpoint(&relay_url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let agent = setup_runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
+    let human = setup_runtime.create_identity(setup).await.unwrap();
+    let group_id = setup_runtime
+        .create_group(
+            &agent.account.account_id_hex,
+            "agent stream",
+            std::slice::from_ref(&human.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    setup_runtime.shutdown().await;
+
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let stream_id_hex = hex::encode([0x77; 32]);
+    let parent_message_id_hex = hex::encode([0x88; 32]);
+    let socket = dir.path().join("dev").join("wn-agent.sock");
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        socket.clone(),
+        vec![relay_url],
+        false,
+        false,
+    ))
+    .unwrap();
+    let listener = bind_connector_socket(&socket).unwrap();
+
+    let missing_begin_id = connector
+        .stream_begin_response(
+            None,
+            &agent.account.account_id_hex,
+            &group_id_hex,
+            Some(stream_id_hex.clone()),
+            Some(parent_message_id_hex.clone()),
+            Vec::new(),
+        )
+        .await;
+    assert!(matches!(
+        missing_begin_id,
+        Err(crate::ConnectorError::InvalidStreamBeginRequestId)
+    ));
+
+    let begin_request = AgentControlRequest::StreamBegin {
+        account_id_hex: agent.account.account_id_hex.clone(),
+        group_id_hex: group_id_hex.clone(),
+        stream_id_hex: Some(stream_id_hex.clone()),
+        parent_message_id_hex: Some(parent_message_id_hex.clone()),
+        quic_candidates: Vec::new(),
+    };
+    let begun = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "req-stream-begin",
+        begin_request.clone(),
+    )
+    .await;
+    let first_begun_payload = begun.payload.clone();
+
+    let retried_begin = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "req-stream-begin",
+        begin_request.clone(),
+    )
+    .await;
+    assert_eq!(
+        retried_begin.payload, first_begun_payload,
+        "an identical begin retry must return the original capability and receipt"
+    );
+
+    let conflicting_retry = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "req-stream-begin",
+        AgentControlRequest::StreamBegin {
+            account_id_hex: agent.account.account_id_hex.clone(),
+            group_id_hex: group_id_hex.clone(),
+            stream_id_hex: Some(stream_id_hex.clone()),
+            parent_message_id_hex: None,
+            quic_candidates: Vec::new(),
+        },
+    )
+    .await;
+    let AgentControlResponse::Error { code, .. } = conflicting_retry.payload else {
+        panic!("expected conflicting stream-begin retry error");
+    };
+    assert_eq!(code, "stream_begin_request_conflict");
+
+    let colliding_begin = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "req-stream-begin-collision",
+        begin_request,
+    )
+    .await;
+    let AgentControlResponse::Error { code, .. } = colliding_begin.payload else {
+        panic!("expected stream-id collision error");
+    };
+    assert_eq!(code, "stream_id_in_use");
+
+    let AgentControlResponse::StreamBegun {
+        stream_id_hex: begun_stream_id_hex,
+        stream_capability,
+        start_message_id_hex,
+        quic_candidates,
+        ..
+    } = begun.payload
+    else {
+        panic!("expected stream begun response");
+    };
+    assert_eq!(begun_stream_id_hex, stream_id_hex);
+    assert_eq!(stream_capability.len(), 64);
+    assert_eq!(hex::decode(&stream_capability).unwrap().len(), 32);
+    assert_eq!(stream_capability, stream_capability.to_ascii_lowercase());
+    assert!(quic_candidates.is_empty());
+    let stored = connector
+        .runtime
+        .messages_with_query(
+            &agent.account.account_id_hex,
+            crate::AppMessageQuery {
+                group_id_hex: Some(group_id_hex.clone()),
+                kinds: None,
+                limit: None,
+            },
+        )
+        .unwrap();
+    let start = stored
+        .iter()
+        .find(|message| message.message_id_hex == start_message_id_hex)
+        .expect("stream start must be in the local app projection");
+    assert_eq!(
+        stored
+            .iter()
+            .filter(|message| message.kind == MARMOT_APP_EVENT_KIND_AGENT_STREAM_START)
+            .count(),
+        1,
+        "begin retries and collisions must not publish another start event"
+    );
+    assert_eq!(start.kind, MARMOT_APP_EVENT_KIND_AGENT_STREAM_START);
+    assert_eq!(
+        start
+            .tags
+            .iter()
+            .find(|tag| tag.first().map(String::as_str) == Some(STREAM_PARENT_TAG))
+            .and_then(|tag| tag.get(1))
+            .map(String::as_str),
+        Some(parent_message_id_hex.as_str())
+    );
+
+    // Matching same-key preview requests may race after an ambiguous client
+    // timeout. Both callers receive Ack, while the compose transcript below
+    // proves the append was dispatched exactly once.
+    let first_append = connector.stream_record_response(
+        marmot_app::AgentPublisherRecord::Text,
+        &stream_id_hex,
+        &stream_capability,
+        "hello stream".to_owned(),
+        Some("preview-key".to_owned()),
+    );
+    let second_append = connector.stream_record_response(
+        marmot_app::AgentPublisherRecord::Text,
+        &stream_id_hex,
+        &stream_capability,
+        "hello stream".to_owned(),
+        Some("preview-key".to_owned()),
+    );
+    let (appended, replayed) = tokio::join!(first_append, second_append);
+    assert_eq!(appended.unwrap(), AgentControlResponse::Ack);
+    assert_eq!(replayed.unwrap(), AgentControlResponse::Ack);
+
+    let conflict = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "req-stream-append-conflict",
+        AgentControlRequest::StreamAppend {
+            stream_id_hex: stream_id_hex.clone(),
+            stream_capability: stream_capability.clone(),
+            append_text: "different".to_owned(),
+            idempotency_key: Some("preview-key".to_owned()),
+        },
+    )
+    .await;
+    let AgentControlResponse::Error { code, .. } = conflict.payload else {
+        panic!("expected preview idempotency conflict");
+    };
+    assert_eq!(code, "stream_preview_idempotency_conflict");
+
+    let status = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "req-stream-status",
+        AgentControlRequest::StreamStatus {
+            stream_id_hex: stream_id_hex.clone(),
+            stream_capability: stream_capability.clone(),
+            status: "thinking".to_owned(),
+            // The operation namespace isolates this from the append key above.
+            idempotency_key: Some("preview-key".to_owned()),
+        },
+    )
+    .await;
+    assert_eq!(status.payload, AgentControlResponse::Ack);
+
+    let transcript_hash_hex = expected_stream_transcript_hash(
+        &stream_id_hex,
+        &start_message_id_hex,
+        &[
+            (AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, "hello stream"),
+            (AGENT_TEXT_STREAM_RECORD_STATUS, "thinking"),
+        ],
+    );
+    let finalized = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "req-stream-finalize",
+        AgentControlRequest::StreamFinalize {
+            stream_id_hex: stream_id_hex.clone(),
+            stream_capability,
+            final_text: "hello stream".to_owned(),
+            transcript_hash_hex,
+            chunk_count: 2,
+            idempotency_key: None,
+        },
+    )
+    .await;
+    let AgentControlResponse::StreamFinalized {
+        stream_id_hex: finalized_stream_id_hex,
+        message_ids_hex,
+    } = finalized.payload
+    else {
+        panic!("expected stream finalized response");
+    };
+    assert_eq!(finalized_stream_id_hex, stream_id_hex);
+    assert_eq!(message_ids_hex.len(), 1);
+    assert!(!message_ids_hex[0].is_empty());
+}
+
+#[tokio::test]
+async fn preview_receipts_do_not_evict_durable_receipts_or_persist_on_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path();
+    let durable = crate::stream_session::SendIdempotencyStore::new(home);
+    let preview = crate::stream_session::SendIdempotencyStore::process_local_preview();
+    let durable_key = "durable-finalize-key".to_owned();
+    let durable_fingerprint = "durable-finalize-fingerprint".to_owned();
+    let durable_message_ids = vec!["ab".repeat(32)];
+
+    durable.record(
+        durable_key.clone(),
+        durable_fingerprint.clone(),
+        durable_message_ids.clone(),
+    );
+    let persisted = home.join("dev").join("send-idempotency.json");
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if persisted
+                .is_file()
+                .then(|| std::fs::read_to_string(&persisted).ok())
+                .flatten()
+                .is_some_and(|raw| raw.contains(&durable_key))
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let persisted_before = std::fs::read(&persisted).unwrap();
+
+    // Exceed the durable FIFO capacity with successful preview mutations.
+    // These must remain process-local and must not consume durable capacity.
+    for index in 0..=crate::stream_session::SEND_IDEMPOTENCY_CAPACITY {
+        let key = format!("stream_append:preview-{index}");
+        let fingerprint = format!("preview-fingerprint-{index}");
+        match preview.acquire_strict(&key, &fingerprint).await.unwrap() {
+            crate::stream_session::StrictIdempotencyAcquisition::Leader(reservation) => {
+                preview.record(key, fingerprint, Vec::new());
+                reservation.complete(Vec::new(), AgentControlSendMaintenanceDisposition::Ready);
+            }
+            crate::stream_session::StrictIdempotencyAcquisition::Completed => {
+                panic!("fresh preview key unexpectedly replayed")
+            }
+            crate::stream_session::StrictIdempotencyAcquisition::Conflict => {
+                panic!("fresh preview key unexpectedly conflicted")
+            }
+        }
+    }
+    sleep(Duration::from_millis(100)).await;
+    assert_eq!(std::fs::read(&persisted).unwrap(), persisted_before);
+
+    match durable
+        .acquire(&durable_key, &durable_fingerprint)
+        .await
+        .unwrap()
+    {
+        crate::stream_session::SendIdempotencyAcquisition::Completed((ids, disposition)) => {
+            assert_eq!(ids, durable_message_ids);
+            assert_eq!(disposition, AgentControlSendMaintenanceDisposition::Ready);
+        }
+        crate::stream_session::SendIdempotencyAcquisition::Leader(_) => {
+            panic!("durable receipt was evicted by preview traffic")
+        }
+    }
+
+    // The durable receipt survives a process restart, while preview receipts
+    // intentionally do not because the associated active streams do not.
+    let reopened = crate::stream_session::SendIdempotencyStore::new(home);
+    match reopened
+        .acquire(&durable_key, &durable_fingerprint)
+        .await
+        .unwrap()
+    {
+        crate::stream_session::SendIdempotencyAcquisition::Completed((ids, disposition)) => {
+            assert_eq!(ids, durable_message_ids);
+            assert_eq!(disposition, AgentControlSendMaintenanceDisposition::Ready);
+        }
+        crate::stream_session::SendIdempotencyAcquisition::Leader(_) => {
+            panic!("durable receipt did not survive restart")
+        }
+    }
+    let reopened_preview = crate::stream_session::SendIdempotencyStore::process_local_preview();
+    match reopened_preview
+        .acquire_strict("stream_append:preview-0", "preview-fingerprint-0")
+        .await
+        .unwrap()
+    {
+        crate::stream_session::StrictIdempotencyAcquisition::Leader(_) => {}
+        crate::stream_session::StrictIdempotencyAcquisition::Completed => {
+            panic!("preview receipt must not survive restart")
+        }
+        crate::stream_session::StrictIdempotencyAcquisition::Conflict => {
+            panic!("absent preview receipt unexpectedly conflicted")
+        }
+    }
+}
+
+/// Regression for #366: a finalize whose expectation does not match the
+/// composed transcript must not tear down the stream session. The compose
+/// task keeps running, further appends succeed, and a corrected finalize
+/// completes the stream.
+#[tokio::test]
+async fn connector_socket_finalize_mismatch_keeps_stream_session_retryable() {
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+    let app = MarmotApp::with_relay(dir.path(), relay_url.clone());
+    let setup_runtime = MarmotAppRuntime::new(app);
+    let setup = AccountSetupRequest {
+        default_relays: vec![crate::validation::endpoint(&relay_url)],
+        bootstrap_relays: vec![crate::validation::endpoint(&relay_url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let agent = setup_runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
+    let human = setup_runtime.create_identity(setup).await.unwrap();
+    let group_id = setup_runtime
+        .create_group(
+            &agent.account.account_id_hex,
+            "agent retryable finalize",
+            std::slice::from_ref(&human.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    setup_runtime.shutdown().await;
+
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let stream_id_hex = hex::encode([0x99; 32]);
+    let socket = dir.path().join("dev").join("wn-agent.sock");
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        socket.clone(),
+        vec![relay_url],
+        false,
+        false,
+    ))
+    .unwrap();
+    let listener = bind_connector_socket(&socket).unwrap();
+
+    let begun = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "req-retry-begin",
+        AgentControlRequest::StreamBegin {
+            account_id_hex: agent.account.account_id_hex.clone(),
+            group_id_hex: group_id_hex.clone(),
+            stream_id_hex: Some(stream_id_hex.clone()),
+            parent_message_id_hex: None,
+            quic_candidates: vec!["quic://127.0.0.1:9".to_owned()],
+        },
+    )
+    .await;
+    let AgentControlResponse::StreamBegun {
+        stream_capability,
+        start_message_id_hex,
+        ..
+    } = begun.payload
+    else {
+        panic!("expected stream begun response");
+    };
+
+    let appended = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "req-retry-append",
+        AgentControlRequest::StreamAppend {
+            stream_id_hex: stream_id_hex.clone(),
+            stream_capability: stream_capability.clone(),
+            append_text: "hello stream".to_owned(),
+            idempotency_key: None,
+        },
+    )
+    .await;
+    assert_eq!(appended.payload, AgentControlResponse::Ack);
+
+    // Correct text and hash, wrong chunk count: the finalize must fail
+    // without tearing down the compose session.
+    let first_hash = expected_stream_transcript_hash(
+        &stream_id_hex,
+        &start_message_id_hex,
+        &[(AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, "hello stream")],
+    );
+    let mismatched = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "req-retry-finalize-mismatch",
+        AgentControlRequest::StreamFinalize {
+            stream_id_hex: stream_id_hex.clone(),
+            stream_capability: stream_capability.clone(),
+            final_text: "hello stream".to_owned(),
+            transcript_hash_hex: first_hash,
+            chunk_count: 7,
+            idempotency_key: None,
+        },
+    )
+    .await;
+    let AgentControlResponse::Error { code, .. } = mismatched.payload else {
+        panic!("expected finalize mismatch error");
+    };
+    assert_eq!(code, "stream_finalize_mismatch");
+
+    // The compose session must have survived the mismatch: a further append
+    // still succeeds.
+    let appended_again = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "req-retry-append-again",
+        AgentControlRequest::StreamAppend {
+            stream_id_hex: stream_id_hex.clone(),
+            stream_capability: stream_capability.clone(),
+            append_text: " again".to_owned(),
+            idempotency_key: None,
+        },
+    )
+    .await;
+    assert_eq!(appended_again.payload, AgentControlResponse::Ack);
+
+    // A corrected finalize over the full transcript succeeds.
+    let corrected_hash = expected_stream_transcript_hash(
+        &stream_id_hex,
+        &start_message_id_hex,
+        &[
+            (AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, "hello stream"),
+            (AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, " again"),
+        ],
+    );
+    let finalized = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "req-retry-finalize",
+        AgentControlRequest::StreamFinalize {
+            stream_id_hex: stream_id_hex.clone(),
+            stream_capability,
+            final_text: "hello stream again".to_owned(),
+            transcript_hash_hex: corrected_hash,
+            chunk_count: 2,
+            idempotency_key: None,
+        },
+    )
+    .await;
+    let AgentControlResponse::StreamFinalized {
+        stream_id_hex: finalized_stream_id_hex,
+        message_ids_hex,
+    } = finalized.payload
+    else {
+        panic!("expected stream finalized response");
+    };
+    assert_eq!(finalized_stream_id_hex, stream_id_hex);
+    assert_eq!(message_ids_hex.len(), 1);
+    assert!(!message_ids_hex[0].is_empty());
+}
+
+// A lost control receipt must not publish another durable final.
+#[tokio::test]
+async fn connector_finish_reuses_receipt() {
+    use crate::error::ConnectorError;
+    use crate::validation::normalize_hex;
+
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+    let app = MarmotApp::with_relay(dir.path(), relay_url.clone());
+    let setup_runtime = MarmotAppRuntime::new(app);
+    let setup = AccountSetupRequest {
+        default_relays: vec![crate::validation::endpoint(&relay_url)],
+        bootstrap_relays: vec![crate::validation::endpoint(&relay_url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let agent = setup_runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
+    let human = setup_runtime.create_identity(setup).await.unwrap();
+    let group_id = setup_runtime
+        .create_group(
+            &agent.account.account_id_hex,
+            "agent durable finalize retry",
+            std::slice::from_ref(&human.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    setup_runtime.shutdown().await;
+
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let stream_id_hex = hex::encode([0x5a; 32]);
+    let socket = dir.path().join("dev").join("wn-agent.sock");
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        socket.clone(),
+        vec![relay_url],
+        false,
+        false,
+    ))
+    .unwrap();
+    let listener = bind_connector_socket(&socket).unwrap();
+
+    // Begin (and start the runtime) so the durable finish below has a real
+    // account, group, and stream-start event to reference.
+    let begun = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "req-durable-begin",
+        AgentControlRequest::StreamBegin {
+            account_id_hex: agent.account.account_id_hex.clone(),
+            group_id_hex,
+            stream_id_hex: Some(stream_id_hex.clone()),
+            parent_message_id_hex: None,
+            quic_candidates: vec!["quic://127.0.0.1:9".to_owned()],
+        },
+    )
+    .await;
+    let AgentControlResponse::StreamBegun {
+        stream_capability, ..
+    } = begun.payload
+    else {
+        panic!("expected stream begun response");
+    };
+
+    // Model a successful publisher finish whose control response was lost.
+    // The retained publisher must return its receipt without a second send.
+    let stream_id_norm = normalize_hex(&stream_id_hex).unwrap();
+    let session = connector.streams.get(&stream_id_norm).unwrap();
+    session
+        .publisher
+        .append(
+            marmot_app::AgentPublisherRecord::Text,
+            "frozen final".into(),
+        )
+        .await
+        .unwrap();
+    let original = session.publisher.finish(None).await.unwrap();
+    drop(session);
+    assert_eq!(connector.streams.sweep_idle(Duration::ZERO).await, 0);
+    // A retry that disagrees with the frozen transcript is rejected and leaves
+    // the session registered.
+    let mismatch = connector
+        .stream_finish_response(
+            &stream_id_hex,
+            &stream_capability,
+            "different final".to_owned(),
+            Some("frozen-finalize".to_owned()),
+        )
+        .await;
+    assert!(
+        matches!(
+            mismatch,
+            Err(ConnectorError::App(AppError::AgentStreamFinishMismatch))
+        ),
+        "a retry disagreeing with the frozen transcript must be rejected"
+    );
+    assert_eq!(mismatch.unwrap_err().code(), "stream_finalize_mismatch");
+    assert!(
+        connector.streams.get(&stream_id_norm).is_ok(),
+        "a rejected retry must not drop the session"
+    );
+
+    // Matching concurrent retries reuse the publisher receipt.
+    let start = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+    let first_start = std::sync::Arc::clone(&start);
+    let second_start = std::sync::Arc::clone(&start);
+    let first_finalize = async {
+        first_start.wait().await;
+        connector
+            .stream_finish_response(
+                &stream_id_hex,
+                &stream_capability,
+                "frozen final".to_owned(),
+                Some("frozen-finalize".to_owned()),
+            )
+            .await
+    };
+    let second_finalize = async {
+        second_start.wait().await;
+        connector
+            .stream_finish_response(
+                &stream_id_hex,
+                &stream_capability,
+                "frozen final".to_owned(),
+                Some("frozen-finalize".to_owned()),
+            )
+            .await
+    };
+    let (first_result, second_result) = tokio::join!(first_finalize, second_finalize);
+    let finalized =
+        first_result.expect("first frozen-transcript retry finalizes without the compose task");
+    let concurrent_retry =
+        second_result.expect("concurrent frozen-transcript retry reuses the leader result");
+    let AgentControlResponse::StreamFinalized {
+        message_ids_hex, ..
+    } = finalized
+    else {
+        panic!("expected stream finalized response");
+    };
+    assert_eq!(message_ids_hex, original.message_ids);
+    let AgentControlResponse::StreamFinalized {
+        message_ids_hex: concurrent_ids,
+        ..
+    } = concurrent_retry
+    else {
+        panic!("expected concurrent stream finalized response");
+    };
+    assert_eq!(
+        concurrent_ids, message_ids_hex,
+        "a concurrent stream finalize must reuse the leader message ids"
+    );
+    assert!(
+        connector.streams.get(&stream_id_norm).is_err(),
+        "a successful durable finish must remove the session"
+    );
+
+    // A client retry after receiving a timeout from the successful durable
+    // publish path must return the original ids even though the stream session
+    // is gone. This is the post-success half of stream_finalize idempotency.
+    let retried_after_success = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "retry-finish",
+        AgentControlRequest::StreamFinish {
+            stream_id_hex: stream_id_hex.clone(),
+            stream_capability: stream_capability.clone(),
+            final_text: "frozen final".to_owned(),
+            idempotency_key: Some("frozen-finalize".to_owned()),
+        },
+    )
+    .await;
+    let AgentControlResponse::StreamFinalized {
+        message_ids_hex: retried_ids,
+        ..
+    } = retried_after_success.payload
+    else {
+        panic!("expected stream finalized response");
+    };
+    assert_eq!(retried_ids, message_ids_hex);
+
+    let wrong_capability = hex::encode([0x99; 32]);
+    let wrong_capability_retry = connector
+        .stream_finish_response(
+            &stream_id_hex,
+            &wrong_capability,
+            "frozen final".to_owned(),
+            Some("frozen-finalize".to_owned()),
+        )
+        .await;
+    assert!(
+        wrong_capability_retry.is_err(),
+        "a finalized idempotency receipt must remain bound to its capability"
+    );
+}
+
+#[tokio::test]
+async fn connector_socket_cancels_stream_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+    let app = MarmotApp::with_relay(dir.path(), relay_url.clone());
+    let setup_runtime = MarmotAppRuntime::new(app);
+    let setup = AccountSetupRequest {
+        default_relays: vec![crate::validation::endpoint(&relay_url)],
+        bootstrap_relays: vec![crate::validation::endpoint(&relay_url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let agent = setup_runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
+    let human = setup_runtime.create_identity(setup).await.unwrap();
+    let group_id = setup_runtime
+        .create_group(
+            &agent.account.account_id_hex,
+            "agent cancelled stream",
+            std::slice::from_ref(&human.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    setup_runtime.shutdown().await;
+
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let stream_id_hex = hex::encode([0x88; 32]);
+    let socket = dir.path().join("dev").join("wn-agent.sock");
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        socket.clone(),
+        vec![relay_url],
+        false,
+        false,
+    ))
+    .unwrap();
+    let listener = bind_connector_socket(&socket).unwrap();
+
+    let begun = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "req-stream-begin-cancel",
+        AgentControlRequest::StreamBegin {
+            account_id_hex: agent.account.account_id_hex,
+            group_id_hex,
+            stream_id_hex: Some(stream_id_hex.clone()),
+            parent_message_id_hex: None,
+            quic_candidates: vec!["quic://127.0.0.1:9".to_owned()],
+        },
+    )
+    .await;
+    let AgentControlResponse::StreamBegun {
+        stream_capability, ..
+    } = begun.payload
+    else {
+        panic!("expected stream begun response");
+    };
+
+    let wrong_capability = hex::encode([0x99; 32]);
+    let denied_cancel = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "req-stream-cancel-denied",
+        AgentControlRequest::StreamCancel {
+            stream_id_hex: stream_id_hex.clone(),
+            stream_capability: wrong_capability,
+            reason: Some("unauthorized".to_owned()),
+        },
+    )
+    .await;
+    let AgentControlResponse::Error { code, .. } = denied_cancel.payload else {
+        panic!("expected denied cancel error");
+    };
+    assert_eq!(code, "stream_capability_denied");
+
+    let status = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "req-stream-status",
+        AgentControlRequest::StreamStatus {
+            stream_id_hex: stream_id_hex.clone(),
+            stream_capability: stream_capability.clone(),
+            status: "thinking".to_owned(),
+            idempotency_key: None,
+        },
+    )
+    .await;
+    assert_eq!(status.payload, AgentControlResponse::Ack);
+
+    let cancelled = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "req-stream-cancel",
+        AgentControlRequest::StreamCancel {
+            stream_id_hex: stream_id_hex.clone(),
+            stream_capability: stream_capability.clone(),
+            reason: Some("gateway_replaced_text".to_owned()),
+        },
+    )
+    .await;
+    assert_eq!(cancelled.payload, AgentControlResponse::Ack);
+
+    let append_after_cancel = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "req-stream-append-after-cancel",
+        AgentControlRequest::StreamAppend {
+            stream_id_hex,
+            stream_capability,
+            append_text: "late".to_owned(),
+            idempotency_key: None,
+        },
+    )
+    .await;
+    let AgentControlResponse::Error { code, .. } = append_after_cancel.payload else {
+        panic!("expected append-after-cancel error");
+    };
+    assert_eq!(code, "stream_capability_denied");
+}
+
+async fn connect_with_retry(socket: &Path) -> UnixStream {
+    for _ in 0..100 {
+        match UnixStream::connect(socket).await {
+            Ok(stream) => return stream,
+            Err(_) => sleep(Duration::from_millis(20)).await,
+        }
+    }
+    UnixStream::connect(socket).await.unwrap()
+}
+
+async fn send_control_request(
+    socket: &Path,
+    id: &str,
+    request: AgentControlRequest,
+) -> AgentControlEnvelope<AgentControlResponse> {
+    send_control_request_with_auth(socket, id, request, None).await
+}
+
+async fn send_control_request_with_auth(
+    socket: &Path,
+    id: &str,
+    request: AgentControlRequest,
+    auth_token: Option<&str>,
+) -> AgentControlEnvelope<AgentControlResponse> {
+    let client = connect_with_retry(socket).await;
+    let (client_read, mut client_write) = tokio::io::split(client);
+    let mut client_read = BufReader::new(client_read);
+    let mut request = AgentControlEnvelope::request(Some(id.to_owned()), request);
+    if let Some(auth_token) = auth_token {
+        request = request.with_auth_token(auth_token);
+    }
+    write_frame(&mut client_write, &request).await.unwrap();
+    timeout(CONTROL_RESPONSE_TIMEOUT, read_envelope(&mut client_read))
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+}
+
+async fn serve_control_request_once(
+    connector: &AgentConnector,
+    listener: &tokio::net::UnixListener,
+    socket: &Path,
+    id: &str,
+    request: AgentControlRequest,
+) -> AgentControlEnvelope<AgentControlResponse> {
+    let (server, response) = tokio::join!(
+        connector.serve_once(listener),
+        send_control_request(socket, id, request)
+    );
+    server.unwrap();
+    response
+}
+
+async fn serve_control_request_once_with_auth(
+    connector: &AgentConnector,
+    listener: &tokio::net::UnixListener,
+    socket: &Path,
+    id: &str,
+    request: AgentControlRequest,
+    auth_token: Option<&str>,
+) -> AgentControlEnvelope<AgentControlResponse> {
+    let (server, response) = tokio::join!(
+        connector.serve_once(listener),
+        send_control_request_with_auth(socket, id, request, auth_token)
+    );
+    server.unwrap();
+    response
+}
+
+fn assert_allowlist(
+    response: AgentControlEnvelope<AgentControlResponse>,
+    expected_id: &str,
+    expected_account_id_hex: &str,
+    expected_welcomer_account_ids_hex: &[&str],
+) {
+    assert_eq!(response.id.as_deref(), Some(expected_id));
+    let AgentControlResponse::Allowlist {
+        account_id_hex,
+        welcomer_account_ids_hex,
+    } = response.payload
+    else {
+        panic!("expected allowlist response");
+    };
+    assert_eq!(account_id_hex, expected_account_id_hex);
+    assert_eq!(
+        welcomer_account_ids_hex,
+        expected_welcomer_account_ids_hex
+            .iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+    );
+}
+
+fn expected_stream_transcript_hash(
+    stream_id_hex: &str,
+    start_message_id_hex: &str,
+    records: &[(u8, &str)],
+) -> String {
+    let stream_id = hex::decode(stream_id_hex).unwrap();
+    let start_event_id = MessageId::new(hex::decode(start_message_id_hex).unwrap());
+    let mut transcript = AgentTextStreamTranscriptV1::new(stream_id, start_event_id);
+    for (seq, (record_type, text)) in (1_u64..).zip(records.iter()) {
+        transcript.append(seq, *record_type, text.as_bytes());
+    }
+    hex::encode(transcript.hash())
+}
+
+struct ExistingPendingInviteSetup {
+    dir: tempfile::TempDir,
+    _relay: MockRelay,
+    relay_url: String,
+    app: MarmotApp,
+    agent_label: String,
+    agent_account_id_hex: String,
+    human_account_id_hex: String,
+    group_id_hex: String,
+}
+
+async fn setup_existing_pending_invite(group_name: &str) -> ExistingPendingInviteSetup {
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+    let app = MarmotApp::with_relay(dir.path(), relay_url.clone());
+    let setup_runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![crate::validation::endpoint(&relay_url)],
+        bootstrap_relays: vec![crate::validation::endpoint(&relay_url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let agent = setup_runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
+    let human = setup_runtime.create_identity(setup).await.unwrap();
+
+    let group_id = setup_runtime
+        .create_group(
+            &human.account.account_id_hex,
+            group_name,
+            std::slice::from_ref(&agent.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    wait_for_group_state(&app, &agent.account.label, &group_id_hex, |group| {
+        group.pending_confirmation && !group.archived
+    })
+    .await;
+    setup_runtime.shutdown().await;
+
+    ExistingPendingInviteSetup {
+        dir,
+        _relay: relay,
+        relay_url,
+        app,
+        agent_label: agent.account.label,
+        agent_account_id_hex: agent.account.account_id_hex,
+        human_account_id_hex: human.account.account_id_hex,
+        group_id_hex,
+    }
+}
+
+async fn wait_for_group_state<F>(
+    app: &MarmotApp,
+    account_label: &str,
+    group_id_hex: &str,
+    mut predicate: F,
+) where
+    F: FnMut(&marmot_app::AppGroupRecord) -> bool,
+{
+    timeout(Duration::from_secs(30), async {
+        loop {
+            if let Some(group) = app.group(account_label, group_id_hex).unwrap()
+                && predicate(&group)
+            {
+                return;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+async fn read_matching_inbound_message<R>(
+    reader: &mut R,
+    expected_text: &str,
+) -> AgentControlEnvelope<AgentControlEvent>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    for _ in 0..10 {
+        let event: AgentControlEnvelope<AgentControlEvent> =
+            timeout(CONTROL_RESPONSE_TIMEOUT, read_envelope(reader))
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        if matches!(
+            &event.payload,
+            AgentControlEvent::InboundMessage { message, .. } if message.text == expected_text
+        ) {
+            return event;
+        }
+    }
+    panic!("expected inbound message event with text {expected_text:?}");
+}
+
+#[test]
+fn control_event_from_debug_event_passes_resync_required_through_filters() {
+    let resync = AgentControlEvent::ResyncRequired {
+        account_id_hex: Some("aa".to_owned()),
+        group_id_hex: Some("bb".to_owned()),
+        dropped_events: 3,
+    };
+
+    // Matching filters keep the event.
+    assert_eq!(
+        control_event_from_debug_event(resync.clone(), Some("aa"), Some("bb")),
+        Some(resync.clone())
+    );
+    // A non-matching account filter drops it.
+    assert_eq!(
+        control_event_from_debug_event(resync.clone(), Some("zz"), None),
+        None
+    );
+    // No filters always keep it.
+    assert_eq!(
+        control_event_from_debug_event(resync.clone(), None, None),
+        Some(resync)
+    );
+}
+
+fn received_chat_record(
+    message_id_hex: &str,
+    group_id_hex: &str,
+    sender: &str,
+    text: &str,
+) -> AppMessageRecord {
+    AppMessageRecord {
+        authority: None,
+        message_id_hex: message_id_hex.to_owned(),
+        direction: "received".to_owned(),
+        group_id_hex: group_id_hex.to_owned(),
+        sender: sender.to_owned(),
+        plaintext: text.to_owned(),
+        kind: MARMOT_APP_EVENT_KIND_CHAT,
+        tags: Vec::new(),
+        source_epoch: Some(1),
+        retention: None,
+        recorded_at: 100,
+        received_at: 100,
+        insert_order: 0,
+        invalidated: false,
+        moderation_grant: false,
+    }
+}
+
+#[tokio::test]
+async fn inbound_message_event_from_record_projects_received_chat() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = MarmotAppRuntime::new(MarmotApp::with_relays(dir.path(), Vec::new()));
+    // Regression for mdk#210: a missed inbound chat recovered from storage must
+    // project into exactly the same InboundMessage event the live path emits, so the
+    // consumer's existing handler delivers it to the agent.
+    let record = received_chat_record("aa", "bb", "cc", "hello agent");
+    let event = inbound_message_event_from_record_with_runtime(
+        &runtime,
+        "acct",
+        "acct",
+        record,
+        Some("acct"),
+        Some("bb"),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        event,
+        AgentControlEvent::InboundMessage {
+            account_id_hex: "acct".to_owned(),
+            group_id_hex: "bb".to_owned(),
+            message: agent_control::AgentControlMessage {
+                message_id_hex: "aa".to_owned(),
+                sender: agent_control::AgentControlActor {
+                    account_id_hex: "cc".to_owned(),
+                    display_name: None,
+                    is_self: false,
+                },
+                text: "hello agent".to_owned(),
+                recorded_at: 100,
+                media: Vec::new(),
+            },
+            mentions_self: false,
+            reply_to: None,
+        }
+    );
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn inbound_message_event_from_record_projects_group_system_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = MarmotAppRuntime::new(MarmotApp::with_relays(dir.path(), Vec::new()));
+    // Regression for mdk#505: durable kind-1210 group-system rows synthesized from
+    // GroupStateChanged events must replay as group_state_changed control events after lag.
+    let content = cgka_traits::app_event::GroupSystemEvent::new(
+        cgka_traits::app_event::GROUP_SYSTEM_TYPE_GROUP_RENAMED,
+        "Group renamed",
+        Some(serde_json::json!({
+            cgka_traits::app_event::GROUP_SYSTEM_DATA_NAME: "Team",
+            // Subject/actor-like data must not be surfaced in the control event.
+            cgka_traits::app_event::GROUP_SYSTEM_DATA_SUBJECT: "99".repeat(32),
+        })),
+    )
+    .to_content()
+    .unwrap();
+    let mut record = received_chat_record("ee", "bb", "", &content);
+    record.direction = "system".to_owned();
+    record.kind = MARMOT_APP_EVENT_KIND_GROUP_SYSTEM;
+
+    let event = inbound_message_event_from_record_with_runtime(
+        &runtime,
+        "acct",
+        "acct",
+        record,
+        Some("acct"),
+        Some("bb"),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        event,
+        AgentControlEvent::GroupStateChanged {
+            account_id_hex: "acct".to_owned(),
+            group_id_hex: "bb".to_owned(),
+            event_id_hex: Some("ee".to_owned()),
+            change: "group_renamed".to_owned(),
+            detail: Some("Team".to_owned()),
+        }
+    );
+    runtime.shutdown().await;
+}
+
+#[test]
+fn runtime_replay_dedup_key_matches_group_system_storage_row_id() {
+    // The live GroupStateChanged event and the synthesized storage row must share the same
+    // replay cursor id, otherwise replay after later lag would duplicate already-delivered state.
+    assert_runtime_replay_dedup_key_matches_group_rename(None);
+}
+
+#[test]
+fn runtime_replay_dedup_key_matches_group_system_storage_row_id_with_old_name() {
+    // `previous_name` is rendered as `data.old_name`, which participates in the
+    // canonical row id. Live delivery and replay must therefore agree when it is
+    // populated, not only when it is absent.
+    assert_runtime_replay_dedup_key_matches_group_rename(Some("Old Team"));
+}
+
+fn assert_runtime_replay_dedup_key_matches_group_rename(previous_name: Option<&str>) {
+    let group_id = GroupId::new(vec![0x22; 32]);
+    let actor = cgka_traits::MemberId::new(vec![0xbb; 32]);
+    let change = GroupStateChange::GroupRenamed {
+        name: "Team".to_owned(),
+        previous_name: previous_name.map(str::to_owned),
+    };
+    let event = MarmotAppEvent::GroupEvent(marmot_app::RuntimeGroupEvent {
+        account_id_hex: "acct".to_owned(),
+        account_label: "agent".to_owned(),
+        event: GroupEvent::GroupStateChanged {
+            group_id: group_id.clone(),
+            epoch: EpochId(3),
+            actor: Some(actor.clone()),
+            change: change.clone(),
+            origin_commit_id: None,
+        },
+    });
+
+    let expected =
+        cgka_traits::app_event::group_system_canonical_id(&group_id, 3, Some(&actor), &change)
+            .unwrap();
+
+    assert_eq!(
+        runtime_replay_dedup_key(&event).as_deref(),
+        Some(expected.as_str())
+    );
+}
+
+#[test]
+fn inbound_message_event_from_record_extracts_mention_and_reply() {
+    // A `p`-tag for the receiving account marks a mention; the first `e`-tag is
+    // the reply target. Both let a channel gate/thread without re-parsing tags.
+    let parent_msg_id = "bb".repeat(32);
+    let tags = vec![
+        vec!["p".to_owned(), "acct".to_owned()],
+        vec!["e".to_owned(), parent_msg_id.clone()],
+    ];
+    assert!(
+        message_mentions_account(&tags, "hey there", "acct"),
+        "p-tag for the account should mark a mention"
+    );
+    assert_eq!(
+        reply_target_from_tags(&tags).as_deref(),
+        Some(parent_msg_id.as_str())
+    );
+}
+
+#[test]
+fn inbound_message_event_detects_inline_nostr_mention() {
+    // Marmot clients address a member with an inline `nostr:<pubkey-hex>` token
+    // (no p-tag), and the account id IS the pubkey hex.
+    assert!(
+        message_mentions_account(&[], "hey nostr:acct can you help?", "acct"),
+        "inline nostr:<pubkey> should mark a mention"
+    );
+}
+
+#[test]
+fn inbound_message_event_does_not_scan_for_hex_mentions_past_the_cap() {
+    let account = "aa".repeat(32);
+    let mut text = "x".repeat(AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize);
+    text.push_str(&format!(" nostr:{account}"));
+
+    assert!(
+        !inbound_message_mentions_self_for_text(&account, &text),
+        "nostr:<hex> mentions past the bounded scan window must be ignored"
+    );
+}
+
+#[test]
+fn inbound_message_event_detects_npub_bech32_mention() {
+    // A p-tag-less mention whose inline text is the bech32 `nostr:npub1…` form
+    // (what marmot-markdown renders) must still be detected.
+    let account = "aa".repeat(32);
+    let npub = marmot_app::npub_for_account_id(&account).unwrap();
+    let text = format!("hey nostr:{npub} can you help?");
+    assert!(
+        message_mentions_account(&[], &text, &account),
+        "inline nostr:<npub> bech32 mention should be detected"
+    );
+}
+
+fn inbound_message_mentions_self_for_text(account: &str, text: &str) -> bool {
+    message_mentions_account(&[], text, account)
+}
+
+#[test]
+fn inbound_message_event_detects_bare_at_npub_mention() {
+    // Clients can emit the visible bare `@npub1…` handle without a p-tag or
+    // `nostr:` scheme; agent-control mention classification must still fire.
+    let account = "aa".repeat(32);
+    let npub = marmot_app::npub_for_account_id(&account).unwrap();
+
+    assert!(
+        inbound_message_mentions_self_for_text(&account, &format!("hey @{npub} can you help?")),
+        "bare @npub bech32 mention should be detected"
+    );
+}
+
+#[test]
+fn inbound_message_event_uses_markdown_boundaries_for_bare_at_npub_mention() {
+    let account = "aa".repeat(32);
+    let npub = marmot_app::npub_for_account_id(&account).unwrap();
+
+    for text in [
+        format!("not-a-mention@{npub}"),
+        format!("a_@{npub}"),
+        format!("/@{npub}"),
+        format!("@{npub}_tail"),
+        format!("@{npub}/tail"),
+    ] {
+        assert!(
+            !inbound_message_mentions_self_for_text(&account, &text),
+            "non-visible markdown mention must not be detected: {text}"
+        );
+    }
+}
+
+#[test]
+fn inbound_message_event_ignores_uppercase_bare_at_npub_mention() {
+    let account = "aa".repeat(32);
+    let npub = marmot_app::npub_for_account_id(&account).unwrap();
+    let text = format!("@{}", npub.to_ascii_uppercase());
+
+    assert!(
+        !inbound_message_mentions_self_for_text(&account, &text),
+        "uppercase @NPUB is not a visible marmot-markdown mention"
+    );
+}
+
+#[test]
+fn inbound_message_event_ignores_different_account_bare_at_npub_mention() {
+    let account = "aa".repeat(32);
+    let other_account = "bb".repeat(32);
+    let other_npub = marmot_app::npub_for_account_id(&other_account).unwrap();
+    let text = format!("hey @{other_npub}");
+
+    assert!(
+        !inbound_message_mentions_self_for_text(&account, &text),
+        "visible mention for a different account must not mention this account"
+    );
+}
+
+#[test]
+fn inbound_message_event_ignores_bare_at_npub_in_image_alt_text() {
+    let account = "aa".repeat(32);
+    let npub = marmot_app::npub_for_account_id(&account).unwrap();
+    let text = format!("![hey @{npub}](https://example.invalid/a.png)");
+
+    assert!(
+        !inbound_message_mentions_self_for_text(&account, &text),
+        "image alt text should not count as a visible addressed mention"
+    );
+}
+
+#[test]
+fn inbound_message_mention_check_is_fast_on_hostile_markdown_without_npub() {
+    // Regression for mdk#663: mention classification ran the unbounded
+    // Markdown parser on attacker-controlled inbound plaintext. A bracket/image
+    // emphasis bomb with no p-tag and no npub reference forced a super-linear
+    // full parse on every kind-9 chat message (live projection and replay).
+    // With no visible npub token present, classification must short-circuit
+    // before parsing and stay fast.
+    let account = "aa".repeat(32);
+    // `![a](` repeated has known super-linear parse cost; 80 KB of it parses in
+    // well over a second unbounded. It contains no npub and no p-tag, so the
+    // correct answer is "not a mention" and the cheap path must reach it.
+    let hostile = "![a](".repeat(16_000);
+
+    let start = std::time::Instant::now();
+    let mentions = inbound_message_mentions_self_for_text(&account, &hostile);
+    let elapsed = start.elapsed();
+
+    assert!(
+        !mentions,
+        "hostile markdown without an npub is not a mention"
+    );
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "mention classification must not run the unbounded parser on hostile \
+         markdown (took {elapsed:?})"
+    );
+}
+
+#[test]
+fn inbound_message_mention_check_is_fast_on_hostile_markdown_with_visible_npub() {
+    // A visible candidate npub must not send the remaining hostile plaintext
+    // through the Markdown parser. The parser path previously spent hundreds of
+    // milliseconds on this capped prefix; the bounded token scanner should be
+    // effectively linear and still detect the visible mention.
+    let account = "aa".repeat(32);
+    let npub = marmot_app::npub_for_account_id(&account).unwrap();
+    let hostile = format!("hey @{npub} {}", "![a](".repeat(16_000));
+
+    let start = std::time::Instant::now();
+    let mentions = inbound_message_mentions_self_for_text(&account, &hostile);
+    let elapsed = start.elapsed();
+
+    assert!(mentions, "visible @npub mention should be detected");
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "visible-npub classification must not parse hostile markdown \
+         (took {elapsed:?})"
+    );
+}
+
+#[test]
+fn inbound_message_mention_check_ignores_image_alt_npub_fast_on_hostile_markdown() {
+    // Review regression for PR #677: putting the target npub in image alt text
+    // made the old pre-filter call the Markdown parser on the hostile capped
+    // prefix even though image alt text is not an addressed visible mention.
+    let account = "aa".repeat(32);
+    let npub = marmot_app::npub_for_account_id(&account).unwrap();
+    let hostile = format!("![hey @{npub}]({}", "![a](".repeat(16_000));
+
+    let start = std::time::Instant::now();
+    let mentions = inbound_message_mentions_self_for_text(&account, &hostile);
+    let elapsed = start.elapsed();
+
+    assert!(
+        !mentions,
+        "npub in image alt text should not count as a visible addressed mention"
+    );
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "image-alt npub classification must not parse hostile markdown \
+         (took {elapsed:?})"
+    );
+}
+
+#[test]
+fn inbound_message_event_detects_p_tag_mention_without_inline_text() {
+    // The p-tag is authoritative: a mention with only the structured tag (no
+    // inline nostr: reference in the body) is still detected.
+    let account = "aa".repeat(32);
+    assert!(
+        message_mentions_account(
+            &[vec!["p".to_owned(), account.clone()]],
+            "please take a look",
+            &account,
+        ),
+        "p-tag mention should be detected without inline text"
+    );
+}
+
+#[test]
+fn media_download_subdir_is_stable_and_content_derived() {
+    use crate::messaging::media_download_subdir;
+
+    let a = media_download_subdir(b"plaintext-a");
+    let b = media_download_subdir(b"plaintext-b");
+    assert_eq!(a, media_download_subdir(b"plaintext-a"), "stable per blob");
+    assert_ne!(a, b, "distinct content must not share a subdir");
+    // Lowercase hex: always a single safe path component.
+    assert_eq!(a.len(), 64);
+    assert!(
+        a.bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    );
+}
+
+#[test]
+fn safe_media_filename_strips_path_traversal() {
+    use crate::messaging::safe_media_filename;
+    assert_eq!(safe_media_filename("a.png"), "a.png");
+    assert_eq!(safe_media_filename("../../etc/passwd"), "passwd");
+    assert_eq!(safe_media_filename("dir/b.jpg"), "b.jpg");
+    assert_eq!(safe_media_filename(".."), "media");
+    assert_eq!(safe_media_filename(""), "media");
+}
+
+#[tokio::test]
+async fn inbound_message_event_from_record_skips_non_inbound_and_own_and_filtered() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = MarmotAppRuntime::new(MarmotApp::with_relays(dir.path(), Vec::new()));
+    let project = |record, account_filter, group_filter| {
+        inbound_message_event_from_record_with_runtime(
+            &runtime,
+            "acct",
+            "acct",
+            record,
+            account_filter,
+            group_filter,
+        )
+        .unwrap()
+    };
+    // Outbound (own) messages are never re-delivered as inbound.
+    let mut own = received_chat_record("aa", "bb", "acct", "mine");
+    own.direction = "sent".to_owned();
+    assert!(project(own, None, None).is_none());
+
+    // A received message authored by the subscribed account itself is skipped (mirrors live).
+    let self_authored = received_chat_record("aa", "bb", "acct", "loopback");
+    assert!(project(self_authored, None, None).is_none());
+
+    // Agent stream markers are not part of the inbound durable-event feed.
+    let mut stream_start = received_chat_record("aa", "bb", "cc", "+1");
+    stream_start.kind = MARMOT_APP_EVENT_KIND_AGENT_STREAM_START;
+    assert!(project(stream_start, None, None).is_none());
+
+    // A group-system row that was received as an app message, rather than synthesized locally,
+    // is not treated as a durable GroupStateChanged replay event.
+    let mut received_system = received_chat_record("aa", "bb", "cc", "{}");
+    received_system.kind = MARMOT_APP_EVENT_KIND_GROUP_SYSTEM;
+    assert!(project(received_system, None, None).is_none());
+
+    // A mismatched group filter excludes the message.
+    let other_group = received_chat_record("aa", "bb", "cc", "elsewhere");
+    assert!(project(other_group, Some("acct"), Some("zz")).is_none());
+    runtime.shutdown().await;
+}
+
+#[test]
+fn delivered_inbound_cursor_dedups_and_evicts_oldest() {
+    let mut cursor = DeliveredInboundCursor::new(3);
+    assert!(!cursor.contains("a"));
+    cursor.record("a".to_owned());
+    cursor.record("b".to_owned());
+    cursor.record("c".to_owned());
+    assert!(cursor.contains("a"));
+    assert!(cursor.contains("c"));
+
+    // Re-recording an existing id is a no-op and does not evict anything.
+    cursor.record("a".to_owned());
+    assert!(cursor.contains("b"));
+
+    // Exceeding capacity evicts the oldest id ("a"), keeping the most recent three.
+    cursor.record("d".to_owned());
+    assert!(
+        !cursor.contains("a"),
+        "oldest id should be evicted at capacity"
+    );
+    assert!(cursor.contains("b"));
+    assert!(cursor.contains("c"));
+    assert!(cursor.contains("d"));
+}
+
+#[tokio::test]
+async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
+    // End-to-end regression for mdk#210: when the inbound broadcast lags, the
+    // connector re-queries storage and re-delivers the genuinely-missed inbound messages on
+    // the existing InboundMessage path the consumer already handles. A real send populates
+    // storage; replay must surface it, and a second replay (with the id already delivered)
+    // must not re-deliver it.
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+    let app = MarmotApp::with_relay(dir.path(), relay_url.clone());
+    let setup_runtime = MarmotAppRuntime::new(app);
+    let setup = AccountSetupRequest {
+        default_relays: vec![crate::validation::endpoint(&relay_url)],
+        bootstrap_relays: vec![crate::validation::endpoint(&relay_url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let agent = setup_runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
+    let human = setup_runtime.create_identity(setup).await.unwrap();
+    let group_id = setup_runtime
+        .create_group(
+            &agent.account.account_id_hex,
+            "agent inbound replay",
+            std::slice::from_ref(&human.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    setup_runtime.shutdown().await;
+    let group_id_hex = hex::encode(group_id.as_slice());
+
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        dir.path().join("dev").join("wn-agent.sock"),
+        vec![relay_url],
+        false,
+        false,
+    ))
+    .unwrap();
+
+    // Deliver a real inbound message into storage via a normal send + catch-up.
+    connector.runtime.catch_up_accounts().await.unwrap();
+    let sent = connector
+        .send_final_response(
+            &human.account.account_id_hex,
+            &group_id_hex,
+            "missed while lagging".to_owned(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let AgentControlResponse::FinalSent {
+        message_ids_hex, ..
+    } = sent
+    else {
+        panic!("expected final send");
+    };
+    let target_message_id_hex = message_ids_hex[0].clone();
+    // Let the agent account observe the message so it lands in its storage projection.
+    for _ in 0..40 {
+        connector.runtime.catch_up_accounts().await.unwrap();
+        let stored = connector
+            .runtime
+            .messages_with_query(
+                &agent.account.account_id_hex,
+                crate::AppMessageQuery {
+                    group_id_hex: Some(group_id_hex.clone()),
+                    kinds: None,
+                    limit: None,
+                },
+            )
+            .unwrap();
+        if stored.iter().any(|m| m.plaintext == "missed while lagging") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // First replay surfaces the missed inbound message as an InboundMessage event.
+    let mut delivered = DeliveredInboundCursor::new(crate::DELIVERED_INBOUND_CURSOR_CAPACITY);
+    let replayed = connector
+        .replay_missed_inbound(
+            Some(&agent.account.account_id_hex),
+            Some(&group_id_hex),
+            &mut delivered,
+        )
+        .unwrap();
+    let recovered: Vec<_> = replayed
+        .iter()
+        .filter_map(|event| match event {
+            AgentControlEvent::InboundMessage { message, .. } => {
+                Some((message.text.clone(), message.sender.account_id_hex.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        recovered
+            .iter()
+            .any(|(text, sender)| text == "missed while lagging"
+                && sender == &human.account.account_id_hex),
+        "replay should recover the missed inbound message, got {recovered:?}"
+    );
+
+    // Exercise every durable mutation through the same production projection
+    // used by live delivery and replay.
+    connector
+        .runtime
+        .edit_message(
+            &human.account.account_id_hex,
+            &group_id,
+            &target_message_id_hex,
+            "edited while lagging",
+        )
+        .await
+        .unwrap();
+    let reaction = connector
+        .runtime
+        .react_to_message(
+            &human.account.account_id_hex,
+            &group_id,
+            &target_message_id_hex,
+            "👍",
+        )
+        .await
+        .unwrap();
+    let expected_reaction_event_id_hex = reaction.message_ids[0].clone();
+    connector
+        .runtime
+        .unreact_from_message(
+            &human.account.account_id_hex,
+            &group_id,
+            &target_message_id_hex,
+        )
+        .await
+        .unwrap();
+
+    for _ in 0..40 {
+        connector.runtime.catch_up_accounts().await.unwrap();
+        let stored = connector
+            .runtime
+            .messages_with_query(
+                &agent.account.account_id_hex,
+                crate::AppMessageQuery {
+                    group_id_hex: Some(group_id_hex.clone()),
+                    kinds: None,
+                    limit: None,
+                },
+            )
+            .unwrap();
+        if stored.iter().any(|message| {
+            message.kind == MARMOT_APP_EVENT_KIND_DELETE
+                && message
+                    .tags
+                    .iter()
+                    .any(|tag| tag.get(1) == Some(&expected_reaction_event_id_hex))
+        }) {
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    let mutation_replay = connector
+        .replay_missed_inbound(
+            Some(&agent.account.account_id_hex),
+            Some(&group_id_hex),
+            &mut delivered,
+        )
+        .unwrap();
+    assert!(
+        mutation_replay.iter().any(|event| matches!(
+            event,
+            AgentControlEvent::MessageEdited {
+                target_message_id_hex: target,
+                replacement_text,
+                ..
+            } if target == &target_message_id_hex && replacement_text == "edited while lagging"
+        )),
+        "accepted edit must replay through the production projector: {mutation_replay:?}"
+    );
+    assert!(
+        mutation_replay.iter().any(|event| matches!(
+            event,
+            AgentControlEvent::ReactionAdded {
+                target_message_id_hex: target,
+                emoji,
+                ..
+            } if target == &target_message_id_hex && emoji == "👍"
+        )),
+        "accepted reaction must replay through the production projector: {mutation_replay:?}"
+    );
+    assert!(
+        mutation_replay.iter().any(|event| matches!(
+            event,
+            AgentControlEvent::ReactionRemoved {
+                target_message_id_hex: target,
+                reaction_event_id_hex,
+                emoji,
+                ..
+            } if target == &target_message_id_hex
+                && reaction_event_id_hex == &expected_reaction_event_id_hex
+                && emoji == "👍"
+        )),
+        "accepted reaction removal must replay through the production projector: {mutation_replay:?}"
+    );
+
+    // A subsequent replay must not re-deliver either the message or mutations.
+    let replayed_again = connector
+        .replay_missed_inbound(
+            Some(&agent.account.account_id_hex),
+            Some(&group_id_hex),
+            &mut delivered,
+        )
+        .unwrap();
+    assert!(
+        replayed_again.is_empty(),
+        "subsequent replay must not duplicate delivered durable events: {replayed_again:?}"
+    );
+
+    // Raw modifiers that the materialized timeline rejects must also stay out
+    // of the agent feed. Send them as valid MLS application messages to bypass
+    // the local convenience APIs' authorship checks.
+    let forged_edit = MarmotInnerEvent::new(
+        agent.account.account_id_hex.clone(),
+        1_785_200_100,
+        MARMOT_APP_EVENT_KIND_EDIT,
+        vec![vec!["e".to_owned(), target_message_id_hex.clone()]],
+        "forged replacement",
+    )
+    .encode()
+    .unwrap();
+    connector
+        .runtime
+        .send_message(&agent.account.account_id_hex, &group_id, forged_edit)
+        .await
+        .unwrap();
+
+    let retained_reaction = connector
+        .runtime
+        .react_to_message(
+            &human.account.account_id_hex,
+            &group_id,
+            &target_message_id_hex,
+            "🔥",
+        )
+        .await
+        .unwrap();
+    let retained_reaction_id_hex = retained_reaction.message_ids[0].clone();
+    let forged_reaction_removal = MarmotInnerEvent::new(
+        agent.account.account_id_hex.clone(),
+        1_785_200_101,
+        MARMOT_APP_EVENT_KIND_DELETE,
+        vec![vec!["e".to_owned(), retained_reaction_id_hex.clone()]],
+        "",
+    )
+    .encode()
+    .unwrap();
+    connector
+        .runtime
+        .send_message(
+            &agent.account.account_id_hex,
+            &group_id,
+            forged_reaction_removal,
+        )
+        .await
+        .unwrap();
+
+    for _ in 0..40 {
+        connector.runtime.catch_up_accounts().await.unwrap();
+        let stored = connector
+            .runtime
+            .messages_with_query(
+                &human.account.account_id_hex,
+                crate::AppMessageQuery {
+                    group_id_hex: Some(group_id_hex.clone()),
+                    kinds: None,
+                    limit: None,
+                },
+            )
+            .unwrap();
+        if stored.iter().any(|message| {
+            message.kind == MARMOT_APP_EVENT_KIND_DELETE
+                && message
+                    .tags
+                    .iter()
+                    .any(|tag| tag.get(1) == Some(&retained_reaction_id_hex))
+        }) {
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    let mut human_delivered = DeliveredInboundCursor::new(crate::DELIVERED_INBOUND_CURSOR_CAPACITY);
+    let rejected = connector
+        .replay_missed_inbound(
+            Some(&human.account.account_id_hex),
+            Some(&group_id_hex),
+            &mut human_delivered,
+        )
+        .unwrap();
+    assert!(
+        !rejected.iter().any(|event| matches!(
+            event,
+            AgentControlEvent::MessageEdited {
+                target_message_id_hex: projected_target,
+                ..
+            } if projected_target == &target_message_id_hex
+        )),
+        "wrong-author edit must not enter the agent feed: {rejected:?}"
+    );
+    assert!(
+        !rejected.iter().any(|event| matches!(
+            event,
+            AgentControlEvent::ReactionRemoved {
+                reaction_event_id_hex,
+                ..
+            } if reaction_event_id_hex == &retained_reaction_id_hex
+        )),
+        "wrong-author reaction removal must not enter the agent feed: {rejected:?}"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_send_final_with_repeated_idempotency_key_sends_once() {
+    // GAP-06: a retry that reuses the same idempotency key must return the
+    // ORIGINAL durable message ids without re-sending, so a post-write-timeout
+    // retry can never double-post an unrecallable encrypted message. Observable
+    // proof of "no second send": only one copy of the text lands in storage.
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+    let app = MarmotApp::with_relay(dir.path(), relay_url.clone());
+    let setup_runtime = MarmotAppRuntime::new(app);
+    let setup = AccountSetupRequest {
+        default_relays: vec![crate::validation::endpoint(&relay_url)],
+        bootstrap_relays: vec![crate::validation::endpoint(&relay_url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let agent = setup_runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
+    let human = setup_runtime.create_identity(setup).await.unwrap();
+    let group_id = setup_runtime
+        .create_group(
+            &agent.account.account_id_hex,
+            "agent idempotent send",
+            std::slice::from_ref(&human.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap();
+    setup_runtime.shutdown().await;
+    let group_id_hex = hex::encode(group_id.as_slice());
+
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        dir.path().join("dev").join("wn-agent.sock"),
+        vec![relay_url],
+        false,
+        false,
+    ))
+    .unwrap();
+    connector.runtime.catch_up_accounts().await.unwrap();
+
+    let key = "retry-key-1".to_owned();
+    let start = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+    let first_start = std::sync::Arc::clone(&start);
+    let second_start = std::sync::Arc::clone(&start);
+    let first_send = async {
+        first_start.wait().await;
+        connector
+            .send_final_response(
+                &agent.account.account_id_hex,
+                &group_id_hex.to_uppercase(),
+                "idempotent reply".to_owned(),
+                None,
+                Some(key.clone()),
+            )
+            .await
+    };
+    let second_send = async {
+        second_start.wait().await;
+        connector
+            .send_final_response(
+                &agent.account.account_id_hex,
+                &group_id_hex,
+                "idempotent reply".to_owned(),
+                None,
+                Some(key.clone()),
+            )
+            .await
+    };
+    let (first_result, second_result) = tokio::join!(first_send, second_send);
+
+    let AgentControlResponse::FinalSent {
+        message_ids_hex: first_ids,
+        ..
+    } = first_result.unwrap()
+    else {
+        panic!("expected first send to return FinalSent");
+    };
+    assert!(!first_ids.is_empty(), "a real send returns message ids");
+
+    let AgentControlResponse::FinalSent {
+        message_ids_hex: second_ids,
+        ..
+    } = second_result.unwrap()
+    else {
+        panic!("expected concurrent retry to return FinalSent");
+    };
+    assert_eq!(
+        second_ids, first_ids,
+        "a concurrent retry must return the leader ids across equivalent hex casing"
+    );
+
+    // Observable proof there was no second underlying send: exactly one copy of
+    // the text exists in the agent's own group storage projection.
+    let stored = connector
+        .runtime
+        .messages_with_query(
+            &agent.account.account_id_hex,
+            crate::AppMessageQuery {
+                group_id_hex: Some(group_id_hex.clone()),
+                kinds: None,
+                limit: None,
+            },
+        )
+        .unwrap();
+    let copies = stored
+        .iter()
+        .filter(|m| m.plaintext == "idempotent reply")
+        .count();
+    assert_eq!(copies, 1, "a deduped retry must not re-post the message");
+}
+
+#[test]
+fn send_idempotency_store_returns_recorded_ids_for_a_key() {
+    use crate::stream_session::SendIdempotencyStore;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = SendIdempotencyStore::new(dir.path());
+    let fingerprint = "fp-k1".to_owned();
+    assert_eq!(
+        store.get("k1", &fingerprint),
+        None,
+        "an unseen key has no cached ids"
+    );
+
+    let ids = vec!["aa".repeat(32), "bb".repeat(32)];
+    store.record("k1".to_owned(), fingerprint.clone(), ids.clone());
+    assert_eq!(
+        store.get("k1", &fingerprint),
+        Some(ids),
+        "a recorded key returns its message ids for a matching fingerprint"
+    );
+    assert_eq!(
+        store.get("k1", "fp-other"),
+        None,
+        "a recorded key with a non-matching fingerprint is a cache miss"
+    );
+    assert_eq!(
+        store.get("k2", &fingerprint),
+        None,
+        "an unrelated key stays absent"
+    );
+
+    let pending_ids = vec!["cc".repeat(32)];
+    store.record_with_disposition(
+        "k-pending".to_owned(),
+        "fp-pending".to_owned(),
+        pending_ids.clone(),
+        AgentControlSendMaintenanceDisposition::PostJoinRotationPendingRetryable,
+    );
+    assert_eq!(
+        store.get_with_disposition("k-pending", "fp-pending"),
+        Some((
+            pending_ids,
+            AgentControlSendMaintenanceDisposition::PostJoinRotationPendingRetryable,
+        )),
+        "a retry must preserve the original machine-readable send disposition"
+    );
+}
+
+async fn wait_for_idempotency_follower(
+    store: &crate::stream_session::SendIdempotencyStore,
+    key: &str,
+    fingerprint: &str,
+) {
+    timeout(Duration::from_secs(1), async {
+        while store.in_flight_participant_count(key, fingerprint) < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the follower must join the leader's in-flight gate");
+}
+
+#[tokio::test]
+async fn send_idempotency_store_same_request_waits_for_leader_result() {
+    use crate::stream_session::{SendIdempotencyAcquisition, SendIdempotencyStore};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = SendIdempotencyStore::new(dir.path());
+    let leader = match store.acquire("same-key", "same-fingerprint").await.unwrap() {
+        SendIdempotencyAcquisition::Leader(leader) => leader,
+        SendIdempotencyAcquisition::Completed(_) => panic!("first caller must lead"),
+    };
+
+    let follower_store = store.clone();
+    let follower = tokio::spawn(async move {
+        follower_store
+            .acquire("same-key", "same-fingerprint")
+            .await
+            .unwrap()
+    });
+    wait_for_idempotency_follower(&store, "same-key", "same-fingerprint").await;
+    assert!(!follower.is_finished());
+
+    let ids = vec!["aa".repeat(32)];
+    store.record(
+        "same-key".to_owned(),
+        "same-fingerprint".to_owned(),
+        ids.clone(),
+    );
+    leader.complete(ids.clone(), AgentControlSendMaintenanceDisposition::Ready);
+    drop(leader);
+
+    match follower.await.unwrap() {
+        SendIdempotencyAcquisition::Completed((recorded, disposition)) => {
+            assert_eq!(recorded, ids);
+            assert_eq!(disposition, AgentControlSendMaintenanceDisposition::Ready);
+        }
+        SendIdempotencyAcquisition::Leader(_) => {
+            panic!("a follower must reuse the leader's committed result")
+        }
+    }
+}
+
+#[tokio::test]
+async fn send_idempotency_store_failed_leader_leaves_request_retryable() {
+    use crate::stream_session::{SendIdempotencyAcquisition, SendIdempotencyStore};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = SendIdempotencyStore::new(dir.path());
+    let leader = match store
+        .acquire("retry-key", "retry-fingerprint")
+        .await
+        .unwrap()
+    {
+        SendIdempotencyAcquisition::Leader(leader) => leader,
+        SendIdempotencyAcquisition::Completed(_) => panic!("first caller must lead"),
+    };
+
+    let follower_store = store.clone();
+    let follower = tokio::spawn(async move {
+        follower_store
+            .acquire("retry-key", "retry-fingerprint")
+            .await
+            .unwrap()
+    });
+    wait_for_idempotency_follower(&store, "retry-key", "retry-fingerprint").await;
+    assert!(!follower.is_finished());
+    drop(leader);
+
+    match follower.await.unwrap() {
+        SendIdempotencyAcquisition::Leader(_) => {}
+        SendIdempotencyAcquisition::Completed(_) => {
+            panic!("a failed leader has no committed result")
+        }
+    }
+}
+
+#[tokio::test]
+async fn concurrent_new_fingerprint_reuses_transient_leader_result() {
+    use crate::stream_session::{SendIdempotencyAcquisition, SendIdempotencyStore};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = SendIdempotencyStore::new(dir.path());
+    store.record(
+        "shared-key".to_owned(),
+        "first-fingerprint".to_owned(),
+        vec!["aa".repeat(32)],
+    );
+    let leader = match store
+        .acquire("shared-key", "second-fingerprint")
+        .await
+        .unwrap()
+    {
+        SendIdempotencyAcquisition::Leader(leader) => leader,
+        SendIdempotencyAcquisition::Completed(_) => {
+            panic!("a new request body must remain a cache miss")
+        }
+    };
+
+    let follower_store = store.clone();
+    let follower = tokio::spawn(async move {
+        follower_store
+            .acquire("shared-key", "second-fingerprint")
+            .await
+            .unwrap()
+    });
+    wait_for_idempotency_follower(&store, "shared-key", "second-fingerprint").await;
+    assert!(!follower.is_finished());
+
+    let ids = vec!["bb".repeat(32)];
+    store.record(
+        "shared-key".to_owned(),
+        "second-fingerprint".to_owned(),
+        ids.clone(),
+    );
+    assert_eq!(
+        store.get("shared-key", "second-fingerprint"),
+        None,
+        "the original durable key binding remains first-write-wins"
+    );
+    leader.complete(
+        ids.clone(),
+        AgentControlSendMaintenanceDisposition::PostJoinRotationPendingRetryable,
+    );
+    drop(leader);
+
+    match follower.await.unwrap() {
+        SendIdempotencyAcquisition::Completed((recorded, disposition)) => {
+            assert_eq!(recorded, ids);
+            assert_eq!(
+                disposition,
+                AgentControlSendMaintenanceDisposition::PostJoinRotationPendingRetryable
+            );
+        }
+        SendIdempotencyAcquisition::Leader(_) => {
+            panic!("a concurrent follower must reuse the transient leader result")
+        }
+    }
+    assert!(matches!(
+        store
+            .acquire("shared-key", "second-fingerprint")
+            .await
+            .unwrap(),
+        SendIdempotencyAcquisition::Leader(_)
+    ));
+}
+
+#[tokio::test]
+async fn send_idempotency_store_different_fingerprint_remains_a_cache_miss() {
+    use crate::stream_session::{SendIdempotencyAcquisition, SendIdempotencyStore};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = SendIdempotencyStore::new(dir.path());
+    store.record(
+        "shared-key".to_owned(),
+        "first-fingerprint".to_owned(),
+        vec!["aa".repeat(32)],
+    );
+
+    match store
+        .acquire("shared-key", "different-fingerprint")
+        .await
+        .unwrap()
+    {
+        SendIdempotencyAcquisition::Leader(_) => {}
+        SendIdempotencyAcquisition::Completed(_) => {
+            panic!("different request bodies must not reuse unrelated message ids")
+        }
+    }
+}
+
+#[test]
+fn send_idempotency_persist_preserves_existing_socket_directory_mode() {
+    use crate::stream_session::SendIdempotencyStore;
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let dev = dir.path().join("dev");
+    std::fs::create_dir(&dev).unwrap();
+    std::fs::set_permissions(&dev, std::fs::Permissions::from_mode(0o750)).unwrap();
+
+    let store = SendIdempotencyStore::new(dir.path());
+    store.record(
+        "key".to_owned(),
+        "fingerprint".to_owned(),
+        vec!["aa".repeat(32)],
+    );
+
+    assert_eq!(
+        std::fs::metadata(dev).unwrap().permissions().mode() & 0o777,
+        0o750
+    );
+}
+
+#[test]
+fn send_idempotency_store_keeps_first_recorded_ids_for_a_key() {
+    use crate::stream_session::SendIdempotencyStore;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = SendIdempotencyStore::new(dir.path());
+    let first = vec!["11".repeat(32)];
+    let second = vec!["22".repeat(32)];
+    store.record("dup".to_owned(), "fp-first".to_owned(), first.clone());
+    // A repeat record (e.g. a racing duplicate) must not overwrite the original
+    // committed entry: the first successful send for a key always wins, even if
+    // the later record carries a different fingerprint.
+    store.record("dup".to_owned(), "fp-second".to_owned(), second);
+    assert_eq!(store.get("dup", "fp-first"), Some(first));
+}
+
+#[test]
+fn send_idempotency_store_evicts_oldest_keys_past_capacity() {
+    use crate::stream_session::SendIdempotencyStore;
+
+    // Cap is 1024; fill past it and assert the oldest key is evicted FIFO while
+    // the newest remain. This bounds memory for a long-lived connector.
+    let dir = tempfile::tempdir().unwrap();
+    let store = SendIdempotencyStore::new(dir.path());
+    for n in 0..1100u32 {
+        store.record(
+            format!("key-{n}"),
+            format!("fp-{n}"),
+            vec![format!("{n:064x}")],
+        );
+    }
+    assert_eq!(
+        store.get("key-0", "fp-0"),
+        None,
+        "oldest key must be evicted"
+    );
+    assert_eq!(
+        store.get("key-75", "fp-75"),
+        None,
+        "early keys must be evicted"
+    );
+    assert_eq!(
+        store.get("key-1099", "fp-1099"),
+        Some(vec![format!("{:064x}", 1099)]),
+        "the newest key must still be cached"
+    );
+    assert_eq!(
+        store.get("key-200", "fp-200"),
+        Some(vec![format!("{:064x}", 200)]),
+        "a key within the retained window must still be cached"
+    );
+}
+
+#[test]
+fn send_idempotency_store_survives_connector_restart() {
+    use crate::messaging::send_final_fingerprint;
+    use crate::stream_session::SendIdempotencyStore;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fingerprint = send_final_fingerprint("aa", "bb", "hello", Some("cc"));
+    let ids = vec!["aa".repeat(32)];
+    {
+        let store = SendIdempotencyStore::new(dir.path());
+        store.record("retry-key".to_owned(), fingerprint.clone(), ids.clone());
+    }
+    let reloaded = SendIdempotencyStore::new(dir.path());
+    assert_eq!(
+        reloaded.get("retry-key", &fingerprint),
+        Some(ids),
+        "a persisted idempotency record must survive restart"
+    );
+    assert_eq!(
+        reloaded.get(
+            "retry-key",
+            &send_final_fingerprint("aa", "bb", "hello", None)
+        ),
+        None,
+        "a mismatched fingerprint must remain a cache miss after restart"
+    );
+}
+
+#[test]
+fn send_idempotency_store_persists_fifo_eviction() {
+    use crate::stream_session::SendIdempotencyStore;
+
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let store = SendIdempotencyStore::new(dir.path());
+        for n in 0..1100u32 {
+            store.record(
+                format!("key-{n}"),
+                format!("fp-{n}"),
+                vec![format!("{n:064x}")],
+            );
+        }
+    }
+    let reloaded = SendIdempotencyStore::new(dir.path());
+    assert_eq!(
+        reloaded.get("key-0", "fp-0"),
+        None,
+        "oldest key must stay evicted"
+    );
+    assert_eq!(
+        reloaded.get("key-1099", "fp-1099"),
+        Some(vec![format!("{:064x}", 1099)]),
+        "newest retained key must reload from disk"
+    );
+}
+
+#[test]
+fn send_idempotency_store_ignores_corrupt_on_disk_file() {
+    use crate::stream_session::SendIdempotencyStore;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = SendIdempotencyStore::new(dir.path());
+    std::fs::create_dir_all(store.file_path().parent().unwrap()).unwrap();
+    std::fs::write(store.file_path(), b"{not valid json").unwrap();
+
+    let reloaded = SendIdempotencyStore::new(dir.path());
+    assert_eq!(reloaded.get("missing", "fp-missing"), None);
+    reloaded.record(
+        "fresh".to_owned(),
+        "fp-fresh".to_owned(),
+        vec!["cc".repeat(32)],
+    );
+    assert_eq!(
+        reloaded.get("fresh", "fp-fresh"),
+        Some(vec!["cc".repeat(32)])
+    );
+}
+
+#[test]
+fn send_idempotency_store_atomic_write_replaces_stale_temp_file() {
+    use crate::stream_session::SendIdempotencyStore;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = SendIdempotencyStore::new(dir.path());
+    let temp_path = store.temp_path();
+    std::fs::create_dir_all(store.file_path().parent().unwrap()).unwrap();
+    std::fs::write(&temp_path, b"partial write from crashed writer").unwrap();
+
+    store.record("k1".to_owned(), "fp-k1".to_owned(), vec!["aa".repeat(32)]);
+
+    assert!(!temp_path.exists());
+    assert!(store.file_path().exists());
+    assert_eq!(
+        store.file_path().metadata().unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let reloaded = SendIdempotencyStore::new(dir.path());
+    assert_eq!(reloaded.get("k1", "fp-k1"), Some(vec!["aa".repeat(32)]));
+}
+
+#[test]
+fn send_final_fingerprint_pins_stable_digests() {
+    use crate::messaging::send_final_fingerprint;
+
+    assert_eq!(
+        send_final_fingerprint("aa", "bb", "hello", None),
+        "e252cba2c8a1728d36a0cc74a06b00502113fb22cdf10076dd73f5aa88d60f27"
+    );
+    assert_eq!(
+        send_final_fingerprint("aa", "bb", "hello", Some("cc")),
+        "f44ab9cc17e0db7571b1e6b1d76b12f09346ea94a576a2a8711272e2caaa6588"
+    );
+}
+
+#[test]
+fn send_final_fingerprint_includes_reply_to_target() {
+    use crate::messaging::send_final_fingerprint;
+
+    let without_reply = send_final_fingerprint("aa", "bb", "hello", None);
+    let with_reply = send_final_fingerprint("aa", "bb", "hello", Some("cc"));
+    assert_ne!(
+        without_reply, with_reply,
+        "reply target must participate in the request fingerprint"
+    );
+    assert_eq!(
+        send_final_fingerprint("aa", "bb", "hello", Some("cc")),
+        with_reply,
+        "the same reply target must hash consistently"
+    );
+    assert_ne!(
+        send_final_fingerprint("aa", "bb", "hello", None),
+        send_final_fingerprint("aa", "bb", "hello", Some("")),
+        "missing reply target must not collide with an empty reply target"
+    );
+}
+
+#[test]
+fn send_media_fingerprint_is_content_bound() {
+    use crate::messaging::send_media_fingerprint;
+    use marmot_app::MediaUploadAttachmentRequest;
+
+    let attachment = |plaintext: &[u8]| MediaUploadAttachmentRequest {
+        file_name: "a.png".to_owned(),
+        media_type: "image/png".to_owned(),
+        plaintext: plaintext.to_vec(),
+        dim: None,
+        thumbhash: None,
+    };
+    let first = send_media_fingerprint("aa", "bb", Some("caption"), &[attachment(b"same bytes")]);
+    assert_eq!(
+        first,
+        send_media_fingerprint("aa", "bb", Some("caption"), &[attachment(b"same bytes")],)
+    );
+    assert_ne!(
+        first,
+        send_media_fingerprint(
+            "aa",
+            "bb",
+            Some("caption"),
+            &[attachment(b"different bytes")],
+        )
+    );
+    assert_ne!(
+        first,
+        send_media_fingerprint("aa", "bb", None, &[attachment(b"same bytes")])
+    );
+    let ordered = send_media_fingerprint(
+        "aa",
+        "bb",
+        Some("caption"),
+        &[attachment(b"one"), attachment(b"two")],
+    );
+    assert_ne!(
+        ordered,
+        send_media_fingerprint(
+            "aa",
+            "bb",
+            Some("caption"),
+            &[attachment(b"two"), attachment(b"one")],
+        ),
+        "attachment order must change the fingerprint"
+    );
+    assert_ne!(
+        first,
+        send_media_fingerprint("aa", "cc", Some("caption"), &[attachment(b"same bytes")]),
+        "destination group must change the fingerprint"
+    );
+}
+
+#[tokio::test]
+async fn media_upload_reader_enforces_connector_count_and_byte_limits() {
+    use crate::media_roots::MediaAllowedRoots;
+    use crate::messaging::{MediaUploadLimits, read_media_upload_attachments_with_limits};
+    use agent_control::AgentControlMediaUpload;
+
+    let root = tempfile::tempdir().unwrap();
+    let first = root.path().join("first.bin");
+    let second = root.path().join("second.bin");
+    let third = root.path().join("third.bin");
+    let oversize = root.path().join("oversize.bin");
+    std::fs::write(&first, b"1234").unwrap();
+    std::fs::write(&second, b"12").unwrap();
+    std::fs::write(&third, b"123").unwrap();
+    std::fs::write(&oversize, b"12345").unwrap();
+    let roots = MediaAllowedRoots::prepare(&[root.path().to_owned()]).unwrap();
+    let limits = MediaUploadLimits {
+        max_attachments: 2,
+        max_attachment_bytes: 4,
+        max_batch_bytes: 6,
+    };
+    let attachment = |path: &std::path::Path| AgentControlMediaUpload {
+        path: path.to_string_lossy().into_owned(),
+        media_type: "application/octet-stream".to_owned(),
+        file_name: path.file_name().unwrap().to_string_lossy().into_owned(),
+        dim: None,
+        thumbhash: None,
+    };
+
+    let accepted = read_media_upload_attachments_with_limits(
+        &roots,
+        vec![attachment(&first), attachment(&second)],
+        limits,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        accepted
+            .iter()
+            .map(|item| item.plaintext.as_slice())
+            .collect::<Vec<_>>(),
+        vec![b"1234".as_slice(), b"12".as_slice()]
+    );
+
+    for (attachments, reason) in [
+        (
+            vec![attachment(&first), attachment(&second), attachment(&third)],
+            "attachment_count",
+        ),
+        (vec![attachment(&oversize)], "attachment_bytes"),
+        (
+            vec![attachment(&first), attachment(&third)],
+            "aggregate_bytes",
+        ),
+    ] {
+        assert!(matches!(
+            read_media_upload_attachments_with_limits(&roots, attachments, limits).await,
+            Err(crate::ConnectorError::MediaLimitsExceeded(actual)) if actual == reason
+        ));
+    }
+}
+
+#[tokio::test]
+async fn media_temp_sweeper_removes_directories_older_than_cutoff() {
+    use std::time::{Duration, SystemTime};
+
+    use crate::media_temp::sweep_media_dirs_modified_before;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let stale = tmp.path().join("stale-blob");
+    tokio::fs::create_dir_all(&stale).await.unwrap();
+    let cutoff = SystemTime::now() + Duration::from_secs(3600);
+    let swept = sweep_media_dirs_modified_before(tmp.path(), cutoff)
+        .await
+        .unwrap();
+    assert_eq!(
+        swept, 1,
+        "directories older than the cutoff must be removed"
+    );
+    assert!(!stale.exists(), "stale media dir must be deleted");
+}
+
+#[tokio::test]
+async fn media_temp_sweeper_spares_dirs_with_recently_rewritten_files() {
+    use std::time::{Duration, SystemTime};
+
+    use crate::media_temp::sweep_media_dirs_modified_before;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let blob_dir = tmp.path().join("blob");
+    tokio::fs::create_dir_all(&blob_dir).await.unwrap();
+    let file_path = blob_dir.join("media.bin");
+    tokio::fs::write(&file_path, b"first download")
+        .await
+        .unwrap();
+
+    // Pick a cutoff after the dir was created, then mimic a re-download of
+    // the same blob: an in-place truncating overwrite updates the file mtime
+    // but not the parent dir mtime.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let cutoff = SystemTime::now();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&file_path)
+        .await
+        .unwrap();
+    use tokio::io::AsyncWriteExt as _;
+    file.write_all(b"second download").await.unwrap();
+    drop(file);
+
+    let swept = sweep_media_dirs_modified_before(tmp.path(), cutoff)
+        .await
+        .unwrap();
+    assert_eq!(
+        swept, 0,
+        "a dir whose file was re-downloaded after the cutoff must not be swept"
+    );
+    assert!(
+        file_path.exists(),
+        "recently re-downloaded media must survive the sweep"
+    );
+
+    // Once nothing inside the dir is newer than the cutoff, it is reclaimed.
+    let late_cutoff = SystemTime::now() + Duration::from_secs(3600);
+    let swept = sweep_media_dirs_modified_before(tmp.path(), late_cutoff)
+        .await
+        .unwrap();
+    assert_eq!(swept, 1, "fully stale dirs are still reclaimed");
+    assert!(!blob_dir.exists());
+}
+
+#[tokio::test]
+async fn create_media_download_dir_hardens_root_and_blob_dir_to_0700() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use crate::media_temp::create_media_download_dir_in;
+
+    // Drive an isolated root directly so we never touch the process-global
+    // `$TMPDIR` (which would race the rest of the suite under parallel load).
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("marmot-media");
+
+    let subdir = "deadbeefcafef00d";
+    let dir = create_media_download_dir_in(&root, subdir).await.unwrap();
+
+    assert!(dir.is_dir(), "per-blob dir must be created");
+    assert_eq!(
+        dir,
+        root.join(subdir),
+        "per-blob dir must live under the marmot-media root"
+    );
+
+    let root_mode = std::fs::metadata(&root).unwrap().permissions().mode() & 0o777;
+    let blob_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        root_mode, 0o700,
+        "marmot-media root must be owner-only (0700), not world-traversable"
+    );
+    assert_eq!(
+        blob_mode, 0o700,
+        "per-blob dir must be owner-only (0700), not world-traversable"
+    );
+
+    // Idempotent: a repeat download for the same blob re-hardens cleanly even
+    // when the root and subdir already exist.
+    let dir_again = create_media_download_dir_in(&root, subdir).await.unwrap();
+    assert_eq!(dir, dir_again);
+    let blob_mode_again = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+    assert_eq!(blob_mode_again, 0o700);
+}
+
+#[tokio::test]
+async fn create_media_download_dir_creates_root_atomically_at_0700() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use crate::media_temp::create_media_download_dir_in;
+
+    // A fresh (absent) root must be created already-private, never transiently
+    // at the umask-masked default mode while empty.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("marmot-media");
+    assert!(!root.exists(), "precondition: root must not exist yet");
+
+    let dir = create_media_download_dir_in(&root, "cafebabe00ff")
+        .await
+        .unwrap();
+
+    let root_mode = std::fs::metadata(&root).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        root_mode, 0o700,
+        "freshly created marmot-media root must be owner-only (0700)"
+    );
+    assert!(dir.is_dir());
+}
+
+#[tokio::test]
+async fn create_media_download_dir_rejects_symlink_root_without_creating_child() {
+    use crate::media_temp::create_media_download_dir_in;
+
+    // A local attacker pre-creates `marmot-media` as a symlink to a directory
+    // they control. We must refuse to use it and must NOT create the
+    // secret-named `<ciphertext_sha256>` child (which would leak the hash into
+    // the attacker's tree).
+    let tmp = tempfile::tempdir().unwrap();
+    let attacker_dir = tmp.path().join("attacker-owned");
+    std::fs::create_dir(&attacker_dir).unwrap();
+    let root = tmp.path().join("marmot-media");
+    std::os::unix::fs::symlink(&attacker_dir, &root).unwrap();
+
+    let subdir = "deadbeefcafef00d";
+    let err = create_media_download_dir_in(&root, subdir)
+        .await
+        .expect_err("symlink root must be rejected");
+    assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+
+    // The ciphertext-hash child must not have been materialized anywhere.
+    assert!(
+        !attacker_dir.join(subdir).exists(),
+        "secret-named child must NOT be created inside the attacker-controlled symlink target"
+    );
+    assert!(
+        std::fs::symlink_metadata(&root)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "we must not have replaced or followed the attacker's symlink"
+    );
+}
+
+#[tokio::test]
+async fn create_media_download_dir_rejects_non_directory_root_without_creating_child() {
+    use crate::media_temp::create_media_download_dir_in;
+
+    // If `marmot-media` already exists as a plain file (pre-created by another
+    // user), refuse to use it and never derive the secret-named child.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("marmot-media");
+    std::fs::write(&root, b"not a directory").unwrap();
+
+    let subdir = "deadbeefcafef00d";
+    let err = create_media_download_dir_in(&root, subdir)
+        .await
+        .expect_err("non-directory root must be rejected");
+    assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+
+    assert!(
+        root.is_file(),
+        "the pre-existing file root must be left untouched"
+    );
+    assert!(
+        !root.join(subdir).exists(),
+        "no secret-named child may be created under a non-directory root"
+    );
+}
+
+#[tokio::test]
+async fn create_media_download_dir_rejects_symlink_per_blob_child() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use crate::media_temp::create_media_download_dir_in;
+
+    // The root itself is a valid owner-only directory, but a `<ciphertext_sha256>`
+    // child was pre-planted as a symlink to an attacker-controlled directory
+    // (the window a legacy/loose root leaves open). We must refuse to follow it,
+    // so neither the 0700 chmod nor the later 0600 plaintext write lands in the
+    // attacker's tree.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("marmot-media");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let attacker_dir = tmp.path().join("attacker-owned");
+    std::fs::create_dir(&attacker_dir).unwrap();
+    let subdir = "deadbeefcafef00d";
+    std::os::unix::fs::symlink(&attacker_dir, root.join(subdir)).unwrap();
+
+    let err = create_media_download_dir_in(&root, subdir)
+        .await
+        .expect_err("symlink per-blob child must be rejected");
+    assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+
+    // The symlink must be left as-is (not followed) and the attacker's target
+    // must not have been chmodded to 0700 by `harden_media_dir`.
+    assert!(
+        std::fs::symlink_metadata(root.join(subdir))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "we must not have replaced or followed the attacker's child symlink"
+    );
+    let attacker_mode = std::fs::metadata(&attacker_dir)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_ne!(
+        attacker_mode, 0o700,
+        "the attacker-controlled target must not be hardened through the symlink"
+    );
+}
+
+#[tokio::test]
+async fn create_media_download_dir_rejects_non_directory_per_blob_child() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use crate::media_temp::create_media_download_dir_in;
+
+    // A `<ciphertext_sha256>` child pre-planted as a plain file under an
+    // otherwise valid root must be rejected rather than written through.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("marmot-media");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let subdir = "deadbeefcafef00d";
+    std::fs::write(root.join(subdir), b"not a directory").unwrap();
+
+    let err = create_media_download_dir_in(&root, subdir)
+        .await
+        .expect_err("non-directory per-blob child must be rejected");
+    assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+
+    assert!(
+        root.join(subdir).is_file(),
+        "the pre-existing file child must be left untouched"
+    );
+}
+
+// ---- mdk#1380 opt-in large-session reconciliation benchmark ----
+//
+// `just bench-idle-reconciliation` runs this ignored test (release profile).
+// It builds one agent account with several joined groups, lets one long-lived
+// inbound subscription idle over many compressed former-intervals, then proves
+// with deterministic counters that (a) steady-state idle reconciliation no
+// longer scales as repeated full-state scans and (b) a real state change still
+// triggers a prompt pass. The MDK_BENCH lines are the recorded profile result.
+
+#[tokio::test]
+#[ignore = "opt-in reconciliation benchmark; run via just bench-idle-reconciliation"]
+async fn bench_idle_reconciliation_scaling() {
+    const BENCH_BASE: Duration = Duration::from_millis(250);
+    const BENCH_MAX: Duration = Duration::from_millis(2_000);
+    let group_total: usize = std::env::var("MDK_IDLE_RECONCILE_GROUPS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(8);
+
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+    let app = MarmotApp::with_relay(dir.path(), relay_url.clone());
+    let setup_runtime = MarmotAppRuntime::new(app);
+    let setup = AccountSetupRequest {
+        default_relays: vec![crate::validation::endpoint(&relay_url)],
+        bootstrap_relays: vec![crate::validation::endpoint(&relay_url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let agent = setup_runtime
+        .create_identity(setup.relay_options_only())
+        .await
+        .unwrap();
+    let human = setup_runtime.create_identity(setup).await.unwrap();
+    let mut group_ids = Vec::new();
+    for index in 0..group_total {
+        let group_id = setup_runtime
+            .create_group(
+                &human.account.account_id_hex,
+                &format!("idle reconcile bench {index}"),
+                std::slice::from_ref(&agent.account.account_id_hex),
+                None,
+            )
+            .await
+            .unwrap();
+        accept_group_invite_retrying_busy(&setup_runtime, &agent.account.account_id_hex, &group_id)
+            .await;
+        group_ids.push(group_id);
+    }
+    setup_runtime.shutdown().await;
+
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        dir.path().join("dev").join("wn-agent.sock"),
+        vec![relay_url],
+        false,
+        false,
+    ))
+    .unwrap();
+    connector.start().await.unwrap();
+
+    // Drive the shared catch-up driver and the invite-policy worker over the
+    // connector's real runtime at compressed intervals, on the connector's own
+    // telemetry so the counters attribute both sources in one process.
+    let driver = crate::event_projection::InboundCatchUpDriver::with_schedule(
+        connector.runtime.clone(),
+        connector.reconcile_telemetry.clone(),
+        crate::event_projection::InboundCatchUpSchedule {
+            base: BENCH_BASE,
+            max: BENCH_MAX,
+        },
+    );
+    let (_catch_up_events, _catch_up_subscription) = driver.subscribe();
+    let invite_connector = connector.clone();
+    let invite_worker = tokio::spawn(async move {
+        invite_connector
+            .run_invite_policy_worker(crate::invite_policy::InvitePolicySchedule {
+                base: BENCH_BASE,
+                max: BENCH_MAX,
+                retry_base: BENCH_BASE,
+                retry_max: BENCH_MAX,
+            })
+            .await;
+    });
+
+    // One long-lived, otherwise-idle subscription: initial catch-up plus the
+    // safety net over ~10 seconds (40 former base intervals at fixed rate).
+    driver.request().await.unwrap();
+    sleep(Duration::from_millis(10_000)).await;
+
+    let snapshot = connector.reconcile_telemetry.snapshot();
+    let performance = connector
+        .runtime
+        .shared_services()
+        .app_performance_telemetry()
+        .snapshot();
+    assert_eq!(snapshot.catch_up_passes_failed, 0);
+    assert_eq!(snapshot.invite_enumerations_failed, 0);
+    assert!(
+        snapshot.catch_up_passes_started >= 3,
+        "safety net must still run while quiet"
+    );
+    assert!(
+        snapshot.catch_up_passes_started <= 10,
+        "idle passes must back off, got {}",
+        snapshot.catch_up_passes_started
+    );
+    assert!(
+        snapshot.invite_enumerations_completed <= 12,
+        "idle enumerations must back off, got {}",
+        snapshot.invite_enumerations_completed
+    );
+    assert_eq!(
+        snapshot.invite_candidate_rows_considered, 0,
+        "no pending invites: the enumeration must read zero candidate rows"
+    );
+    let catch_up_avg_ms = performance
+        .account_catch_up
+        .duration_ms
+        .sum_ms
+        .checked_div(performance.account_catch_up.attempts.max(1))
+        .unwrap_or(0);
+    let sync_avg_ms = performance
+        .account_sync
+        .duration_ms
+        .sum_ms
+        .checked_div(performance.account_sync.attempts.max(1))
+        .unwrap_or(0);
+    crate::test_support::emit_benchmark_line(format!(
+        "MDK_BENCH idle groups={group_total} scheduled_passes={} pass_avg_ms={catch_up_avg_ms} sync_avg_ms={sync_avg_ms}",
+        snapshot.catch_up_passes_started,
+    ));
+    crate::test_support::emit_benchmark_line(format!(
+        "MDK_BENCH idle invite_enumerations={} candidate_rows={} accounts={}",
+        snapshot.invite_enumerations_completed,
+        snapshot.invite_candidate_rows_considered,
+        snapshot.invite_accounts_considered,
+    ));
+
+    // A real state change must pull the net back promptly: send a live message
+    // and measure the gap until the next scheduled pass starts.
+    let before = connector
+        .reconcile_telemetry
+        .snapshot()
+        .catch_up_passes_started;
+    connector
+        .runtime
+        .send_message(
+            &agent.account.label,
+            &group_ids[0],
+            b"bench activity marker".to_vec(),
+        )
+        .await
+        .unwrap();
+    let sent_at = std::time::Instant::now();
+    wait_for_counter(
+        || {
+            connector
+                .reconcile_telemetry
+                .snapshot()
+                .catch_up_passes_started
+        },
+        before + 1,
+        4 * BENCH_BASE,
+    )
+    .await;
+    let wake_gap_ms = sent_at.elapsed().as_millis();
+    crate::test_support::emit_benchmark_line(format!(
+        "MDK_BENCH activity wake_gap_ms={wake_gap_ms} base_ms=250"
+    ));
+    assert!(
+        wake_gap_ms <= 2 * BENCH_BASE.as_millis() + 250,
+        "activity must reset the net promptly, took {wake_gap_ms}ms"
+    );
+
+    let session_db = dir
+        .path()
+        .join("accounts")
+        .join(&agent.account.label)
+        .join("session.sqlite");
+    if let Ok(metadata) = std::fs::metadata(&session_db) {
+        crate::test_support::emit_benchmark_line(format!(
+            "MDK_BENCH session_db_bytes={}",
+            metadata.len()
+        ));
+    }
+    invite_worker.abort();
+    connector.runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn optional_management_socket_cannot_interrupt_regular_control() {
+    for blocked_bind in [true, false] {
+        let dir = tempfile::Builder::new()
+            .prefix(".mdk-mgmt-")
+            .tempdir_in(std::env::var_os("HOME").unwrap())
+            .unwrap();
+        let socket = dir.path().join("dev/wn-agent.sock");
+        let management = dir.path().join("dev/usage-diagnostics.sock");
+        if blocked_bind {
+            fs_private::create_dir_all_private(&management).unwrap();
+        }
+        let config = test_config(dir.path(), socket.clone(), Vec::new(), false, false);
+        let server = tokio::spawn(serve_socket(config));
+        let response = send_control_request(
+            &socket,
+            "management-start",
+            AgentControlRequest::AccountList,
+        )
+        .await;
+        assert!(matches!(
+            response.payload,
+            AgentControlResponse::AccountList { .. }
+        ));
+        let _stalled = if !blocked_bind {
+            let mut malformed = tokio::net::UnixStream::connect(&management).await.unwrap();
+            tokio::io::AsyncWriteExt::write_all(&mut malformed, &[255])
+                .await
+                .unwrap();
+            let stalled = tokio::net::UnixStream::connect(&management).await.unwrap();
+            Some(stalled)
+        } else {
+            None
+        };
+        let response = timeout(
+            Duration::from_secs(1),
+            send_control_request(
+                &socket,
+                "management-stalled",
+                AgentControlRequest::AccountList,
+            ),
+        )
+        .await
+        .expect("management peers must not consume the normal control loop's two-second budget");
+        assert!(matches!(
+            response.payload,
+            AgentControlResponse::AccountList { .. }
+        ));
+        assert!(!server.is_finished());
+        server.abort();
+        let _ = server.await;
+    }
+}
+
+#[tokio::test]
+async fn connector_creates_owner_admin_in_the_founding_group_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let socket = dir.path().join("dev/wn-agent.sock");
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        socket.clone(),
+        vec![relay.url().await.to_string()],
+        false,
+        false,
+    ))
+    .unwrap();
+    let agent = connector.account_home.create_account("agent").unwrap();
+    let owner = connector.account_home.create_account("owner").unwrap();
+    let outsider = connector.account_home.create_account("outsider").unwrap();
+    connector
+        .runtime
+        .publish_key_package(&owner.label)
+        .await
+        .unwrap();
+    let listener = bind_connector_socket(&socket).unwrap();
+    let capabilities = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "creation-capabilities",
+        AgentControlRequest::GroupCreateCapabilities,
+    )
+    .await;
+    assert!(matches!(
+        capabilities.payload,
+        AgentControlResponse::GroupCreateCapabilities {
+            initial_admins: true
+        }
+    ));
+    assert!(connector.app.groups(&agent.label).unwrap().is_empty());
+    for (index, admins) in [
+        vec![outsider.account_id_hex.clone()],
+        vec![marmot_app::npub_for_account_id(&owner.account_id_hex).unwrap()],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let before = connector.app.groups(&agent.label).unwrap().len();
+        let request: AgentControlRequest = serde_json::from_value(serde_json::json!({
+            "type":"group_create_with_admins","account_id_hex":agent.account_id_hex,
+            "name":"Owner-admin group","members":[owner.account_id_hex],"admins":admins
+        }))
+        .expect("owner-admin creation must be a supported, explicit control operation");
+        let response = serve_control_request_once(
+            &connector,
+            &listener,
+            &socket,
+            "owner-admin-create",
+            request,
+        )
+        .await;
+        if index == 0 {
+            assert!(matches!(
+                response.payload,
+                AgentControlResponse::Error { .. }
+            ));
+            assert_eq!(
+                connector.app.groups(&agent.label).unwrap().len(),
+                before,
+                "A non-member admin must be rejected before creation"
+            );
+            continue;
+        }
+        let AgentControlResponse::GroupCreated { group_id_hex, .. } = response.payload else {
+            panic!("Expected canonical owner-admin creation");
+        };
+        let group = connector
+            .app
+            .group(&agent.label, &group_id_hex)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            group
+                .admin_policy
+                .admins
+                .iter()
+                .cloned()
+                .collect::<HashSet<_>>(),
+            HashSet::from([agent.account_id_hex.clone(), owner.account_id_hex.clone()])
+        );
+        let group_id = GroupId::new(hex::decode(&group_id_hex).unwrap());
+        timeout(Duration::from_secs(10), async {
+            loop {
+                if connector
+                    .app
+                    .group(&owner.label, &group_id_hex)
+                    .unwrap()
+                    .is_some()
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        accept_group_invite_retrying_busy(&connector.runtime, &owner.label, &group_id).await;
+        let joined = connector
+            .app
+            .group(&owner.label, &group_id_hex)
+            .unwrap()
+            .unwrap();
+        assert!(
+            joined.admin_policy.admins.contains(&owner.account_id_hex),
+            "The owner must receive admin rights in its initial Welcome state"
+        );
+    }
+    connector.runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn connector_socket_creates_group_with_member_refs_and_relay_override() {
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+    let alternate = MockRelay::run().await.unwrap();
+    let alternate_url = alternate.url().await.to_string();
+    let socket = dir.path().join("dev/wn-agent.sock");
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        socket.clone(),
+        vec![relay_url.clone()],
+        false,
+        false,
+    ))
+    .unwrap();
+    let agent = connector.account_home.create_account("agent").unwrap();
+    let peer = connector.account_home.create_account("peer").unwrap();
+    connector
+        .runtime
+        .publish_key_package(&peer.label)
+        .await
+        .unwrap();
+    let listener = bind_connector_socket(&socket).unwrap();
+    let member_refs = [
+        peer.label.clone(),
+        peer.account_id_hex.clone(),
+        marmot_app::npub_for_account_id(&peer.account_id_hex).unwrap(),
+    ];
+    for (index, member_ref) in member_refs.into_iter().enumerate() {
+        let relays = (index == 1).then(|| vec![alternate_url.clone()]);
+        let response = serve_control_request_once(
+            &connector,
+            &listener,
+            &socket,
+            "create-group",
+            AgentControlRequest::GroupCreate {
+                account_id_hex: agent.account_id_hex.to_uppercase(),
+                name: "Agent group".into(),
+                members: vec![member_ref],
+                description: Some("Created through the control socket".into()),
+                relays,
+            },
+        )
+        .await;
+        assert_eq!(response.id.as_deref(), Some("create-group"));
+        let AgentControlResponse::GroupCreated {
+            group_id_hex,
+            pending_welcome_count,
+            agent_created,
+        } = response.payload
+        else {
+            panic!("expected group_created, got {:?}", response.payload);
+        };
+        assert!(
+            crate::agent_created_groups::AgentCreatedGroupsStore::new(dir.path())
+                .contains(&agent.account_id_hex, &group_id_hex)
+                .unwrap()
+        );
+        assert!(
+            !connector
+                .allowlists
+                .contains(&agent.account_id_hex, &peer.account_id_hex)
+                .unwrap()
+        );
+        assert_eq!(hex::decode(&group_id_hex).unwrap().len(), 16);
+        assert_eq!(pending_welcome_count, Some(0));
+        assert!(agent_created);
+        let groups = connector.app.groups(&agent.label).unwrap();
+        let group = groups
+            .iter()
+            .find(|group| group.group_id_hex == group_id_hex)
+            .unwrap();
+        assert_eq!(group.profile.name, "Agent group");
+        assert_eq!(
+            group.admin_policy.admins,
+            vec![agent.account_id_hex.clone()],
+            "Legacy creation must retain creator-only admins"
+        );
+        assert_eq!(
+            group.profile.description,
+            "Created through the control socket"
+        );
+        assert_eq!(
+            group.nostr_routing.relays,
+            vec![if index == 1 {
+                alternate_url.clone()
+            } else {
+                relay_url.clone()
+            }]
+        );
+        let info = connector
+            .group_info_response(&agent.account_id_hex, &group_id_hex)
+            .await
+            .unwrap();
+        assert!(matches!(
+            info,
+            AgentControlResponse::GroupInfo {
+                member_count: 2,
+                agent_created: true,
+                ..
+            }
+        ));
+    }
+    // A group created outside the control op has no activation provenance.
+    let other = connector
+        .runtime
+        .create_group(
+            &agent.label,
+            "External group",
+            std::slice::from_ref(&peer.label),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        connector
+            .group_info_response(&agent.account_id_hex, &hex::encode(other.as_slice()))
+            .await
+            .unwrap(),
+        AgentControlResponse::GroupInfo {
+            agent_created: false,
+            ..
+        }
+    ));
+    // Persistence failure must not disguise a canonical create as a retryable
+    // failure or enable activation without a durable provenance record.
+    std::fs::rename(
+        &connector.agent_created_groups.dir,
+        dir.path().join("saved-provenance"),
+    )
+    .unwrap();
+    std::fs::write(&connector.agent_created_groups.dir, b"blocked directory").unwrap();
+    let response = connector
+        .create_group_response(
+            &agent.account_id_hex,
+            "Untracked group".into(),
+            vec![peer.label.clone()],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let AgentControlResponse::GroupCreated {
+        group_id_hex,
+        agent_created: false,
+        ..
+    } = response
+    else {
+        panic!("expected canonical create with unavailable provenance");
+    };
+    assert!(matches!(
+        connector
+            .group_info_response(&agent.account_id_hex, &group_id_hex)
+            .await
+            .expect("unavailable provenance must not suppress valid group info"),
+        AgentControlResponse::GroupInfo {
+            member_count: 2,
+            is_direct: true,
+            agent_created: false,
+            ..
+        }
+    ));
+    assert!(
+        connector
+            .app
+            .groups(&agent.label)
+            .unwrap()
+            .iter()
+            .any(|group| group.group_id_hex == group_id_hex)
+    );
+    connector.runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn connector_group_profile_update_preserves_fields_and_requires_current_admin() {
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let socket = dir.path().join("dev/wn-agent.sock");
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        socket.clone(),
+        vec![relay.url().await.to_string()],
+        false,
+        false,
+    ))
+    .unwrap();
+    let agent = connector.account_home.create_account("agent").unwrap();
+    let peer = connector.account_home.create_account("peer").unwrap();
+    connector
+        .runtime
+        .publish_key_package(&peer.label)
+        .await
+        .unwrap();
+    let group_id = connector
+        .runtime
+        .create_group(
+            &agent.label,
+            "Original",
+            std::slice::from_ref(&peer.label),
+            Some("Keep this description".into()),
+        )
+        .await
+        .unwrap();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let listener = bind_connector_socket(&socket).unwrap();
+
+    let update = |name, description| AgentControlRequest::GroupProfileUpdate {
+        account_id_hex: agent.account_id_hex.clone(),
+        group_id_hex: group_id_hex.clone(),
+        name,
+        description,
+    };
+    let renamed = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "rename",
+        update(Some("Renamed".into()), None),
+    )
+    .await;
+    assert!(matches!(
+        renamed.payload,
+        AgentControlResponse::GroupProfileUpdated {
+            ref group_id_hex,
+            ref message_ids_hex,
+        } if group_id_hex == &hex::encode(group_id.as_slice()) && !message_ids_hex.is_empty()
+    ));
+    let changed = connector
+        .app
+        .groups(&agent.label)
+        .unwrap()
+        .into_iter()
+        .find(|group| group.group_id_hex == group_id_hex)
+        .unwrap();
+    assert_eq!(changed.profile.name, "Renamed");
+    assert_eq!(changed.profile.description, "Keep this description");
+
+    let cleared = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "clear-description",
+        update(None, Some(String::new())),
+    )
+    .await;
+    assert!(matches!(
+        cleared.payload,
+        AgentControlResponse::GroupProfileUpdated { .. }
+    ));
+    let changed = connector
+        .app
+        .groups(&agent.label)
+        .unwrap()
+        .into_iter()
+        .find(|group| group.group_id_hex == group_id_hex)
+        .unwrap();
+    assert_eq!(changed.profile.name, "Renamed");
+    assert_eq!(changed.profile.description, "");
+
+    let oversized = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "oversized-name",
+        update(Some("é".repeat(129)), None),
+    )
+    .await;
+    assert!(matches!(
+        oversized.payload,
+        AgentControlResponse::Error { ref code, retryable: false, .. } if code == "invalid_group_profile"
+    ));
+
+    connector
+        .runtime
+        .promote_admin(&agent.label, &group_id, &peer.account_id_hex)
+        .await
+        .unwrap();
+    connector
+        .runtime
+        .self_demote_admin(&agent.label, &group_id)
+        .await
+        .unwrap();
+    let denied = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "not-admin",
+        update(Some("Forbidden".into()), None),
+    )
+    .await;
+    assert!(matches!(
+        denied.payload,
+        AgentControlResponse::Error { ref code, retryable: false, .. } if code == "not_group_admin"
+    ));
+    let invalid = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "no-fields",
+        update(None, None),
+    )
+    .await;
+    assert!(matches!(
+        invalid.payload,
+        AgentControlResponse::Error { ref code, retryable: false, .. } if code == "invalid_group_profile"
+    ));
+    connector.runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn connector_group_create_rejects_invalid_inputs_without_creating_groups() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("dev/wn-agent.sock");
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        socket.clone(),
+        vec!["wss://relay.example.com".into()],
+        false,
+        false,
+    ))
+    .unwrap();
+    let agent = connector.account_home.create_account("agent").unwrap();
+    let listener = bind_connector_socket(&socket).unwrap();
+    let cases = [
+        (
+            "not-hex".into(),
+            "Group".into(),
+            vec![],
+            None,
+            None,
+            "invalid_hex",
+        ),
+        (
+            "11".repeat(32),
+            "Group".into(),
+            vec![],
+            None,
+            None,
+            "account_home_error",
+        ),
+        (
+            agent.account_id_hex.clone(),
+            " ".into(),
+            vec![],
+            None,
+            None,
+            "invalid_group_create",
+        ),
+        (
+            agent.account_id_hex.clone(),
+            "é".repeat(129),
+            vec![],
+            None,
+            None,
+            "invalid_group_create",
+        ),
+        (
+            agent.account_id_hex.clone(),
+            "Group".into(),
+            vec![" ".into()],
+            None,
+            None,
+            "invalid_group_create",
+        ),
+        (
+            agent.account_id_hex.clone(),
+            "Group".into(),
+            vec![],
+            Some("x".repeat(4097)),
+            None,
+            "invalid_group_create",
+        ),
+        (
+            agent.account_id_hex.clone(),
+            "Group".into(),
+            vec!["invalid-member".into()],
+            None,
+            None,
+            "app_error",
+        ),
+        (
+            agent.account_id_hex.clone(),
+            "Group".into(),
+            vec![],
+            None,
+            Some(vec![]),
+            "app_error",
+        ),
+        (
+            agent.account_id_hex.clone(),
+            "Group".into(),
+            vec![],
+            None,
+            Some(vec!["https://relay.example.com".into()]),
+            "app_error",
+        ),
+        (
+            agent.account_id_hex.clone(),
+            "Group".into(),
+            vec![],
+            None,
+            Some(vec!["wss://192.168.1.1".into()]),
+            "app_error",
+        ),
+    ];
+    for (account_id_hex, name, members, description, relays, expected_code) in cases {
+        let response = serve_control_request_once(
+            &connector,
+            &listener,
+            &socket,
+            "invalid-create",
+            AgentControlRequest::GroupCreate {
+                account_id_hex,
+                name,
+                members,
+                description,
+                relays,
+            },
+        )
+        .await;
+        let AgentControlResponse::Error {
+            code,
+            message,
+            retryable,
+        } = response.payload
+        else {
+            panic!("expected error");
+        };
+        assert_eq!(code, expected_code);
+        assert!(!retryable);
+        assert!(!message.contains(&agent.account_id_hex));
+        assert!(connector.app.groups(&agent.label).unwrap().is_empty());
+    }
+    connector.runtime.shutdown().await;
+}
+
+#[test]
+fn agent_created_groups_store_round_trip_is_private_and_account_scoped() {
+    use crate::agent_created_groups::AgentCreatedGroupsStore;
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let store = AgentCreatedGroupsStore::new(dir.path());
+    let account = "ab".repeat(32);
+    let other_account = "cd".repeat(32);
+    let group = "ef".repeat(16);
+    assert!(!store.contains(&account, &group).unwrap());
+    store
+        .add(&account.to_uppercase(), &group.to_uppercase())
+        .unwrap();
+    store.add(&account, &group).unwrap();
+    // MLS group ids are variable length, not Nostr routing handles.
+    store.add(&account, "123456").unwrap();
+    let reopened = AgentCreatedGroupsStore::new(dir.path());
+    assert!(reopened.contains(&account, &group).unwrap());
+    assert!(reopened.contains(&account, "123456").unwrap());
+    assert!(!reopened.contains(&other_account, &group).unwrap());
+    let path = store.dir.join(format!("{account}.json"));
+    let record: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(record["group_ids_hex"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        std::fs::metadata(&store.dir).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(std::fs::read_dir(&store.dir).unwrap().count(), 1);
+    assert!(store.add("../escape", &group).is_err());
+    // A relocated record cannot activate a different account or redirect writes.
+    let other_path = store.dir.join(format!("{other_account}.json"));
+    std::fs::copy(&path, &other_path).unwrap();
+    assert!(!store.contains(&other_account, &group).unwrap());
+    std::fs::write(&path, b"invalid json").unwrap();
+    assert!(!store.contains(&account, &group).unwrap());
+    store.add(&account, &group).unwrap();
+    assert!(reopened.contains(&account, &group).unwrap());
+}
+
+#[test]
+fn agent_created_groups_store_removal_is_durable_and_scoped() {
+    use crate::agent_created_groups::AgentCreatedGroupsStore;
+    let dir = tempfile::tempdir().unwrap();
+    let store = AgentCreatedGroupsStore::new(dir.path());
+    let account = "ab".repeat(32);
+    let other_account = "cd".repeat(32);
+    let group = "ef".repeat(16);
+    store.remove(&account, &group).unwrap();
+    assert!(!store.dir.exists(), "missing records need no write");
+    store.add(&account, &group).unwrap();
+    store.add(&account, "123456").unwrap();
+    store.add(&other_account, &group).unwrap();
+    store
+        .remove(&account.to_uppercase(), &group.to_uppercase())
+        .unwrap();
+    store.remove(&account, &group).unwrap();
+    let reopened = AgentCreatedGroupsStore::new(dir.path());
+    assert!(!reopened.contains(&account, &group).unwrap());
+    assert!(reopened.contains(&account, "123456").unwrap());
+    assert!(reopened.contains(&other_account, &group).unwrap());
+    let path = store.dir.join(format!("{account}.json"));
+    assert_eq!(
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
+#[tokio::test]
+async fn connector_socket_leaves_group_and_removes_activation_provenance() {
+    connector_leave_group_case(false).await;
+}
+
+#[tokio::test]
+async fn connector_leave_acknowledges_success_when_provenance_cleanup_fails() {
+    connector_leave_group_case(true).await;
+}
+
+async fn connector_leave_group_case(block_cleanup: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let socket = dir.path().join("dev/wn-agent.sock");
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        socket.clone(),
+        vec![relay.url().await.to_string()],
+        false,
+        false,
+    ))
+    .unwrap();
+    let agent = connector.account_home.create_account("agent").unwrap();
+    let peer = connector.account_home.create_account("peer").unwrap();
+    connector
+        .runtime
+        .publish_key_package(&peer.label)
+        .await
+        .unwrap();
+    let AgentControlResponse::GroupCreated { group_id_hex, .. } = connector
+        .create_group_response(
+            &agent.account_id_hex,
+            "Leave test".into(),
+            vec![peer.label.clone()],
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("expected created group")
+    };
+    let listener = bind_connector_socket(&socket).unwrap();
+    let missing = "ab".repeat(16);
+    connector
+        .agent_created_groups
+        .add(&agent.account_id_hex, &missing)
+        .unwrap();
+    for (account, group, expected_code) in [
+        (
+            agent.account_id_hex.clone(),
+            "not-hex".into(),
+            "invalid_hex",
+        ),
+        ("not-hex".into(), group_id_hex.clone(), "invalid_hex"),
+        (agent.account_id_hex.clone(), missing.clone(), "app_error"),
+    ] {
+        let response = serve_control_request_once(
+            &connector,
+            &listener,
+            &socket,
+            "leave-invalid",
+            AgentControlRequest::GroupLeave {
+                account_id_hex: account,
+                group_id_hex: group,
+            },
+        )
+        .await;
+        let AgentControlResponse::Error {
+            code, retryable, ..
+        } = response.payload
+        else {
+            panic!("expected leave error");
+        };
+        assert_eq!(code, expected_code);
+        assert!(!retryable);
+        assert!(
+            connector
+                .agent_created_groups
+                .contains(&agent.account_id_hex, &group_id_hex)
+                .unwrap()
+        );
+        assert!(
+            connector
+                .agent_created_groups
+                .contains(&agent.account_id_hex, &missing)
+                .unwrap()
+        );
+    }
+    let admin_error = connector
+        .leave_group_response(&agent.account_id_hex, &group_id_hex)
+        .await
+        .unwrap_err();
+    assert_eq!(admin_error.code(), "app_error");
+    assert!(!admin_error.retryable());
+    assert!(
+        connector
+            .agent_created_groups
+            .contains(&agent.account_id_hex, &group_id_hex)
+            .unwrap()
+    );
+    let group_id = GroupId::new(hex::decode(&group_id_hex).unwrap());
+    connector
+        .runtime
+        .promote_admin(&agent.label, &group_id, &peer.account_id_hex)
+        .await
+        .unwrap();
+    connector
+        .runtime
+        .self_demote_admin(&agent.label, &group_id)
+        .await
+        .unwrap();
+    // A directory at the atomic-write staging path reliably fails writes,
+    // including when tests run as root, without damaging the durable record.
+    let blocked_temp = connector
+        .agent_created_groups
+        .dir
+        .join(format!(".{}.json.tmp", agent.account_id_hex));
+    if block_cleanup {
+        std::fs::create_dir(&blocked_temp).unwrap();
+    }
+    let response = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "leave-1",
+        AgentControlRequest::GroupLeave {
+            account_id_hex: agent.account_id_hex.to_uppercase(),
+            group_id_hex: group_id_hex.to_uppercase(),
+        },
+    )
+    .await;
+    assert_eq!(response.id.as_deref(), Some("leave-1"));
+    assert_eq!(response.payload, AgentControlResponse::Ack);
+    let reopened = crate::agent_created_groups::AgentCreatedGroupsStore::new(dir.path());
+    if block_cleanup {
+        assert!(
+            reopened
+                .contains(&agent.account_id_hex, &group_id_hex)
+                .unwrap()
+        );
+        std::fs::remove_dir(&blocked_temp).unwrap();
+        // Repair only the idempotent metadata operation, never repeat the leave.
+        reopened
+            .remove(&agent.account_id_hex, &group_id_hex)
+            .unwrap();
+        reopened
+            .remove(&agent.account_id_hex, &group_id_hex)
+            .unwrap();
+    }
+    assert!(
+        !reopened
+            .contains(&agent.account_id_hex, &group_id_hex)
+            .unwrap()
+    );
+    assert!(matches!(
+        connector
+            .group_info_response(&agent.account_id_hex, &group_id_hex)
+            .await
+            .unwrap(),
+        AgentControlResponse::GroupInfo {
+            agent_created: false,
+            ..
+        }
+    ));
+    assert!(reopened.contains(&agent.account_id_hex, &missing).unwrap());
+    connector.runtime.shutdown().await;
+}
+async fn mock_relay_url() -> (MockRelay, String) {
+    let relay = MockRelay::run().await.unwrap();
+    let relay_url = relay.url().await.to_string();
+    (relay, relay_url)
+}
+
+/// Publish one NIP-65 and one inbox list, each naming a second relay, so every
+/// entry a later edit must preserve is a real reachable endpoint.
+async fn publish_nip65_and_inbox(
+    app: &MarmotApp,
+    account: &marmot_account::AccountSummary,
+    relay_endpoint: cgka_traits::TransportEndpoint,
+    read_only_endpoint: cgka_traits::TransportEndpoint,
+    write_only_endpoint: cgka_traits::TransportEndpoint,
+    inbox_endpoint: cgka_traits::TransportEndpoint,
+) {
+    app.publish_account_nip65_relay_set(
+        &account.label,
+        vec![relay_endpoint.clone(), read_only_endpoint],
+        vec![relay_endpoint.clone(), write_only_endpoint],
+        vec![relay_endpoint.clone()],
+    )
+    .await
+    .unwrap();
+    app.publish_account_relay_list_kind(
+        &account.label,
+        "inbox",
+        vec![relay_endpoint.clone(), inbox_endpoint],
+        vec![relay_endpoint],
+    )
+    .await
+    .unwrap();
+}
+
+/// Deterministic publication targets for the relay-list preservation test.
+/// `None` refuses all writes; `Some(url)` refuses NIP-65 declarations adopting
+/// that URL while accepting seeds and removals. Reads remain available.
+#[derive(Debug)]
+struct RelayListTestWritePolicy(Option<String>);
+
+impl nostr_relay_builder::builder::WritePolicy for RelayListTestWritePolicy {
+    fn admit_event<'a>(
+        &'a self,
+        event: &'a nostr_relay_builder::prelude::Event,
+        _addr: &'a std::net::SocketAddr,
+    ) -> nostr_relay_builder::prelude::BoxedFuture<'a, nostr_relay_builder::builder::PolicyResult>
+    {
+        Box::pin(async move {
+            let reject = match &self.0 {
+                None => true,
+                Some(url) => {
+                    event.kind.as_u16() == 10002
+                        && event.tags.iter().any(|tag| {
+                            let tag = tag.as_slice();
+                            tag.first().is_some_and(|name| name == "r") && tag.get(1) == Some(url)
+                        })
+                }
+            };
+            if reject {
+                nostr_relay_builder::builder::PolicyResult::Reject("fixture write refusal".into())
+            } else {
+                nostr_relay_builder::builder::PolicyResult::Accept
+            }
+        })
+    }
+}
+
+async fn relay_list_test_relay(
+    rejected_nip65_url: Option<String>,
+) -> (nostr_relay_builder::LocalRelay, String) {
+    let relay = nostr_relay_builder::LocalRelay::new(
+        nostr_relay_builder::RelayBuilder::default()
+            .write_policy(RelayListTestWritePolicy(rejected_nip65_url)),
+    );
+    relay.run().await.unwrap();
+    let url = relay.url().await.to_string();
+    (relay, url)
+}
+
+#[tokio::test]
+async fn connector_relay_list_edit_preserves_entries_the_request_did_not_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_added_relay, added_url) = mock_relay_url().await;
+    // Seed on the primary relay. For the NIP-65 add, both old outbox relays
+    // refuse that declaration, so only the newly adopted relay can acknowledge
+    // it. This makes the route assertion below independent of quorum races.
+    let (_relay, relay_url) = relay_list_test_relay(Some(added_url.clone())).await;
+    let (_write_relay, write_url) = relay_list_test_relay(None).await;
+    let (_read_relay, read_url) = mock_relay_url().await;
+    let (_inbox_relay, inbox_url) = mock_relay_url().await;
+    let (_inbox_added_relay, inbox_added_url) = mock_relay_url().await;
+    let account_home = AccountHome::open(dir.path());
+    let account = account_home.create_account("agent").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), relay_url.clone());
+    let relay_endpoint = crate::validation::endpoint(&relay_url);
+    publish_nip65_and_inbox(
+        &app,
+        &account,
+        relay_endpoint.clone(),
+        crate::validation::endpoint(&read_url),
+        crate::validation::endpoint(&write_url),
+        crate::validation::endpoint(&inbox_url),
+    )
+    .await;
+
+    let seeded = app.account_relay_list_status(&account.label).unwrap();
+    assert!(
+        seeded.inbox.relays.contains(&inbox_url),
+        "seeded local inbox list must contain the untouched entry: {:?}",
+        seeded.inbox
+    );
+    // Give both seeded replaceable kinds an older timestamp than their first
+    // edit. Same-second event-id ordering could otherwise keep the seed on
+    // the relay, just as the removal below needs a newer second than the add.
+    sleep(Duration::from_millis(1_100)).await;
+
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        dir.path().join("dev").join("wn-agent.sock"),
+        vec![relay_url.clone()],
+        false,
+        false,
+    ))
+    .unwrap();
+
+    // kind 10002 is replaceable: adding one relay must keep the read-only,
+    // write-only and inbox entries the request never named.
+    connector
+        .relay_list_edit_response(crate::relays::RelayListEdit {
+            account_id_hex: account.account_id_hex.clone(),
+            relay_type: agent_control::AgentControlRelayListType::Nip65,
+            url: added_url.clone(),
+            direction: agent_control::AgentControlRelayListDirection::Both,
+            add: true,
+        })
+        .await
+        .unwrap();
+    let inbox_edit = connector
+        .relay_list_edit_response(crate::relays::RelayListEdit {
+            account_id_hex: account.account_id_hex.clone(),
+            relay_type: agent_control::AgentControlRelayListType::Inbox,
+            url: inbox_added_url.clone(),
+            direction: agent_control::AgentControlRelayListDirection::Both,
+            add: true,
+        })
+        .await
+        .unwrap();
+
+    let AgentControlResponse::RelayLists { relay_lists, .. } = inbox_edit else {
+        panic!("expected inbox edit response: {inbox_edit:?}");
+    };
+    assert!(
+        relay_lists.inbox.relays.contains(&inbox_url),
+        "edit response must preserve the untouched inbox entry: {:?}",
+        relay_lists.inbox
+    );
+    assert!(
+        relay_lists.inbox.relays.contains(&inbox_added_url),
+        "edit response must include the added inbox entry: {:?}",
+        relay_lists.inbox
+    );
+
+    // Publications require one acknowledgement, not an acknowledgement from
+    // every endpoint. Read all possible accepting relays: querying only the
+    // primary relay can legitimately return its older replaceable event.
+    let publication_route = vec![
+        relay_endpoint.clone(),
+        crate::validation::endpoint(&write_url),
+        crate::validation::endpoint(&added_url),
+        crate::validation::endpoint(&inbox_added_url),
+    ];
+
+    // Publication requires one acknowledgement, not every routed relay's ACK.
+    // Also, an overlapping directory read can share a pre-edit query. Wait for
+    // this relay to expose the acknowledged revision before checking its tags.
+    let published = timeout(Duration::from_secs(15), async {
+        loop {
+            let status = app
+                .directory()
+                .fetch_current_account_relay_list_status_for_account_id(
+                    &account.account_id_hex,
+                    publication_route.clone(),
+                    Some("nip65"),
+                )
+                .await
+                .unwrap()
+                .expect("published relay lists");
+            if status.inbox.created_at >= relay_lists.inbox.created_at {
+                break status;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the routed relay must expose the acknowledged inbox revision");
+    for expected in [&added_url, &read_url, &relay_url] {
+        assert!(
+            published
+                .nip65
+                .read_relays
+                .iter()
+                .any(|relay| relay == expected),
+            "read set should still hold {expected}"
+        );
+    }
+    for expected in [&relay_url, &write_url] {
+        assert!(
+            published
+                .nip65
+                .write_relays
+                .iter()
+                .any(|relay| relay == expected),
+            "write set should still hold {expected}"
+        );
+    }
+    for expected in [&inbox_url, &inbox_added_url] {
+        assert!(
+            published.inbox.relays.iter().any(|relay| relay == expected),
+            "inbox list should still hold {expected}; readback={:?}, edit={:?}",
+            published.inbox,
+            relay_lists.inbox
+        );
+    }
+
+    // The relay being adopted must actually receive the event that names it: it
+    // is not in the account's pre-edit outbox, so the route has to include it.
+    let added_copy = app
+        .directory()
+        .fetch_current_account_relay_list_status_for_account_id(
+            &account.account_id_hex,
+            vec![crate::validation::endpoint(&added_url)],
+            Some("nip65"),
+        )
+        .await
+        .unwrap()
+        .expect("the added relay received the list naming it");
+    assert!(
+        added_copy
+            .nip65
+            .read_relays
+            .iter()
+            .any(|relay| relay == &added_url)
+    );
+
+    // Removing one entry keeps the rest, in both list kinds. Replaceable events
+    // are second-resolution: a removal published in the same second as the
+    // addition cannot supersede it, so the removal waits for the next second.
+    sleep(Duration::from_millis(1_100)).await;
+    connector
+        .relay_list_edit_response(crate::relays::RelayListEdit {
+            account_id_hex: account.account_id_hex.clone(),
+            relay_type: agent_control::AgentControlRelayListType::Nip65,
+            url: added_url.clone(),
+            direction: agent_control::AgentControlRelayListDirection::Both,
+            add: false,
+        })
+        .await
+        .unwrap();
+    let published = app
+        .directory()
+        .fetch_current_account_relay_list_status_for_account_id(
+            &account.account_id_hex,
+            publication_route,
+            Some("nip65"),
+        )
+        .await
+        .unwrap()
+        .expect("published relay lists");
+    assert!(
+        !published
+            .nip65
+            .read_relays
+            .iter()
+            .any(|relay| relay == &added_url)
+    );
+    assert!(
+        published
+            .nip65
+            .read_relays
+            .iter()
+            .any(|relay| relay == &read_url)
+    );
+}
+
+#[tokio::test]
+async fn connector_relay_lists_reports_the_cached_lists() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, relay_url) = mock_relay_url().await;
+    let (_read_relay, read_url) = mock_relay_url().await;
+    let (_write_relay, write_url) = mock_relay_url().await;
+    let (_inbox_relay, inbox_url) = mock_relay_url().await;
+    let account_home = AccountHome::open(dir.path());
+    let account = account_home.create_account("agent").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), relay_url.clone());
+    publish_nip65_and_inbox(
+        &app,
+        &account,
+        crate::validation::endpoint(&relay_url),
+        crate::validation::endpoint(&read_url),
+        crate::validation::endpoint(&write_url),
+        crate::validation::endpoint(&inbox_url),
+    )
+    .await;
+
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        dir.path().join("dev").join("wn-agent.sock"),
+        vec![relay_url],
+        false,
+        false,
+    ))
+    .unwrap();
+
+    let response = connector
+        .relay_lists_response(&account.account_id_hex)
+        .unwrap();
+    let AgentControlResponse::RelayLists {
+        account_id_hex,
+        relay_lists,
+    } = response
+    else {
+        panic!("expected relay lists response, got {response:?}");
+    };
+    assert_eq!(account_id_hex, account.account_id_hex);
+    assert!(
+        relay_lists
+            .nip65
+            .write_relays
+            .iter()
+            .any(|relay| relay == &write_url)
+    );
+    assert!(
+        relay_lists
+            .inbox
+            .relays
+            .iter()
+            .any(|relay| relay == &inbox_url)
+    );
+    assert!(relay_lists.nip65.created_at > 0);
+    assert!(relay_lists.inbox.created_at > 0);
+}
+
+#[tokio::test]
+async fn connector_relay_list_edit_refuses_an_unconfirmed_published_list() {
+    let dir = tempfile::tempdir().unwrap();
+    // The relay the connector reads through holds no relay-list event, and the
+    // account has never published one: the read is unconfirmed, so the edit must
+    // refuse rather than publish a list built from nothing.
+    let (_relay, relay_url) = mock_relay_url().await;
+    let account_home = AccountHome::open(dir.path());
+    let account = account_home.create_account("agent").unwrap();
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        dir.path().join("dev").join("wn-agent.sock"),
+        vec![relay_url.clone()],
+        false,
+        false,
+    ))
+    .unwrap();
+
+    let error = connector
+        .relay_list_edit_response(crate::relays::RelayListEdit {
+            account_id_hex: account.account_id_hex.clone(),
+            relay_type: agent_control::AgentControlRelayListType::Nip65,
+            url: relay_url,
+            direction: agent_control::AgentControlRelayListDirection::Both,
+            add: true,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "relay_list_inconclusive");
+    assert!(error.retryable());
+}
+
+#[tokio::test]
+async fn connector_relay_list_edit_rejects_invalid_inputs_before_reading() {
+    let dir = tempfile::tempdir().unwrap();
+    let account_home = AccountHome::open(dir.path());
+    let account = account_home.create_account("agent").unwrap();
+    // Loopback relays stay a dev-only gate: this connector does not set it, so a
+    // `ws://` loopback entry is refused even though a local agent may well reach
+    // one. No relay is configured: validation precedes any relay read.
+    let mut config = test_config(
+        dir.path(),
+        dir.path().join("dev").join("wn-agent.sock"),
+        Vec::new(),
+        false,
+        false,
+    );
+    config.allow_loopback_relays = false;
+    let connector = AgentConnector::open(config).unwrap();
+
+    for url in [
+        "",
+        "not-a-relay",
+        "http://relay.example",
+        "wss://relay.example\u{1b}]8;;https://evil.example\u{7}",
+    ] {
+        let error = connector
+            .relay_list_edit_response(crate::relays::RelayListEdit {
+                account_id_hex: account.account_id_hex.clone(),
+                relay_type: agent_control::AgentControlRelayListType::Nip65,
+                url: url.to_owned(),
+                direction: agent_control::AgentControlRelayListDirection::Both,
+                add: true,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "invalid_relay_url", "url {url:?}");
+    }
+
+    let error = connector
+        .relay_list_edit_response(crate::relays::RelayListEdit {
+            account_id_hex: account.account_id_hex.clone(),
+            relay_type: agent_control::AgentControlRelayListType::Nip65,
+            url: "ws://127.0.0.1:8080".to_owned(),
+            direction: agent_control::AgentControlRelayListDirection::Both,
+            add: true,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "invalid_relay_url");
+
+    // The inbox list has no read/write roles, so a named direction is refused
+    // rather than silently ignored.
+    let error = connector
+        .relay_list_edit_response(crate::relays::RelayListEdit {
+            account_id_hex: account.account_id_hex.clone(),
+            relay_type: agent_control::AgentControlRelayListType::Inbox,
+            url: "wss://inbox.example".to_owned(),
+            direction: agent_control::AgentControlRelayListDirection::Read,
+            add: true,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "invalid_relay_list_edit");
+}
+
+#[tokio::test]
+async fn connector_relay_list_edit_starts_from_the_newer_cached_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_lagging_relay, lagging_url) = mock_relay_url().await;
+    let (_current_relay, current_url) = mock_relay_url().await;
+    let (_old_entry_relay, old_entry_url) = mock_relay_url().await;
+    let (_current_entry_relay, current_entry_url) = mock_relay_url().await;
+    let (_added_relay, added_url) = mock_relay_url().await;
+    let account_home = AccountHome::open(dir.path());
+    let account = account_home.create_account("agent").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), lagging_url.clone());
+    let lagging_endpoint = crate::validation::endpoint(&lagging_url);
+    let current_endpoint = crate::validation::endpoint(&current_url);
+
+    // The pre-edit list: read-only entries routed through the relay the
+    // connector will read through, and no write relay. That empty write set is
+    // what keeps the next publication off this relay, so it goes on serving this
+    // copy after the account has moved on.
+    app.publish_account_nip65_relay_set(
+        &account.label,
+        vec![
+            lagging_endpoint.clone(),
+            crate::validation::endpoint(&old_entry_url),
+        ],
+        Vec::new(),
+        vec![lagging_endpoint.clone()],
+    )
+    .await
+    .unwrap();
+
+    // Replaceable-event timestamps are second-resolution, so the newer list has
+    // to be published in a later second to supersede the cached copy anywhere.
+    sleep(Duration::from_millis(1_100)).await;
+
+    // The newer local edit, published where the lagging relay cannot see it.
+    app.publish_account_nip65_relay_set(
+        &account.label,
+        vec![
+            current_endpoint.clone(),
+            crate::validation::endpoint(&current_entry_url),
+        ],
+        vec![current_endpoint.clone()],
+        vec![current_endpoint.clone()],
+    )
+    .await
+    .unwrap();
+    let cached = app.account_relay_list_status(&account.label).unwrap();
+    assert!(
+        cached
+            .nip65
+            .read_relays
+            .iter()
+            .any(|relay| relay == &current_entry_url),
+        "cached list before the stale read"
+    );
+
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        dir.path().join("dev").join("wn-agent.sock"),
+        vec![lagging_url.clone()],
+        false,
+        false,
+    ))
+    .unwrap();
+    // Pin the premise: the read this publish makes returns the pre-edit copy,
+    // and the cache is not older than it.
+    let read_copy = app
+        .directory()
+        .fetch_current_account_relay_list_status_for_account_id(
+            &account.account_id_hex,
+            vec![lagging_endpoint.clone()],
+            Some("nip65"),
+        )
+        .await
+        .unwrap()
+        .expect("lagging relay copy");
+    assert!(
+        read_copy
+            .nip65
+            .read_relays
+            .iter()
+            .any(|relay| relay == &old_entry_url)
+    );
+    assert!(cached.nip65.created_at >= read_copy.nip65.created_at);
+
+    connector
+        .relay_list_edit_response(crate::relays::RelayListEdit {
+            account_id_hex: account.account_id_hex.clone(),
+            relay_type: agent_control::AgentControlRelayListType::Nip65,
+            url: added_url.clone(),
+            direction: agent_control::AgentControlRelayListDirection::Both,
+            add: true,
+        })
+        .await
+        .unwrap();
+
+    // What the lagging relay now holds is the newer list plus the edit, not the
+    // pre-edit entries that same relay was still serving.
+    let published = app
+        .directory()
+        .fetch_current_account_relay_list_status_for_account_id(
+            &account.account_id_hex,
+            vec![lagging_endpoint.clone()],
+            Some("nip65"),
+        )
+        .await
+        .unwrap()
+        .expect("published relay list");
+    for expected in [&added_url, &current_entry_url] {
+        assert!(
+            published
+                .nip65
+                .read_relays
+                .iter()
+                .any(|relay| relay == expected),
+            "published list should hold {expected}"
+        );
+    }
+    assert!(
+        !published
+            .nip65
+            .read_relays
+            .iter()
+            .any(|relay| relay == &old_entry_url),
+        "the pre-edit entries the lagging relay served must not come back"
+    );
+}

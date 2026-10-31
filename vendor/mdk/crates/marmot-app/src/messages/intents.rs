@@ -1,0 +1,1307 @@
+use cgka_traits::agent_text_stream::{
+    AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN, AGENT_TEXT_STREAM_PROFILE_STREAM_ID_LEN,
+};
+use cgka_traits::app_event::{
+    AGENT_ACTIVITY_STATUS_TAG, AGENT_OPERATION_NAME_TAG, AGENT_OPERATION_STATUS_TAG,
+    AGENT_OPERATION_TYPE_TAG, EVENT_REF_TAG, GROUP_SYSTEM_TYPE_TAG,
+    MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY, MARMOT_APP_EVENT_KIND_AGENT_OPERATION,
+    MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_CHAT,
+    MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_EDIT, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
+    MARMOT_APP_EVENT_KIND_REACTION, MarmotAppEvent as MarmotInnerEvent, QUOTE_REF_TAG,
+    STREAM_BROKER_TAG, STREAM_CHUNKS_TAG, STREAM_FINAL_KIND_TAG, STREAM_HASH_TAG,
+    STREAM_PARENT_TAG, STREAM_ROUTE_TAG, STREAM_START_TAG, STREAM_TAG, STREAM_TYPE_TAG,
+};
+use cgka_traits::app_event::{
+    MARMOT_APP_EVENT_KIND_REMOVE, MARMOT_APP_EVENT_KIND_REPORT, MARMOT_APP_EVENT_KIND_REVIEW,
+};
+use cgka_traits::reporting::ReportReason;
+use cgka_traits::{
+    MARMOT_APP_EVENT_KIND_POLL, MARMOT_APP_EVENT_KIND_POLL_RESPONSE, PollType, poll_response_tags,
+    poll_tags,
+};
+use nostr::nips::nip21::Nip21;
+use serde_json::{Map, Value, json};
+
+use crate::ids::parse_account_id_hex;
+use crate::{AgentTextStreamFinishRequest, AppError, MediaAttachmentReference};
+use crate::{
+    MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST, MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL,
+    MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE,
+};
+
+/// Nostr pubkey-reference (`p`) tag name.
+pub(crate) const PUBKEY_REF_TAG: &str = "p";
+
+/// Upper bound for app-internal Markdown mention scans over untrusted message
+/// plaintext. The sender stores the full content, but p-tag derivation only
+/// parses this bounded prefix so one hostile message cannot force unbounded
+/// synchronous Markdown work before send/classification (mdk#654).
+pub(crate) const MAX_MARKDOWN_MENTION_SCAN_BYTES: usize =
+    AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize;
+
+/// Reactions are display metadata that flow into timelines and notification
+/// previews. Keep them compact and free of terminal/control sequences while
+/// still allowing arbitrary multi-scalar emoji clusters.
+const MAX_REACTION_CONTENT_CHARS: usize = 64;
+
+/// Extract the mentioned pubkey hex from a token following a `nostr:` scheme (or
+/// a bare hex/npub), covering NIP-21 `npub` + `nprofile` and a raw hex pubkey.
+/// Event/coordinate references (`note`/`nevent`/`naddr`) are not pubkey mentions.
+pub(crate) fn mention_pubkey_hex(token: &str) -> Option<String> {
+    if let Ok(parsed) = Nip21::parse(&format!("nostr:{token}")) {
+        return match parsed {
+            Nip21::Pubkey(pubkey) => Some(pubkey.to_hex()),
+            Nip21::Profile(profile) => Some(profile.public_key.to_hex()),
+            _ => None,
+        };
+    }
+    // Non-NIP-21 fallback: a bare hex pubkey or bare npub.
+    parse_account_id_hex(token).ok()
+}
+
+/// Extract pubkey mentions from inline nostr entities in message content.
+///
+/// Derived from the `marmot-markdown` tokenizer's mention/URI tokens, which
+/// recognize **both** bare `@npub1…` handles (`Inline::NostrMention`) and
+/// explicit `nostr:<hrp>1…` URIs (`Inline::NostrUri`) — the same display
+/// surface a client renders as a mention. Scanning the raw `"nostr:"`
+/// substring missed bare `@npub1…` mentions (the form clients actually emit),
+/// so those never got a `p`-tag on send or classified on receive
+/// (mdk#617). Event/coordinate references (`note`/`nevent`/`naddr`) and
+/// unparseable tokens are ignored.
+pub(crate) fn inline_mention_pubkey_hexes(content: &str) -> Vec<String> {
+    let content = markdown_mention_scan_input(content);
+    // Both pubkey token forms require these literal HRPs. Keep escaped/entity
+    // input on the parser path so Markdown normalization remains authoritative.
+    if !content.contains("npub1")
+        && !content.contains("nprofile1")
+        && !content.contains(['\\', '&'])
+    {
+        return Vec::new();
+    }
+    let mut hexes = Vec::new();
+    for block in &marmot_markdown::parse(content).blocks {
+        collect_block_mention_hexes(block, &mut hexes);
+    }
+    hexes
+}
+
+fn markdown_mention_scan_input(content: &str) -> &str {
+    if content.len() <= MAX_MARKDOWN_MENTION_SCAN_BYTES {
+        return content;
+    }
+    let mut end = MAX_MARKDOWN_MENTION_SCAN_BYTES;
+    while !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    &content[..end]
+}
+
+fn collect_block_mention_hexes(block: &marmot_markdown::Block, out: &mut Vec<String>) {
+    use marmot_markdown::Block;
+    match block {
+        Block::Paragraph { inlines } | Block::Heading { inlines, .. } => {
+            collect_inline_mention_hexes(inlines, out);
+        }
+        Block::BlockQuote { blocks, .. } => {
+            for block in blocks {
+                collect_block_mention_hexes(block, out);
+            }
+        }
+        Block::List { items, .. } => {
+            for item in items {
+                for block in &item.blocks {
+                    collect_block_mention_hexes(block, out);
+                }
+            }
+        }
+        Block::Table { header, rows, .. } => {
+            for cell in header {
+                collect_inline_mention_hexes(&cell.inlines, out);
+            }
+            for row in rows {
+                for cell in row {
+                    collect_inline_mention_hexes(&cell.inlines, out);
+                }
+            }
+        }
+        // Code blocks, math blocks, and thematic breaks carry no inline
+        // mentions.
+        Block::Details { summary, body, .. } => {
+            collect_inline_mention_hexes(summary, out);
+            for block in body {
+                collect_block_mention_hexes(block, out);
+            }
+        }
+        Block::ThematicBreak | Block::CodeBlock { .. } | Block::MathBlock { .. } => {}
+    }
+}
+
+fn collect_inline_mention_hexes(inlines: &[marmot_markdown::Inline], out: &mut Vec<String>) {
+    use marmot_markdown::Inline;
+    for inline in inlines {
+        match inline {
+            Inline::NostrMention(entity) | Inline::NostrUri(entity) => {
+                if let Some(hex) = mention_pubkey_hex(&entity.bech32) {
+                    out.push(hex);
+                }
+            }
+            Inline::Emph(children)
+            | Inline::Strong(children)
+            | Inline::Strikethrough(children)
+            | Inline::Link { children, .. } => collect_inline_mention_hexes(children, out),
+            Inline::Image { alt, .. } => collect_inline_mention_hexes(alt, out),
+            Inline::Text(_)
+            | Inline::SoftBreak
+            | Inline::HardBreak
+            | Inline::Code(_)
+            | Inline::Autolink { .. }
+            | Inline::Timestamp { .. }
+            | Inline::Math(_) => {}
+        }
+    }
+}
+
+/// Derive NIP-27 `["p", <pubkey-hex>]` tags from inline nostr mentions in
+/// message content (both bare `@npub1…` handles and explicit `nostr:<hrp>1…`
+/// URIs). Each distinct mentioned pubkey gets one tag (in first-seen order);
+/// event references and unparseable tokens are ignored. This is how a Marmot
+/// client makes a mention discoverable (a p-tag alongside the inline
+/// reference), per NIP-27.
+fn mention_p_tags(content: &str) -> Vec<Vec<String>> {
+    let mut seen = std::collections::HashSet::new();
+    let mut tags = Vec::new();
+    for hex in inline_mention_pubkey_hexes(content) {
+        if seen.insert(hex.clone()) {
+            tags.push(vec![PUBKEY_REF_TAG.to_owned(), hex]);
+        }
+    }
+    tags
+}
+
+/// Value of the `stream-type` tag on an agent text stream start event.
+const STREAM_TYPE_TEXT: &str = "text";
+/// Value of the `route` tag on a brokered QUIC agent text stream start event.
+pub(crate) const STREAM_ROUTE_QUIC: &str = "quic";
+/// `final-kind` tag value: the kind of the eventual stream-final chat message.
+const STREAM_FINAL_KIND_CHAT: &str = "9";
+
+/// A structured outgoing app message, resolved into a [`MarmotInnerEvent`] by
+/// the account worker, which owns the authoring account id and the clock.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum AppMessageIntent {
+    Report {
+        target_message_id: String,
+        reason: ReportReason,
+        explanation: String,
+        target_author: Option<String>,
+    },
+    RemoveMessage {
+        target_message_id: String,
+    },
+    DismissReports {
+        report_ids: Vec<String>,
+        explanation: String,
+    },
+    Chat {
+        content: String,
+    },
+    TaggedChat {
+        content: String,
+        tags: Vec<Vec<String>>,
+    },
+    Reaction {
+        target_message_id: String,
+        emoji: String,
+        /// Extra tags, e.g. NIP-30 `emoji` naming a custom reaction image.
+        tags: Vec<Vec<String>>,
+        /// Encrypted images those tags point at, emitted as `imeta`.
+        attachments: Vec<MediaAttachmentReference>,
+    },
+    Unreact {
+        target_message_id: String,
+        emoji: Option<String>,
+    },
+    DeleteReactions {
+        reaction_message_ids: Vec<String>,
+    },
+    Reply {
+        target_message_id: String,
+        text: String,
+    },
+    Edit {
+        target_message_id: String,
+        content: String,
+    },
+    Delete {
+        target_message_id: String,
+    },
+    Poll {
+        question: String,
+        options: Vec<String>,
+        poll_type: PollType,
+        ends_at: Option<u64>,
+    },
+    PollResponse {
+        poll_event_id: String,
+        option_ids: Vec<String>,
+    },
+    Media {
+        attachments: Vec<MediaAttachmentReference>,
+        caption: Option<String>,
+        message_tags: Vec<Vec<String>>,
+    },
+    StreamStart {
+        stream_id: Vec<u8>,
+        parent_message_id: Option<String>,
+        quic_candidates: Vec<String>,
+    },
+    StreamFinal {
+        request: AgentTextStreamFinishRequest,
+    },
+    AgentActivity {
+        status: String,
+        text: String,
+        reply_to_message_id: Option<String>,
+        extra: Option<Value>,
+    },
+    AgentOperation {
+        event_type: String,
+        status: String,
+        operation_id: Option<String>,
+        run_id: Option<String>,
+        turn_id: Option<String>,
+        name: Option<String>,
+        text: String,
+        preview: Option<String>,
+        details: Option<Value>,
+        sequence: Option<u64>,
+        ok: Option<bool>,
+        duration_ms: Option<u64>,
+        reply_to_message_id: Option<String>,
+    },
+    GroupSystem {
+        system_type: String,
+        text: String,
+        data: Option<Value>,
+    },
+    PushTokenUpdate {
+        content: String,
+    },
+    PushTokenRemoval {
+        content: String,
+    },
+    /// An app-defined event with an arbitrary non-reserved kind. Tags and
+    /// content pass through verbatim: the intent layer neither derives
+    /// `p`-tags from the content nor shapes the payload, so the caller owns
+    /// the event's semantics end to end.
+    Custom {
+        kind: u64,
+        tags: Vec<Vec<String>>,
+        content: String,
+    },
+}
+
+/// Build the inner Marmot app event for `intent`, authored by `sender_pubkey_hex`
+/// at `created_at`. `Unreact` must be resolved to `DeleteReactions` before this
+/// is called.
+pub(crate) fn build_inner_event(
+    intent: &AppMessageIntent,
+    sender_pubkey_hex: &str,
+    created_at: u64,
+) -> Result<MarmotInnerEvent, AppError> {
+    build_inner_event_with_media_reply(intent, sender_pubkey_hex, created_at, None)
+}
+
+/// The draft-only media reply context keeps the public Media intent compatible.
+/// Tags and validation still belong to this single event builder.
+pub(crate) fn build_inner_event_with_media_reply(
+    intent: &AppMessageIntent,
+    sender_pubkey_hex: &str,
+    created_at: u64,
+    media_reply: Option<&str>,
+) -> Result<MarmotInnerEvent, AppError> {
+    let event = |kind, tags, content| {
+        MarmotInnerEvent::new(
+            sender_pubkey_hex.to_owned(),
+            created_at,
+            kind,
+            tags,
+            content,
+        )
+    };
+    match intent {
+        AppMessageIntent::Chat { content } => Ok(event(
+            MARMOT_APP_EVENT_KIND_CHAT,
+            mention_p_tags(content),
+            content.clone(),
+        )),
+        AppMessageIntent::TaggedChat { content, tags } => {
+            validate_message_tags(tags)?;
+            let mut tags = tags.clone();
+            for mention in mention_p_tags(content) {
+                if !tags.contains(&mention) {
+                    tags.push(mention);
+                }
+            }
+            Ok(event(MARMOT_APP_EVENT_KIND_CHAT, tags, content.clone()))
+        }
+        AppMessageIntent::Reaction {
+            target_message_id,
+            emoji,
+            tags,
+            attachments,
+        } => {
+            validate_message_ref(target_message_id)?;
+            validate_reaction_content(emoji)?;
+            validate_message_tags(tags)?;
+            let mut event_tags = vec![event_ref_tag(target_message_id)];
+            event_tags.extend(attachments.iter().map(MediaAttachmentReference::imeta_tag));
+            event_tags.extend(tags.iter().cloned());
+            Ok(event(
+                MARMOT_APP_EVENT_KIND_REACTION,
+                event_tags,
+                emoji.clone(),
+            ))
+        }
+        AppMessageIntent::Reply {
+            target_message_id,
+            text,
+        } => {
+            validate_message_ref(target_message_id)?;
+            if text.trim().is_empty() {
+                return Err(AppError::InvalidAppMessagePayload(
+                    "reply requires non-empty text".into(),
+                ));
+            }
+            let mut tags = vec![
+                event_ref_tag(target_message_id),
+                vec![QUOTE_REF_TAG.to_owned(), target_message_id.clone()],
+            ];
+            tags.extend(mention_p_tags(text));
+            Ok(event(MARMOT_APP_EVENT_KIND_CHAT, tags, text.clone()))
+        }
+        AppMessageIntent::Edit {
+            target_message_id,
+            content,
+        } => {
+            validate_message_ref(target_message_id)?;
+            if content.trim().is_empty() {
+                return Err(AppError::InvalidAppMessagePayload(
+                    "edit requires non-empty content".into(),
+                ));
+            }
+            let mut tags = vec![event_ref_tag(target_message_id)];
+            tags.extend(mention_p_tags(content));
+            Ok(event(MARMOT_APP_EVENT_KIND_EDIT, tags, content.clone()))
+        }
+        AppMessageIntent::Report {
+            target_message_id,
+            reason,
+            explanation,
+            target_author,
+        } => {
+            validate_message_ref(target_message_id)?;
+            let author = target_author.as_ref().ok_or_else(|| {
+                AppError::InvalidAppMessagePayload("report target has not been resolved".into())
+            })?;
+            validate_message_ref(author)?;
+            Ok(event(
+                MARMOT_APP_EVENT_KIND_REPORT,
+                vec![
+                    vec![
+                        "e".into(),
+                        target_message_id.clone(),
+                        reason.as_str().into(),
+                    ],
+                    vec!["p".into(), author.clone()],
+                ],
+                explanation.clone(),
+            ))
+        }
+        AppMessageIntent::DismissReports {
+            report_ids,
+            explanation,
+        } => {
+            if report_ids.is_empty() || report_ids.len() > 100 {
+                return Err(AppError::InvalidAppMessagePayload(
+                    "review requires between 1 and 100 reports".into(),
+                ));
+            }
+            for id in report_ids {
+                validate_message_ref(id)?;
+            }
+            let mut ids = report_ids.clone();
+            ids.sort();
+            ids.dedup();
+            let namespace = cgka_traits::reporting::REPORT_REVIEW_NAMESPACE;
+            let mut tags = vec![
+                vec!["L".into(), namespace.into()],
+                vec!["l".into(), "dismissed".into(), namespace.into()],
+            ];
+            tags.extend(ids.iter().map(|id| event_ref_tag(id)));
+            Ok(event(
+                MARMOT_APP_EVENT_KIND_REVIEW,
+                tags,
+                explanation.clone(),
+            ))
+        }
+        AppMessageIntent::RemoveMessage { target_message_id } => {
+            validate_message_ref(target_message_id)?;
+            Ok(event(
+                MARMOT_APP_EVENT_KIND_REMOVE,
+                vec![event_ref_tag(target_message_id)],
+                r#"{"v":1,"action":"remove"}"#.into(),
+            ))
+        }
+        AppMessageIntent::Delete { target_message_id } => {
+            validate_message_ref(target_message_id)?;
+            Ok(event(
+                MARMOT_APP_EVENT_KIND_DELETE,
+                vec![event_ref_tag(target_message_id)],
+                String::new(),
+            ))
+        }
+        AppMessageIntent::Poll {
+            question,
+            options,
+            poll_type,
+            ends_at,
+        } => {
+            let tags = poll_tags(created_at, question, options, *poll_type, *ends_at)
+                .map_err(|error| AppError::InvalidAppMessagePayload(error.to_string()))?;
+            Ok(event(MARMOT_APP_EVENT_KIND_POLL, tags, question.clone()))
+        }
+        AppMessageIntent::PollResponse {
+            poll_event_id,
+            option_ids,
+        } => {
+            let tags = poll_response_tags(poll_event_id, option_ids)
+                .map_err(|error| AppError::InvalidAppMessagePayload(error.to_string()))?;
+            Ok(event(
+                MARMOT_APP_EVENT_KIND_POLL_RESPONSE,
+                tags,
+                String::new(),
+            ))
+        }
+        AppMessageIntent::DeleteReactions {
+            reaction_message_ids,
+        } => {
+            if reaction_message_ids.is_empty() {
+                return Err(AppError::ReactionNotFound);
+            }
+            let mut tags = Vec::with_capacity(reaction_message_ids.len());
+            for reaction_message_id in reaction_message_ids {
+                validate_message_ref(reaction_message_id)?;
+                tags.push(event_ref_tag(reaction_message_id));
+            }
+            Ok(event(MARMOT_APP_EVENT_KIND_DELETE, tags, String::new()))
+        }
+        AppMessageIntent::Unreact { .. } => Err(AppError::InvalidAppMessagePayload(
+            "unreact must be resolved before event construction".into(),
+        )),
+        AppMessageIntent::Media {
+            attachments,
+            caption,
+            message_tags,
+        } => {
+            validate_message_tags(message_tags)?;
+            if attachments.is_empty() {
+                return Err(AppError::InvalidAppMessagePayload(
+                    "media message requires at least one attachment".into(),
+                ));
+            }
+            let source_epoch = attachments[0].source_epoch;
+            for attachment in attachments {
+                // Structural + group-policy validation of outbound attachments
+                // happens in `Client::send_media_attachments`, which holds the
+                // group's `allowed_locator_kinds`. Here we only enforce the
+                // cross-attachment invariant that one message shares a single
+                // source epoch.
+                if attachment.source_epoch != source_epoch {
+                    return Err(AppError::InvalidAppMessagePayload(
+                        "media attachments in one message must share a source epoch".into(),
+                    ));
+                }
+            }
+            let mut tags: Vec<Vec<String>> = attachments
+                .iter()
+                .map(MediaAttachmentReference::imeta_tag)
+                .collect();
+            tags.extend(message_tags.iter().cloned());
+            if let Some(caption) = caption {
+                tags.extend(mention_p_tags(caption));
+            }
+            if let Some(target) = media_reply {
+                validate_message_ref(target)?;
+                tags.push(event_ref_tag(target));
+                tags.push(vec![QUOTE_REF_TAG.to_owned(), target.to_owned()]);
+            }
+            Ok(event(
+                MARMOT_APP_EVENT_KIND_CHAT,
+                tags,
+                caption.clone().unwrap_or_default(),
+            ))
+        }
+        AppMessageIntent::StreamStart {
+            stream_id,
+            parent_message_id,
+            quic_candidates,
+        } => {
+            let stream_id_hex = hex::encode(stream_id);
+            if stream_id.len() != AGENT_TEXT_STREAM_PROFILE_STREAM_ID_LEN {
+                return Err(AppError::InvalidAppMessagePayload(
+                    "agent text stream id must be 32 bytes".into(),
+                ));
+            }
+            for candidate in quic_candidates {
+                transport_quic_stream::QuicCandidate::parse(candidate)
+                    .map_err(|_| AppError::AgentStreamInvalidCandidate(candidate.clone()))?;
+            }
+            let mut tags = vec![
+                vec![STREAM_TAG.to_owned(), stream_id_hex],
+                vec![STREAM_TYPE_TAG.to_owned(), STREAM_TYPE_TEXT.to_owned()],
+                vec![
+                    STREAM_FINAL_KIND_TAG.to_owned(),
+                    STREAM_FINAL_KIND_CHAT.to_owned(),
+                ],
+                vec![STREAM_ROUTE_TAG.to_owned(), STREAM_ROUTE_QUIC.to_owned()],
+            ];
+            if let Some(parent_message_id) = parent_message_id {
+                tags.push(vec![
+                    STREAM_PARENT_TAG.to_owned(),
+                    normalize_stream_parent_message_id(parent_message_id)?,
+                ]);
+            }
+            tags.extend(
+                quic_candidates
+                    .iter()
+                    .map(|candidate| vec![STREAM_BROKER_TAG.to_owned(), candidate.clone()]),
+            );
+            Ok(event(
+                MARMOT_APP_EVENT_KIND_AGENT_STREAM_START,
+                tags,
+                String::new(),
+            ))
+        }
+        AppMessageIntent::StreamFinal { request } => {
+            if request.stream_id.len() != AGENT_TEXT_STREAM_PROFILE_STREAM_ID_LEN {
+                return Err(AppError::InvalidAppMessagePayload(
+                    "agent text stream id must be 32 bytes".into(),
+                ));
+            }
+            let start_event_id = hex::decode(&request.start_event_id).map_err(|_| {
+                AppError::InvalidAppMessagePayload(
+                    "agent text stream start event id must be 32-byte hex".into(),
+                )
+            })?;
+            if start_event_id.len() != 32 {
+                return Err(AppError::InvalidAppMessagePayload(
+                    "agent text stream start event id must be 32-byte hex".into(),
+                ));
+            }
+            let tags = vec![
+                vec![STREAM_TAG.to_owned(), hex::encode(&request.stream_id)],
+                vec![STREAM_START_TAG.to_owned(), request.start_event_id.clone()],
+                vec![
+                    STREAM_HASH_TAG.to_owned(),
+                    hex::encode(request.transcript_hash),
+                ],
+                vec![
+                    STREAM_CHUNKS_TAG.to_owned(),
+                    request.chunk_count.to_string(),
+                ],
+            ];
+            Ok(event(
+                MARMOT_APP_EVENT_KIND_CHAT,
+                tags,
+                request.final_text_or_reference.clone(),
+            ))
+        }
+        AppMessageIntent::AgentActivity {
+            status,
+            text,
+            reply_to_message_id,
+            extra,
+        } => {
+            let status = validate_non_empty_field(status, "agent activity status")?;
+            let mut tags = vec![vec![AGENT_ACTIVITY_STATUS_TAG.to_owned(), status.clone()]];
+            if let Some(target_message_id) = optional_message_ref(reply_to_message_id)? {
+                tags.push(event_ref_tag(&target_message_id));
+            }
+            let mut content = app_payload_base(status.clone(), text.clone());
+            if let Some(extra) = extra {
+                content.insert("extra".to_owned(), extra.clone());
+            }
+            Ok(event(
+                MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY,
+                tags,
+                Value::Object(content).to_string(),
+            ))
+        }
+        AppMessageIntent::AgentOperation {
+            event_type,
+            status,
+            operation_id,
+            run_id,
+            turn_id,
+            name,
+            text,
+            preview,
+            details,
+            sequence,
+            ok,
+            duration_ms,
+            reply_to_message_id,
+        } => {
+            let event_type = validate_non_empty_field(event_type, "agent operation type")?;
+            let status = validate_non_empty_field(status, "agent operation status")?;
+            let mut tags = vec![
+                vec![AGENT_OPERATION_TYPE_TAG.to_owned(), event_type.clone()],
+                vec![AGENT_OPERATION_STATUS_TAG.to_owned(), status.clone()],
+            ];
+            if let Some(name) = optional_non_empty_field(name) {
+                tags.push(vec![AGENT_OPERATION_NAME_TAG.to_owned(), name.to_owned()]);
+            }
+            if let Some(target_message_id) = optional_message_ref(reply_to_message_id)? {
+                tags.push(event_ref_tag(&target_message_id));
+            }
+            let mut content = app_payload_base(status.clone(), text.clone());
+            content.insert("event_type".to_owned(), Value::String(event_type));
+            if let Some(operation_id) = optional_non_empty_field(operation_id) {
+                content.insert(
+                    "operation_id".to_owned(),
+                    Value::String(operation_id.to_owned()),
+                );
+            }
+            if let Some(run_id) = optional_non_empty_field(run_id) {
+                content.insert("run_id".to_owned(), Value::String(run_id.to_owned()));
+            }
+            if let Some(turn_id) = optional_non_empty_field(turn_id) {
+                content.insert("turn_id".to_owned(), Value::String(turn_id.to_owned()));
+            }
+            if let Some(name) = optional_non_empty_field(name) {
+                content.insert("name".to_owned(), Value::String(name.to_owned()));
+            }
+            if let Some(preview) = optional_non_empty_field(preview) {
+                content.insert("preview".to_owned(), Value::String(preview.to_owned()));
+            }
+            if let Some(details) = details {
+                content.insert("details".to_owned(), details.clone());
+            }
+            if let Some(sequence) = sequence {
+                content.insert("sequence".to_owned(), json!(sequence));
+            }
+            if let Some(ok) = ok {
+                content.insert("ok".to_owned(), json!(ok));
+            }
+            if let Some(duration_ms) = duration_ms {
+                content.insert("duration_ms".to_owned(), json!(duration_ms));
+            }
+            Ok(event(
+                MARMOT_APP_EVENT_KIND_AGENT_OPERATION,
+                tags,
+                Value::Object(content).to_string(),
+            ))
+        }
+        AppMessageIntent::GroupSystem {
+            system_type,
+            text,
+            data,
+        } => {
+            let system_type = validate_non_empty_field(system_type, "group system type")?;
+            let mut content = Map::new();
+            content.insert("v".to_owned(), json!(1));
+            content.insert("system_type".to_owned(), Value::String(system_type.clone()));
+            content.insert("text".to_owned(), Value::String(text.clone()));
+            if let Some(data) = data {
+                content.insert("data".to_owned(), data.clone());
+            }
+            Ok(event(
+                MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
+                vec![vec![GROUP_SYSTEM_TYPE_TAG.to_owned(), system_type]],
+                Value::Object(content).to_string(),
+            ))
+        }
+        AppMessageIntent::PushTokenUpdate { content } => Ok(event(
+            MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE,
+            vec![vec!["v".to_owned(), crate::PUSH_VERSION.to_owned()]],
+            content.clone(),
+        )),
+        AppMessageIntent::PushTokenRemoval { content } => Ok(event(
+            MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL,
+            vec![vec!["v".to_owned(), crate::PUSH_VERSION.to_owned()]],
+            content.clone(),
+        )),
+        AppMessageIntent::Custom {
+            kind,
+            tags,
+            content,
+        } => {
+            validate_custom_event_kind(*kind)?;
+            Ok(event(*kind, tags.clone(), content.clone()))
+        }
+    }
+}
+
+/// Inner app-event kinds MDK assigns protocol semantics to. The custom-event
+/// path rejects these so an app cannot forge, e.g., a kind-5 delete or a
+/// kind-447 push-token update that other members' clients would act on under
+/// MDK's interpretation.
+const RESERVED_APP_EVENT_KINDS: &[u64] = &[
+    MARMOT_APP_EVENT_KIND_REPORT,
+    MARMOT_APP_EVENT_KIND_REVIEW,
+    MARMOT_APP_EVENT_KIND_REMOVE,
+    MARMOT_APP_EVENT_KIND_DELETE,
+    MARMOT_APP_EVENT_KIND_REACTION,
+    MARMOT_APP_EVENT_KIND_CHAT,
+    MARMOT_APP_EVENT_KIND_EDIT,
+    MARMOT_APP_EVENT_KIND_POLL_RESPONSE,
+    MARMOT_APP_EVENT_KIND_POLL,
+    MARMOT_APP_EVENT_KIND_AGENT_STREAM_START,
+    MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY,
+    MARMOT_APP_EVENT_KIND_AGENT_OPERATION,
+    MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
+    MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE,
+    MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST,
+    MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL,
+];
+
+/// True when `kind` is one MDK owns (chat, reactions, edits, agent, group
+/// system, push token). Custom sends must use any other kind.
+pub fn is_reserved_app_event_kind(kind: u64) -> bool {
+    RESERVED_APP_EVENT_KINDS.contains(&kind)
+}
+
+// Application tags may decorate chat, but encrypted media references remain typed.
+pub(crate) fn validate_message_tags(tags: &[Vec<String>]) -> Result<(), AppError> {
+    if tags.len() > 64 || tags.iter().flatten().map(String::len).sum::<usize>() > 16 * 1024 {
+        return Err(AppError::InvalidAppMessagePayload(
+            "message tags exceed limits".into(),
+        ));
+    }
+    for tag in tags {
+        if tag.is_empty() || tag[0].is_empty() || tag[0] == "imeta" {
+            return Err(AppError::InvalidAppMessagePayload(
+                "invalid additional message tag".into(),
+            ));
+        }
+        if tag[0] == "e" || tag[0] == "q" {
+            let target = tag.get(1).ok_or_else(|| {
+                AppError::InvalidAppMessagePayload("missing message reference".into())
+            })?;
+            validate_message_ref(target)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_custom_event_kind(kind: u64) -> Result<(), AppError> {
+    if is_reserved_app_event_kind(kind) {
+        return Err(AppError::InvalidAppMessagePayload(format!(
+            "custom event kind {kind} is reserved for Marmot protocol use"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_reaction_content(emoji: &str) -> Result<(), AppError> {
+    if emoji.trim().is_empty() {
+        return Err(AppError::InvalidAppMessagePayload(
+            "reaction add requires a non-empty emoji".into(),
+        ));
+    }
+    if emoji.trim() != emoji {
+        return Err(AppError::InvalidAppMessagePayload(
+            "reaction content must not have leading or trailing whitespace".into(),
+        ));
+    }
+    if emoji.chars().any(char::is_control) {
+        return Err(AppError::InvalidAppMessagePayload(
+            "reaction content must not contain control characters".into(),
+        ));
+    }
+    if emoji.chars().count() > MAX_REACTION_CONTENT_CHARS {
+        return Err(AppError::InvalidAppMessagePayload(
+            "reaction content exceeds the maximum length".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn event_ref_tag(target_message_id: &str) -> Vec<String> {
+    vec![EVENT_REF_TAG.to_owned(), target_message_id.to_owned()]
+}
+
+fn validate_message_ref(target_message_id: &str) -> Result<(), AppError> {
+    if target_message_id.trim().is_empty() {
+        return Err(AppError::InvalidAppMessagePayload(
+            "target message id cannot be empty".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_stream_parent_message_id(parent_message_id: &str) -> Result<String, AppError> {
+    let raw = hex::decode(parent_message_id).map_err(|_| {
+        AppError::InvalidAppMessagePayload(
+            "agent text stream parent message id must be 32-byte hex".into(),
+        )
+    })?;
+    if raw.len() != 32 {
+        return Err(AppError::InvalidAppMessagePayload(
+            "agent text stream parent message id must be 32-byte hex".into(),
+        ));
+    }
+    Ok(hex::encode(raw))
+}
+
+fn validate_non_empty_field(value: &str, field: &str) -> Result<String, AppError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::InvalidAppMessagePayload(format!(
+            "{field} cannot be empty"
+        )));
+    }
+    Ok(trimmed.to_owned())
+}
+
+fn optional_non_empty_field(value: &Option<String>) -> Option<&str> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn optional_message_ref(value: &Option<String>) -> Result<Option<String>, AppError> {
+    let Some(value) = optional_non_empty_field(value) else {
+        return Ok(None);
+    };
+    validate_message_ref(value)?;
+    Ok(Some(value.to_owned()))
+}
+
+fn app_payload_base(kind_or_status: String, text: String) -> Map<String, Value> {
+    let mut content = Map::new();
+    content.insert("v".to_owned(), json!(1));
+    content.insert("status".to_owned(), Value::String(kind_or_status));
+    content.insert("text".to_owned(), Value::String(text));
+    content
+}
+
+/// Encode a built inner event into MLS application-message plaintext bytes.
+pub(crate) fn encode_inner_event(event: &MarmotInnerEvent) -> Result<Vec<u8>, AppError> {
+    event
+        .encode()
+        .map_err(|err| AppError::InvalidAppMessagePayload(err.to_string()))
+}
+
+/// True when an inner event is a kind-9 chat that finalizes an agent text
+/// stream (it carries a `stream` tag plus a `stream-start` or `stream-hash`
+/// tag). Such events flow as normal timeline messages, not start signals.
+pub fn is_stream_final_event(kind: u64, tags: &[Vec<String>]) -> bool {
+    kind == MARMOT_APP_EVENT_KIND_CHAT
+        && tag_value(tags, STREAM_TAG).is_some()
+        && (tag_value(tags, STREAM_START_TAG).is_some()
+            || tag_value(tags, STREAM_HASH_TAG).is_some())
+}
+
+/// First value of the named tag (`tag[0] == name` -> `tag[1]`).
+pub fn tag_value<'a>(tags: &'a [Vec<String>], name: &str) -> Option<&'a str> {
+    tags.iter()
+        .find(|tag| tag.first().is_some_and(|tag_name| tag_name == name))
+        .and_then(|tag| tag.get(1))
+        .map(String::as_str)
+}
+
+/// All values of the named tag across every matching tag entry.
+pub fn tag_values<'a>(tags: &'a [Vec<String>], name: &str) -> Vec<&'a str> {
+    tags.iter()
+        .filter(|tag| tag.first().is_some_and(|tag_name| tag_name == name))
+        .filter_map(|tag| tag.get(1))
+        .map(String::as_str)
+        .collect()
+}
+
+#[cfg(test)]
+mod mention_tests {
+    use super::*;
+    use crate::ids::{nprofile_for_account_id, npub_for_account_id};
+
+    fn valid_pubkey_hex() -> String {
+        nostr::prelude::Keys::generate().public_key().to_hex()
+    }
+
+    #[test]
+    fn mention_p_tags_handles_nostr_uri_npub_and_nprofile() {
+        let hex = valid_pubkey_hex();
+        let npub = npub_for_account_id(&hex).unwrap();
+        let nprofile = nprofile_for_account_id(&hex, &[]).unwrap();
+        // NIP-27 `nostr:` URIs carry bech32 entities (npub/nprofile), which the
+        // markdown tokenizer renders as mentions.
+        for token in [npub.as_str(), nprofile.as_str()] {
+            let content = format!("hey nostr:{token} how are you?");
+            assert_eq!(
+                mention_p_tags(&content),
+                vec![vec!["p".to_owned(), hex.clone()]],
+                "mention token form failed: {token}"
+            );
+        }
+    }
+
+    #[test]
+    fn mention_p_tags_ignores_nostr_uri_with_raw_hex() {
+        // `nostr:<raw-hex>` is not a NIP-21 URI (those carry bech32 entities,
+        // never raw hex), so the markdown tokenizer leaves it as literal text
+        // and never renders it as a mention. p-tag derivation tracks that
+        // display surface, so it yields no p-tag (mdk#617).
+        let hex = valid_pubkey_hex();
+        assert!(mention_p_tags(&format!("hey nostr:{hex} how are you?")).is_empty());
+    }
+
+    #[test]
+    fn mention_p_tags_dedups_same_pubkey_and_ignores_plain_text() {
+        let hex = valid_pubkey_hex();
+        let npub = npub_for_account_id(&hex).unwrap();
+        // Same pubkey referenced twice (bare `@npub1…` then `nostr:npub1…`)
+        // collapses to one p-tag.
+        let content = format!("ping @{npub} ... and again nostr:{npub}");
+        assert_eq!(mention_p_tags(&content), vec![vec!["p".to_owned(), hex]]);
+        assert!(mention_p_tags("plain text, no mentions here").is_empty());
+        assert!(mention_p_tags("a dangling nostr: with no token").is_empty());
+    }
+
+    #[test]
+    fn mention_p_tags_covers_bare_npub_mention() {
+        // Clients insert mentions as the bare `@npub1…` form (no `nostr:`),
+        // which the markdown tokenizer renders as a mention. That form must
+        // still get its NIP-27 `p`-tag on send. Regression for mdk#617.
+        let hex = valid_pubkey_hex();
+        let npub = npub_for_account_id(&hex).unwrap();
+        let content = format!("hey @{npub} how are you?");
+        assert_eq!(mention_p_tags(&content), vec![vec!["p".to_owned(), hex]]);
+    }
+
+    #[test]
+    fn mention_prefilter_matches_ast() {
+        let hex = valid_pubkey_hex();
+        let npub = npub_for_account_id(&hex).unwrap();
+        let profile = nprofile_for_account_id(&hex, &[]).unwrap();
+        for content in [
+            "ordinary **Markdown**, no references".to_owned(),
+            "日本語\n\n```rust\nlet n = 1;\n```".to_owned(),
+            format!("{npub} @{npub} nostr:{profile}"),
+            format!("`@{npub}` [@{npub}](https://example.com)"),
+            format!("&#64;{npub} \\@{npub}"),
+            format!("<details>\n<summary>@{npub}</summary>\nnostr:{profile}\n</details>"),
+            format!("{} @{npub}", "x".repeat(MAX_MARKDOWN_MENTION_SCAN_BYTES)),
+        ] {
+            let mut expected = Vec::new();
+            for block in &marmot_markdown::parse(markdown_mention_scan_input(&content)).blocks {
+                collect_block_mention_hexes(block, &mut expected);
+            }
+            assert_eq!(inline_mention_pubkey_hexes(&content), expected);
+        }
+    }
+
+    #[test]
+    fn chat_intent_p_tags_the_inline_mention() {
+        let hex = valid_pubkey_hex();
+        let npub = npub_for_account_id(&hex).unwrap();
+        let intent = AppMessageIntent::Chat {
+            content: format!("yo nostr:{npub}"),
+        };
+        let event = build_inner_event(&intent, &valid_pubkey_hex(), 0).unwrap();
+        assert!(event.tags.contains(&vec!["p".to_owned(), hex]));
+    }
+
+    #[test]
+    fn local_admission_preserves_legacy_chat_reply_and_media_wire_identity() {
+        let sender = valid_pubkey_hex();
+        let intents = [
+            AppMessageIntent::Chat {
+                content: "same text".into(),
+            },
+            AppMessageIntent::Reply {
+                target_message_id: "aa".repeat(32),
+                text: "same text".into(),
+            },
+            AppMessageIntent::Media {
+                message_tags: Vec::new(),
+                caption: Some("same text".into()),
+                attachments: vec![MediaAttachmentReference {
+                    locators: vec![],
+                    ciphertext_sha256: "11".repeat(32),
+                    plaintext_sha256: "22".repeat(32),
+                    nonce_hex: "33".repeat(12),
+                    file_name: "photo.jpg".into(),
+                    media_type: "image/jpeg".into(),
+                    version: "2".into(),
+                    source_epoch: 0,
+                    dim: None,
+                    thumbhash: None,
+                }],
+            },
+        ];
+        for intent in intents {
+            let legacy = build_inner_event(&intent, &sender, 42).unwrap();
+            let admitted = build_inner_event_with_media_reply(&intent, &sender, 42, None).unwrap();
+            assert_eq!(legacy.id, admitted.id);
+            assert_eq!(
+                encode_inner_event(&legacy).unwrap(),
+                encode_inner_event(&admitted).unwrap()
+            );
+            assert_eq!(legacy.content, admitted.content);
+            for event in [legacy, admitted] {
+                event.validate_id().unwrap();
+                let nonces: Vec<_> = event.tags.iter().filter(|tag| tag[0] == "nonce").collect();
+                assert!(nonces.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn reply_intent_keeps_e_q_and_adds_mention_p_tag() {
+        let hex = valid_pubkey_hex();
+        let npub = npub_for_account_id(&hex).unwrap();
+        let target = "ff".repeat(32);
+        let intent = AppMessageIntent::Reply {
+            target_message_id: target.clone(),
+            text: format!("re nostr:{npub}"),
+        };
+        let event = build_inner_event(&intent, &valid_pubkey_hex(), 0).unwrap();
+        assert!(
+            event
+                .tags
+                .contains(&vec![EVENT_REF_TAG.to_owned(), target.clone()])
+        );
+        assert!(event.tags.contains(&vec![QUOTE_REF_TAG.to_owned(), target]));
+        assert!(event.tags.contains(&vec!["p".to_owned(), hex]));
+    }
+
+    #[test]
+    fn mention_scan_input_cap_preserves_utf8_boundary() {
+        let input = format!("{}🦫", "a".repeat(MAX_MARKDOWN_MENTION_SCAN_BYTES - 1));
+        let capped = markdown_mention_scan_input(&input);
+        assert_eq!(capped, "a".repeat(MAX_MARKDOWN_MENTION_SCAN_BYTES - 1));
+    }
+
+    #[test]
+    fn mention_p_tags_walk_details_summary_and_body() {
+        let summary_hex = valid_pubkey_hex();
+        let body_hex = valid_pubkey_hex();
+        let summary_npub = npub_for_account_id(&summary_hex).unwrap();
+        let body_npub = npub_for_account_id(&body_hex).unwrap();
+        let closed = format!(
+            "<details>\n<summary>hi @{summary_npub}</summary>\nalso @{body_npub}\n</details>"
+        );
+        let opened = format!(
+            "<details open>\n<summary>hi @{summary_npub}</summary>\nalso @{body_npub}\n</details>"
+        );
+        let expected = vec![
+            vec!["p".to_owned(), summary_hex.clone()],
+            vec!["p".to_owned(), body_hex.clone()],
+        ];
+        assert_eq!(mention_p_tags(&closed), expected);
+        assert_eq!(mention_p_tags(&opened), expected);
+        let nested = format!(
+            "<details>\n<summary>outer</summary>\n<details>\n<summary>@{summary_npub}</summary>\n@{body_npub}\n</details>\n</details>"
+        );
+        assert_eq!(mention_p_tags(&nested), expected);
+        let in_code = format!(
+            "<details>\n<summary>`@{summary_npub}`</summary>\n```\n@{body_npub}\n```\n</details>"
+        );
+        assert!(mention_p_tags(&in_code).is_empty());
+        let ignored_attr = format!(
+            "<details title=\"@{summary_npub}\">\n<summary>plain</summary>\nbody\n</details>"
+        );
+        assert!(mention_p_tags(&ignored_attr).is_empty());
+        let duplicate = format!(
+            "<details>\n<summary>@{summary_npub}</summary>\nagain @{summary_npub}\n</details>"
+        );
+        assert_eq!(
+            mention_p_tags(&duplicate),
+            vec![vec!["p".to_owned(), summary_hex.clone()]]
+        );
+        let fallback = format!("<details>\n<summary>hi @{summary_npub}</summary>\nbody");
+        assert_eq!(
+            mention_p_tags(&fallback),
+            vec![vec!["p".to_owned(), summary_hex.clone()]]
+        );
+        let later = format!(
+            "<details>\n    code\n<summary>@{summary_npub}</summary>\n@{body_npub}\n</details>"
+        );
+        assert_eq!(mention_p_tags(&later), expected);
+        let heading_fallback =
+            format!("<details>\n<summary>@{summary_npub}\n# heading\n\n@{body_npub}\n</details>");
+        assert_eq!(mention_p_tags(&heading_fallback), expected);
+    }
+
+    #[test]
+    fn mention_p_tags_caps_pathological_markdown_before_parsing() {
+        let hex = valid_pubkey_hex();
+        let npub = npub_for_account_id(&hex).unwrap();
+        let input = format!(
+            "{}{} @{npub}",
+            "[".repeat(MAX_MARKDOWN_MENTION_SCAN_BYTES + 1024),
+            "]".repeat(MAX_MARKDOWN_MENTION_SCAN_BYTES + 1024)
+        );
+        assert!(mention_p_tags(&input).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod reporting_tests {
+    use super::*;
+    #[test]
+    fn report_and_label_builders_follow_the_simple_wire_contract() {
+        let target = "11".repeat(32);
+        let author = "22".repeat(32);
+        let reporter = "33".repeat(32);
+        let report = build_inner_event(
+            &AppMessageIntent::Report {
+                target_message_id: target.clone(),
+                target_author: Some(author.clone()),
+                reason: ReportReason::Other,
+                explanation: String::new(),
+            },
+            &reporter,
+            1,
+        )
+        .unwrap();
+        assert_eq!(report.kind, 1984);
+        assert_eq!(
+            report.tags,
+            vec![
+                vec!["e".to_owned(), target, "other".into()],
+                vec!["p".to_owned(), author]
+            ]
+        );
+        assert!(report.content.is_empty());
+        let label = build_inner_event(
+            &AppMessageIntent::DismissReports {
+                report_ids: vec![report.id.clone()],
+                explanation: "reviewed".into(),
+            },
+            &reporter,
+            2,
+        )
+        .unwrap();
+        assert_eq!(label.kind, 1985);
+        assert_eq!(label.content, "reviewed");
+        assert_eq!(
+            cgka_traits::reporting::parse_dismissal(&label.tags, &label.content),
+            Some(vec![report.id])
+        );
+        for kind in [1984, 1985, 4891] {
+            assert!(is_reserved_app_event_kind(kind));
+        }
+    }
+}
+
+#[cfg(test)]
+mod application_tag_tests {
+    use super::*;
+
+    fn tags() -> Vec<Vec<String>> {
+        vec![
+            vec!["effect".into(), "party".into()],
+            vec!["q".into(), "ab".repeat(32)],
+        ]
+    }
+
+    fn emoji_reference() -> MediaAttachmentReference {
+        MediaAttachmentReference {
+            locators: vec![],
+            ciphertext_sha256: "ab".repeat(32),
+            plaintext_sha256: "cd".repeat(32),
+            nonce_hex: "11".repeat(12),
+            file_name: "party.png".into(),
+            media_type: "image/png".into(),
+            version: "encrypted-media-v2".into(),
+            source_epoch: 1,
+            dim: None,
+            thumbhash: None,
+        }
+    }
+
+    fn sender() -> String {
+        nostr::prelude::Keys::generate().public_key().to_hex()
+    }
+
+    #[test]
+    fn tagged_chat_keeps_application_tags() {
+        let intent = AppMessageIntent::TaggedChat {
+            content: "hello".into(),
+            tags: tags(),
+        };
+        let event = build_inner_event(&intent, &sender(), 1).unwrap();
+        assert_eq!(event.kind, MARMOT_APP_EVENT_KIND_CHAT);
+        assert_eq!(event.tags, tags());
+    }
+
+    #[test]
+    fn media_appends_tags_after_imeta() {
+        let intent = AppMessageIntent::Media {
+            attachments: vec![emoji_reference()],
+            caption: None,
+            message_tags: tags(),
+        };
+        let event = build_inner_event(&intent, &sender(), 1).unwrap();
+        assert_eq!(event.kind, MARMOT_APP_EVENT_KIND_CHAT);
+        assert_eq!(event.tags[0][0], "imeta");
+        assert_eq!(&event.tags[1..], tags());
+    }
+
+    #[test]
+    fn media_reaction_emits_imeta_and_emoji() {
+        let emoji = vec!["emoji".into(), "party".into(), "https://blob/x".into()];
+        let intent = AppMessageIntent::Reaction {
+            target_message_id: "abc123".into(),
+            emoji: ":party:".into(),
+            tags: vec![emoji.clone()],
+            attachments: vec![emoji_reference()],
+        };
+        let event = build_inner_event(&intent, &sender(), 1).unwrap();
+        assert_eq!(event.kind, MARMOT_APP_EVENT_KIND_REACTION);
+        assert_eq!(event.content, ":party:");
+        assert_eq!(event.tags[0][0], "e");
+        assert_eq!(event.tags[1][0], "imeta");
+        assert_eq!(event.tags[2], emoji);
+    }
+
+    #[test]
+    fn reaction_rejects_forged_imeta_tag() {
+        let intent = AppMessageIntent::Reaction {
+            target_message_id: "abc123".into(),
+            emoji: ":party:".into(),
+            tags: vec![vec!["imeta".into(), "url https://blob/x".into()]],
+            attachments: Vec::new(),
+        };
+        assert!(build_inner_event(&intent, &sender(), 1).is_err());
+    }
+
+    #[test]
+    fn message_tag_count_limit() {
+        let tag = vec!["effect".to_owned()];
+        assert!(validate_message_tags(&vec![tag.clone(); 64]).is_ok());
+        assert!(validate_message_tags(&vec![tag; 65]).is_err());
+    }
+
+    #[test]
+    fn message_tag_byte_limit() {
+        let at_limit = vec![vec!["t".to_owned(), "x".repeat(16 * 1024 - 1)]];
+        assert!(validate_message_tags(&at_limit).is_ok());
+        let over_limit = vec![vec!["t".to_owned(), "x".repeat(16 * 1024)]];
+        assert!(validate_message_tags(&over_limit).is_err());
+    }
+
+    #[test]
+    fn message_tags_reject_malformed_rows() {
+        assert!(validate_message_tags(&[vec![]]).is_err());
+        assert!(validate_message_tags(&[vec![String::new(), "x".into()]]).is_err());
+        assert!(validate_message_tags(&[vec!["imeta".into(), "forged".into()]]).is_err());
+        assert!(validate_message_tags(&[vec!["q".into(), " ".into()]]).is_err());
+        assert!(validate_message_tags(&[vec!["e".into()]]).is_err());
+    }
+}

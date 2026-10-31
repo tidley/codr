@@ -39,6 +39,94 @@ fn release() -> update::Release {
         "checksum":{"filename":format!("{filename}.sha256"),"url":"https://blossom.example/checksum","sha256":"12".repeat(32),"size":"100"}})).unwrap()
 }
 
+#[test]
+fn default_probe_keeps_the_shipped_090_contract_and_full_probe_is_explicit() {
+    let binary = env!("CARGO_BIN_EXE_herdr-white-noise-bridge");
+    let output = std::process::Command::new(binary)
+        .arg("update-info")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let legacy: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(legacy.get("runtimes").is_none());
+    assert!(legacy.get("storage_cohort").is_none());
+    let output = std::process::Command::new(binary)
+        .args(["update-info", "--full"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let full: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(full, update::info().unwrap());
+    assert_eq!(legacy["connector"], full["connector"]);
+    assert_eq!(legacy["protocol"], full["protocol"]);
+    assert_eq!(legacy["state_version"], full["state_version"]);
+}
+
+#[test]
+fn shipped_090_installer_accepts_the_real_binary_without_changing_the_connector() {
+    let root = tempfile::tempdir().unwrap();
+    let bridge = setup(root.path());
+    std::fs::write(root.path().join("config.toml"), format!(
+        "phone_npub = {:?}\naccount_id_hex = {:?}\nherdr_socket = {:?}\nwn_agent_socket = {:?}\nstate_path = {:?}\n",
+        bridge.config.phone_npub, bridge.config.account_id_hex, bridge.config.herdr_socket,
+        bridge.config.wn_agent_socket, bridge.config.state_path)).unwrap();
+    let output = std::process::Command::new("python3")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/check_090_upgrade.py"
+        ))
+        .arg(root.path())
+        .arg(env!("CARGO_BIN_EXE_herdr-white-noise-bridge"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
+async fn external_mode_offers_local_handover_without_fabricating_a_release() {
+    let root = tempfile::tempdir().unwrap();
+    let mut bridge = setup(root.path());
+    bridge
+        .inbound(&event("handover-check", "/update"))
+        .await
+        .unwrap();
+    let offer = bridge.state.mappings["one"]
+        .update_offer
+        .as_ref()
+        .expect("local handover offer");
+    let value = serde_json::to_value(offer).unwrap();
+    assert!(value["release"].is_null());
+    assert_eq!(value["handover"], true);
+    assert!(
+        bridge
+            .state
+            .outbox
+            .last()
+            .unwrap()
+            .text
+            .contains("cold backup")
+    );
+    let code = offer.code.clone();
+    let job = update::prepare(
+        &mut bridge,
+        "one",
+        &"bb".repeat(16),
+        "handover-confirm",
+        &code,
+    )
+    .unwrap();
+    let request: Value =
+        serde_json::from_slice(&std::fs::read(job.join("request.json")).unwrap()).unwrap();
+    assert_eq!(request["action"], "handover");
+    assert!(request["release"].is_null());
+    assert!(job.join("handover.py").is_file());
+    assert!(job.join("codr.service").is_file());
+}
+
 fn event(id: &str, text: &str) -> Value {
     json!({"marmot_agent_control":"marmot.agent-control.v2","type":"inbound_message",
         "account_id_hex":"aa".repeat(32),"group_id_hex":"bb".repeat(16),
@@ -269,4 +357,157 @@ fn a_stale_offer_cannot_reinstall_or_downgrade_the_current_version() {
         .clone();
     assert!(update::prepare(&mut bridge, "one", &"bb".repeat(16), "stale", &code).is_err());
     assert!(bridge.state.update_job.is_none());
+}
+
+#[tokio::test]
+async fn code_free_confirmation_uses_a_fresh_offer_and_never_asks_for_a_code() {
+    let root = tempfile::tempdir().unwrap();
+    let mut bridge = setup(root.path());
+    update::store_offer(&mut bridge, "one", &"bb".repeat(16), "check", release()).unwrap();
+    let text = &bridge.state.outbox.last().unwrap().text;
+    assert!(text.contains("\n/update confirm\n"));
+    let offer = bridge.state.mappings["one"].update_offer.clone().unwrap();
+    assert!(!text.contains(&offer.code));
+    // Age the offer, not the clock, so the transport event is strictly newer.
+    bridge
+        .state
+        .mappings
+        .get_mut("one")
+        .unwrap()
+        .update_offer
+        .as_mut()
+        .unwrap()
+        .expires_at -= 2;
+    let mut confirm = event("plain-confirm", "/update confirm");
+    confirm["message"]["recorded_at"] = json!(herdr_white_noise_bridge::bridge::now());
+    bridge.inbound(&confirm).await.unwrap();
+    // The isolated test binary cannot pass managed-install preflight. Reaching
+    // that refusal proves the code-free route prepared and launched its helper.
+    assert!(bridge.state.mappings["one"].update_offer.is_none());
+    assert!(bridge.state.update_job.is_none());
+    assert!(
+        bridge
+            .state
+            .outbox
+            .last()
+            .unwrap()
+            .text
+            .contains("nothing was installed")
+    );
+    let count = bridge.state.outbox.len();
+    bridge.inbound(&confirm).await.unwrap();
+    assert_eq!(bridge.state.outbox.len(), count);
+}
+
+#[tokio::test]
+async fn code_free_confirmation_rejects_stale_or_unverifiable_transport_times() {
+    let root = tempfile::tempdir().unwrap();
+    let mut bridge = setup(root.path());
+    update::store_offer(&mut bridge, "one", &"bb".repeat(16), "check", release()).unwrap();
+    let before = bridge.state.mappings["one"].update_offer.clone();
+    let mut foreign = event("foreign-confirm", "/update confirm");
+    foreign["message"]["sender"]["account_id_hex"] = json!("22".repeat(32));
+    foreign["message"]["recorded_at"] = json!(herdr_white_noise_bridge::bridge::now());
+    bridge.inbound(&foreign).await.unwrap();
+    assert_eq!(bridge.state.mappings["one"].update_offer, before);
+    for (id, at) in [
+        ("missing-time", None),
+        ("stale-time", Some(1)),
+        ("future-time", Some(u64::MAX)),
+    ] {
+        let mut confirm = event(id, "/update confirm");
+        if let Some(at) = at {
+            confirm["message"]["recorded_at"] = json!(at);
+        }
+        bridge.inbound(&confirm).await.unwrap();
+        assert_eq!(bridge.state.mappings["one"].update_offer, before);
+        assert!(bridge.state.update_job.is_none());
+        assert!(
+            !bridge
+                .state
+                .outbox
+                .last()
+                .unwrap()
+                .text
+                .contains("Use /update,")
+        );
+    }
+}
+
+#[tokio::test]
+async fn starting_a_new_check_clears_the_old_offer_before_the_background_check() {
+    let root = tempfile::tempdir().unwrap();
+    let mut bridge = setup(root.path());
+    bridge.update_messaging_home = Some(root.path().join("mdk"));
+    update::store_offer(&mut bridge, "one", &"bb".repeat(16), "check", release()).unwrap();
+    bridge.inbound(&event("refresh", "/update")).await.unwrap();
+    assert!(bridge.state.mappings["one"].update_offer.is_none());
+    // Current-thread Tokio has not polled the spawned check; Drop cancels it.
+    drop(bridge);
+}
+
+#[tokio::test]
+async fn combined_update_records_home_and_waits_for_messaging_readiness() {
+    use tokio::{io::AsyncWriteExt, net::UnixListener};
+    let root = tempfile::tempdir().unwrap();
+    let mut bridge = setup(root.path());
+    let home = root.path().join("messaging");
+    std::fs::create_dir(&home).unwrap();
+    bridge.update_messaging_home = Some(home.clone());
+    update::store_offer(&mut bridge, "one", &"bb".repeat(16), "check", release()).unwrap();
+    assert!(
+        bridge
+            .state
+            .outbox
+            .last()
+            .unwrap()
+            .text
+            .contains("messaging executable will update together")
+    );
+    let code = bridge.state.mappings["one"]
+        .update_offer
+        .as_ref()
+        .unwrap()
+        .code
+        .clone();
+    let directory =
+        update::prepare(&mut bridge, "one", &"bb".repeat(16), "confirm", &code).unwrap();
+    let request: Value =
+        serde_json::from_slice(&std::fs::read(directory.join("request.json")).unwrap()).unwrap();
+    assert_eq!(request["service"], "codr");
+    assert_eq!(request["messaging_home"], home.to_str().unwrap());
+    assert_eq!(request["info"]["storage_cohort"], "mdk-0.14");
+    let socket = bridge.config.wn_agent_socket.clone();
+    let account = bridge.config.account_id_hex.clone();
+    let worker = tokio::spawn(async move { bridge.run(false).await });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let early = directory.join("ready.json").exists();
+    let listener = UnixListener::bind(&socket).unwrap();
+    let messaging = tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = tokio::io::BufReader::new(stream);
+            let request = herdr_white_noise_bridge::wire::read_line(&mut stream)
+                .await
+                .unwrap();
+            let response = json!({"id":request["id"], "marmot_agent_control":"marmot.agent-control.v2", "type":"account_list", "accounts":[{"account_id_hex":account,"local_signing":true}]});
+            let _ = stream
+                .get_mut()
+                .write_all(format!("{response}\n").as_bytes())
+                .await;
+        }
+    });
+    let ready = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !directory.join("ready.json").exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    worker.abort();
+    messaging.abort();
+    assert!(
+        !early,
+        "combined readiness must not be published before messaging works"
+    );
+    ready.unwrap();
 }

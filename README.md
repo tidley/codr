@@ -19,8 +19,10 @@ New bridge accounts introduce themselves as **Pat**, your messenger between Whit
 
 ## Install
 
-**Current stable: `v0.9.0`.** See the [release notes](docs/releases/0.9.0.md)
-and [release verification and update-test guide](docs/releases/0.9.0-readiness.md).
+**0.10.0 targets existing accounts.** Fresh accounts use the
+stable 0.9.0 setup below, then the owner-confirmed chat handover. See the
+[0.10.0 release notes](docs/releases/0.10.0.md) and
+[combined runtime/handover guide](docs/COMBINED.md).
 
 Needs Linux x86_64 or aarch64 or macOS on Apple silicon or Intel, a per-user service manager (systemd or launchd), Python 3.11+, Git, and **herdr** 0.9.1+. No Rust toolchain required.
 
@@ -37,7 +39,22 @@ Or give your coding agent this prompt, with your own public key:
 
 [Full installation and upgrade guide →](docs/INSTALL.md)
 
-### New in 0.9.0
+### New in 0.10.0
+
+- One executable hosts bridge and messaging in one managed service. Chat upgrades
+  keep the existing worker service name.
+- `/update confirm` needs no code and updates both embedded components together.
+- Existing 0.9 users have a two-stage chat upgrade: first the bridge-only update,
+  then a separately confirmed cold backup and combined-service handover.
+  The first step still uses 0.9's old confirmation code. Supported managed
+  installations need no terminal commands. [Upgrade details](docs/COMBINED.md).
+  This implementation targets existing accounts.
+- Large OpenCode histories use bounded 100-message pages instead of full exports,
+  so the 128 MiB reader limit no longer blocks synchronization of the whole export.
+- New verified native sessions get separate chats, including on reused terminals.
+  Native V2 decision choices use their verified form API, and project menus are shorter.
+
+### Retained from 0.9.0
 
 - Read this chat's latest message with `/last`, or several with `/last4`, without
   resuming sync. `/recent [hours]` keeps its three-message excerpt per active chat.
@@ -94,7 +111,7 @@ New phone text does not join a worker-scheduled task queue. Messages are deliver
 
 Handoff is automatic. Manual controls remain available through **herdr**'s **White Noise forwarding: At desk / Away** action. [Controls and limits →](docs/REFERENCE.md#at-desk--away-forwarding)
 
-**Phone updates:** `/update` shows an available version and a ten-minute confirmation command. `/update cancel` dismisses the offer. Updates use ngit v3 and independent Blossom downloads, not GitHub. Only the managed bridge worker restarts; connector/storage changes require local setup. [Update safety and recovery →](docs/REFERENCE.md#confirmed-updates-from-ngit)
+**Phone updates:** `/update` shows an offer; reply **`/update confirm`** within ten minutes in 0.10, with no code. `/update cancel` dismisses it. The first 0.9-to-0.10 update keeps the external connector and still uses 0.9's displayed code. Send `/update` again in 0.10 to confirm the private cold backup and combined-service handover. Supported standard installations need no shell commands. Later combined updates replace bridge and messaging together. Unsupported layouts and storage migrations still require local setup. [Upgrade details →](docs/COMBINED.md) · [Update safety →](docs/REFERENCE.md#confirmed-updates-from-ngit)
 
 To test an update, wait for the stable release and its verified ngit/Blossom
 mirror, then send `/update` from the owner's phone. Check the offered version

@@ -1,0 +1,8265 @@
+//! First app runtime bridge for Marmot.
+//!
+//! This crate wires `AccountHome` into the concrete local runtime pieces needed by
+//! early app surfaces: encrypted session storage, Nostr MLS peeling, Nostr
+//! transport publishing, and relay-backed app projections.
+
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use async_trait::async_trait;
+use cgka_engine::{
+    FeatureRegistry, canonicalization::CanonicalizationPolicy, key_package::key_package_metadata,
+};
+use cgka_session::{AccountDeviceSession, SessionConfig};
+use cgka_traits::agent_text_stream::{
+    AGENT_TEXT_STREAM_QUIC_FANOUT_CAPABILITY, AGENT_TEXT_STREAM_QUIC_FANOUT_FEATURE,
+    AGENT_TEXT_STREAM_QUIC_RECEIVE_CAPABILITY, AGENT_TEXT_STREAM_QUIC_RECEIVE_FEATURE,
+    AGENT_TEXT_STREAM_QUIC_SEND_CAPABILITY, AGENT_TEXT_STREAM_QUIC_SEND_FEATURE,
+};
+#[allow(deprecated)]
+pub use cgka_traits::app_components::{
+    AGENT_TEXT_STREAM_QUIC_COMPONENT as AGENT_TEXT_STREAM_COMPONENT,
+    AGENT_TEXT_STREAM_QUIC_COMPONENT_ID as AGENT_TEXT_STREAM_COMPONENT_ID,
+    GROUP_ADMIN_POLICY_COMPONENT, GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_AVATAR_URL_COMPONENT_ID,
+    GROUP_BLOSSOM_IMAGE_COMPONENT, GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
+    GROUP_ENCRYPTED_MEDIA_COMPONENT, GROUP_ENCRYPTED_MEDIA_COMPONENT_ID,
+    GROUP_ENCRYPTED_MEDIA_V1_COMPONENT, GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
+    GROUP_ENCRYPTED_MEDIA_V2_COMPONENT, GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+    GROUP_MESSAGE_RETENTION_COMPONENT, GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+    GROUP_PROFILE_COMPONENT, GROUP_PROFILE_COMPONENT_ID, NOSTR_ROUTING_COMPONENT,
+    NOSTR_ROUTING_COMPONENT_ID,
+};
+use cgka_traits::app_components::{
+    AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, NostrRoutingV1, default_group_components,
+};
+pub use cgka_traits::app_event::AppMessageRetentionDecision;
+use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM};
+use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
+use cgka_traits::engine::{GroupEvent, KeyPackage};
+use cgka_traits::storage::{
+    DisbandRequestStatus, DisbandRequestStorage, DisbandTombstoneStorage, KeyPackageBundleStorage,
+    LeaveRequestStorage, MaintenanceStorage,
+};
+use cgka_traits::transport::{TransportEnvelope, TransportMessage};
+use cgka_traits::{
+    GroupId, MemberId, MessageId, TransportEndpoint, TransportGroupSubscription,
+    TransportPublishTarget,
+};
+use marmot_account::{
+    AccountDeviceRuntime, AccountHome, AccountHomeError, AccountSetupKind, AccountSummary,
+    KeyPackagePublication, KeyPackagePublishError, KeyPackagePublishReceipt, KeyPackagePublisher,
+    TransportRoutingError, TransportRoutingPolicy,
+};
+use nostr_sdk::prelude::{
+    EventBuilder, FinalizeUnsignedEvent, Kind, PublicKey, Tag, Timestamp as NostrTimestamp,
+};
+use rand::RngCore;
+use rand::rngs::OsRng;
+use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
+use storage_sqlite::{
+    SecurePruneAppEventsResult, SqliteAccountStorage, SqliteSharedStorage, StoredAppMessageQuery,
+    TimelineProjectionUpdate,
+};
+use transport_nostr_adapter::{
+    KIND_MARMOT_INBOX_RELAY_LIST, KIND_MARMOT_KEY_PACKAGE, KIND_NIP65_RELAY_LIST,
+    NostrAccountRelayListKind, NostrAccountRelayListPublication, NostrEventPublishRequest,
+    NostrKeyPackagePublication, NostrKeyPackagePublisher, NostrNip65RelayListPublication,
+    NostrNip65RelaySet, NostrRelayClient,
+};
+use transport_nostr_peeler::{NostrMlsPeeler, NostrTransportEvent};
+
+mod close_registry;
+mod user_blocks;
+pub use runtime::RuntimeBlockListSubscription;
+pub use user_blocks::{BlockListSnapshot, BlockedUser};
+mod agent_streams;
+mod app_telemetry;
+mod collector_host_safety;
+mod network_proxy;
+pub mod product_analytics;
+pub use product_analytics::*;
+mod audit_log;
+pub mod audit_otlp_sender;
+mod chat_presentation;
+mod client;
+mod config;
+mod deployment;
+pub use deployment::{
+    KeyPackageClientPreference, MarmotDeployment, NEUTRAL_KEYCHAIN_SERVICE_NAME,
+    OpenRankingProvider,
+};
+pub mod conversation_presentation;
+mod conversions;
+mod directory_resources;
+#[cfg(test)]
+mod directory_tests;
+mod drafts;
+mod local_submissions;
+pub use local_submissions::{LocalSendAcceptance, LocalSendStatus};
+mod error;
+mod external_signer;
+mod groups;
+mod history_notices;
+pub use history_notices::{HistoryNotice, HistoryNoticeCause};
+mod ids;
+mod key_package_records;
+#[cfg(test)]
+mod local_open_test_gate;
+mod media;
+mod profile_pseudonyms;
+#[cfg(feature = "media-benchmarks")]
+#[doc(hidden)]
+pub use media::MediaDownloadBenchmarkTransport;
+mod audit_export_lifecycle;
+mod messages;
+mod moderation_reports;
+pub use moderation_reports::{
+    MODERATION_REPORT_EXPLANATION_MAX_CHARS, MODERATION_REPORT_IDEMPOTENCY_WINDOW,
+    MODERATION_REPORT_RATE_LIMIT, MODERATION_REPORT_RATE_WINDOW, ModerationReportConfig,
+    ModerationReportOrigin, ModerationReportOutcome, ModerationReportRetrySummary,
+    ModerationReportStatus,
+};
+mod nostr_secret;
+mod nostr_verification;
+mod notifications;
+mod profile_publication;
+mod projection;
+mod publisher_sequences;
+mod relay_telemetry_export;
+mod root_closers;
+mod root_runtime_lease;
+mod runtime;
+mod sqlcipher;
+mod startup_diagnostics;
+pub use startup_diagnostics::{
+    NativeStartupObservation, NativeStartupOutcome, NativeStartupSnapshot, NativeStartupStage,
+};
+#[cfg(feature = "test-policy-overrides")]
+mod test_support;
+
+pub use cgka_traits::engine::{
+    SupersededIntentKind, SupersededIntentOutcome, SupersededIntentReport,
+};
+use external_signer::{AccountSigner, RegisteredExternalSigner};
+pub use external_signer::{EXTERNAL_SIGNER_REJECTED, ExternalAccountSigner};
+pub(crate) use groups::AppGroupImageInput;
+pub use marmot_account::MaintenanceTiming;
+pub use root_runtime_lease::{MARMOT_ROOT_RUNTIME_LOCK_FILE, MarmotRootRuntimeLease};
+use runtime::account_worker::{AccountStartupProgress, AccountStartupStage};
+pub(crate) use runtime::blocking_app_task;
+pub use runtime::{
+    AccountAttentionEntry, AccountAttentionSnapshot, AccountAttentionState, AccountAttentionTotal,
+    AccountAttentionUnavailable, AccountManager, AccountSetupReadiness, AccountSetupRequest,
+    AccountSetupResult, AgentPublisher, AgentPublisherOptions, AgentPublisherRecord,
+    AgentPublisherRouting, AgentStreamWatchOptions, AgentTextStreamCryptoContext,
+    AuditOtlpAttemptOutcome, CatchUpAccountsSummary, ChatListUpdateTrigger, GroupLeaveFailure,
+    LocalCleanupReport, ManagedAccount, MarmotAppEvent, MarmotAppRuntime, OnboardingAction,
+    OnboardingCheckOutcome, OnboardingCheckPurpose, OnboardingDeviceDiscovery,
+    OnboardingDevicePackage, OnboardingFinding, OnboardingFindingContext, OnboardingIssue,
+    OnboardingOptions, OnboardingRelayCapability, OnboardingRelayRepair, OnboardingRelayRepairMode,
+    OnboardingRelayTag, OnboardingRelayTagChange, OnboardingRelayTagDisposition,
+    OnboardingRelayTagRole, OnboardingRepairProposal, OnboardingSingleDeviceNotice,
+    OnboardingSnapshot, OnboardingStatus, OnboardingStep, OnboardingStepState,
+    OnboardingSubscription, RelayFailure, RuntimeAccountAttentionSubscription, RuntimeAccountError,
+    RuntimeAgentStreamMessage, RuntimeAgentStreamUpdate, RuntimeAgentStreamWatch,
+    RuntimeChatListSubscription, RuntimeChatListUpdate, RuntimeChatsSubscription,
+    RuntimeEventsSubscription, RuntimeGroupEvent, RuntimeGroupStateSubscription,
+    RuntimeMessageReceived, RuntimeMessageUpdate, RuntimeMessagesSubscription,
+    RuntimeNotificationsSubscription, RuntimeProjectionUpdate, RuntimeSharedServices,
+    RuntimeTimelineMessageUpdate, RuntimeTimelineMessagesSubscription, SignOutOptions,
+    SignOutOutcome, StreamStartView, TimelineWindowHandle, WipeOutcome,
+};
+pub use runtime::{
+    CHAT_LIST_WINDOW_INITIAL_ROWS, CHAT_LIST_WINDOW_MAX_ROWS, ChatListAnchorOutcome,
+    ChatListPageDirection, ChatListView, ChatListWindowError, ChatListWindowHandle,
+    ChatListWindowSnapshot, PresentedChatListUpdate, RuntimeChatListWindowSubscription,
+    RuntimePresentedChatListSubscription,
+};
+pub use runtime::{
+    CONVERSATION_WINDOW_MAX_ROWS, ConversationAnchor, ConversationOpenAnchorOutcome,
+    ConversationOpenQuery, ConversationOpenReadState, ConversationOpenTarget,
+    ConversationPageDirection, ConversationWindowError, ConversationWindowHandle,
+    ConversationWindowRevision, ConversationWindowSnapshot, RuntimeConversationWindowSubscription,
+};
+pub(crate) use sqlcipher::{SqlcipherDatabaseKind, remove_sqlite_file_set};
+pub use storage_sqlite::{
+    CHAT_LIST_DRAFT_PREVIEW_CHARS, ChatListDraftPreview, ChatListRowActions, ChatPinState,
+    ChatPresentationVersion, ConversationOpenError, ConversationPresentation,
+    PresentationResolution, PresentationSource, PresentationText, PresentedChatListSnapshot,
+    PresentedChatRow, SelectedAvatar, SelectedChatPreview, TimelineMessageChange,
+    TimelineRemoveReason, TimelineUpdateTrigger,
+};
+
+pub use agent_streams::{
+    AgentStreamDelta, AgentStreamUpdate, AgentStreamWatchCompletion, AgentStreamWatchManager,
+    AgentStreamWatchReport, AgentStreamWatchStart,
+};
+pub use app_telemetry::{
+    AppPerformanceOperationSnapshot, AppPerformanceSnapshot, AppPerformanceTelemetry,
+    HostPerformanceOperation, HostPerformanceOutcome, RuntimePerformanceOperation,
+    RuntimePerformanceSnapshot, SyncErrorClass, SyncFailureClassification, SyncFailureCount,
+    SyncFailureStage,
+};
+pub use audit_log::{
+    AuditLogDeleteOutcome, AuditLogFile, AuditLogSettings, AuditLogTrackerUpdateResult,
+    AuditLogUploadResult, AuditOtlpTrackerResult,
+};
+pub use cgka_traits::{
+    MARMOT_APP_EVENT_KIND_POLL, MARMOT_APP_EVENT_KIND_POLL_RESPONSE, PollOptionResult,
+    PollProjection, PollType, PollVote, PollVotePage,
+};
+pub use client::AppClient;
+pub(crate) use client::{ConvergenceScheduleState, EpochBackfillRunOutcome};
+pub use config::{
+    AttachmentAcquisitionMode, AttachmentAcquisitionPolicy, AuditLogTrackerConfig,
+    AuditLogUploadSource, CursorPersistence, MarmotAppConfig, MarmotServiceEndpoints,
+    RelayTelemetryExportConfig, RelayTelemetryResource, RelayTelemetryRuntimeConfig,
+    RelayTelemetrySettings,
+};
+pub use drafts::{
+    ChatListDraftVersion, MessageDraft, MessageDraftAttachment, MessageDraftAttachmentSummary,
+    MessageDraftInvalidation, MessageDraftRevision, MessageDraftSummary, SelectedMessageDraft,
+    SelectedMessageDraftAttachment, SelectedMessageDraftContent,
+};
+pub use error::{
+    AccountCatchUpFailure, AppError, FullHistoryRepairIncompleteReason, MissingKeyPackageReason,
+};
+pub use groups::{
+    AppAgentTextStreamComponent, AppBlobEndpoint, AppCreateGroupOptions, AppDisbandFailureReason,
+    AppDisbandRequest, AppGroupAdminPolicyComponent, AppGroupAvatarUrlComponent,
+    AppGroupConversationSnapshot, AppGroupEncryptedMediaComponent,
+    AppGroupHydrationQuarantineReason, AppGroupImageComponent, AppGroupLifecycleState,
+    AppGroupMemberIds, AppGroupMemberRecord, AppGroupMessageRetentionComponent, AppGroupMlsState,
+    AppGroupNostrRoutingComponent, AppGroupOpaqueComponent, AppGroupProfileComponent,
+    AppGroupRecord, AppGroupRoster, AppGroupRosterMember, AppGroupSystemEvent,
+    AppInitialGroupImage, AppPreparedGroupImageUpload, AppPreparedGroupImageUploadState,
+    AppPriorNostrRoute, AppProtocolProfile, AppQuarantinedGroup, GroupRecoveryStatus,
+    GroupRejoinInvitation, GroupSystemEventProvenance, MAX_GROUP_MEMBER_IDS_PAGE_SIZE,
+    PendingGroupInvite, group_system_event_from_message,
+};
+pub use ids::{
+    account_id_hex_from_ref, nprofile_for_account_id, npub_for_account_id, validate_relay_urls,
+};
+pub use media::file_transfer::{
+    MAX_FILE_MEDIA_CIPHERTEXT_BYTES, MediaFileTransferControl, MediaFileUploadAttachmentRequest,
+    MediaFileUploadRequest,
+};
+pub use media::handoff::AttachmentHandoff;
+pub use media::{
+    ENCRYPTED_MEDIA_VERSION, EncryptedMediaVersion, MAX_ENCRYPTED_MEDIA_BLOB_BYTES,
+    MAX_GROUP_IMAGE_BYTES, MAX_GROUP_IMAGE_DIMENSION, MAX_GROUP_IMAGE_PIXELS,
+    MediaAttachmentOutcome, MediaAttachmentReference, MediaAttachmentRejection,
+    MediaAttachmentRejectionKind, MediaDownloadResult, MediaLocator, MediaUploadAttachmentRequest,
+    MediaUploadAttachmentResult, MediaUploadRequest, MediaUploadResult, download_profile_image,
+    media_attachment_from_imeta_tag, media_attachment_outcomes_from_media_json,
+    media_attachment_outcomes_from_tags, parse_media_attachment,
+};
+pub use messages::{is_reserved_app_event_kind, is_stream_final_event, tag_value, tag_values};
+pub use nostr_directory::Directory;
+#[cfg(test)]
+use nostr_directory::USER_DIRECTORY_SEARCH_MAX_FRONTIER;
+pub use nostr_directory::error::DirectoryError;
+#[cfg(test)]
+pub(crate) use nostr_directory::relays_from_relay_list_event;
+pub use nostr_directory::{
+    AccountRelayListState, AccountRelayListStatus, FetchedKeyPackage, MissingRelayListKind,
+};
+pub use nostr_directory::{
+    CachedIdentityProjection, DirectoryKeyPackage, MAX_CACHED_IDENTITY_PAGE_SIZE, MatchQuality,
+    MatchedField, MemberKeyPackagePrewarmSummary, OFF_GRAPH_SEARCH_RADIUS, SearchUpdateTrigger,
+    UserDirectoryLocalAccount, UserDirectoryRecord, UserDirectoryRefresh, UserDirectorySearch,
+    UserDirectorySearchResult, UserProfileMetadata, UserSearchParams, UserSearchSubscription,
+    UserSearchUpdate, sort_user_search_results,
+};
+pub(crate) use nostr_directory::{KIND_NOSTR_CONTACT_LIST, KIND_NOSTR_METADATA};
+pub use nostr_directory::{
+    MAX_PUBLIC_EVENT_REFERENCES, PublicEventPreview, PublicEventPreviewRead,
+};
+pub(crate) use nostr_directory::{
+    push_unique_strings, relay_list_state_from_event, sort_directory_records,
+};
+pub use nostr_secret::is_nostr_secret;
+pub use nostr_verification::verify_public_nostr_event_json;
+pub use notifications::{
+    BackgroundNotificationCollection, ChatNotificationSettings, GroupPushDebugInfo,
+    GroupPushTokenDebugEntry, GroupPushTokenRecord, KIND_MARMOT_NOTIFICATION_RUMOR,
+    KIND_MARMOT_NOTIFICATION_SERVER_RELAYS, LocalPushRegistrationDebug,
+    MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST, MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL,
+    MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE, NotificationCollectionStatus, NotificationSettings,
+    NotificationTrafficClass, NotificationTrigger, NotificationUpdate, NotificationUser,
+    NotificationWakeSource, PUSH_ENCRYPTED_TOKEN_LEN, PUSH_VERSION, PushPlatform, PushRegistration,
+    PushRegistrationShareOutcome, PushRegistrationShareStatus, PushRegistrationSyncResult,
+    build_notification_gift_wrap, build_notification_rumor_content, encrypted_push_token,
+    parse_provider_token, push_token_fingerprint,
+};
+pub use profile_pseudonyms::{default_profile_pseudonym, random_profile_pseudonym};
+pub use relay_telemetry_export::{
+    ExportHistogram, ExportMetricPoint, ExportMetricValue, RelayExportError,
+    RelayTelemetryExportBatch, RelayTelemetryExporter, build_export_batch,
+    build_export_batch_with_app_performance, metric_names,
+};
+pub use storage_sqlite::{
+    ChatConversationKind, ChatListAttachmentKind, ChatListAvatar, ChatListMessageDeliveryState,
+    ChatListMessagePreview, ChatListQuery, ChatListRow, DeletionSource, ExistingDirectConversation,
+    MAX_TIMELINE_LIMIT, SelfMembership, TimelineEditHistoryPage, TimelineEditSummary,
+    TimelineEditVersion, TimelineMessageQuery, TimelineMessageRecord, TimelinePage,
+    TimelinePagination, TimelineReactionSummary, TimelineReplyPreview, TimelineUserReaction,
+    select_reusable_direct_conversation,
+};
+#[cfg(test)]
+use transport_nostr::DirectoryRelayEventRecord as RelayEventRecord;
+pub use transport_nostr::{
+    EngineReorgMetrics, MarmotRelayPlane, MarmotRelayPlaneAccountAdapter,
+    RelayEndpointClassification, RelayEndpointPolicy, RelayPlaneHealth, RelayRollupEntry,
+    RelayTelemetryRollup, RelayTelemetrySnapshot, retired_relay_hosts,
+};
+#[cfg(test)]
+use transport_nostr_adapter::parse_nip65_relay_set;
+pub use transport_nostr_adapter::{
+    DurationHistogramSnapshot, HistogramBucket, NostrAdapterMetrics, RelayDeliverySpread,
+    RelayDeliveryStats, RelayLabelResolution, RelayLatencyStats, RelayRefusalStats,
+    RelaySyncSnapshot, SubscriptionRefusalDisposition, SubscriptionRouteKind,
+};
+
+/// Canonical group-create result at the host response boundary.
+///
+/// `chat_list_row` is the exact row committed with the app projection before
+/// this value is returned. Hosts can navigate immediately without issuing a
+/// read-after-create query.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreatedGroup {
+    pub group_id: GroupId,
+    pub chat_list_row: ChatListRow,
+}
+
+/// Internal outcome used to preserve the legacy create API's post-canonical
+/// success contract while the detailed API requires its durable projection.
+#[derive(Clone, Debug)]
+pub(crate) struct CanonicalCreatedGroup {
+    pub group_id: GroupId,
+    pub chat_list_row: Option<ChatListRow>,
+}
+
+impl CanonicalCreatedGroup {
+    pub(crate) fn into_detailed(self) -> Result<CreatedGroup, AppError> {
+        let group_id_hex = hex::encode(self.group_id.as_slice());
+        let chat_list_row = self
+            .chat_list_row
+            .ok_or(AppError::CreatedGroupProjectionUnavailable(group_id_hex))?;
+        Ok(CreatedGroup {
+            group_id: self.group_id,
+            chat_list_row,
+        })
+    }
+}
+
+fn chat_pin_error_from_storage(error: storage_sqlite::ChatPinError) -> AppError {
+    match error {
+        storage_sqlite::ChatPinError::Storage(error) => AppError::Storage(error),
+        storage_sqlite::ChatPinError::UnknownGroup(group_id_hex) => {
+            AppError::UnknownGroup(group_id_hex)
+        }
+        storage_sqlite::ChatPinError::ArchivedChat => {
+            AppError::InvalidChatPin("archived chats cannot be pinned".to_owned())
+        }
+        storage_sqlite::ChatPinError::InvalidOrder(details) => AppError::InvalidChatPin(details),
+    }
+}
+
+use conversions::{
+    account_group_push_token_from_app, account_push_registration_from_app,
+    account_state_from_stored, app_group_from_stored_group, app_message_record_from_stored,
+    chat_notification_settings_from_account, group_push_token_from_account,
+    normalize_relay_telemetry_settings, notification_settings_from_account,
+    pending_push_registration_removal_from_account, relay_telemetry_settings_from_storage,
+    relay_telemetry_settings_to_storage, stored_app_event_from_message_record,
+    stored_app_event_from_projection, stored_push_registration_from_account,
+    stored_state_from_account_state,
+};
+use ids::parse_account_id_hex;
+use key_package_records::{
+    account_key_package_record_from_fetched, account_key_package_relay_events_from_records,
+    key_package_from_hex_with_optional_source, key_package_from_record, merge_key_package_records,
+    parse_key_package_event_id_hex, publish_endpoints_from_bootstrap,
+};
+#[cfg(test)]
+use key_package_records::{
+    fresh_or_cached_key_package, latest_fresh_key_package_from_records,
+    validated_cached_key_package,
+};
+use nostr_directory::DirectoryCache;
+use nostr_directory::display_name_for_profile;
+use projection::LegacyAccountProjectionDb;
+
+const LEGACY_ACCOUNT_APP_DB_FILE: &str = "app.sqlite3";
+const LEGACY_ACCOUNT_PROJECTION_IMPORT_MARKER: &str = "legacy-account-projection-v1";
+/// Once-only marker for the open/upgrade backfill that derives
+/// `account_groups.self_membership` from current engine state for rows that
+/// predate migration 0018 (where every row defaulted to `'member'`).
+const SELF_MEMBERSHIP_BACKFILL_MARKER: &str = "self-membership-backfill-v1";
+/// Once-only marker for the open/upgrade backfill that writes
+/// `direct_conversation_members` from live rosters for Direct groups that
+/// predate migration 0050.
+const DIRECT_CONVERSATION_MEMBERS_BACKFILL_MARKER: &str = "direct-conversation-members-backfill-v1";
+/// Invalidation reason for a sent app event that will never reach anyone,
+/// whether it was refused at send time or its group turned terminal while the
+/// engine still held it. The derived-state SQL keys the app-facing `Failed`
+/// delivery state off this exact literal, so both producers must share it —
+/// which is why storage owns the definition and this is a re-export rather than
+/// a second copy of the string.
+pub(crate) use storage_sqlite::LOCAL_PUBLISH_FAILED_REASON;
+const APP_CACHE_DB_FILE: &str = "app-cache.sqlite3";
+const SHARED_DB_FILE: &str = "shared.sqlite3";
+const KEY_PACKAGE_CUTOVER_RELAY_SCAN_LIMIT: usize = 1_024;
+const SESSION_DB_FILE: &str = "session.sqlite";
+const KEY_PACKAGE_DIR: &str = "key-packages";
+const SDK_FIRST_SYNC_WAIT: Duration = Duration::from_millis(750);
+const SDK_DRAIN_WAIT: Duration = Duration::from_millis(250);
+/// How long a recovery attempt waits before the automatic seams may start
+/// another, doubling per attempt up to [`EPOCH_BACKFILL_RETRY_BACKOFF_CAP`].
+///
+/// Without pacing, the receive seam would start a recovery job after *every*
+/// inbound ingest. Progress (new coverage or admitted history) resets it to
+/// this floor, which matches the maintenance tick cadence.
+pub(crate) const EPOCH_BACKFILL_RETRY_BACKOFF: Duration = Duration::from_secs(15);
+/// Ceiling on the doubling in [`EPOCH_BACKFILL_RETRY_BACKOFF`]. A relay outage
+/// that outlasts this is not going to be resolved by trying harder, and the
+/// intent is durable, so a five-minute floor between attempts costs nothing but
+/// leaves recovery responsive when the relay returns.
+pub(crate) const EPOCH_BACKFILL_RETRY_BACKOFF_CAP: Duration = Duration::from_secs(5 * 60);
+const APP_RUNTIME_ACCOUNT_READY_WAIT: Duration = Duration::from_secs(45);
+/// Local worker operations include SQLite's bounded busy retry but no relay or
+/// blob transfer. A missing response beyond this point indicates a wedged
+/// worker, not ordinary storage contention.
+const APP_RUNTIME_LOCAL_WORKER_RESPONSE_WAIT: Duration = Duration::from_secs(10);
+/// Default deadline for worker commands that may sign, publish, or perform a
+/// bounded relay exchange.
+const APP_RUNTIME_WORKER_RESPONSE_WAIT: Duration = Duration::from_secs(2 * 60);
+/// Legacy media commands have a 15-minute transfer cap; leave one minute for
+/// queueing, projection, and response delivery. File uploads wait for their
+/// size-bounded endpoint attempts instead of using this outer deadline.
+const APP_RUNTIME_LONG_WORKER_RESPONSE_WAIT: Duration = Duration::from_secs(16 * 60);
+/// Cap for advisory account-setup steps (directory discovery/refresh): their
+/// results are best-effort, so a slow indexer must not stall login.
+pub(crate) const ACCOUNT_SETUP_ADVISORY_WAIT: Duration = Duration::from_secs(10);
+const APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
+const APP_RUNTIME_RELAY_REBUILD_LOOKBACK: Duration = Duration::from_secs(120);
+/// Maximum amount the persisted transport cursor may run ahead of local
+/// wall-clock. The cursor is advanced from the inbound message timestamp, which
+/// is the sender-controlled Nostr `created_at` of the outer kind-445 event and
+/// is never validated upstream. Clamping the advance to `now + skew` bounds how
+/// far a malicious or buggy far-future `created_at` can move the subscription
+/// `since` filter, preventing an account from silently halting message
+/// reception (mdk#182). The margin tolerates benign sender clock skew.
+const TRANSPORT_CURSOR_MAX_FUTURE_SKEW: Duration = Duration::from_secs(5 * 60);
+/// Clock-skew allowance below an anchor time from which a REQ requests group
+/// history: the Welcome that installed a joined copy, for its post-join
+/// maintenance REQ, or the moment a route was replaced, for that retained
+/// route's REQ. See [`history_floor`].
+///
+/// Events carry their sender's clock in `created_at`, while the anchor carries
+/// the inviter's clock (the Welcome) or this device's (the switch). The
+/// allowance absorbs the disagreement, and the seconds between an Add commit's
+/// wrap and its Welcome's. The directions cost differently. A floor too high
+/// can miss a commit made after the Welcome, and the joining member's first
+/// self-update then forks from the group until the epoch gap is acquired. A
+/// floor too low only re-requests history the member cannot open or already
+/// holds: once per join, and on every activation for a retained route.
+///
+/// So the allowance leans wide. Fifteen minutes is the future-dated-event
+/// limit relays commonly enforce, so an inviter whose Add commit a relay
+/// accepted cannot run fast enough to put the floor after the commits that
+/// followed it. It also tolerates committers three times further behind than
+/// the stack's five-minute sender-clock tolerance
+/// ([`TRANSPORT_CURSOR_MAX_FUTURE_SKEW`]). The cost is at most fifteen minutes
+/// of history before each anchor. Anything a floor still misses inside the
+/// retained-inventory window stays within reach of the comparison, which
+/// covers current and retained routes alike.
+const HISTORY_FLOOR_CLOCK_SKEW_ALLOWANCE: Duration = Duration::from_secs(15 * 60);
+const ACCOUNT_WORKER_RECONNECT_BASE_DELAY: Duration = Duration::from_secs(2);
+const ACCOUNT_WORKER_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(60);
+const ACCOUNT_WORKER_RECONNECT_JITTER_MAX_MS: u64 = 500;
+const APP_RUNTIME_SUBSCRIPTION_BUFFER: usize = 1024;
+const AGENT_STREAM_START_LOOKBACK_LIMIT: usize = 200;
+const DIRECTORY_FUTURE_CREATED_AT_CLEANUP_MARKER: &str =
+    ".marmot-directory-future-created-at-cleanup-v1";
+pub(crate) const MAX_SEEN_EVENT_IDS: usize = 16_384;
+type AppRuntime = AccountDeviceRuntime<
+    MarmotRelayPlaneAccountAdapter,
+    AppTransportRouting,
+    AppKeyPackagePublisher,
+>;
+
+#[cfg(test)]
+type LegacyProjectionOpenHook = Arc<dyn Fn() + Send + Sync>;
+
+/// One account's encrypted media store over its SQLCipher catalog.
+pub(crate) type AccountMediaStore = media_store::MediaStore<storage_sqlite::SqliteMediaCatalog>;
+
+fn media_close_key(label: &str) -> String {
+    format!("media/{label}")
+}
+
+#[derive(Clone)]
+pub struct MarmotApp {
+    block_list_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    moderation_reports: Arc<moderation_reports::ModerationReportState>,
+    pub(crate) block_list_updates: Arc<tokio::sync::watch::Sender<u64>>,
+    root: PathBuf,
+    /// Present for exclusive-root entry points. Every clone shares this cell,
+    /// so the root remains exclusively owned until all database-capable app and
+    /// runtime handles have been released — or until [`Self::close_storage`]
+    /// takes the lease out, which is the only way to release it early. The
+    /// lease is an advisory lock on a file *inside the Marmot root*, so on iOS
+    /// it counts against the same App Group suspension rule as the databases
+    /// (see [`Self::close_storage`]).
+    root_runtime_lease: Arc<Mutex<Option<MarmotRootRuntimeLease>>>,
+    /// Latched as soon as [`Self::close_storage`] starts. Every database
+    /// accessor checks it so a late call cannot silently reopen a database
+    /// while terminal close is in progress or after it completes.
+    storage_closed: Arc<AtomicBool>,
+    /// Published only after every database close has been attempted and the
+    /// root lease has been released. This is the host-facing completion fact;
+    /// `storage_closed` above is the earlier admission latch.
+    storage_close_completed: Arc<AtomicBool>,
+    /// Admission control that makes the close *atomic* rather than merely
+    /// latched: database opens hold the read side across create-and-publish,
+    /// [`Self::close_storage`] holds the write side across its whole teardown.
+    /// See [`Self::begin_storage_open`].
+    storage_lifecycle: Arc<RwLock<()>>,
+    /// What [`Self::close_storage`] closes: every resource in the root that
+    /// can hold a file lock, registered when it opens under
+    /// `storage_lifecycle`. The handle caches below only serve lookups.
+    root_closers: root_closers::RootClosers,
+    audit_export_lifecycle: audit_export_lifecycle::AuditExportLifecycle,
+    relay_urls: Vec<String>,
+    account_home: AccountHome,
+    relay_plane: MarmotRelayPlane,
+    config: MarmotAppConfig,
+    account_storages: Arc<Mutex<HashMap<String, SqliteAccountStorage>>>,
+    /// One encrypted media store per account (mdk#2314), over that account's
+    /// cached storage handle. Its in-flight set and sweep cursor are per
+    /// instance, so every caller shares this one.
+    account_media_stores: Arc<Mutex<HashMap<String, AccountMediaStore>>>,
+    /// What this process's legacy attachment migration batches saw, per
+    /// account (mdk#2314 step 6). Dropped with the account's media store.
+    legacy_media_migrations:
+        Arc<Mutex<HashMap<String, media::legacy_migration::SharedLegacyMigration>>>,
+    /// Closers for handles outside the storage caches; `close_storage` runs
+    /// them all.
+    close_registry: Arc<close_registry::CloseRegistry>,
+    account_session_owners: Arc<Mutex<HashSet<String>>>,
+    directory_caches: Arc<Mutex<HashMap<String, DirectoryCache>>>,
+    /// What the directory keeps between calls; [`Self::directory`] shares it
+    /// with every service it builds.
+    directory_state: nostr_directory::DirectoryState,
+    legacy_directory_cache_checked: Arc<Mutex<bool>>,
+    #[cfg(test)]
+    directory_test_clock: Option<Arc<std::sync::atomic::AtomicU64>>,
+    #[cfg(test)]
+    directory_cache_open_count: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    directory_handle_acquire_count: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    local_open_gates: local_open_test_gate::LocalOpenGates,
+    #[cfg(test)]
+    legacy_projection_open_hook: Arc<Mutex<Option<LegacyProjectionOpenHook>>>,
+    #[cfg(test)]
+    inventory_snapshot_between_reads: Arc<Mutex<Option<LegacyProjectionOpenHook>>>,
+    #[cfg(test)]
+    test_relay_client: Option<Arc<dyn NostrRelayClient>>,
+    #[cfg(test)]
+    audit_v5_peel_slot: Option<(String, Arc<Mutex<client::audit_v5_probe::PeelSlot>>)>,
+    shared_storage: Arc<Mutex<Option<SqliteSharedStorage>>>,
+    pub(crate) presentation_signals: Arc<chat_presentation::signals::PresentationSignals>,
+    account_state_ready: Arc<Mutex<HashSet<String>>>,
+    chat_list_projection_warmed: Arc<Mutex<HashSet<String>>>,
+    chat_list_projection_stale: Arc<Mutex<HashSet<String>>>,
+    audit_log_tracker_config: Arc<Mutex<AuditLogTrackerConfig>>,
+    product_analytics: ProductAnalytics,
+    startup_diagnostics: startup_diagnostics::NativeStartupDiagnostics,
+    external_signers: Arc<Mutex<HashMap<String, RegisteredExternalSigner>>>,
+    public_indexer_copy_tasks: Arc<Mutex<PublicIndexerCopyTasks>>,
+    /// In-memory view of the persisted per-kind authoring floors; see
+    /// `sign_replaceable_identity_event`.
+    replaceable_identity_created_at: Arc<Mutex<HashMap<(String, u64), u64>>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentTextStreamFinishRequest {
+    pub stream_id: Vec<u8>,
+    /// Hex-encoded MLS message id of the kind-1200 stream-start event. Carried
+    /// on the kind-9 stream-final as the `["stream-start", <start_event_id>]`
+    /// tag (`spec/features/agent-text-streams-quic.md:310-318`).
+    pub start_event_id: String,
+    pub final_text_or_reference: String,
+    pub transcript_hash: [u8; 32],
+    pub chunk_count: u64,
+    pub finished_at: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentOperationEventRequest {
+    pub event_type: String,
+    pub status: String,
+    pub operation_id: Option<String>,
+    pub run_id: Option<String>,
+    pub turn_id: Option<String>,
+    pub name: Option<String>,
+    pub text: String,
+    pub preview: Option<String>,
+    pub details: Option<serde_json::Value>,
+    pub sequence: Option<u64>,
+    pub ok: Option<bool>,
+    pub duration_ms: Option<u64>,
+    pub reply_to_message_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppStatus {
+    pub account: String,
+    pub account_id_hex: String,
+    pub transport: String,
+    pub groups: Vec<AppGroupRecord>,
+    pub seen_events: usize,
+    pub group_count: usize,
+    pub message_count: usize,
+    pub projections: AppProjectionStatus,
+    pub relay_lists: AccountRelayListStatus,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppProjectionStatus {
+    pub account: AppDatabaseStatus,
+    pub shared: AppDatabaseStatus,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppDatabaseStatus {
+    pub path: String,
+    pub exists: bool,
+    pub encrypted: bool,
+}
+
+pub(crate) struct GeneratedAccountBootstrapPublication {
+    pub status: AccountRelayListStatus,
+    pub relay_and_follow_duration: Duration,
+    pub default_profile_duration: Duration,
+    pub indexer_copy: Option<PublicIndexerCopy>,
+    /// The published profile, stamped with its signed kind-0 `created_at`.
+    pub profile: UserProfileMetadata,
+}
+
+pub(crate) struct PublicIndexerCopy {
+    relay_client: Arc<dyn NostrRelayClient>,
+    account_id: MemberId,
+    events: Vec<NostrTransportEvent>,
+    indexers: Vec<TransportEndpoint>,
+}
+
+#[derive(Default)]
+struct PublicIndexerCopyTasks {
+    stopped: bool,
+    by_account: HashMap<String, Vec<tokio::task::JoinHandle<()>>>,
+}
+
+impl PublicIndexerCopy {
+    fn new(
+        relay_client: Arc<dyn NostrRelayClient>,
+        account_id: MemberId,
+        events: Vec<NostrTransportEvent>,
+        indexers: Vec<TransportEndpoint>,
+    ) -> Option<Self> {
+        (!events.is_empty() && !indexers.is_empty()).then_some(Self {
+            relay_client,
+            account_id,
+            events,
+            indexers,
+        })
+    }
+
+    pub(crate) async fn run(self) {
+        publish_public_indexer_copies(
+            self.relay_client.as_ref(),
+            &self.account_id,
+            &self.events,
+            &self.indexers,
+        )
+        .await;
+    }
+}
+
+/// Background completion for replaceable identity records (kind 0, kind 3,
+/// relay lists) saved with a one-acknowledgement quorum. Reaching the quorum
+/// aborts sends still in flight, and a relay left unsent keeps serving the
+/// previous version to every reader that queries it (mdk#2216). Each
+/// cancelled relay gets one bounded send of the identical signed event after
+/// the save has already returned.
+pub(crate) struct QuorumCancelledDelivery {
+    relay_client: Arc<dyn NostrRelayClient>,
+    account_id: MemberId,
+    requests: Vec<NostrEventPublishRequest>,
+}
+
+impl QuorumCancelledDelivery {
+    pub(crate) fn new(relay_client: Arc<dyn NostrRelayClient>, account_id: MemberId) -> Self {
+        Self {
+            relay_client,
+            account_id,
+            requests: Vec::new(),
+        }
+    }
+
+    /// Queue `event` for every attempted endpoint the quorum outcome neither
+    /// accepted nor reported as failed. A reported failure already used the
+    /// transport's own retries; only cancellation left a relay unattempted.
+    pub(crate) fn add(
+        &mut self,
+        event: &NostrTransportEvent,
+        attempted: &[TransportEndpoint],
+        outcome: &transport_nostr_adapter::NostrPublishOutcome,
+    ) {
+        // Re-signing would create a different event, not complete this one.
+        if event.sig.is_none() {
+            debug_assert!(false, "quorum completion requires a pre-signed event");
+            return;
+        }
+        let mut settled = outcome
+            .accepted
+            .iter()
+            .map(|receipt| relay_endpoint_key(&receipt.endpoint))
+            .chain(
+                outcome
+                    .failed
+                    .iter()
+                    .map(|failure| relay_endpoint_key(&failure.endpoint)),
+            )
+            .collect::<HashSet<_>>();
+        for endpoint in attempted {
+            if settled.insert(relay_endpoint_key(endpoint)) {
+                self.requests.push(NostrEventPublishRequest {
+                    endpoints: vec![endpoint.clone()],
+                    event: event.clone(),
+                    required_acks: 1,
+                });
+            }
+        }
+    }
+
+    async fn run(self) {
+        let outcomes = self
+            .relay_client
+            .publish_events_for_account(&self.account_id, &self.requests)
+            .await;
+        let delivered = outcomes
+            .iter()
+            .filter(|outcome| {
+                outcome
+                    .as_ref()
+                    .is_ok_and(|outcome| !outcome.accepted.is_empty())
+            })
+            .count();
+        let undelivered = self.requests.len().saturating_sub(delivered);
+        if undelivered == 0 {
+            tracing::debug!(
+                target: "marmot_app",
+                method = "complete_quorum_cancelled_delivery",
+                delivered,
+                "replaceable identity records reached quorum-cancelled relays"
+            );
+        } else {
+            tracing::warn!(
+                target: "marmot_app",
+                method = "complete_quorum_cancelled_delivery",
+                delivered,
+                undelivered,
+                "replaceable identity records did not reach every quorum-cancelled relay"
+            );
+        }
+    }
+}
+
+/// Compare relay endpoints the way the transport reports them in receipts.
+fn relay_endpoint_key(endpoint: &TransportEndpoint) -> String {
+    nostr::prelude::RelayUrl::parse(endpoint.as_str())
+        .map(|url| url.to_string())
+        .unwrap_or_else(|_| endpoint.0.clone())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountRelayListBootstrap {
+    pub default_relays: Vec<TransportEndpoint>,
+    pub bootstrap_relays: Vec<TransportEndpoint>,
+    /// Publication-only copies of public directory records. Never advertised
+    /// as NIP-65 write relays or used for KeyPackage publication.
+    pub indexer_relays: Vec<TransportEndpoint>,
+    /// Relays declared in the kind-10050 inbox list. Empty declares
+    /// `default_relays`, so one list still serves both kinds.
+    pub inbox_relays: Vec<TransportEndpoint>,
+}
+
+impl AccountRelayListBootstrap {
+    pub fn new(
+        default_relays: Vec<TransportEndpoint>,
+        bootstrap_relays: Vec<TransportEndpoint>,
+    ) -> Self {
+        let bootstrap_relays = if bootstrap_relays.is_empty() {
+            default_relays.clone()
+        } else {
+            bootstrap_relays
+        };
+        Self {
+            default_relays,
+            bootstrap_relays,
+            indexer_relays: Vec::new(),
+            inbox_relays: Vec::new(),
+        }
+    }
+
+    pub fn with_indexer_relays(mut self, indexer_relays: Vec<TransportEndpoint>) -> Self {
+        self.indexer_relays = indexer_relays;
+        self
+    }
+
+    pub fn with_inbox_relays(mut self, inbox_relays: Vec<TransportEndpoint>) -> Self {
+        self.inbox_relays = inbox_relays;
+        self
+    }
+
+    /// The relays a published kind-10050 inbox list declares.
+    pub fn inbox_declaration(&self) -> &[TransportEndpoint] {
+        if self.inbox_relays.is_empty() {
+            &self.default_relays
+        } else {
+            &self.inbox_relays
+        }
+    }
+
+    fn declared_relays(&self, list_kind: NostrAccountRelayListKind) -> Vec<TransportEndpoint> {
+        match list_kind {
+            NostrAccountRelayListKind::Nip65 => self.default_relays.clone(),
+            NostrAccountRelayListKind::Inbox => self.inbox_declaration().to_vec(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SyncSummary {
+    pub joined_groups: Vec<GroupId>,
+    pub messages: Vec<ReceivedMessage>,
+    pub events: Vec<GroupEvent>,
+    pub projection_updates: Vec<AppProjectionUpdate>,
+    /// Groups whose epoch-gap backfill has been armed repeatedly without the
+    /// device catching up. Surfaced as [`MarmotAppEvent::EpochStallEscalated`].
+    pub epoch_stall_escalations: Vec<EpochStallEscalation>,
+}
+
+impl SyncSummary {
+    /// Fold another summary's contents into this one. Used to combine the
+    /// relay-delivery sync with the no-inbound engine-event drain so a single
+    /// `sync()` returns all surfaced events together (mdk#426).
+    pub fn merge(&mut self, other: SyncSummary) {
+        self.joined_groups.extend(other.joined_groups);
+        self.messages.extend(other.messages);
+        self.events.extend(other.events);
+        self.projection_updates.extend(other.projection_updates);
+        self.epoch_stall_escalations
+            .extend(other.epoch_stall_escalations);
+    }
+}
+
+/// A sync failure together with the prefix that was already durably applied.
+///
+/// Catch-up processes deliveries incrementally, so a later transport, engine,
+/// or projection error cannot roll back earlier deliveries. Callers of
+/// [`AppClient::sync_with_partial_progress`] must report or otherwise consume
+/// `partial_summary`; dropping it would hide durable progress until the host
+/// takes a fresh storage snapshot. The compatibility [`AppClient::sync`] entry
+/// point retains its original [`AppError`] result.
+#[derive(Debug, thiserror::Error)]
+#[error("{source}")]
+pub struct SyncFailure {
+    pub partial_summary: SyncSummary,
+    #[source]
+    pub source: AppError,
+}
+
+impl SyncFailure {
+    pub fn new(partial_summary: SyncSummary, source: AppError) -> Self {
+        Self {
+            partial_summary,
+            source,
+        }
+    }
+}
+
+impl From<AppError> for SyncFailure {
+    fn from(source: AppError) -> Self {
+        Self::new(SyncSummary::default(), source)
+    }
+}
+
+/// Internal sync failure that retains the bounded telemetry classification.
+///
+/// The sidecar is deliberately separate from [`SyncFailure`] so the public
+/// two-field struct remains constructible by downstream callers.
+#[derive(Debug)]
+pub(crate) struct ClassifiedSyncFailure {
+    pub(crate) partial_summary: SyncSummary,
+    pub(crate) source: AppError,
+    classification: app_telemetry::SyncFailureClassification,
+}
+
+impl ClassifiedSyncFailure {
+    pub(crate) fn at_stage(
+        partial_summary: SyncSummary,
+        source: AppError,
+        failure_stage: app_telemetry::SyncFailureStage,
+    ) -> Self {
+        let error_class = source.sync_error_class();
+        Self {
+            partial_summary,
+            source,
+            classification: app_telemetry::SyncFailureClassification::new(
+                failure_stage,
+                error_class,
+            ),
+        }
+    }
+
+    pub(crate) const fn classification(&self) -> app_telemetry::SyncFailureClassification {
+        self.classification
+    }
+}
+
+impl From<ClassifiedSyncFailure> for SyncFailure {
+    fn from(failure: ClassifiedSyncFailure) -> Self {
+        Self {
+            partial_summary: failure.partial_summary,
+            source: failure.source,
+        }
+    }
+}
+
+/// A group that full-history replay is not repairing: it armed `arms` epoch-gap
+/// backfills in one run with no sign in between that the device caught up, and
+/// it is still sitting at `stalled_epoch`.
+///
+/// "No sign it caught up" is the honest strength of the claim. The runtime never
+/// decrypts the traffic that would reveal a group's live epoch, so it infers the
+/// stall from what it can see, and an advance it does not observe reads the same
+/// as no advance at all. Surface this as a strong hint, not a verdict.
+///
+/// Reported once per unrecovered run so the application can say "this group
+/// cannot catch up; re-syncing is recommended" and offer the stronger repair —
+/// rotating this device's key package and re-activating transport over full
+/// history. MDK deliberately does not rotate keys on its own: that publishes new
+/// key material and is the app's decision.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EpochStallEscalation {
+    pub group_id: GroupId,
+    /// The device's group epoch when the escalating backfill was armed.
+    pub stalled_epoch: u64,
+    /// Backfills armed in this unrecovered run, including the escalating one.
+    pub arms: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReceivedMessage {
+    pub authority: Option<cgka_traits::app_event::AppMessageAuthority>,
+    pub message_id_hex: String,
+    pub source_message_id_hex: String,
+    pub sender: String,
+    pub sender_display_name: Option<String>,
+    pub group_id: GroupId,
+    pub source_epoch: u64,
+    /// Retention decision pinned from this message's authenticated MLS source
+    /// epoch. `None` means the historical policy was not recoverable and is
+    /// intentionally retained rather than evaluated against live group state.
+    pub retention: Option<AppMessageRetentionDecision>,
+    /// Displayed text for the inner app event (its `content`).
+    pub plaintext: String,
+    /// Nostr `kind` of the inner Marmot app event.
+    pub kind: u64,
+    /// Nostr `tags` of the inner Marmot app event.
+    pub tags: Vec<Vec<String>>,
+    /// Sender-authenticated inner app-event timestamp (seconds since epoch).
+    /// Clients should sort the timeline by this value so chronology reflects
+    /// send time, not delivery time. It is intentionally not clamped.
+    pub recorded_at: u64,
+    /// Local wall-clock time when this device observed the delivery.
+    pub received_at: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppProjectionUpdate {
+    pub group_id_hex: String,
+    pub timeline_messages: Vec<TimelineMessageRecord>,
+    #[serde(default)]
+    pub timeline_changes: Vec<TimelineMessageChange>,
+    pub chat_list_row: Option<ChatListRow>,
+    #[serde(default)]
+    pub chat_list_trigger: ChatListUpdateTrigger,
+}
+
+/// Records `event_id` as seen, using the caller-held `seen` set for O(1)
+/// duplicate detection. The ordered `seen_events` Vec is kept only for pruning;
+/// when pruning drops the oldest ids it removes them from `seen` incrementally
+/// so the two stay in sync without rebuilding the set.
+fn remember_seen_event(
+    seen: &mut HashSet<String>,
+    state: &mut AccountState,
+    event_id: String,
+) -> bool {
+    if seen.insert(event_id.clone()) {
+        state.seen_events.push(event_id);
+        for pruned in prune_seen_events(&mut state.seen_events) {
+            seen.remove(&pruned);
+        }
+        true
+    } else {
+        false
+    }
+}
+
+pub(crate) fn prune_seen_events(seen_events: &mut Vec<String>) -> std::vec::Drain<'_, String> {
+    let overflow = seen_events.len().saturating_sub(MAX_SEEN_EVENT_IDS);
+    seen_events.drain(0..overflow)
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppMessageRecord {
+    /// Authenticated source-state evidence. Legacy and unresolved rows remain
+    /// `None`; recovery must never infer this from current group policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority: Option<cgka_traits::app_event::AppMessageAuthority>,
+    pub message_id_hex: String,
+    pub direction: String,
+    pub group_id_hex: String,
+    pub sender: String,
+    pub plaintext: String,
+    /// Nostr `kind` of the inner Marmot app event (9 chat, 7 reaction, …).
+    pub kind: u64,
+    /// Nostr `tags` of the inner Marmot app event.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<Vec<String>>,
+    #[serde(default)]
+    pub source_epoch: Option<u64>,
+    /// Durable source-epoch retention decision. Legacy rows are `None` and are
+    /// never destructively interpreted using the current group component.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention: Option<AppMessageRetentionDecision>,
+    /// Sender-authenticated inner app-event timestamp. Synthesized rows without
+    /// an inner event use their local observation time.
+    pub recorded_at: u64,
+    /// Local wall-clock time when this device observed or created the row.
+    pub received_at: u64,
+    /// Local `app_events` insert order (rowid). The final LOCAL tiebreak of the
+    /// raw-event replay cursor used by lag-recovery watermark/suppression (#630);
+    /// not part of the cross-client display order. `#[serde(default)]` keeps
+    /// older serialized records readable.
+    #[serde(default)]
+    pub insert_order: i64,
+    /// True when convergence retained this raw row only as an invalidated
+    /// losing-branch tombstone.
+    #[serde(default)]
+    pub invalidated: bool,
+    /// Whether this admin deletion or dismissal label carried an authenticated
+    /// source-state moderation grant when it was recorded.
+    #[serde(default)]
+    pub moderation_grant: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AppMessageQuery {
+    pub group_id_hex: Option<String>,
+    /// Restrict to these inner app-event kinds (e.g. an app-defined custom
+    /// kind). `None` or an empty list applies no kind constraint.
+    pub kinds: Option<Vec<u64>>,
+    pub limit: Option<usize>,
+}
+
+/// The group's oldest confirmed change that some group relays have not accepted
+/// yet (mdk#2255). Members who read only those relays cannot follow the group
+/// until they do; MDK keeps retrying them with the exact event. Reported as
+/// soon as a relay is owed; group changes fail only once `since` is two
+/// minutes old. A newer change can be owed to other relays as well.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GroupCommitDelivery {
+    /// Relays that have not accepted the change yet.
+    pub owed_relay_urls: Vec<String>,
+    /// Relays the change was published to.
+    pub relay_count: u32,
+    /// When the first relay accepted the change, in Unix seconds.
+    pub since: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SendSummary {
+    pub published: usize,
+    pub message_ids: Vec<String>,
+    /// Whether the accepted send reached the transport, is retained in the
+    /// group's durable queue, or has unknown transport completion while the
+    /// exact event remains frozen. Callers never infer these states from an
+    /// empty `message_ids` list (mdk#1177, mdk#1577).
+    pub accept_disposition: cgka_traits::SendAcceptDisposition,
+    pub maintenance_disposition: cgka_traits::SendMaintenanceDisposition,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MaintenanceRunSummary {
+    pub published: u32,
+    pub message_ids: Vec<String>,
+    pub deferred: u32,
+    pub ambiguous_exposure: u32,
+    pub failures: u32,
+}
+
+/// A welcome that a confirmed group create/invite could not deliver to its
+/// recipient (mdk#352). The commit is already durable, so the member is added
+/// but unjoinable until the welcome reaches them. Persisted so the repair
+/// handle survives the call return and a restart; re-deliver it with
+/// [`AppClient::redeliver_welcome`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingWelcomeDelivery {
+    pub group_id_hex: String,
+    /// The stored welcome's MLS message id — the key for re-delivery.
+    pub message_id_hex: String,
+    pub recipient_hex: String,
+    pub recorded_at: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SecureDeleteExpiredResult {
+    /// Number of expired raw app-event rows securely scrubbed and pruned.
+    pub pruned_messages: u64,
+    /// Number of encrypted-media epoch-secret rows securely scrubbed and
+    /// deleted after their final retained source-message reference expired.
+    pub secrets_deleted: u64,
+    /// Ciphertext hashes for encrypted-media attachments referenced by the
+    /// pruned rows. Host apps can use these opaque blob ids to purge their own
+    /// decrypted-media disk caches alongside the engine plaintext wipe. The
+    /// list is sorted for deterministic output, but callers should treat it as
+    /// an unordered purge set.
+    pub media_ciphertext_sha256: Vec<String>,
+    /// True when logical deletion committed but secure WAL truncation remains
+    /// pending. A later retention pass will retry it.
+    pub erasure_pending: bool,
+}
+
+impl From<SecurePruneAppEventsResult> for SecureDeleteExpiredResult {
+    fn from(value: SecurePruneAppEventsResult) -> Self {
+        Self {
+            pruned_messages: value.pruned_messages as u64,
+            secrets_deleted: value.pruned_media_epoch_secrets as u64,
+            media_ciphertext_sha256: value.media_ciphertext_sha256,
+            erasure_pending: value.erasure_pending,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetentionSweepStatus {
+    NoExpiredMessages,
+    Pruned,
+    DeferredClockSkew,
+    DeferredUnread,
+    Failed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetentionSweepGroupOutcome {
+    pub group_id_hex: String,
+    pub status: RetentionSweepStatus,
+    pub pruned_messages: u64,
+    pub secrets_deleted: u64,
+    pub media_ciphertext_sha256: Vec<String>,
+    /// Stable privacy-safe category such as `storage_busy`. Raw error text is
+    /// intentionally never returned across the app boundary.
+    pub failure_kind: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RetentionSweepReport {
+    pub groups: Vec<RetentionSweepGroupOutcome>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupInviteDeclineResult {
+    pub group: AppGroupRecord,
+    pub summary: SendSummary,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountKeyPackageRecord {
+    pub account_label: Option<String>,
+    pub account_id_hex: String,
+    /// Relay `d` tag / durable lifecycle slot when known. For a local bundle
+    /// with no lifecycle or legacy metadata, this falls back to the
+    /// KeyPackageRef hex so it remains stable and non-secret.
+    pub key_package_id: String,
+    pub key_package_ref_hex: String,
+    pub key_package_event_id: String,
+    pub published_at: u64,
+    pub key_package_bytes: usize,
+    pub source_relays: Vec<String>,
+    /// True only when the corresponding private OpenMLS bundle is durably
+    /// stored and can be looked up for Welcome processing.
+    pub local: bool,
+    /// True when this exact event id was discovered from a relay.
+    pub relay: bool,
+}
+
+/// Durable ownership classification for one inventory row.
+///
+/// Classification comes from durable lifecycle references, never an empty
+/// event ID, timestamp, or pubkey match. `AccountKeyPackageRecord::local` is
+/// true exactly when this is not [`NotLocal`](Self::NotLocal).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccountKeyPackageLocalState {
+    /// No corresponding durably owned private bundle.
+    NotLocal,
+    /// Owned ref equals the durable current ref.
+    Current,
+    /// Owned ref equals the durable pending replacement ref.
+    PendingReplacement,
+    /// Owned ref occurs in durable retained material.
+    RetainedPrivateMaterial,
+    /// Genuinely owned, but not classified by the durable lifecycle
+    /// (including legacy or unclassified cases).
+    OtherOwned,
+}
+
+impl AccountKeyPackageLocalState {
+    /// True for every state that has a usable local private bundle.
+    #[must_use]
+    pub const fn is_local(self) -> bool {
+        !matches!(self, Self::NotLocal)
+    }
+}
+
+/// One KeyPackage inventory row plus its typed local provenance.
+///
+/// `record.local` and `record.relay` remain orthogonal facts.
+/// `record.relay` means a validated relay observation, never merely an
+/// authored event or a configured relay. `local_state` and `record.relay`
+/// are the authoritative display distinctions; `published_at` and
+/// `source_relays` keep their legacy semantics and are not publication proof.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountKeyPackageInventoryEntry {
+    pub record: AccountKeyPackageRecord,
+    pub local_state: AccountKeyPackageLocalState,
+}
+
+/// Observed relay history for an account's kind-30443 KeyPackage events.
+///
+/// This is the validated, event-ID-deduplicated window returned by a single
+/// fetch — current and superseded events together. `is_current` is the winner
+/// only among those observed valid events, not a global relay guarantee.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountKeyPackageRelayEvent {
+    pub account_id_hex: String,
+    /// Exact validated `d` tag / addressable slot.
+    pub key_package_id: String,
+    pub key_package_ref_hex: String,
+    pub key_package_event_id: String,
+    /// Relay event timestamp. Never a local overlay time.
+    pub created_at: u64,
+    pub key_package_bytes: usize,
+    /// Normalized observations for this exact event.
+    pub source_relays: Vec<String>,
+    /// Winner only within this returned validated window.
+    pub is_current: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct KeyPackageDeletionTarget {
+    pub event_id_hex: String,
+    pub source_relays: Vec<TransportEndpoint>,
+}
+
+#[derive(Debug)]
+pub(crate) struct KeyPackageDeletionResult {
+    pub event_id_hex: String,
+    pub result: Result<usize, AppError>,
+}
+
+/// Per-account unread aggregate, suitable for an account-switcher and
+/// application badge (mdk#461, mdk#1460). Computed from each account's
+/// materialized chat-list projection without loading a full session/timeline,
+/// so it can be reported for accounts that are not the active/running one.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountUnread {
+    pub account_id_hex: String,
+    /// Unread messages in eligible active, accepted, unarchived conversations.
+    pub unread_count: u64,
+    /// Number of eligible conversations that require badge attention:
+    /// unread messages, a manual-unread reminder, or a pending invitation.
+    pub unread_conversations: u64,
+    /// Active unarchived pending invitations (one each) and accepted manual
+    /// reminders with no unread messages. Invite message counts stay suppressed.
+    /// `unread_count + attention_only_conversations` is the application badge.
+    #[serde(default)]
+    pub attention_only_conversations: u64,
+    /// Whether the account has any badge-worthy conversation, including a
+    /// pending invitation or manual-only reminder with no unread messages.
+    pub has_unread: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct AccountState {
+    pub(crate) label: String,
+    #[serde(default)]
+    pub(crate) seen_events: Vec<String>,
+    #[serde(default)]
+    pub(crate) last_transport_timestamp: Option<u64>,
+    #[serde(default)]
+    pub(crate) groups: Vec<AppGroupRecord>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AppMessageProjection {
+    pub authority: Option<cgka_traits::app_event::AppMessageAuthority>,
+    pub(crate) message_id_hex: String,
+    pub(crate) source_message_id_hex: Option<String>,
+    pub(crate) direction: String,
+    pub(crate) group_id_hex: String,
+    pub(crate) sender: String,
+    pub(crate) plaintext: String,
+    pub(crate) kind: u64,
+    pub(crate) tags: Vec<Vec<String>>,
+    pub(crate) source_epoch: Option<u64>,
+    pub(crate) retention: Option<AppMessageRetentionDecision>,
+    pub(crate) recorded_at: Option<u64>,
+    /// Transport id of the originating commit for a synthesized kind-1210 group
+    /// system row, so the row can be invalidated by origin commit if that commit
+    /// loses a fork. `None` for all other projections.
+    pub(crate) origin_commit_id: Option<String>,
+    /// True only for a delete whose authenticated sender may moderate other
+    /// members' messages (group admin, non-direct group), evaluated against
+    /// the signed MLS group state when the delete is recorded and persisted
+    /// with the event. `false` for every other projection.
+    pub(crate) moderation_grant: bool,
+}
+
+fn generate_telemetry_install_id() -> String {
+    let mut bytes = [0u8; 16];
+    OsRng.fill_bytes(&mut bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let encoded = hex::encode(bytes);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &encoded[0..8],
+        &encoded[8..12],
+        &encoded[12..16],
+        &encoded[16..20],
+        &encoded[20..32]
+    )
+}
+
+#[derive(Clone)]
+struct AccountProfile {
+    account_id_hex: String,
+    inbox_endpoints: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct KeyPackageRecord {
+    account_label: String,
+    account_id_hex: String,
+    #[serde(default)]
+    key_package_id: String,
+    #[serde(default)]
+    key_package_ref_hex: String,
+    #[serde(default)]
+    key_package_event_id: String,
+    #[serde(default)]
+    published_at: u64,
+    key_package_hex: String,
+}
+
+struct OpenAppAccount {
+    runtime: AppRuntime,
+    audit_v5_peel_slot: Arc<Mutex<client::audit_v5_probe::PeelSlot>>,
+    session_guard: AppAccountSessionGuard,
+    adapter: MarmotRelayPlaneAccountAdapter,
+    routing: AppTransportRouting,
+    state: AccountState,
+    delivery_overflow_recovery_pending: bool,
+    delivery_overflow_recovery_marker_token: Option<u64>,
+    /// Loss the open imported, recorded once the client exists.
+    recovery_loss_imports: Vec<storage_sqlite::RecoveryLossImport>,
+    signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner>,
+}
+
+struct AppAccountSessionGuard {
+    label: String,
+    owners: Arc<Mutex<HashSet<String>>>,
+}
+
+impl Drop for AppAccountSessionGuard {
+    fn drop(&mut self) {
+        self.owners
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.label);
+    }
+}
+
+impl MarmotApp {
+    /// Dev/test convenience constructor — see [`MarmotApp::with_relays`]. Not a
+    /// production entry point; hidden from the public API docs.
+    #[doc(hidden)]
+    pub fn with_relay(root: impl AsRef<Path>, relay_url: impl Into<String>) -> Self {
+        Self::with_relays(root, vec![relay_url.into()])
+    }
+
+    /// Snapshot the device-local relay telemetry of this app's relay plane.
+    ///
+    /// Aggregate and privacy-safe. Live numbers accumulate in the long-running
+    /// daemon runtime; a standalone command queries its own (typically empty)
+    /// relay plane.
+    pub async fn relay_telemetry(&self) -> RelayTelemetrySnapshot {
+        self.relay_plane.relay_telemetry().await
+    }
+
+    /// Narrow network-sourced relay-list endpoints to the ones this device is
+    /// willing to dial, whether the list belongs to this device's local account
+    /// or to another account. Published data remains untrusted in both cases;
+    /// filtering affects only the operation's route and never rewrites the list.
+    ///
+    /// Routes to the same host-safety rule configured endpoints face; see
+    /// [`RelaySafetyPolicy::retain_safe_endpoints`] for why a published list
+    /// filters rather than fails.
+    pub(crate) fn retain_safe_discovered_endpoints(
+        &self,
+        endpoints: Vec<TransportEndpoint>,
+        context: &str,
+    ) -> Vec<TransportEndpoint> {
+        self.relay_plane
+            .retain_safe_discovered_endpoints(endpoints, context)
+    }
+
+    /// Effective settings for this app instance, including its active consent permit.
+    /// An unstarted instance reports export disabled even if a grant is persisted.
+    /// Read `usage_diagnostics_settings` for the consent decision before startup.
+    pub fn relay_telemetry_settings(&self) -> Result<RelayTelemetrySettings, AppError> {
+        let mut settings =
+            normalize_relay_telemetry_settings(relay_telemetry_settings_from_storage(
+                self.shared_storage()?.relay_telemetry_settings()?,
+            ))?;
+        settings.export_enabled = self.product_analytics.permit().is_some();
+        Ok(settings)
+    }
+
+    /// Deprecated consent control: use `set_usage_diagnostics_consent` instead.
+    /// Disable revokes both exporters; enable requires an existing combined grant.
+    /// Retained for interval configuration and source compatibility.
+    pub fn set_relay_telemetry_settings(
+        &self,
+        settings: RelayTelemetrySettings,
+    ) -> Result<RelayTelemetrySettings, AppError> {
+        let settings = normalize_relay_telemetry_settings(settings)?;
+        if settings.export_enabled && self.product_analytics.permit().is_none() {
+            return Err(ProductAnalyticsError::ConsentRequired.into());
+        }
+        if !settings.export_enabled {
+            self.set_usage_diagnostics_consent(false)?;
+        }
+        self.shared_storage()?
+            .set_relay_telemetry_settings(&relay_telemetry_settings_to_storage(settings.clone()))?;
+        Ok(settings)
+    }
+
+    pub fn relay_telemetry_export_config(&self) -> Result<RelayTelemetryExportConfig, AppError> {
+        Ok(self
+            .relay_telemetry_settings()?
+            .export_config_with_runtime_and_endpoints(
+                config::RelayTelemetryRuntimeConfig::default(),
+                self.service_endpoints(),
+            ))
+    }
+
+    pub(crate) fn service_endpoints(&self) -> &MarmotServiceEndpoints {
+        &self.config.service_endpoints
+    }
+
+    pub(crate) fn deployment(&self) -> &MarmotDeployment {
+        &self.config.deployment
+    }
+
+    /// Public indexer relays used to resolve existing identities and spread
+    /// newly generated accounts' public relay lists and profile metadata: the
+    /// deployment's [`MarmotDeployment::discovery_indexer_relays`].
+    ///
+    /// A brand-new external-signer account (or an imported nsec) keeps its
+    /// NIP-65 relay list (kind:10002) and profile (kind:0) on public indexers,
+    /// not on the app's own messaging relays. Discovering an existing profile
+    /// against the app's relays therefore finds nothing and the display name
+    /// never resolves. These indexers give the directory preflight a discovery
+    /// set distinct from the operational messaging relays, and directory reads
+    /// stay available for imported and external-signer accounts even when
+    /// local development relays suppress public writes. They are never adopted
+    /// as the account's messaging relays.
+    pub fn discovery_indexer_relays(&self) -> Vec<TransportEndpoint> {
+        self.deployment().discovery_indexer_endpoints()
+    }
+
+    /// Whether this build may act on loopback-HTTP blob endpoints (dev/test
+    /// only). Production builds return `false` and skip such endpoints in the
+    /// upload/download act paths.
+    /// Whether this runtime was explicitly configured to act on cleartext
+    /// loopback blob endpoints for development or testing.
+    ///
+    /// Consumers that parse stored V1 media references outside the account
+    /// worker must pass this same policy to the shared media parser so
+    /// reference validation and the eventual fetch path cannot disagree.
+    pub fn allow_loopback_blob_endpoints(&self) -> bool {
+        self.config.allow_loopback_blob_endpoints
+    }
+
+    /// The construction-time durable transport-cursor policy every client
+    /// opened from this app applies (see [`CursorPersistence`]).
+    pub(crate) fn cursor_persistence(&self) -> CursorPersistence {
+        self.config.cursor_persistence
+    }
+
+    pub fn telemetry_install_id(&self) -> Result<String, AppError> {
+        if self.product_analytics.permit().is_none() {
+            return Err(ProductAnalyticsError::ConsentRequired.into());
+        }
+        self.shared_storage()?
+            .telemetry_install_id()?
+            .ok_or_else(|| ProductAnalyticsError::ConsentRequired.into())
+    }
+
+    pub fn with_relay_and_config(
+        root: impl AsRef<Path>,
+        relay_url: impl Into<String>,
+        config: MarmotAppConfig,
+    ) -> Self {
+        Self::with_relays_and_config(root, vec![relay_url.into()], config)
+    }
+
+    /// Dev/test-only convenience constructor. **Not a production entry point**
+    /// and hidden from the public API docs: exclusive-root hosts open through
+    /// [`MarmotApp::try_with_relays_and_account_home_and_config`], which owns
+    /// the root exclusively and defaults the relay-safety gate to production
+    /// posture (loopback rejected). This helper backs the crate's own tests,
+    /// which drive in-process `MockRelay`s at loopback, so it opts the
+    /// relay-safety gate into admitting loopback endpoints. It cannot be
+    /// `#[cfg(test)]`-gated because the crate's integration tests
+    /// (`crates/marmot-app/tests/*`) consume it through the public API. Callers
+    /// that need an explicit posture pass a config through
+    /// `with_relays_and_config`.
+    #[doc(hidden)]
+    pub fn with_relays(root: impl AsRef<Path>, relay_urls: Vec<String>) -> Self {
+        Self::with_relays_and_config(
+            root,
+            relay_urls,
+            MarmotAppConfig::white_noise()
+                .with_allow_loopback_relay_endpoints(true)
+                .with_open_ranking_provider(None, Vec::new()),
+        )
+    }
+
+    pub fn with_relays_and_config(
+        root: impl AsRef<Path>,
+        relay_urls: Vec<String>,
+        mut config: MarmotAppConfig,
+    ) -> Self {
+        // These relay-only constructors are dev/test entry points (production
+        // opens through `with_relays_and_account_home*`). Explicit test-policy
+        // builds default them to instant settlement so multi-client tests are
+        // deterministic. Normal debug and release builds keep the pinned window.
+        if cfg!(feature = "test-policy-overrides") && config.dev_settlement_quiescence_ms.is_none()
+        {
+            config.dev_settlement_quiescence_ms = Some(0);
+        }
+        // `deployment` is a public field, so a struct literal can skip
+        // `with_deployment`; normalize once where the app keeps it.
+        config.deployment = config.deployment.normalize();
+        let root = root.as_ref().to_path_buf();
+        let relay_plane = MarmotRelayPlane::runtime_default_with_loopback(
+            APP_RUNTIME_RELAY_REBUILD_LOOKBACK,
+            config.allow_loopback_relay_endpoints,
+        );
+        let product_analytics = ProductAnalytics::default();
+        product_analytics.silence(
+            config.usage_diagnostics_silent
+                || config.cursor_persistence == CursorPersistence::Frozen,
+        );
+        Self {
+            account_home: AccountHome::open(&root),
+            root,
+            root_runtime_lease: Arc::new(Mutex::new(None)),
+            storage_closed: Arc::new(AtomicBool::new(false)),
+            storage_close_completed: Arc::new(AtomicBool::new(false)),
+            storage_lifecycle: Arc::new(RwLock::new(())),
+            root_closers: root_closers::RootClosers::default(),
+            audit_export_lifecycle: audit_export_lifecycle::AuditExportLifecycle::default(),
+            relay_urls,
+            relay_plane,
+            config,
+            block_list_locks: Arc::default(),
+            moderation_reports: Arc::default(),
+            block_list_updates: Arc::new(tokio::sync::watch::channel(0).0),
+            account_storages: Arc::new(Mutex::new(HashMap::new())),
+            account_media_stores: Arc::new(Mutex::new(HashMap::new())),
+            legacy_media_migrations: Arc::default(),
+            close_registry: Default::default(),
+            account_session_owners: Arc::new(Mutex::new(HashSet::new())),
+            directory_caches: Arc::new(Mutex::new(HashMap::new())),
+            directory_state: nostr_directory::DirectoryState::default(),
+            legacy_directory_cache_checked: Arc::new(Mutex::new(false)),
+            #[cfg(test)]
+            directory_test_clock: None,
+            #[cfg(test)]
+            directory_cache_open_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            directory_handle_acquire_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            local_open_gates: local_open_test_gate::LocalOpenGates::default(),
+            #[cfg(test)]
+            legacy_projection_open_hook: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            inventory_snapshot_between_reads: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            test_relay_client: None,
+            #[cfg(test)]
+            audit_v5_peel_slot: None,
+            shared_storage: Arc::new(Mutex::new(None)),
+            presentation_signals: Arc::new(Default::default()),
+            account_state_ready: Arc::new(Mutex::new(HashSet::new())),
+            chat_list_projection_warmed: Arc::new(Mutex::new(HashSet::new())),
+            chat_list_projection_stale: Arc::new(Mutex::new(HashSet::new())),
+            audit_log_tracker_config: Arc::new(Mutex::new(AuditLogTrackerConfig::default())),
+            product_analytics,
+            startup_diagnostics: Default::default(),
+            external_signers: Arc::new(Mutex::new(HashMap::new())),
+            public_indexer_copy_tasks: Arc::new(Mutex::new(PublicIndexerCopyTasks::default())),
+            replaceable_identity_created_at: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Constructor for tests and embeddings that coordinate root ownership
+    /// externally.
+    ///
+    /// Independently scheduled processes must use
+    /// [`Self::try_with_relays_and_account_home_and_config`].
+    #[doc(hidden)]
+    pub fn with_relays_and_account_home(
+        root: impl AsRef<Path>,
+        relay_urls: Vec<String>,
+        account_home: AccountHome,
+    ) -> Self {
+        Self::with_relays_and_account_home_and_config(
+            root,
+            relay_urls,
+            account_home,
+            MarmotAppConfig::white_noise(),
+        )
+    }
+
+    /// Constructor for tests and embeddings that coordinate ownership
+    /// externally.
+    ///
+    /// Independently scheduled processes sharing a root must use
+    /// [`Self::try_with_relays_and_account_home_and_config`] so independently
+    /// hydrated runtimes cannot write the same root concurrently.
+    #[doc(hidden)]
+    pub fn with_relays_and_account_home_and_config(
+        root: impl AsRef<Path>,
+        relay_urls: Vec<String>,
+        account_home: AccountHome,
+        mut config: MarmotAppConfig,
+    ) -> Self {
+        // `deployment` is a public field, so a struct literal can skip
+        // `with_deployment`; normalize once where the app keeps it.
+        config.deployment = config.deployment.normalize();
+        let relay_plane = MarmotRelayPlane::runtime_default_with_loopback(
+            APP_RUNTIME_RELAY_REBUILD_LOOKBACK,
+            config.allow_loopback_relay_endpoints,
+        );
+        let product_analytics = ProductAnalytics::default();
+        product_analytics.silence(
+            config.usage_diagnostics_silent
+                || config.cursor_persistence == CursorPersistence::Frozen,
+        );
+        Self {
+            root: root.as_ref().to_path_buf(),
+            root_runtime_lease: Arc::new(Mutex::new(None)),
+            storage_closed: Arc::new(AtomicBool::new(false)),
+            storage_close_completed: Arc::new(AtomicBool::new(false)),
+            storage_lifecycle: Arc::new(RwLock::new(())),
+            root_closers: root_closers::RootClosers::default(),
+            audit_export_lifecycle: audit_export_lifecycle::AuditExportLifecycle::default(),
+            relay_urls,
+            account_home,
+            relay_plane,
+            config,
+            block_list_locks: Arc::default(),
+            moderation_reports: Arc::default(),
+            block_list_updates: Arc::new(tokio::sync::watch::channel(0).0),
+            account_storages: Arc::new(Mutex::new(HashMap::new())),
+            account_media_stores: Arc::new(Mutex::new(HashMap::new())),
+            legacy_media_migrations: Arc::default(),
+            close_registry: Default::default(),
+            account_session_owners: Arc::new(Mutex::new(HashSet::new())),
+            directory_caches: Arc::new(Mutex::new(HashMap::new())),
+            directory_state: nostr_directory::DirectoryState::default(),
+            legacy_directory_cache_checked: Arc::new(Mutex::new(false)),
+            #[cfg(test)]
+            directory_test_clock: None,
+            #[cfg(test)]
+            directory_cache_open_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            directory_handle_acquire_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(test)]
+            local_open_gates: local_open_test_gate::LocalOpenGates::default(),
+            #[cfg(test)]
+            legacy_projection_open_hook: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            inventory_snapshot_between_reads: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            test_relay_client: None,
+            #[cfg(test)]
+            audit_v5_peel_slot: None,
+            shared_storage: Arc::new(Mutex::new(None)),
+            presentation_signals: Arc::new(Default::default()),
+            account_state_ready: Arc::new(Mutex::new(HashSet::new())),
+            chat_list_projection_warmed: Arc::new(Mutex::new(HashSet::new())),
+            chat_list_projection_stale: Arc::new(Mutex::new(HashSet::new())),
+            audit_log_tracker_config: Arc::new(Mutex::new(AuditLogTrackerConfig::default())),
+            product_analytics,
+            startup_diagnostics: Default::default(),
+            external_signers: Arc::new(Mutex::new(HashMap::new())),
+            public_indexer_copy_tasks: Arc::new(Mutex::new(PublicIndexerCopyTasks::default())),
+            replaceable_identity_created_at: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Constructor that exclusively owns the Marmot root across processes for
+    /// the full lifetime of every resulting app/runtime clone.
+    ///
+    /// Acquisition is nonblocking. [`AppError::RuntimeBusy`] means a different
+    /// process or independently constructed runtime currently owns the root.
+    /// Hosts should retry later or take a bounded fallback path; they must not
+    /// construct an unleased runtime against the same root.
+    pub fn try_with_relays_and_account_home_and_config(
+        root: impl AsRef<Path>,
+        relay_urls: Vec<String>,
+        account_home: AccountHome,
+        config: MarmotAppConfig,
+    ) -> Result<Self, AppError> {
+        network_proxy::socks5_proxy().map_err(network_proxy::config_error)?;
+        let root = root.as_ref().to_path_buf();
+        let lease = MarmotRootRuntimeLease::try_acquire(&root)?;
+        audit_log::cleanup_legacy_audit_logs(&root);
+        let app =
+            Self::with_relays_and_account_home_and_config(&root, relay_urls, account_home, config);
+        *app.root_runtime_lease
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(lease);
+        Ok(app)
+    }
+
+    pub fn runtime(&self) -> MarmotAppRuntime {
+        MarmotAppRuntime::new(self.clone())
+    }
+
+    #[cfg(test)]
+    fn account_storage_cached_for_test(&self, label: &str) -> bool {
+        self.account_storages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(label)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_local_open_gate(
+        &self,
+        account_ref: &str,
+        stage: AccountStartupStage,
+        reached: std::sync::mpsc::Sender<()>,
+        proceed: std::sync::mpsc::Receiver<()>,
+    ) -> Result<(), AppError> {
+        let label = self.account_home().account(account_ref)?.label;
+        self.local_open_gates
+            .install(label, stage, reached, proceed);
+        Ok(())
+    }
+
+    /// Open the account's exclusive in-memory engine session.
+    ///
+    /// Only one [`AppClient`] for an account may exist within a [`MarmotApp`]
+    /// (including its clones and managed runtime workers). A concurrent open
+    /// returns [`AppError::AccountSessionBusy`]. Drop the owning client before
+    /// retrying.
+    pub async fn client(&self, label: &str) -> Result<AppClient, AppError> {
+        #[cfg(test)]
+        let relay_plane = self
+            .test_relay_client
+            .as_ref()
+            .map(|client| MarmotRelayPlane::new(None, client.clone()))
+            .unwrap_or_else(|| {
+                MarmotRelayPlane::full_history_with_loopback(
+                    self.config.allow_loopback_relay_endpoints,
+                )
+            });
+        #[cfg(not(test))]
+        let relay_plane = MarmotRelayPlane::full_history_with_loopback(
+            self.config.allow_loopback_relay_endpoints,
+        );
+        self.client_with_relay_plane(label, &relay_plane, None)
+            .await
+    }
+
+    async fn runtime_local_client(
+        &self,
+        label: &str,
+        relay_plane: &MarmotRelayPlane,
+        lifecycle: runtime::RuntimeLifecycle,
+        startup_progress: Option<&AccountStartupProgress>,
+    ) -> Result<AppClient, AppError> {
+        // Deferred hydration (mdk#1161): the account worker drives the
+        // background per-group hydration pipeline after signalling local
+        // readiness, so runtime opens stay flat in stored-group count.
+        self.local_client_with_relay_plane_and_hydration(
+            label,
+            relay_plane,
+            Some(lifecycle),
+            true,
+            startup_progress,
+        )
+        .await
+    }
+
+    async fn client_with_relay_plane(
+        &self,
+        label: &str,
+        relay_plane: &MarmotRelayPlane,
+        lifecycle: Option<runtime::RuntimeLifecycle>,
+    ) -> Result<AppClient, AppError> {
+        let mut client = self
+            .local_client_with_relay_plane(label, relay_plane, lifecycle.clone())
+            .await?;
+        client.prepare_transport().await?;
+        if let Some(lifecycle) = &lifecycle {
+            lifecycle.ensure_running()?;
+        }
+        self.finish_client_open_network_maintenance(&mut client)
+            .await;
+        Ok(client)
+    }
+
+    async fn local_client_with_relay_plane(
+        &self,
+        label: &str,
+        relay_plane: &MarmotRelayPlane,
+        lifecycle: Option<runtime::RuntimeLifecycle>,
+    ) -> Result<AppClient, AppError> {
+        self.local_client_with_relay_plane_and_hydration(label, relay_plane, lifecycle, false, None)
+            .await
+    }
+
+    async fn local_client_with_relay_plane_and_hydration(
+        &self,
+        label: &str,
+        relay_plane: &MarmotRelayPlane,
+        lifecycle: Option<runtime::RuntimeLifecycle>,
+        defer_group_hydration: bool,
+        startup_progress: Option<&AccountStartupProgress>,
+    ) -> Result<AppClient, AppError> {
+        let app = self.clone();
+        // Resolve every supported account ref before touching label-keyed
+        // caches or the session-owner registry.
+        let label = self.account_home().account(label)?.label;
+        let relay_plane_for_open = relay_plane.clone();
+        let permit = lifecycle
+            .as_ref()
+            .map(runtime::RuntimeLifecycle::begin_account_open)
+            .transpose()?;
+        // Only a starting worker records stage spans; other opens pass `None`.
+        let enter_stage = |progress: Option<&AccountStartupProgress>, stage| {
+            if let Some(progress) = progress {
+                progress.enter(stage);
+            }
+        };
+        enter_stage(startup_progress, AccountStartupStage::OpenQueued);
+        let blocking_progress = startup_progress.cloned();
+        let open = blocking_app_task(move || {
+            let _permit = permit;
+            enter_stage(
+                blocking_progress.as_ref(),
+                AccountStartupStage::AccountState,
+            );
+            app.ensure_account_state(&label)?;
+            enter_stage(blocking_progress.as_ref(), AccountStartupStage::SessionOpen);
+            let open = app.open_account(&label, &relay_plane_for_open, defer_group_hydration);
+            #[cfg(test)]
+            app.local_open_gates
+                .wait(&label, AccountStartupStage::SessionOpen);
+            open
+        })
+        .await?;
+        enter_stage(startup_progress, AccountStartupStage::ClientRestore);
+        if let Some(lifecycle) = &lifecycle {
+            lifecycle.ensure_running()?;
+        }
+        let seen_events_index = open.state.seen_events.iter().cloned().collect();
+        let checkpointed_transport_timestamp = open.state.last_transport_timestamp;
+        // The wedge clock is the one detector threshold a test has to be able
+        // to shorten: its production value is an hour, and reading a clock
+        // inside the detector instead would cost the I/O-freedom the policy
+        // module is built on.
+        let wedge_rearm_interval_ms = if cfg!(feature = "test-policy-overrides")
+            && let Some(ms) = self.config.dev_epoch_stall_wedge_rearm_interval_ms
+        {
+            ms
+        } else {
+            crate::client::epoch_stall::EPOCH_STALL_WEDGE_REARM_INTERVAL_MS
+        };
+        let _ = open.runtime.take_maintenance_activity();
+        let recovery_policy = if cfg!(feature = "test-policy-overrides")
+            && let Some(ms) = self.config.dev_epoch_backfill_retry_backoff_ms
+        {
+            client::recovery::RecoveryRetryPolicy {
+                base: Duration::from_millis(ms.max(1)),
+                cap: Duration::from_millis(ms.max(1).saturating_mul(20)),
+            }
+        } else {
+            client::recovery::RecoveryRetryPolicy {
+                base: EPOCH_BACKFILL_RETRY_BACKOFF,
+                cap: EPOCH_BACKFILL_RETRY_BACKOFF_CAP,
+            }
+        };
+        let recovery_owner = client::recovery::AccountRecoveryOwner::open(
+            &self.account_storage(&open.state.label)?.app_storage(),
+            client::recovery::wall_now_ms()?,
+            Instant::now(),
+            recovery_policy,
+        )?;
+        let incremental_request = if relay_plane
+            .subscription_rebuild_since(open.state.last_transport_timestamp)
+            .is_none()
+        {
+            Some(
+                self.account_storage(&open.state.label)?
+                    .app_storage()
+                    .request_recovery_observed(
+                        storage_sqlite::RecoveryRequest::IncrementalHistory,
+                        client::recovery::wall_now_ms()?,
+                    )?,
+            )
+        } else {
+            None
+        };
+        let cursor_audit_placements = open.adapter.delivery_placement_counts();
+        let recovery_loss_imports = open.recovery_loss_imports;
+        let audit_v5_enabled = open.runtime.session().audit_v5_enabled();
+        let mut client = AppClient {
+            #[cfg(test)]
+            test_recovery_selection_witness: None,
+            audit_v5_probe: audit_v5_enabled.then(client::audit_v5_probe::WelcomeProbe::live),
+            audit_v5_peel_slot: Some(open.audit_v5_peel_slot.clone()),
+            #[cfg(test)]
+            test_recovery_evidence: None,
+            #[cfg(test)]
+            test_comparison_results: None,
+            #[cfg(test)]
+            test_comparison_delay: None,
+            #[cfg(test)]
+            test_comparison_saved_cursor: None,
+            recovery_owner,
+            epoch_gap_windows: Default::default(),
+            // Unit tests run many directly owned clients in one process; each
+            // gets its own pool so one test's held job cannot stall another.
+            #[cfg(not(test))]
+            recovery_credits:
+                crate::runtime::account_worker::recovery_credits::shared_recovery_credit_pool(),
+            #[cfg(test)]
+            recovery_credits: crate::runtime::account_worker::recovery_credits::private_recovery_credit_pool_for_test(),
+            comparison_startup_requested: false,
+            conversation_captures: Vec::new(),
+            runtime_telemetry: None,
+            send_telemetry: None,
+            app: self.clone(),
+            maintenance_observation_generation: self.product_analytics.permit(),
+            runtime: open.runtime,
+            _session_guard: open.session_guard,
+            adapter: open.adapter,
+            routing: open.routing,
+            relay_plane: relay_plane.clone(),
+            transport_signer: open.signer,
+            blossom_http_transport: crate::media::BlossomHttpTransport::new(
+                self.allow_loopback_blob_endpoints(),
+            ),
+            state: open.state,
+            seen_events_index,
+            pending_seen_event_count: 0,
+            pending_group_projection_updates: std::collections::HashSet::new(),
+            pending_recovery_status_updates: std::collections::HashSet::new(),
+            history_notice_baseline: None,
+            cursor_audit_placements,
+            pending_projection_updates: Vec::new(),
+            pending_applied_sync_summary: SyncSummary::default(),
+            pending_applied_effects: Default::default(),
+            retained_projection_failures: 0,
+            pending_resumed_message_notifications: Default::default(),
+            pending_push_leaf_reconciliations: Default::default(),
+            pending_failed_sync_summary: SyncSummary::default(),
+            pending_native_sync_summary: SyncSummary::default(),
+            native_sync_deliveries: 0,
+            explicit_history_window_certified: false,
+            recovery_job_network_cut: false,
+            recovery_job_admission_expired: false,
+            pending_epoch_stall_escalations: Vec::new(),
+            pending_convergence_groups: std::collections::HashSet::new(),
+            stale_commit_acknowledgements: std::collections::HashMap::new(),
+            undelivered_commit_acknowledgements: std::collections::HashMap::new(),
+            commit_delivery_gate_grace_secs: crate::client::COMMIT_DELIVERY_GATE_GRACE_SECS,
+            pending_local_group_deletion_frontier_clears: std::collections::HashMap::new(),
+            pending_application_event_acks: std::collections::HashSet::new(),
+            fail_next_published_app_message_acknowledgement: cfg!(
+                feature = "test-policy-overrides"
+            ) && self
+                .config
+                .dev_fail_published_app_message_acknowledgement,
+            pending_runtime_group_subscription_refresh: false,
+            checkpointed_transport_timestamp,
+            #[cfg(test)]
+            cursor_seal_probe: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            fail_ingest_of: None,
+            delivery_overflow_recovery_pending: open.delivery_overflow_recovery_pending,
+            delivery_overflow_recovery_marker_token: open.delivery_overflow_recovery_marker_token,
+            delivery_spill: Default::default(),
+            #[cfg(test)]
+            force_event_group_projection_unavailable: false,
+            #[cfg(test)]
+            strict_quarantined_group_reads: false,
+            #[cfg(test)]
+            fail_drained_effect_checkpoints: false,
+            pending_welcome_delivery_events: Vec::new(),
+            pending_superseded_change_events: Vec::new(),
+            maintenance_failed_backlog: 0,
+            unpublished_welcome_delivery: None,
+            epoch_stall: crate::client::epoch_stall::EpochStallDetector::default()
+                .with_wedge_rearm_interval_ms(wedge_rearm_interval_ms),
+            pending_recovery_arm_writes: HashMap::new(),
+            pending_recovery_capacity_writes: HashMap::new(),
+            released_backfill_reload_pending: true,
+            #[cfg(test)]
+            fail_next_released_backfill_reload: false,
+            #[cfg(test)]
+            fail_next_terminal_recovery_retire: false,
+            post_join_maintenance_subscriptions: HashMap::new(),
+            encrypted_media_not_required_epochs: HashMap::new(),
+            checkpoint_route_refresh_recomputes: 0,
+        };
+        // Loss the open imported, and the startup history request, become
+        // audit rows once the client that records them exists.
+        client.record_recovery_loss_imports(recovery_loss_imports);
+        if let Some((ticket, transition)) = incremental_request {
+            client.record_recovery_request(
+                storage_sqlite::RecoveryCause::IncrementalHistory,
+                ticket,
+                transition,
+            );
+        }
+        // Initial access also restores durable backfill work, with or without
+        // new releases, so open does not read the intent table twice.
+        client.transport_receipts()?;
+        // After that call, never before: it restores the durable intents, drops
+        // the terminal ones and retires their runs, so a group retired there
+        // cannot have its evidence re-seeded into the detector here.
+        let persisted_evidence = self.epoch_stall_evidence(&client.state.label)?;
+        client.restore_persisted_epoch_stall_evidence(persisted_evidence);
+        // Reads only the durable terminal guards, never live group state, so it
+        // runs on deferred opens too — and it must, because it is now the sole
+        // reconciler for a disband whose live projection never completed.
+        client.sweep_terminal_groups_from_guards();
+        // Same durable-input rule as the terminal sweep: this reads stored
+        // commit dispositions and stored tombstones, never live group state, so
+        // it repairs a crash-lost branch-selection announcement on every open,
+        // deferred ones included.
+        client.reconcile_branch_selection_withdrawals();
+        if !defer_group_hydration {
+            // These repairs read live group state. Deferred runtime opens run
+            // them after the account worker's hydration pipeline instead.
+            client.reconcile_hydrated_account_state()?;
+            client.record_v5_baselines(marmot_forensics::v5::BaselineReason::Opened);
+        }
+        // Hosts read the notice list after open; later changes raise an event.
+        client.take_history_notice_changes();
+        Ok(client)
+    }
+
+    async fn finish_client_open_network_maintenance(&self, client: &mut AppClient) {
+        client
+            .app
+            .retire_cached_non_current_key_package(&client.state.label)
+            .await;
+        client
+            .app
+            .retire_relay_non_current_key_packages(&client.state.label)
+            .await;
+        if client
+            .app
+            .key_package_cutover_replacement_pending(&client.state.label)
+        {
+            let lifecycle_current = client
+                .runtime
+                .key_package_maintenance_status()
+                .ok()
+                .flatten()
+                .and_then(|lifecycle| lifecycle.current_key_package)
+                .and_then(|key_package| key_package_metadata(&key_package).ok())
+                .is_some_and(|metadata| {
+                    client
+                        .app
+                        .key_package_metadata_matches_current_support(&metadata)
+                });
+            if lifecycle_current {
+                client
+                    .app
+                    .clear_key_package_cutover_replacement_pending(&client.state.label);
+            } else {
+                match client.runtime.publish_fresh_key_package().await {
+                    Ok(_) => tracing::info!(
+                        target: "marmot_app::key_packages",
+                        method = "finish_client_open_network_maintenance",
+                        "published current key package replacement after strict cutover"
+                    ),
+                    Err(error) => tracing::warn!(
+                        target: "marmot_app::key_packages",
+                        method = "finish_client_open_network_maintenance",
+                        error_kind = AppError::from(error).privacy_safe_kind(),
+                        "deferred current key package replacement after strict cutover"
+                    ),
+                }
+                if client
+                    .runtime
+                    .key_package_maintenance_status()
+                    .ok()
+                    .flatten()
+                    .and_then(|lifecycle| lifecycle.current_key_package)
+                    .and_then(|key_package| key_package_metadata(&key_package).ok())
+                    .is_some_and(|metadata| {
+                        client
+                            .app
+                            .key_package_metadata_matches_current_support(&metadata)
+                    })
+                {
+                    client
+                        .app
+                        .clear_key_package_cutover_replacement_pending(&client.state.label);
+                }
+            }
+        }
+        // A generator revision is account-device state, independent of the
+        // strict protocol-profile cutover markers. Local-only/frozen opens
+        // must not start network maintenance.
+        if self.cursor_persistence() == CursorPersistence::Advance {
+            let result = async {
+                if client.runtime.key_package_generation_upgrade_due()? {
+                    client.runtime.publish_fresh_key_package().await?;
+                }
+                Ok::<_, marmot_account::AccountError>(())
+            }
+            .await;
+            if let Err(error) = result {
+                tracing::warn!(
+                    target: "marmot_app::key_packages",
+                    method = "finish_client_open_network_maintenance",
+                    error_kind = AppError::from(error).privacy_safe_kind(),
+                    "key package generator upgrade remains retryable"
+                );
+            }
+        }
+    }
+
+    pub fn status(&self, label: &str) -> Result<AppStatus, AppError> {
+        let account = self.account_home().account(label)?;
+        self.ensure_account_state(label)?;
+        let state = self.load_state(label)?;
+        let message_count = self
+            .account_storage(label)?
+            .app_storage()
+            .app_message_count()?;
+        Ok(AppStatus {
+            account: state.label,
+            account_id_hex: account.account_id_hex.clone(),
+            transport: self.transport_label().to_owned(),
+            group_count: state.groups.len(),
+            message_count,
+            projections: self.projection_status(label)?,
+            groups: state.groups,
+            seen_events: state.seen_events.len(),
+            relay_lists: self
+                .directory()
+                .account_relay_list_status_for_account_id(&account.account_id_hex)?,
+        })
+    }
+
+    pub async fn publish_account_relay_lists(
+        &self,
+        label: &str,
+        bootstrap: AccountRelayListBootstrap,
+    ) -> Result<AccountRelayListStatus, AppError> {
+        self.publish_selected_account_relay_lists(
+            label,
+            bootstrap,
+            &[
+                NostrAccountRelayListKind::Nip65,
+                NostrAccountRelayListKind::Inbox,
+            ],
+        )
+        .await
+    }
+
+    /// Publish every generated-identity bootstrap record through one scoped
+    /// operational relay batch. Once those records are acknowledged and cached,
+    /// copy the public relay lists and profile to indexers in a second batch.
+    pub(crate) async fn publish_generated_account_bootstrap(
+        &self,
+        label: &str,
+        bootstrap: AccountRelayListBootstrap,
+        profile: &UserProfileMetadata,
+    ) -> Result<GeneratedAccountBootstrapPublication, AppError> {
+        if bootstrap.default_relays.is_empty() {
+            return Err(AppError::MissingDefaultRelays);
+        }
+        self.validate_account_relay_list_declarations(&bootstrap, None)?;
+        let account = self.account_home().account(label)?;
+        let signer = self.account_signer_for_summary(&account)?;
+        let account_id = MemberId::new(hex::decode(&account.account_id_hex)?);
+        // Relay lists and profile metadata are public directory records. Copy
+        // those to indexers without advertising indexers as write relays or
+        // routing the contact list and KeyPackage through them.
+        let content_endpoints =
+            self.outbox_endpoints(&account.account_id_hex, bootstrap.default_relays.clone());
+        let endpoints = self.publish_route_including_requested(
+            &account.account_id_hex,
+            publish_endpoints_from_bootstrap(&bootstrap),
+        );
+        let declared_relays = bootstrap
+            .default_relays
+            .iter()
+            .chain(&bootstrap.inbox_relays)
+            .cloned()
+            .collect::<Vec<_>>();
+        let indexer_endpoints = self.public_indexer_publish_endpoints(
+            &bootstrap.indexer_relays,
+            &endpoints,
+            &endpoints,
+            &declared_relays,
+        );
+
+        let mut requests = Vec::with_capacity(4);
+        for list_kind in [
+            NostrAccountRelayListKind::Nip65,
+            NostrAccountRelayListKind::Inbox,
+        ] {
+            requests.push(NostrEventPublishRequest {
+                endpoints: endpoints.clone(),
+                event: NostrAccountRelayListPublication {
+                    account_id: account_id.clone(),
+                    list_kind,
+                    relays: bootstrap.declared_relays(list_kind),
+                    publish_endpoints: endpoints.clone(),
+                }
+                .to_event()?,
+                required_acks: 1,
+            });
+        }
+        requests.push(NostrEventPublishRequest {
+            endpoints: content_endpoints.clone(),
+            event: NostrTransportEvent::new_unsigned(
+                account.account_id_hex.clone(),
+                KIND_NOSTR_CONTACT_LIST,
+                Vec::new(),
+                String::new(),
+            ),
+            required_acks: 1,
+        });
+        requests.push(NostrEventPublishRequest {
+            endpoints: content_endpoints.clone(),
+            event: NostrTransportEvent::new_unsigned(
+                account.account_id_hex.clone(),
+                KIND_NOSTR_METADATA,
+                Vec::new(),
+                serde_json::to_string(&nostr_directory::profile_content_json(profile))?,
+            ),
+            required_acks: 1,
+        });
+        // Sign before sending so indexer copies and quorum completion carry
+        // the exact events the operational relays acknowledged.
+        let nostr_signer = signer.as_nostr_signer();
+        for request in &mut requests {
+            request.event = self
+                .sign_replaceable_identity_event(label, nostr_signer.clone(), &request.event)
+                .await?;
+        }
+        let relay_client = self.relay_client_for_account_id(&account.account_id_hex, nostr_signer);
+        let record_kinds = [
+            "NIP-65 relay list",
+            "inbox relay list",
+            "contact list",
+            "profile metadata",
+        ];
+        let batch = relay_client
+            .publish_events_for_account_with_timings(&account_id, &requests)
+            .await;
+        let outcomes = batch.outcomes;
+        if outcomes.len() != requests.len() {
+            return Err(AppError::Publish(format!(
+                "account bootstrap returned {} outcomes for {} records",
+                outcomes.len(),
+                requests.len()
+            )));
+        }
+        if batch.request_durations.len() != requests.len() {
+            return Err(AppError::Publish(format!(
+                "account bootstrap returned {} timings for {} records",
+                batch.request_durations.len(),
+                requests.len()
+            )));
+        }
+        let relay_and_follow_duration = batch.request_durations[..3]
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or_default();
+        let default_profile_duration = batch.request_durations[3];
+        // Every record was already sent. Complete the acknowledged ones even
+        // when another record fails, then report the first failure.
+        let mut completion = QuorumCancelledDelivery::new(relay_client.clone(), account_id.clone());
+        let mut failure = None;
+        for ((record_kind, outcome), request) in
+            record_kinds.into_iter().zip(outcomes).zip(&requests)
+        {
+            match outcome {
+                Ok(outcome) if !outcome.accepted.is_empty() => {
+                    completion.add(&request.event, &request.endpoints, &outcome);
+                }
+                Ok(_) => {
+                    failure.get_or_insert(AppError::Publish(format!(
+                        "relay acknowledged zero events for bootstrap record {record_kind}"
+                    )));
+                }
+                Err(error) => {
+                    failure.get_or_insert(error.into());
+                }
+            }
+        }
+        self.spawn_quorum_cancelled_delivery(completion);
+        if let Some(failure) = failure {
+            return Err(failure);
+        }
+        let relays = bootstrap
+            .default_relays
+            .iter()
+            .map(|endpoint| endpoint.0.clone())
+            .collect::<Vec<_>>();
+        let mut status = AccountRelayListStatus {
+            complete: false,
+            missing: Vec::new(),
+            default_relays: Vec::new(),
+            bootstrap_relays: endpoints
+                .iter()
+                .map(|endpoint| endpoint.0.clone())
+                .collect(),
+            nip65: AccountRelayListState {
+                kind: KIND_NIP65_RELAY_LIST,
+                created_at: requests[0].event.created_at,
+                relays: relays.clone(),
+                read_relays: relays.clone(),
+                write_relays: relays.clone(),
+            },
+            inbox: AccountRelayListState {
+                kind: KIND_MARMOT_INBOX_RELAY_LIST,
+                created_at: requests[1].event.created_at,
+                relays: bootstrap
+                    .inbox_declaration()
+                    .iter()
+                    .map(|endpoint| endpoint.0.clone())
+                    .collect(),
+                read_relays: Vec::new(),
+                write_relays: Vec::new(),
+            },
+        };
+        status.refresh();
+        self.directory()
+            .remember_directory_relay_lists(&account.account_id_hex, &status)?;
+        self.directory()
+            .remember_directory_follow_edges_for_search(
+                &account.account_id_hex,
+                &nostr_directory::FetchedFollowList {
+                    follows: Vec::new(),
+                    source_relays: content_endpoints
+                        .iter()
+                        .map(|endpoint| endpoint.0.clone())
+                        .collect(),
+                },
+            )?;
+        // Cache the signed kind-0 timestamp: retries can author it ahead of the
+        // clock, and a reopened app recovers its timestamp floor from here.
+        let mut profile = profile.clone();
+        if let Some(request) = requests
+            .iter()
+            .find(|request| request.event.kind == KIND_NOSTR_METADATA)
+        {
+            profile.created_at = request.event.created_at;
+        }
+        self.directory()
+            .remember_directory_profile(&account.account_id_hex, &profile)?;
+        let indexer_events = requests
+            .into_iter()
+            .filter(|request| request.event.kind != KIND_NOSTR_CONTACT_LIST)
+            .map(|request| request.event)
+            .collect();
+        Ok(GeneratedAccountBootstrapPublication {
+            status,
+            relay_and_follow_duration,
+            default_profile_duration,
+            indexer_copy: PublicIndexerCopy::new(
+                relay_client,
+                account_id,
+                indexer_events,
+                indexer_endpoints,
+            ),
+            profile,
+        })
+    }
+
+    /// Rebuild replaceable public directory records after a confirmed setup
+    /// phase is resumed. This does not republish the operational bootstrap.
+    pub(crate) async fn prepare_generated_account_indexer_copy(
+        &self,
+        label: &str,
+        status: &AccountRelayListStatus,
+        profile: &UserProfileMetadata,
+        indexer_relays: &[TransportEndpoint],
+    ) -> Result<Option<PublicIndexerCopy>, AppError> {
+        let operational = status
+            .bootstrap_relays
+            .iter()
+            .cloned()
+            .map(TransportEndpoint)
+            .collect::<Vec<_>>();
+        let declared = status
+            .nip65
+            .relays
+            .iter()
+            .chain(&status.nip65.read_relays)
+            .chain(&status.nip65.write_relays)
+            .chain(&status.inbox.relays)
+            .chain(&status.default_relays)
+            .cloned()
+            .map(TransportEndpoint)
+            .collect::<Vec<_>>();
+        let indexers = self.public_indexer_publish_endpoints(
+            indexer_relays,
+            &operational,
+            &operational,
+            &declared,
+        );
+        if indexers.is_empty() {
+            return Ok(None);
+        }
+        let account = self.account_home().account(label)?;
+        let signer = self.account_signer_for_summary(&account)?;
+        let nostr_signer = signer.as_nostr_signer();
+        let account_id = MemberId::new(hex::decode(&account.account_id_hex)?);
+        let mut events = Vec::with_capacity(3);
+        let nip65_event = NostrNip65RelayListPublication {
+            account_id: account_id.clone(),
+            relays: nip65_relay_set_from_state(&status.nip65),
+            publish_endpoints: operational.clone(),
+        }
+        .to_event()?;
+        events.push(
+            self.sign_replaceable_identity_event(label, nostr_signer.clone(), &nip65_event)
+                .await?,
+        );
+        let inbox_event = NostrAccountRelayListPublication {
+            account_id: account_id.clone(),
+            list_kind: NostrAccountRelayListKind::Inbox,
+            relays: status
+                .inbox
+                .relays
+                .iter()
+                .cloned()
+                .map(TransportEndpoint)
+                .collect(),
+            publish_endpoints: operational,
+        }
+        .to_event()?;
+        events.push(
+            self.sign_replaceable_identity_event(label, nostr_signer.clone(), &inbox_event)
+                .await?,
+        );
+        let profile_event = NostrTransportEvent::new_unsigned(
+            account.account_id_hex.clone(),
+            KIND_NOSTR_METADATA,
+            Vec::new(),
+            serde_json::to_string(&nostr_directory::profile_content_json(profile))?,
+        );
+        events.push(
+            self.sign_replaceable_identity_event(label, nostr_signer.clone(), &profile_event)
+                .await?,
+        );
+        let relay_client = self.relay_client_for_account_id(&account.account_id_hex, nostr_signer);
+        Ok(PublicIndexerCopy::new(
+            relay_client,
+            account_id,
+            events,
+            indexers,
+        ))
+    }
+
+    pub async fn publish_missing_account_relay_lists(
+        &self,
+        label: &str,
+        bootstrap: AccountRelayListBootstrap,
+    ) -> Result<AccountRelayListStatus, AppError> {
+        let current = self.account_relay_list_status(label)?;
+        self.publish_missing_account_relay_lists_from_status(label, bootstrap, current)
+            .await
+    }
+
+    pub async fn publish_missing_account_relay_lists_from_status(
+        &self,
+        label: &str,
+        bootstrap: AccountRelayListBootstrap,
+        current: AccountRelayListStatus,
+    ) -> Result<AccountRelayListStatus, AppError> {
+        let missing = current
+            .missing
+            .iter()
+            .map(|kind| match kind {
+                MissingRelayListKind::Nip65 => NostrAccountRelayListKind::Nip65,
+                MissingRelayListKind::Inbox => NostrAccountRelayListKind::Inbox,
+            })
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            return Ok(current);
+        }
+        self.publish_selected_account_relay_lists(label, bootstrap, &missing)
+            .await
+    }
+
+    async fn ensure_local_account_relay_lists(
+        &self,
+        label: &str,
+    ) -> Result<AccountRelayListStatus, AppError> {
+        let account = self.account_home().account(label)?;
+        // Read the journal before the projection. Setup clears it only after
+        // its bootstrap has projected the chosen lists, so once it is gone the
+        // status read below already reflects them.
+        let setup_owns_relay_lists = self
+            .account_home()
+            .account_setup_state(&account.label)?
+            .is_some_and(|state| state.kind == AccountSetupKind::GeneratedIdentity);
+        let status = self
+            .directory()
+            .account_relay_list_status_for_account_id(&account.account_id_hex)?;
+        if status.complete {
+            return Ok(status);
+        }
+        if setup_owns_relay_lists {
+            // An open generated setup publishes the relays the user chose in
+            // its bootstrap batch, and runtime start resumes it. The app's
+            // relays published here would stay advertised as this account's
+            // write and inbox relays wherever that batch never lands
+            // (mdk#2359).
+            return Ok(status);
+        }
+        let default_relays = self.relay_endpoints();
+        if default_relays.is_empty() {
+            return Err(AppError::MissingRelayLists(status.missing));
+        }
+        self.publish_missing_account_relay_lists_from_status(
+            label,
+            AccountRelayListBootstrap::new(default_relays.clone(), default_relays),
+            status,
+        )
+        .await
+    }
+
+    pub async fn publish_account_relay_list_kind(
+        &self,
+        label: &str,
+        list_kind: &str,
+        relays: Vec<TransportEndpoint>,
+        bootstrap_relays: Vec<TransportEndpoint>,
+    ) -> Result<AccountRelayListStatus, AppError> {
+        let list_kind = match list_kind {
+            "nip65" => NostrAccountRelayListKind::Nip65,
+            "inbox" => NostrAccountRelayListKind::Inbox,
+            other => {
+                return Err(AppError::RelayDirectory(format!(
+                    "unsupported relay list type: {other}"
+                )));
+            }
+        };
+        self.publish_selected_account_relay_lists(
+            label,
+            AccountRelayListBootstrap::new(relays, bootstrap_relays),
+            &[list_kind],
+        )
+        .await
+    }
+
+    /// Return every declared NIP-65 relay for backward-compatible list editing.
+    ///
+    /// Routing code must use `AccountRelayListStatus::nip65.relays`, which is
+    /// the write-capable subset. Returning the union here keeps the established
+    /// getter -> edit -> setter flow from deleting read-only entries. Because
+    /// this faithfully returns published data, it can include retired or unsafe
+    /// endpoints; clients must classify the result and remove every non-allowed
+    /// entry before passing an edited list to a setter.
+    pub fn account_nip65_relays(&self, label: &str) -> Result<Vec<String>, AppError> {
+        let state = self.account_relay_list_status(label)?.nip65;
+        let relay_set = nip65_relay_set_from_state(&state);
+        let mut relays = relay_set
+            .read_relays
+            .into_iter()
+            .map(|endpoint| endpoint.0)
+            .collect::<Vec<_>>();
+        push_unique_strings(
+            &mut relays,
+            relay_set
+                .write_relays
+                .into_iter()
+                .map(|endpoint| endpoint.0),
+        );
+        Ok(relays)
+    }
+
+    /// Return the published inbox list without hiding retired entries.
+    ///
+    /// Clients must classify the result and remove every non-allowed entry
+    /// before passing an edited list to [`Self::set_account_inbox_relays`].
+    pub fn account_inbox_relays(&self, label: &str) -> Result<Vec<String>, AppError> {
+        Ok(self.account_relay_list_status(label)?.inbox.relays)
+    }
+
+    pub async fn set_account_nip65_relays(
+        &self,
+        label: &str,
+        relays: Vec<TransportEndpoint>,
+        bootstrap_relays: Vec<TransportEndpoint>,
+    ) -> Result<AccountRelayListStatus, AppError> {
+        self.set_account_nip65_relays_with_indexers(label, relays, bootstrap_relays, Vec::new())
+            .await
+    }
+
+    pub async fn set_account_nip65_relays_with_indexers(
+        &self,
+        label: &str,
+        relays: Vec<TransportEndpoint>,
+        bootstrap_relays: Vec<TransportEndpoint>,
+        indexer_relays: Vec<TransportEndpoint>,
+    ) -> Result<AccountRelayListStatus, AppError> {
+        let current = self.account_relay_list_status(label)?.nip65;
+        let relay_set = nip65_relay_set_preserving_roles(&current, relays);
+        self.publish_account_nip65_relay_set_with_indexers(
+            label,
+            relay_set.read_relays,
+            relay_set.write_relays,
+            bootstrap_relays,
+            indexer_relays,
+        )
+        .await
+    }
+
+    /// Replace the account's NIP-65 list while preserving explicit relay
+    /// directions in the published kind-10002 event.
+    pub async fn publish_account_nip65_relay_set(
+        &self,
+        label: &str,
+        read_relays: Vec<TransportEndpoint>,
+        write_relays: Vec<TransportEndpoint>,
+        bootstrap_relays: Vec<TransportEndpoint>,
+    ) -> Result<AccountRelayListStatus, AppError> {
+        self.publish_account_nip65_relay_set_with_indexers(
+            label,
+            read_relays,
+            write_relays,
+            bootstrap_relays,
+            Vec::new(),
+        )
+        .await
+    }
+
+    pub async fn publish_account_nip65_relay_set_with_indexers(
+        &self,
+        label: &str,
+        read_relays: Vec<TransportEndpoint>,
+        write_relays: Vec<TransportEndpoint>,
+        bootstrap_relays: Vec<TransportEndpoint>,
+        indexer_relays: Vec<TransportEndpoint>,
+    ) -> Result<AccountRelayListStatus, AppError> {
+        let relay_set = NostrNip65RelaySet {
+            read_relays: unique_transport_endpoints(read_relays),
+            write_relays: unique_transport_endpoints(write_relays),
+        };
+        self.publish_selected_account_relay_lists_with_nip65(
+            label,
+            AccountRelayListBootstrap::new(relay_set.write_relays.clone(), bootstrap_relays)
+                .with_indexer_relays(indexer_relays),
+            &[NostrAccountRelayListKind::Nip65],
+            Some(&relay_set),
+        )
+        .await
+    }
+
+    pub async fn set_account_inbox_relays(
+        &self,
+        label: &str,
+        relays: Vec<TransportEndpoint>,
+        bootstrap_relays: Vec<TransportEndpoint>,
+    ) -> Result<AccountRelayListStatus, AppError> {
+        self.set_account_inbox_relays_with_indexers(label, relays, bootstrap_relays, Vec::new())
+            .await
+    }
+
+    pub async fn set_account_inbox_relays_with_indexers(
+        &self,
+        label: &str,
+        relays: Vec<TransportEndpoint>,
+        bootstrap_relays: Vec<TransportEndpoint>,
+        indexer_relays: Vec<TransportEndpoint>,
+    ) -> Result<AccountRelayListStatus, AppError> {
+        self.set_account_relay_list_kind(
+            label,
+            NostrAccountRelayListKind::Inbox,
+            relays,
+            bootstrap_relays,
+            indexer_relays,
+        )
+        .await
+    }
+
+    async fn set_account_relay_list_kind(
+        &self,
+        label: &str,
+        list_kind: NostrAccountRelayListKind,
+        relays: Vec<TransportEndpoint>,
+        bootstrap_relays: Vec<TransportEndpoint>,
+        indexer_relays: Vec<TransportEndpoint>,
+    ) -> Result<AccountRelayListStatus, AppError> {
+        self.publish_selected_account_relay_lists(
+            label,
+            AccountRelayListBootstrap::new(relays, bootstrap_relays)
+                .with_indexer_relays(indexer_relays),
+            &[list_kind],
+        )
+        .await
+    }
+
+    async fn publish_selected_account_relay_lists(
+        &self,
+        label: &str,
+        bootstrap: AccountRelayListBootstrap,
+        list_kinds: &[NostrAccountRelayListKind],
+    ) -> Result<AccountRelayListStatus, AppError> {
+        self.publish_selected_account_relay_lists_with_nip65(label, bootstrap, list_kinds, None)
+            .await
+    }
+
+    async fn publish_selected_account_relay_lists_with_nip65(
+        &self,
+        label: &str,
+        bootstrap: AccountRelayListBootstrap,
+        list_kinds: &[NostrAccountRelayListKind],
+        nip65_relay_set: Option<&NostrNip65RelaySet>,
+    ) -> Result<AccountRelayListStatus, AppError> {
+        let has_directional_nip65_relays = nip65_relay_set.is_some_and(|relays| {
+            !relays.read_relays.is_empty() || !relays.write_relays.is_empty()
+        });
+        if bootstrap.default_relays.is_empty() && !has_directional_nip65_relays {
+            return Err(AppError::MissingDefaultRelays);
+        }
+        self.validate_account_relay_list_declarations(&bootstrap, nip65_relay_set)?;
+        let account = self.account_home().account(label)?;
+        let signer = self.account_signer_for_summary(&account)?;
+        let account_id = MemberId::new(hex::decode(&account.account_id_hex)?);
+        let account_id_hex = account.account_id_hex;
+        // Outbox routing: publish relay-list events to the account's own NIP-65
+        // write relays; fall back to the bootstrap/seed relays on first publish
+        // (no NIP-65 yet). The declared list (content) is `default_relays`, but
+        // the relays we publish *through* must be reachable — the account's own
+        // relays or the seed, never the (possibly not-yet-reachable) declared set.
+        //
+        // We then UNION in the caller's explicitly-requested publish endpoints.
+        // Without this, a republish/set that *adds* a relay can never reach that
+        // new relay: `outbox_endpoints` returns the existing (narrower) NIP-65
+        // outbox and drops the requested set entirely, so the updated list only
+        // ever lands on the relays you were already on. Unioning means an
+        // explicit republish reaches both your old relays (so they update) and
+        // the newly-declared ones (so they learn about you for the first time).
+        let requested_endpoints = publish_endpoints_from_bootstrap(&bootstrap);
+        let endpoints =
+            self.publish_route_including_requested(&account_id_hex, requested_endpoints.clone());
+        let declared_relays = if let Some(relays) = nip65_relay_set {
+            bootstrap
+                .default_relays
+                .iter()
+                .chain(&bootstrap.inbox_relays)
+                .chain(&relays.read_relays)
+                .chain(&relays.write_relays)
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            bootstrap
+                .default_relays
+                .iter()
+                .chain(&bootstrap.inbox_relays)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let indexer_endpoints = self.public_indexer_publish_endpoints(
+            &bootstrap.indexer_relays,
+            &endpoints,
+            &requested_endpoints,
+            &declared_relays,
+        );
+        let nostr_signer = signer.as_nostr_signer();
+        let relay_client = self.relay_client_for_account_id(&account_id_hex, nostr_signer.clone());
+        let mut requests = Vec::with_capacity(list_kinds.len());
+        for list_kind in list_kinds {
+            let event = if *list_kind == NostrAccountRelayListKind::Nip65
+                && let Some(relays) = nip65_relay_set
+            {
+                NostrNip65RelayListPublication {
+                    account_id: account_id.clone(),
+                    relays: relays.clone(),
+                    publish_endpoints: endpoints.clone(),
+                }
+                .to_event()?
+            } else {
+                NostrAccountRelayListPublication {
+                    account_id: account_id.clone(),
+                    list_kind: *list_kind,
+                    relays: bootstrap.declared_relays(*list_kind),
+                    publish_endpoints: endpoints.clone(),
+                }
+                .to_event()?
+            };
+            requests.push(NostrEventPublishRequest {
+                endpoints: endpoints.clone(),
+                event,
+                required_acks: 1,
+            });
+        }
+        // Sign before sending so indexer copies and quorum completion carry
+        // the exact events the operational relays acknowledged.
+        for request in &mut requests {
+            request.event = self
+                .sign_replaceable_identity_event(label, nostr_signer.clone(), &request.event)
+                .await?;
+        }
+        let outcomes = relay_client
+            .publish_events_for_account(&account_id, &requests)
+            .await;
+        if outcomes.len() != requests.len() {
+            return Err(AppError::Publish(
+                "relay-list publication returned incomplete outcomes".into(),
+            ));
+        }
+        // Every record was already sent. Complete the acknowledged ones even
+        // when another record fails, then report the first failure.
+        let mut completion = QuorumCancelledDelivery::new(relay_client.clone(), account_id.clone());
+        let mut failure = None;
+        for (outcome, request) in outcomes.into_iter().zip(&requests) {
+            match outcome {
+                Ok(outcome) if !outcome.accepted.is_empty() => {
+                    completion.add(&request.event, &request.endpoints, &outcome);
+                }
+                Ok(_) => {
+                    failure.get_or_insert(AppError::Publish(
+                        "relay acknowledged zero account relay-list events".to_owned(),
+                    ));
+                }
+                Err(error) => {
+                    failure.get_or_insert(error.into());
+                }
+            }
+        }
+        self.spawn_quorum_cancelled_delivery(completion);
+        if let Some(failure) = failure {
+            return Err(failure);
+        }
+
+        // The signed replaceable events above are the authoritative effect of
+        // this operation. Persist their declared state directly after every
+        // event has an acknowledgement; synchronously querying the same relays
+        // again adds no confirmation strength and used to turn a post-success
+        // read outage into account-setup rollback (mdk#1436).
+        let mut status = self
+            .directory()
+            .account_relay_list_status_for_account_id(&account_id_hex)?;
+        for (list_kind, request) in list_kinds.iter().zip(&requests) {
+            match list_kind {
+                NostrAccountRelayListKind::Nip65 => {
+                    let (read_relays, write_relays) = nip65_relay_set
+                        .map(|relays| {
+                            (
+                                relays
+                                    .read_relays
+                                    .iter()
+                                    .map(|endpoint| endpoint.0.clone())
+                                    .collect::<Vec<_>>(),
+                                relays
+                                    .write_relays
+                                    .iter()
+                                    .map(|endpoint| endpoint.0.clone())
+                                    .collect::<Vec<_>>(),
+                            )
+                        })
+                        .unwrap_or_else(|| {
+                            let relays = bootstrap
+                                .default_relays
+                                .iter()
+                                .map(|endpoint| endpoint.0.clone())
+                                .collect::<Vec<_>>();
+                            (relays.clone(), relays)
+                        });
+                    status.nip65 = AccountRelayListState {
+                        kind: KIND_NIP65_RELAY_LIST,
+                        created_at: request.event.created_at,
+                        relays: write_relays.clone(),
+                        read_relays,
+                        write_relays,
+                    };
+                }
+                NostrAccountRelayListKind::Inbox => {
+                    status.inbox = AccountRelayListState {
+                        kind: KIND_MARMOT_INBOX_RELAY_LIST,
+                        created_at: request.event.created_at,
+                        relays: bootstrap
+                            .inbox_declaration()
+                            .iter()
+                            .map(|endpoint| endpoint.0.clone())
+                            .collect(),
+                        read_relays: Vec::new(),
+                        write_relays: Vec::new(),
+                    };
+                }
+            }
+        }
+        push_unique_strings(
+            &mut status.bootstrap_relays,
+            endpoints.iter().map(|endpoint| endpoint.0.clone()),
+        );
+        status.refresh();
+        self.directory()
+            .remember_directory_relay_lists(&account_id_hex, &status)?;
+        let indexer_events = requests
+            .iter()
+            .map(|request| request.event.clone())
+            .collect::<Vec<_>>();
+        if let Some(copy) =
+            PublicIndexerCopy::new(relay_client, account_id, indexer_events, indexer_endpoints)
+        {
+            self.spawn_public_indexer_copy(copy);
+        }
+        Ok(status)
+    }
+
+    /// Validate caller-owned relay-list declarations without applying the dial
+    /// route's aggregate endpoint cap to the published list itself. Validating
+    /// one entry at a time retains the exact retired/invalid/unsafe policy while
+    /// the separately constructed publication route remains capped normally.
+    fn validate_account_relay_list_declarations(
+        &self,
+        bootstrap: &AccountRelayListBootstrap,
+        nip65_relay_set: Option<&NostrNip65RelaySet>,
+    ) -> Result<(), AppError> {
+        let mut declarations: Vec<(&[TransportEndpoint], &str)> = Vec::new();
+        if let Some(relays) = nip65_relay_set {
+            declarations.extend([
+                (
+                    relays.read_relays.as_slice(),
+                    "account NIP-65 read-relay declaration",
+                ),
+                (
+                    relays.write_relays.as_slice(),
+                    "account NIP-65 write-relay declaration",
+                ),
+            ]);
+        }
+        declarations.extend([
+            (
+                bootstrap.default_relays.as_slice(),
+                "account relay-list declaration",
+            ),
+            (
+                bootstrap.inbox_relays.as_slice(),
+                "account inbox relay-list declaration",
+            ),
+            (
+                bootstrap.bootstrap_relays.as_slice(),
+                "account relay-list publication",
+            ),
+        ]);
+        for (endpoints, context) in declarations {
+            for endpoint in endpoints {
+                self.relay_plane
+                    .sanitize_relay_endpoints(vec![endpoint.clone()], context)
+                    .map_err(AppError::RelayDirectory)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Outbox routing for account-scoped events. Prefers the safe subset of the
+    /// account's declared NIP-65 write relays (read from the local relay-list
+    /// cache, no network), so e.g. republishing your relay lists / profile goes
+    /// to *your* relays rather than whatever defaults the caller passed. Falls
+    /// back to `fallback` when the account has no usable NIP-65 relay. Filtering
+    /// here affects only the operation's route; it does not rewrite the cached
+    /// or published relay list.
+    fn outbox_endpoints(
+        &self,
+        account_id_hex: &str,
+        fallback: Vec<TransportEndpoint>,
+    ) -> Vec<TransportEndpoint> {
+        let nip65 = self
+            .directory()
+            .account_relay_list_status_for_account_id(account_id_hex)
+            .map(|status| status.nip65.relays)
+            .unwrap_or_default();
+        let safe = self.retain_safe_discovered_endpoints(
+            nip65.into_iter().map(TransportEndpoint).collect(),
+            "local account outbox routing",
+        );
+        if safe.is_empty() { fallback } else { safe }
+    }
+
+    /// Preserve the account's existing outbox route while ensuring every
+    /// explicitly requested publication endpoint is reached at least once.
+    fn publish_route_including_requested(
+        &self,
+        account_id_hex: &str,
+        requested: Vec<TransportEndpoint>,
+    ) -> Vec<TransportEndpoint> {
+        let mut endpoints = self.outbox_endpoints(account_id_hex, requested.clone());
+        for endpoint in requested {
+            if !endpoints.iter().any(|existing| existing.0 == endpoint.0) {
+                endpoints.push(endpoint);
+            }
+        }
+        endpoints
+    }
+
+    fn public_indexer_publish_endpoints(
+        &self,
+        indexer_relays: &[TransportEndpoint],
+        operational_relays: &[TransportEndpoint],
+        publication_relays: &[TransportEndpoint],
+        declared_relays: &[TransportEndpoint],
+    ) -> Vec<TransportEndpoint> {
+        // Development identities may intentionally use loopback relays. Keep
+        // their public discovery reads, but never export their records. A
+        // previous outbox can remain on the delivery route during a relay-list
+        // edit; only this publication's requested route and declaration decide
+        // whether the replacement record is public.
+        if publication_relays
+            .iter()
+            .chain(declared_relays)
+            .any(|endpoint| {
+                url::Url::parse(endpoint.as_str()).ok().is_some_and(|url| {
+                    url.host()
+                        .is_some_and(cgka_traits::app_components::is_loopback_host)
+                })
+            })
+        {
+            return Vec::new();
+        }
+        let operational = self.retain_safe_discovered_endpoints(
+            operational_relays.to_vec(),
+            "public directory operational route",
+        );
+        let mut indexers = self.retain_safe_discovered_endpoints(
+            indexer_relays.to_vec(),
+            "public directory publication",
+        );
+        indexers.retain(|endpoint| !operational.contains(endpoint));
+        indexers
+    }
+
+    pub(crate) fn spawn_public_indexer_copy(&self, copy: PublicIndexerCopy) {
+        let account_id_hex = hex::encode(copy.account_id.as_slice());
+        self.spawn_account_publication_copy(account_id_hex, copy.run());
+    }
+
+    /// Sign a replaceable identity record (kind 0, kind 3, relay lists) with a
+    /// `created_at` strictly after the previous version authored for the same
+    /// account and kind. Relays keep the lower event id on a timestamp tie, so
+    /// a same-second older version delivered late by quorum completion could
+    /// otherwise replace a newer save. The floor is persisted before signing,
+    /// so it survives a restart even when the publication then fails.
+    pub(crate) async fn sign_replaceable_identity_event(
+        &self,
+        account_ref: &str,
+        signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner>,
+        event: &NostrTransportEvent,
+    ) -> Result<NostrTransportEvent, AppError> {
+        let created_at = self.reserve_replaceable_identity_created_at(account_ref, event)?;
+        let event = NostrTransportEvent::new_unsigned_at(
+            event.pubkey.clone(),
+            event.kind,
+            event.tags.clone(),
+            event.content.clone(),
+            created_at,
+        );
+        sign_account_publication_event(signer, &event).await
+    }
+
+    fn reserve_replaceable_identity_created_at(
+        &self,
+        account_ref: &str,
+        event: &NostrTransportEvent,
+    ) -> Result<u64, AppError> {
+        let kind = event.kind;
+        let mut latest = self
+            .replaceable_identity_created_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = (event.pubkey.clone(), kind);
+        let floor = match latest.get(&key) {
+            Some(floor) => *floor,
+            None => self
+                .account_home()
+                .replaceable_record_floors(account_ref)?
+                .get(&kind)
+                .copied()
+                .unwrap_or(0),
+        };
+        let created_at = event.created_at.max(floor.saturating_add(1));
+        self.account_home()
+            .advance_replaceable_record_floor(account_ref, kind, created_at)?;
+        latest.insert(key, created_at);
+        Ok(created_at)
+    }
+
+    pub(crate) fn spawn_quorum_cancelled_delivery(&self, delivery: QuorumCancelledDelivery) {
+        if delivery.requests.is_empty() {
+            return;
+        }
+        let account_id_hex = hex::encode(delivery.account_id.as_slice());
+        self.spawn_account_publication_copy(account_id_hex, delivery.run());
+    }
+
+    /// Track a best-effort copy of already-acknowledged public records so
+    /// account removal and shutdown abort it with the indexer copies.
+    fn spawn_account_publication_copy(
+        &self,
+        account_id_hex: String,
+        copy: impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
+        let mut tasks = self
+            .public_indexer_copy_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if tasks.stopped
+            || self.storage_closed.load(Ordering::Acquire)
+            || self.account_home().account(&account_id_hex).is_err()
+        {
+            return;
+        }
+        let handles = tasks.by_account.entry(account_id_hex).or_default();
+        handles.retain(|handle| !handle.is_finished());
+        handles.push(tokio::spawn(copy));
+    }
+
+    pub(crate) fn abort_public_indexer_copies_for_account(
+        &self,
+        account_id_hex: &str,
+    ) -> Vec<tokio::task::JoinHandle<()>> {
+        let handles = self
+            .public_indexer_copy_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .by_account
+            .remove(account_id_hex)
+            .unwrap_or_default();
+        for handle in &handles {
+            handle.abort();
+        }
+        handles
+    }
+
+    pub(crate) fn abort_all_public_indexer_copies(&self) -> Vec<tokio::task::JoinHandle<()>> {
+        let handles = {
+            let mut tasks = self
+                .public_indexer_copy_tasks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            tasks.stopped = true;
+            tasks
+                .by_account
+                .drain()
+                .flat_map(|(_, handles)| handles)
+                .collect::<Vec<_>>()
+        };
+        for handle in &handles {
+            handle.abort();
+        }
+        handles
+    }
+
+    pub fn messages(&self, label: &str) -> Result<Vec<AppMessageRecord>, AppError> {
+        self.messages_with_query(label, AppMessageQuery::default())
+    }
+
+    pub fn messages_with_query(
+        &self,
+        label: &str,
+        query: AppMessageQuery,
+    ) -> Result<Vec<AppMessageRecord>, AppError> {
+        self.ensure_account_state(label)?;
+        Ok(self
+            .account_storage(label)?
+            .app_storage()
+            .visible_app_messages(StoredAppMessageQuery {
+                group_id_hex: query.group_id_hex,
+                kinds: query.kinds,
+                limit: query.limit,
+            })?
+            .into_iter()
+            .map(app_message_record_from_stored)
+            .collect())
+    }
+
+    /// Resolve one app-visible event by group/message id, applying block policy.
+    pub fn message_by_id(
+        &self,
+        label: &str,
+        group_id_hex: &str,
+        message_id_hex: &str,
+    ) -> Result<Option<AppMessageRecord>, AppError> {
+        self.ensure_account_state(label)?;
+        let storage = self.account_storage(label)?.app_storage();
+        let Some(record) = storage.app_message(group_id_hex, message_id_hex)? else {
+            return Ok(None);
+        };
+        if !storage.is_app_author_visible(&record.sender, group_id_hex)? {
+            return Ok(None);
+        }
+        Ok(Some(app_message_record_from_stored(record)))
+    }
+
+    /// Resolve the reacted-to target for a reaction notification from the
+    /// materialized timeline (the user-visible truth) rather than raw
+    /// `app_events`. Filters by id directly, so the group's full history is not
+    /// scanned. Returns the small [`storage_sqlite::TimelineMessageTarget`]
+    /// view carrying sender + plaintext + kind + deleted/invalidated flags;
+    /// `None` when the id is absent in that group (e.g. retention-pruned, so the
+    /// reaction's author cannot be verified).
+    pub fn reaction_target(
+        &self,
+        label: &str,
+        group_id_hex: &str,
+        message_id_hex: &str,
+    ) -> Result<Option<storage_sqlite::TimelineMessageTarget>, AppError> {
+        self.ensure_account_state(label)?;
+        Ok(self
+            .account_storage(label)?
+            .app_storage()
+            .timeline_message_target(group_id_hex, message_id_hex)?)
+    }
+
+    pub fn timeline_messages_with_query(
+        &self,
+        label: &str,
+        query: TimelineMessageQuery,
+    ) -> Result<TimelinePage, AppError> {
+        let _span = tracing::debug_span!(
+            target: "marmot_app::timeline",
+            "timeline_messages_with_query",
+            method = "timeline_messages_with_query"
+        )
+        .entered();
+        self.ensure_account_state(label)?;
+        Ok(self
+            .account_storage(label)?
+            .app_storage()
+            .message_timeline(query)?)
+    }
+
+    pub(crate) fn retention_expiry_scan(
+        &self,
+        label: &str,
+        group_id_hex: &str,
+        now_seconds: u64,
+        skew_now_seconds: u64,
+    ) -> Result<storage_sqlite::RetentionExpiryScan, AppError> {
+        let account = self.account_home().account(label)?;
+        self.ensure_account_state(&account.label)?;
+        Ok(self
+            .account_storage(&account.label)?
+            .app_storage()
+            .retention_expiry_scan(
+                &account.account_id_hex,
+                group_id_hex,
+                now_seconds,
+                skew_now_seconds,
+            )?)
+    }
+
+    pub fn message_edit_history(
+        &self,
+        label: &str,
+        group: &str,
+        target: &str,
+        before: Option<(u64, String)>,
+        limit: usize,
+    ) -> Result<TimelineEditHistoryPage, AppError> {
+        self.ensure_account_state(label)?;
+        Ok(self
+            .account_storage(label)?
+            .app_storage()
+            .message_edit_history(group, target, before, limit)?)
+    }
+
+    pub fn poll_votes(
+        &self,
+        label: &str,
+        group_id_hex: &str,
+        poll_event_id: &str,
+        after: Option<(u64, String)>,
+        limit: usize,
+    ) -> Result<PollVotePage, AppError> {
+        self.ensure_account_state(label)?;
+        Ok(self.account_storage(label)?.app_storage().poll_votes(
+            group_id_hex,
+            poll_event_id,
+            after,
+            limit,
+        )?)
+    }
+
+    pub fn timeline_message(
+        &self,
+        label: &str,
+        group_id_hex: &str,
+        message_id_hex: &str,
+    ) -> Result<Option<TimelineMessageRecord>, AppError> {
+        self.ensure_account_state(label)?;
+        Ok(self
+            .account_storage(label)?
+            .app_storage()
+            .timeline_message(group_id_hex, message_id_hex)?)
+    }
+
+    pub fn chat_list(
+        &self,
+        label: &str,
+        include_archived: bool,
+    ) -> Result<Vec<ChatListRow>, AppError> {
+        let account = self.account_home().account(label)?;
+        self.ensure_account_state(&account.label)?;
+        self.ensure_chat_list_projection(&account)?;
+        let mut rows = self
+            .account_storage(&account.label)?
+            .app_storage()
+            .chat_list_rows(ChatListQuery { include_archived })?;
+        self.hydrate_chat_list_rows(&mut rows)?;
+        Ok(rows)
+    }
+
+    pub fn chat_list_row(
+        &self,
+        label: &str,
+        group_id_hex: &str,
+    ) -> Result<Option<ChatListRow>, AppError> {
+        let account = self.account_home().account(label)?;
+        self.ensure_account_state(&account.label)?;
+        self.ensure_chat_list_projection(&account)?;
+        let mut row = self
+            .account_storage(&account.label)?
+            .app_storage()
+            .chat_list_row(group_id_hex)?;
+        self.hydrate_chat_list_row(row.as_mut());
+        Ok(row)
+    }
+
+    /// Direct-conversation candidates for a peer-keyed reuse lookup.
+    ///
+    /// This is the SQL-filtered chat-list projection only: empty group name,
+    /// roster size 2, and a persisted member-index hit for `peer_account_id_hex`.
+    /// It does not transfer named chats, 3+ member chats, or Direct chats with
+    /// a different peer, and it does not hydrate last-message display names.
+    pub fn direct_conversation_candidates(
+        &self,
+        label: &str,
+        peer_account_id_hex: &str,
+    ) -> Result<Vec<ChatListRow>, AppError> {
+        let account = self.account_home().account(label)?;
+        self.ensure_account_state(&account.label)?;
+        self.ensure_chat_list_projection(&account)?;
+        Ok(self
+            .account_storage(&account.label)?
+            .app_storage()
+            .direct_conversation_candidate_rows(peer_account_id_hex)?)
+    }
+
+    /// Pin or unpin one unarchived local chat and return the complete
+    /// authoritative pin order after the transaction.
+    pub fn set_chat_pinned(
+        &self,
+        label: &str,
+        group_id_hex: &str,
+        pinned: bool,
+    ) -> Result<ChatPinState, AppError> {
+        self.ensure_account_state(label)?;
+        self.account_storage(label)?
+            .app_storage()
+            .set_chat_pinned(group_id_hex, pinned)
+            .map_err(chat_pin_error_from_storage)
+    }
+
+    /// Atomically replace the order of the current pinned set.
+    ///
+    /// The input must contain every currently pinned group exactly once.
+    pub fn set_pinned_chat_order(
+        &self,
+        label: &str,
+        ordered_group_ids: &[String],
+    ) -> Result<ChatPinState, AppError> {
+        self.ensure_account_state(label)?;
+        self.account_storage(label)?
+            .app_storage()
+            .set_pinned_chat_order(ordered_group_ids)
+            .map_err(chat_pin_error_from_storage)
+    }
+
+    /// Per-account unread aggregate for the account-switcher and application
+    /// badge (mdk#461, mdk#1460). Each account's count is read from its
+    /// materialized `chat_list_rows` projection (a single grouped
+    /// `COUNT`/`SUM`), so this does not require switching into, or loading a
+    /// full session/timeline for, any account — non-active accounts are
+    /// reported too. `attention_only_conversations` counts each active unarchived
+    /// pending invitation once and accepted manual-only reminders, without
+    /// overlapping unread-message totals. Archived and departed/departing chats
+    /// contribute nothing.
+    ///
+    /// Only local-signing accounts are reported (matching `managed_accounts`).
+    /// The chat-list projection is built from the on-disk store if missing;
+    /// this is a local operation and never touches the network. Intended for
+    /// account-switcher scale, this does one encrypted database open per local
+    /// signing account. A single account that fails to open or project is
+    /// skipped with a privacy-safe warning rather than failing the whole query.
+    pub fn account_unread_summary(&self) -> Result<Vec<AccountUnread>, AppError> {
+        let accounts = self
+            .account_home()
+            .accounts()?
+            .into_iter()
+            .filter(|account| account.local_signing)
+            .collect::<Vec<_>>();
+        let mut summaries = Vec::with_capacity(accounts.len());
+        for account in accounts {
+            match self.account_unread_for(&account) {
+                Ok(summary) => summaries.push(summary),
+                Err(error) => {
+                    tracing::warn!(
+                        target: "marmot_app::storage",
+                        method = "account_unread_summary",
+                        error_kind = error.privacy_safe_kind(),
+                        "skipped an account whose unread aggregate could not be computed"
+                    );
+                }
+            }
+        }
+        Ok(summaries)
+    }
+
+    fn account_unread_for(&self, account: &AccountSummary) -> Result<AccountUnread, AppError> {
+        self.ensure_account_state(&account.label)?;
+        self.ensure_chat_list_projection(account)?;
+        let total = self
+            .account_storage(&account.label)?
+            .app_storage()
+            .account_unread_total()?;
+        Ok(AccountUnread {
+            account_id_hex: account.account_id_hex.clone(),
+            unread_count: total.unread_count,
+            unread_conversations: total.unread_conversations,
+            attention_only_conversations: total.attention_only_conversations,
+            has_unread: total.has_unread(),
+        })
+    }
+
+    fn refresh_chat_list_row(
+        &self,
+        label: &str,
+        group_id_hex: &str,
+    ) -> Result<Option<ChatListRow>, AppError> {
+        let account = self.account_home().account(label)?;
+        let classifier = Self::chat_list_mention_classifier(&account.account_id_hex);
+        let mut row = self
+            .account_storage(&account.label)?
+            .app_storage()
+            .refresh_chat_list_row(&account.account_id_hex, group_id_hex, &classifier)?;
+        self.hydrate_chat_list_row(row.as_mut());
+        Ok(row)
+    }
+
+    fn refresh_chat_list_row_for_messages(
+        &self,
+        label: &str,
+        group_id_hex: &str,
+        message_ids_hex: &[String],
+    ) -> Result<(Option<ChatListRow>, bool), AppError> {
+        let account = self.account_home().account(label)?;
+        let classifier = Self::chat_list_mention_classifier(&account.account_id_hex);
+        let (mut row, content_changed) = self
+            .account_storage(&account.label)?
+            .app_storage()
+            .refresh_chat_list_row_for_messages_with_content_change(
+                &account.account_id_hex,
+                group_id_hex,
+                message_ids_hex,
+                &classifier,
+            )?;
+        self.hydrate_chat_list_row(row.as_mut());
+        Ok((row, content_changed))
+    }
+
+    pub fn initialize_chat_read_state(
+        &self,
+        label: &str,
+        group_id_hex: &str,
+    ) -> Result<Option<ChatListRow>, AppError> {
+        let account = self.account_home().account(label)?;
+        self.ensure_account_state(&account.label)?;
+        let classifier = Self::chat_list_mention_classifier(&account.account_id_hex);
+        let mut row = self
+            .account_storage(&account.label)?
+            .app_storage()
+            .initialize_chat_read_state(&account.account_id_hex, group_id_hex, &classifier)?;
+        self.hydrate_chat_list_row(row.as_mut());
+        Ok(row)
+    }
+
+    pub fn mark_timeline_message_read(
+        &self,
+        label: &str,
+        group_id_hex: &str,
+        message_id_hex: &str,
+    ) -> Result<Option<ChatListRow>, AppError> {
+        let account = self.account_home().account(label)?;
+        self.ensure_account_state(&account.label)?;
+        let classifier = Self::chat_list_mention_classifier(&account.account_id_hex);
+        let mut row = self
+            .account_storage(&account.label)?
+            .app_storage()
+            .mark_timeline_message_read(
+                &account.account_id_hex,
+                group_id_hex,
+                message_id_hex,
+                &classifier,
+            )?;
+        self.hydrate_chat_list_row(row.as_mut());
+        Ok(row)
+    }
+
+    /// Set or clear a manual-unread reminder without rewinding the cumulative
+    /// timeline read marker.
+    pub fn set_chat_manually_unread(
+        &self,
+        label: &str,
+        group_id_hex: &str,
+        manually_unread: bool,
+    ) -> Result<Option<ChatListRow>, AppError> {
+        let account = self.account_home().account(label)?;
+        self.ensure_account_state(&account.label)?;
+        let classifier = Self::chat_list_mention_classifier(&account.account_id_hex);
+        let mut row = self
+            .account_storage(&account.label)?
+            .app_storage()
+            .set_chat_manually_unread(
+                &account.account_id_hex,
+                group_id_hex,
+                manually_unread,
+                &classifier,
+            )?;
+        self.hydrate_chat_list_row(row.as_mut());
+        Ok(row)
+    }
+
+    pub fn notification_settings(
+        &self,
+        account_ref: &str,
+    ) -> Result<NotificationSettings, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        Ok(notification_settings_from_account(
+            self.account_storage(&account.label)?
+                .app_storage()
+                .notification_settings(&account.label, &account.account_id_hex)?,
+        ))
+    }
+
+    pub fn chat_notification_settings(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+    ) -> Result<ChatNotificationSettings, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        self.group(&account.label, group_id_hex)?
+            .ok_or_else(|| AppError::UnknownGroup(group_id_hex.to_owned()))?;
+        let settings = self
+            .account_storage(&account.label)?
+            .app_storage()
+            .chat_notification_settings(group_id_hex)?;
+        Ok(chat_notification_settings_from_account(
+            account.label,
+            account.account_id_hex,
+            settings,
+        ))
+    }
+
+    pub fn set_chat_muted(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+        muted_until_ms: Option<i64>,
+    ) -> Result<ChatNotificationSettings, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        self.group(&account.label, group_id_hex)?
+            .ok_or_else(|| AppError::UnknownGroup(group_id_hex.to_owned()))?;
+        let settings = self
+            .account_storage(&account.label)?
+            .app_storage()
+            .set_chat_muted(group_id_hex, muted_until_ms)?;
+        Ok(chat_notification_settings_from_account(
+            account.label,
+            account.account_id_hex,
+            settings,
+        ))
+    }
+
+    pub fn clear_chat_muted(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+    ) -> Result<ChatNotificationSettings, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        self.group(&account.label, group_id_hex)?
+            .ok_or_else(|| AppError::UnknownGroup(group_id_hex.to_owned()))?;
+        let settings = self
+            .account_storage(&account.label)?
+            .app_storage()
+            .clear_chat_muted(group_id_hex)?;
+        Ok(chat_notification_settings_from_account(
+            account.label,
+            account.account_id_hex,
+            settings,
+        ))
+    }
+
+    pub fn set_local_notifications_enabled(
+        &self,
+        account_ref: &str,
+        enabled: bool,
+    ) -> Result<NotificationSettings, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        Ok(notification_settings_from_account(
+            self.account_storage(&account.label)?
+                .app_storage()
+                .set_local_notifications_enabled(
+                    &account.label,
+                    &account.account_id_hex,
+                    enabled,
+                )?,
+        ))
+    }
+
+    pub fn set_native_push_enabled(
+        &self,
+        account_ref: &str,
+        enabled: bool,
+    ) -> Result<NotificationSettings, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        Ok(notification_settings_from_account(
+            self.account_storage(&account.label)?
+                .app_storage()
+                .set_native_push_enabled(&account.label, &account.account_id_hex, enabled)?,
+        ))
+    }
+
+    pub fn push_registration(
+        &self,
+        account_ref: &str,
+    ) -> Result<Option<PushRegistration>, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        Ok(self
+            .account_storage(&account.label)?
+            .app_storage()
+            .push_registration(&account.label)?
+            .map(stored_push_registration_from_account)
+            .transpose()?
+            .map(|stored| stored.registration))
+    }
+
+    pub(crate) fn stored_push_registration(
+        &self,
+        account_ref: &str,
+    ) -> Result<Option<notifications::StoredPushRegistration>, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        self.account_storage(&account.label)?
+            .app_storage()
+            .push_registration(&account.label)?
+            .map(stored_push_registration_from_account)
+            .transpose()
+    }
+
+    pub fn upsert_push_registration(
+        &self,
+        account_ref: &str,
+        platform: PushPlatform,
+        raw_token: &str,
+        server_pubkey_hex: &str,
+        relay_hint: Option<String>,
+    ) -> Result<PushRegistration, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        let token_bytes = parse_provider_token(platform, raw_token)?;
+        let server_pubkey = PublicKey::parse(server_pubkey_hex)
+            .map_err(|_| AppError::InvalidPushServer("server pubkey must be valid".into()))?;
+        let now = notifications::unix_now_ms();
+        let registration = PushRegistration {
+            account_ref: account.label.clone(),
+            account_id_hex: account.account_id_hex.clone(),
+            platform,
+            token_fingerprint: push_token_fingerprint(platform, &token_bytes),
+            server_pubkey_hex: server_pubkey.to_hex(),
+            relay_hint: relay_hint.and_then(|relay| {
+                let relay = relay.trim().to_owned();
+                (!relay.is_empty()).then_some(relay)
+            }),
+            created_at_ms: now,
+            updated_at_ms: now,
+            last_shared_at_ms: None,
+        };
+        let stored = self
+            .account_storage(&account.label)?
+            .app_storage()
+            .upsert_push_registration(
+                account_push_registration_from_app(registration),
+                token_bytes,
+            )?;
+        Ok(stored_push_registration_from_account(stored)?.registration)
+    }
+
+    pub fn clear_push_registration(&self, account_ref: &str) -> Result<(), AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        self.account_storage(&account.label)?
+            .app_storage()
+            .clear_push_registration(&account.label)?;
+        Ok(())
+    }
+
+    pub(crate) fn mark_push_registration_shared(
+        &self,
+        account_ref: &str,
+        token_fingerprint: &str,
+        registration_updated_at_ms: i64,
+        shared_at_ms: i64,
+    ) -> Result<bool, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        Ok(self
+            .account_storage(&account.label)?
+            .app_storage()
+            .mark_push_registration_shared(
+                &account.label,
+                token_fingerprint,
+                registration_updated_at_ms,
+                shared_at_ms,
+            )?)
+    }
+
+    pub(crate) fn pending_push_registration_shares(
+        &self,
+        account_ref: &str,
+        token_fingerprint: &str,
+        registration_updated_at_ms: i64,
+    ) -> Result<Vec<String>, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        Ok(self
+            .account_storage(&account.label)?
+            .app_storage()
+            .pending_push_registration_shares(token_fingerprint, registration_updated_at_ms)?)
+    }
+
+    pub(crate) fn mark_push_registration_share_attempted(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+        token_fingerprint: &str,
+        registration_updated_at_ms: i64,
+        attempted_at_ms: i64,
+    ) -> Result<(), AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        self.account_storage(&account.label)?
+            .app_storage()
+            .mark_push_registration_share_attempted(
+                group_id_hex,
+                token_fingerprint,
+                registration_updated_at_ms,
+                attempted_at_ms,
+            )?;
+        Ok(())
+    }
+
+    pub(crate) fn complete_push_registration_share(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+        token_fingerprint: &str,
+        registration_updated_at_ms: i64,
+    ) -> Result<bool, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        Ok(self
+            .account_storage(&account.label)?
+            .app_storage()
+            .complete_push_registration_share(
+                group_id_hex,
+                token_fingerprint,
+                registration_updated_at_ms,
+            )?)
+    }
+
+    pub(crate) fn queue_push_registration_removals(
+        &self,
+        account_ref: &str,
+        registration: PushRegistration,
+    ) -> Result<usize, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        Ok(self
+            .account_storage(&account.label)?
+            .app_storage()
+            .queue_push_registration_removals(
+                &account_push_registration_from_app(registration),
+                notifications::unix_now_ms(),
+            )?)
+    }
+
+    pub(crate) fn queue_push_registration_removal_for_group(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+        registration: &PushRegistration,
+    ) -> Result<(), AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        self.account_storage(&account.label)?
+            .app_storage()
+            .queue_push_registration_removal_for_group(
+                group_id_hex,
+                &account_push_registration_from_app(registration.clone()),
+                notifications::unix_now_ms(),
+            )?;
+        Ok(())
+    }
+
+    pub(crate) fn queue_push_registration_share_for_group(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+        registration: &PushRegistration,
+    ) -> Result<bool, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        Ok(self
+            .account_storage(&account.label)?
+            .app_storage()
+            .queue_push_registration_share_for_group(
+                group_id_hex,
+                &registration.token_fingerprint,
+                registration.updated_at_ms,
+                notifications::unix_now_ms(),
+            )?)
+    }
+
+    pub(crate) fn has_pending_push_registration_work(
+        &self,
+        account_ref: &str,
+    ) -> Result<bool, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        Ok(self
+            .account_storage(&account.label)?
+            .app_storage()
+            .has_pending_push_registration_work()?)
+    }
+
+    pub(crate) fn pending_push_registration_removals(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<(String, PushRegistration)>, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        self.account_storage(&account.label)?
+            .app_storage()
+            .pending_push_registration_removals()?
+            .into_iter()
+            .map(pending_push_registration_removal_from_account)
+            .collect()
+    }
+
+    pub(crate) fn mark_push_registration_removal_attempted(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+        registration: &PushRegistration,
+        attempted_at_ms: i64,
+    ) -> Result<(), AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        let pending = storage_sqlite::AccountPendingPushRegistrationRemoval {
+            group_id_hex: group_id_hex.to_owned(),
+            registration: account_push_registration_from_app(registration.clone()),
+            last_attempted_at_ms: None,
+        };
+        self.account_storage(&account.label)?
+            .app_storage()
+            .mark_push_registration_removal_attempted(&pending, attempted_at_ms)?;
+        Ok(())
+    }
+
+    pub(crate) fn complete_push_registration_removal(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+        registration: &PushRegistration,
+    ) -> Result<bool, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        let pending = storage_sqlite::AccountPendingPushRegistrationRemoval {
+            group_id_hex: group_id_hex.to_owned(),
+            registration: account_push_registration_from_app(registration.clone()),
+            last_attempted_at_ms: None,
+        };
+        Ok(self
+            .account_storage(&account.label)?
+            .app_storage()
+            .complete_push_registration_removal(&pending)?)
+    }
+
+    pub(crate) fn upsert_group_push_token(
+        &self,
+        account_ref: &str,
+        token: &GroupPushTokenRecord,
+    ) -> Result<(), AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        self.account_storage(&account.label)?
+            .app_storage()
+            .upsert_group_push_token(&account_group_push_token_from_app(token))?;
+        Ok(())
+    }
+
+    pub(crate) fn group_push_tokens(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+    ) -> Result<Vec<GroupPushTokenRecord>, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        self.account_storage(&account.label)?
+            .app_storage()
+            .group_push_tokens(group_id_hex)?
+            .into_iter()
+            .map(group_push_token_from_account)
+            .collect()
+    }
+
+    /// Ingest inbound push-token gossip (kinds 447/448/449) into
+    /// `group_push_tokens`. `active_leaves` is the carrying group's current
+    /// authenticated account/device roster. Owners are verified by
+    /// [`notifications::verify_push_gossip_for_profile`]; token upserts must also
+    /// name a live device leaf before the spec's
+    /// `(owner_ts, record_digest)` ordering primitive and tombstones (enforced by
+    /// the storage `apply_*` calls) decide what mutates state. Because authority
+    /// comes from each record's `owner_sig`, a kind 448 may carry — and apply —
+    /// records owned by members other than `message.sender`.
+    pub(crate) fn ingest_push_gossip_message(
+        &self,
+        account_ref: &str,
+        message: &ReceivedMessage,
+        active_leaves: &[cgka_traits::engine::GroupMemberLeaf],
+        profile: cgka_traits::group::ProtocolProfile,
+    ) -> Result<(), AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        let group_id_hex = hex::encode(message.group_id.as_slice());
+        let storage = self.account_storage(&account.label)?.app_storage();
+        let action =
+            notifications::parse_push_gossip(message.kind, &group_id_hex, &message.plaintext)?;
+        let active_leaves = active_leaves
+            .iter()
+            .map(|leaf| (hex::encode(leaf.member.as_slice()), leaf.leaf_index))
+            .collect::<std::collections::HashSet<_>>();
+        let active_member_ids = active_leaves
+            .iter()
+            .map(|(member, _)| member.clone())
+            .collect::<Vec<_>>();
+        let action = notifications::verify_push_gossip_for_profile(
+            action,
+            &group_id_hex,
+            &active_member_ids,
+            profile,
+        );
+        match action {
+            notifications::PushGossipAction::Upsert(records) => {
+                for record in records {
+                    // A valid account signature does not make a departed
+                    // sibling leaf eligible for a notification destination.
+                    if active_leaves.contains(&(record.member_id_hex.clone(), record.leaf_index)) {
+                        storage
+                            .apply_group_push_token(&account_group_push_token_from_app(&record))?;
+                    }
+                }
+            }
+            notifications::PushGossipAction::Remove(removals) => {
+                for removal in removals {
+                    let digest = removal.record_digest(&group_id_hex)?;
+                    storage.apply_group_push_token_tombstone(
+                        &group_id_hex,
+                        &removal.member_id_hex,
+                        removal.leaf_index,
+                        removal.platform.platform_byte(),
+                        &removal.server_pubkey_hex,
+                        removal.owner_ts,
+                        &digest,
+                        notifications::unix_now_ms(),
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply immutable engine leaf-departure facts through the account-scoped storage boundary.
+    pub(crate) fn remove_group_push_tokens_for_leaves(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+        leaves: &[cgka_traits::engine::GroupMemberLeaf],
+        departed_members: &[MemberId],
+    ) -> Result<(), AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        let leaves = leaves
+            .iter()
+            .map(|leaf| (hex::encode(leaf.member.as_slice()), leaf.leaf_index))
+            .collect::<Vec<_>>();
+        let departed_members = departed_members
+            .iter()
+            .map(|member| hex::encode(member.as_slice()))
+            .collect::<Vec<_>>();
+        self.account_storage(&account.label)?
+            .app_storage()
+            .remove_group_push_tokens_for_leaves(group_id_hex, &leaves, &departed_members)?;
+        Ok(())
+    }
+
+    /// Apply our own owner-signed removal locally: tombstone the record key with
+    /// the removal's `(owner_ts, record_digest)` stamp so a later stale kind 448
+    /// relaying our pre-removal record cannot resurrect it.
+    pub(crate) fn apply_local_push_removal(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+        removal: &notifications::PushTokenRemovalRecord,
+    ) -> Result<(), AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        let digest = removal.record_digest(group_id_hex)?;
+        self.account_storage(&account.label)?
+            .app_storage()
+            .apply_group_push_token_tombstone(
+                group_id_hex,
+                &removal.member_id_hex,
+                removal.leaf_index,
+                removal.platform.platform_byte(),
+                &removal.server_pubkey_hex,
+                removal.owner_ts,
+                &digest,
+                notifications::unix_now_ms(),
+            )?;
+        Ok(())
+    }
+
+    pub(crate) fn set_group_self_membership(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+        membership: SelfMembership,
+    ) -> Result<(), AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        let storage = self.account_storage(&account.label)?.app_storage();
+        // A voluntary departure stays voluntary. `Left` is written the moment
+        // this device publishes its leave; the commit that later realizes it
+        // is authored by a peer, and the roster-derived classification of
+        // that commit reads as an eviction. Now that peers apply a leave
+        // within seconds (mdk#1736) the two writes land back to back, so the
+        // eviction must never overwrite the recorded intent.
+        if membership == SelfMembership::Removed
+            && storage.group_self_membership(group_id_hex)? == Some(SelfMembership::Left)
+        {
+            tracing::debug!(
+                target: "marmot_app",
+                method = "set_group_self_membership",
+                "keeping voluntary Left classification over a realized removal"
+            );
+            return Ok(());
+        }
+        storage.set_group_self_membership(group_id_hex, membership)?;
+        self.presentation_signals.wake();
+        Ok(())
+    }
+
+    /// Storage-owned `account_groups.self_membership` for roster and chat-list
+    /// reads. In-memory `AppClient.state.groups` may lag after a local leave or
+    /// observed self-eviction because those paths write storage directly.
+    pub(crate) fn stored_group_self_membership(
+        &self,
+        label: &str,
+        group_id_hex: &str,
+    ) -> Result<Option<SelfMembership>, AppError> {
+        self.ensure_account_state(label)?;
+        Ok(self
+            .account_storage(label)?
+            .app_storage()
+            .group_self_membership(group_id_hex)?)
+    }
+
+    pub(crate) fn account_group_self_memberships(
+        &self,
+        label: &str,
+    ) -> Result<std::collections::HashMap<String, SelfMembership>, AppError> {
+        self.ensure_account_state(label)?;
+        Ok(self
+            .account_storage(label)?
+            .app_storage()
+            .account_group_self_memberships()?)
+    }
+
+    pub(crate) fn arm_epoch_backfill_intents(
+        &self,
+        label: &str,
+        intents: &[storage_sqlite::StoredEpochBackfillIntent],
+    ) -> Result<(), AppError> {
+        self.ensure_account_state(label)?;
+        self.account_storage(label)?
+            .app_storage()
+            .arm_epoch_backfill_intents(intents)?;
+        Ok(())
+    }
+
+    pub(crate) fn record_epoch_stall_evidence(
+        &self,
+        label: &str,
+        evidence: &[storage_sqlite::StoredEpochStallEvidence],
+        fruitless_threshold: u32,
+    ) -> Result<Vec<GroupId>, AppError> {
+        self.ensure_account_state(label)?;
+        Ok(self
+            .account_storage(label)?
+            .app_storage()
+            .record_recovery_evidence(evidence, fruitless_threshold)?)
+    }
+
+    pub(crate) fn epoch_stall_evidence(
+        &self,
+        label: &str,
+    ) -> Result<Vec<storage_sqlite::StoredEpochStallEvidence>, AppError> {
+        self.ensure_account_state(label)?;
+        Ok(self
+            .account_storage(label)?
+            .app_storage()
+            .epoch_stall_evidence()?)
+    }
+
+    /// `group_id_hex` of every `account_groups` row carrying
+    /// `self_membership = 'member'`. The one-time open/upgrade backfill reads
+    /// this complete candidate set only while its account marker is absent.
+    pub(crate) fn account_group_ids_defaulting_to_member(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<String>, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        Ok(self
+            .account_storage(&account.label)?
+            .app_storage()
+            .account_group_ids_defaulting_to_member()?)
+    }
+
+    /// Whether the named once-only account-import marker has been recorded.
+    pub(crate) fn account_import_marker(
+        &self,
+        account_ref: &str,
+        name: &str,
+    ) -> Result<bool, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        Ok(self
+            .account_storage(&account.label)?
+            .app_storage()
+            .account_import_marker(name)?)
+    }
+
+    /// Record the named once-only account-import marker as complete.
+    pub(crate) fn mark_account_import_complete(
+        &self,
+        account_ref: &str,
+        name: &str,
+    ) -> Result<(), AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        self.account_storage(&account.label)?
+            .app_storage()
+            .mark_account_import_complete(name)?;
+        Ok(())
+    }
+
+    /// Test seam: empty the peer index and clear its completion marker so the
+    /// next account-worker open looks like the first open after migration 50.
+    #[cfg(any(test, feature = "test-policy-overrides"))]
+    pub fn reset_direct_conversation_members_backfill_for_test(
+        &self,
+        account_ref: &str,
+    ) -> Result<(), AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        self.account_storage(&account.label)?
+            .app_storage()
+            .reset_direct_conversation_members_backfill(
+                DIRECT_CONVERSATION_MEMBERS_BACKFILL_MARKER,
+            )?;
+        Ok(())
+    }
+
+    /// Reconcile hydrated canonical device leaves through account-scoped storage.
+    pub(crate) fn reconcile_group_push_token_leaves(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+        leaves: &[cgka_traits::engine::GroupMemberLeaf],
+    ) -> Result<usize, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        let leaves = leaves
+            .iter()
+            .map(|leaf| (hex::encode(leaf.member.as_slice()), leaf.leaf_index))
+            .collect::<Vec<_>>();
+        Ok(self
+            .account_storage(&account.label)?
+            .app_storage()
+            .reconcile_group_push_token_leaves(group_id_hex, &leaves)?)
+    }
+
+    pub(crate) fn remove_stale_group_push_tokens(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+        active_members: &[String],
+    ) -> Result<usize, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        Ok(self
+            .account_storage(&account.label)?
+            .app_storage()
+            .remove_stale_group_push_tokens(group_id_hex, active_members)?)
+    }
+
+    pub fn group_push_debug_info(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+        active_members: &[String],
+    ) -> Result<GroupPushDebugInfo, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        let storage = self.account_storage(&account.label)?.app_storage();
+        let settings = notification_settings_from_account(
+            storage.notification_settings(&account.label, &account.account_id_hex)?,
+        );
+        let registration = storage
+            .push_registration(&account.label)?
+            .map(stored_push_registration_from_account)
+            .transpose()?;
+        let tokens = storage
+            .group_push_tokens(group_id_hex)?
+            .into_iter()
+            .map(group_push_token_from_account)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(notifications::group_debug_info(
+            settings,
+            registration,
+            tokens,
+            &account.account_id_hex,
+            active_members,
+        ))
+    }
+
+    pub fn groups(&self, label: &str) -> Result<Vec<AppGroupRecord>, AppError> {
+        // Keep overlays aligned with group(); keyed_group_matches_list checks parity.
+        self.ensure_account_state(label)?;
+        let storage = self.account_storage(label)?;
+        let mut groups = storage
+            .app_storage()
+            .account_groups(None)?
+            .into_iter()
+            .map(app_group_from_stored_group)
+            .collect::<Result<Vec<_>, _>>()?;
+        // Engine-owned leave and disband state can change without an app projection write.
+        let pending = storage.pending_leave_requests()?;
+        if !pending.is_empty() {
+            for group in &mut groups {
+                group.leave_requested_at_ms = pending.get(&group.group_id_hex).copied();
+            }
+        }
+        let disbanding = storage.disbanding_group_ids_hex()?;
+        let requests = storage.disband_requests_by_group_hex()?;
+        let disbanded = storage
+            .list_disband_tombstones()?
+            .into_iter()
+            .map(|(group_id, _)| hex::encode(group_id.as_slice()))
+            .collect::<HashSet<_>>();
+        for group in &mut groups {
+            group.disbanding = disbanding.contains(&group.group_id_hex);
+            group.disband_request = requests.get(&group.group_id_hex).cloned().map(Into::into);
+            group.disbanded = disbanded.contains(&group.group_id_hex);
+        }
+        Ok(groups)
+    }
+
+    /// Outstanding durable leave requests for this account, keyed by group id hex
+    /// and mapped to when the user asked to leave.
+    ///
+    /// Reads the engine's own `cgka_leave_requests` rows rather than a
+    /// denormalized projection column: the engine clears them from paths that
+    /// never notify the app layer (an accepted commit that removed us, hydration
+    /// finding the local member gone, a convergence reorg), so a cached copy
+    /// would silently go stale.
+    pub fn pending_leave_requests(&self, label: &str) -> Result<HashMap<String, u64>, AppError> {
+        self.ensure_account_state(label)?;
+        Ok(self.account_storage(label)?.pending_leave_requests()?)
+    }
+
+    /// Group invites still pending the local device's confirmation decision.
+    ///
+    /// This is the invite-policy reconciliation read (mdk#1380): unlike
+    /// [`Self::groups`], it touches only the two projection columns the policy
+    /// decision needs — never the seen-event window, component blobs, or
+    /// disband tables — so a periodic enumeration over an idle session reads
+    /// O(pending invites) rows instead of the full account projection.
+    ///
+    /// A row whose stored ids cannot be decoded is skipped with a privacy-safe
+    /// warning (the same policy `routing_for` applies to malformed persisted
+    /// group routes): one corrupt row must not disable policy reconciliation
+    /// for every valid invite in the account.
+    pub fn pending_group_invites(&self, label: &str) -> Result<Vec<PendingGroupInvite>, AppError> {
+        self.ensure_account_state(label)?;
+        let mut invites = Vec::new();
+        for invite in self
+            .account_storage(label)?
+            .app_storage()
+            .pending_confirmation_group_invites()?
+        {
+            let group_id_hex = invite.group_id_hex.trim().to_ascii_lowercase();
+            let Ok(group_id_bytes) = hex::decode(&group_id_hex) else {
+                tracing::warn!(
+                    target: "marmot_app",
+                    method = "pending_group_invites",
+                    error_kind = "invalid_persisted_group_record",
+                    "skipping malformed persisted pending invite",
+                );
+                continue;
+            };
+            let welcomer = match invite.welcomer_account_id_hex.as_deref() {
+                Some(welcomer) => {
+                    let welcomer = welcomer.trim().to_ascii_lowercase();
+                    match hex::decode(&welcomer) {
+                        Ok(welcomer) => Some(MemberId::new(welcomer)),
+                        Err(_) => {
+                            tracing::warn!(
+                                target: "marmot_app",
+                                method = "pending_group_invites",
+                                error_kind = "invalid_persisted_welcomer_record",
+                                "skipping malformed persisted pending invite",
+                            );
+                            continue;
+                        }
+                    }
+                }
+                None => None,
+            };
+            invites.push(PendingGroupInvite {
+                group_id: GroupId::new(group_id_bytes),
+                welcomer,
+            });
+        }
+        Ok(invites)
+    }
+
+    pub fn visible_groups(&self, label: &str) -> Result<Vec<AppGroupRecord>, AppError> {
+        self.listed_groups(label, false)
+    }
+
+    pub(crate) fn listed_groups(
+        &self,
+        label: &str,
+        include_archived: bool,
+    ) -> Result<Vec<AppGroupRecord>, AppError> {
+        let blocked = self
+            .account_storage(label)?
+            .app_storage()
+            .block_list_snapshot()?
+            .users
+            .into_iter()
+            .map(|u| u.public_key)
+            .collect::<std::collections::HashSet<_>>();
+        Ok(self
+            .groups(label)?
+            .into_iter()
+            .filter(|group| {
+                (include_archived || !group.archived)
+                    && !(group.pending_confirmation
+                        && group
+                            .welcomer_account_id_hex
+                            .as_ref()
+                            .is_some_and(|key| blocked.contains(key)))
+            })
+            .collect())
+    }
+
+    pub fn group(
+        &self,
+        label: &str,
+        group_id_hex: &str,
+    ) -> Result<Option<AppGroupRecord>, AppError> {
+        // Keep overlays aligned with groups(); keyed_group_matches_list checks parity.
+        self.ensure_account_state(label)?;
+        let storage = self.account_storage(label)?;
+        let Some(stored) = storage
+            .app_storage()
+            .account_groups(Some(group_id_hex))?
+            .pop()
+        else {
+            return Ok(None);
+        };
+        let mut group = app_group_from_stored_group(stored)?;
+        // Defend parity for noncanonical persisted ids: list overlays only match
+        // lowercase hex keys, even when the projection row itself matches exactly.
+        let Ok(group_id) = hex::decode(group_id_hex) else {
+            return Ok(Some(group));
+        };
+        if hex::encode(&group_id) != group_id_hex {
+            return Ok(Some(group));
+        }
+        let group_id = GroupId::new(group_id);
+        group.leave_requested_at_ms = storage
+            .leave_request(&group_id)?
+            .map(|request| request.requested_at_ms);
+        let request = storage.disband_request(&group_id)?;
+        group.disbanding = request
+            .as_ref()
+            .is_some_and(|request| request.status == DisbandRequestStatus::Pending)
+            || storage.has_disband_candidates(&group_id)?;
+        group.disband_request = request.map(Into::into);
+        group.disbanded = storage.disband_tombstone(&group_id)?.is_some();
+        Ok(Some(group))
+    }
+
+    pub fn set_group_archived(
+        &self,
+        label: &str,
+        group_id_hex: &str,
+        archived: bool,
+    ) -> Result<AppGroupRecord, AppError> {
+        self.ensure_account_state(label)?;
+        let mut state = self.load_state(label)?;
+        let group = state
+            .groups
+            .iter_mut()
+            .find(|group| group.group_id_hex == group_id_hex)
+            .ok_or_else(|| AppError::UnknownGroup(group_id_hex.to_owned()))?;
+        group.archived = archived;
+        let group = group.clone();
+        self.save_state_delta_clearing_local_group_deletion_frontiers_and_acking_application_events(
+            &AccountState {
+                label: state.label,
+                seen_events: Vec::new(),
+                last_transport_timestamp: state.last_transport_timestamp,
+                groups: vec![group.clone()],
+            },
+            &[],
+            &[],
+        )?;
+        Ok(group)
+    }
+
+    fn open_account(
+        &self,
+        label: &str,
+        relay_plane: &MarmotRelayPlane,
+        defer_group_hydration: bool,
+    ) -> Result<OpenAppAccount, AppError> {
+        let account = self.account_home().account(label)?;
+        // Account refs may be labels, hex pubkeys, or npubs. Ownership is keyed
+        // by the canonical stored label so aliases cannot open a second engine.
+        let label = account.label.as_str();
+        let session_guard = self.acquire_account_session(label)?;
+        let state = self.load_state(label)?;
+        let recovery_storage = self.account_storage(label)?;
+        recovery_storage
+            .app_storage()
+            .restore_unacknowledged_recovery_loss()?;
+        let recovery_loss_imports = recovery_storage
+            .app_storage()
+            .synchronize_account_delivery_loss(label)?;
+        let delivery_overflow_recovery = recovery_storage
+            .app_storage()
+            .account_delivery_recovery(label)?;
+        let notification_loss = recovery_storage
+            .app_storage()
+            .pending_recovery_demands()?
+            .into_iter()
+            .find(|demand| demand.cause == storage_sqlite::RecoveryCause::NotificationLoss);
+        let delivery_overflow_recovery_pending =
+            delivery_overflow_recovery.is_some() || notification_loss.is_some();
+        let delivery_overflow_recovery_marker_token = delivery_overflow_recovery
+            .map(|recovery| recovery.marker_token)
+            .or_else(|| notification_loss.and_then(|demand| demand.marker_token));
+        let signer = self.account_signer_for_summary(&account)?;
+        let account_id = MemberId::new(hex::decode(&account.account_id_hex)?);
+        let nostr_signer = signer.as_nostr_signer();
+        let peeler = NostrMlsPeeler::new().with_welcome_signer_arc(nostr_signer.clone());
+        #[cfg(test)]
+        let audit_v5_peel_slot = self
+            .audit_v5_peel_slot
+            .as_ref()
+            .filter(|(selected, _)| selected == label)
+            .map(|(_, slot)| slot.clone())
+            .unwrap_or_else(|| Arc::new(Mutex::new(client::audit_v5_probe::PeelSlot::default())));
+        #[cfg(not(test))]
+        let audit_v5_peel_slot = Arc::new(Mutex::new(client::audit_v5_probe::PeelSlot::default()));
+        let peeler: Box<dyn cgka_traits::peeler::TransportPeeler> =
+            Box::new(client::audit_v5_probe::ProbePeeler {
+                inner: peeler,
+                slot: audit_v5_peel_slot.clone(),
+            });
+        let session_path = self.account_dir(label).join(SESSION_DB_FILE);
+        // The engine gets its own connection to `session.sqlite`, which no
+        // cache holds. Open and register it under storage-open admission so
+        // `close_storage` reaches it while this open is in flight and while
+        // the worker later runs on it (mdk#2323).
+        let (engine_storage, engine_storage_open) = {
+            let lifecycle = self.begin_storage_open("account session")?;
+            // load_state/account_storage above completed the first database
+            // open. Serialize any remaining key-migration probe with other
+            // openers.
+            let lock = sqlcipher::database_open_lock(&session_path);
+            let database = lock.lock();
+            let session_key = if let AccountSigner::Local(keys) = &signer {
+                self.sqlcipher_key_locked(label, keys, &database, SqlcipherDatabaseKind::Session)?
+            } else {
+                self.external_sqlcipher_key(
+                    label,
+                    &account.account_id_hex,
+                    &database,
+                    SqlcipherDatabaseKind::Session,
+                )?
+            };
+            let started = Instant::now();
+            let storage = SqliteAccountStorage::open_encrypted(&session_path, &session_key)?;
+            self.root_closers.register(&lifecycle, storage.closer());
+            (storage, started.elapsed())
+        };
+        // Optional forensic audit log. Enable `AuditLogSettings` before opening
+        // an account session to record per-account/device JSONL at
+        // `<account_dir>/audit-<engine_id>-v4.jsonl`. The v4 schema contains
+        // privacy-safe derived values only: obfuscated identifiers, digests,
+        // lengths, counts, reduced convergence data, and typed outcomes.
+        let mut session_config = SessionConfig::with_storage(
+            engine_storage,
+            engine_storage_open,
+            account_id.as_slice().to_vec(),
+            peeler,
+        )
+        .account_identity_proof_signer(signer.as_proof_signer())
+        .feature_registry(app_feature_registry())
+        .supported_app_components(self.supported_app_component_ids());
+        if defer_group_hydration {
+            session_config = session_config.defer_group_hydration();
+        }
+        // Production uses the protocol-pinned convergence policy (SessionConfig's
+        // default). Only an explicit test-policy build may change it; normal
+        // debug and release builds ignore the knob (mdk#970).
+        if let Some(ms) = self.config.dev_settlement_quiescence_ms {
+            if cfg!(feature = "test-policy-overrides") {
+                session_config = session_config.convergence_policy(CanonicalizationPolicy {
+                    settlement_quiescence_ms: ms,
+                    ..CanonicalizationPolicy::default()
+                });
+            } else {
+                tracing::warn!(
+                    target: "marmot_app",
+                    method = "open_account",
+                    "ignoring dev_settlement_quiescence_ms without test-policy-overrides; pinned v1 policy required"
+                );
+            }
+        }
+        let audit_log_enabled = match self.audit_log_settings() {
+            Ok(settings) => settings.enabled,
+            Err(e) => {
+                tracing::warn!(
+                    target: "marmot_app",
+                    method = "open_account",
+                    error_kind = e.privacy_safe_kind(),
+                    "failed to read forensic audit log settings; continuing without audit logging"
+                );
+                false
+            }
+        };
+        if audit_log_enabled && let Some(recorder) = self.open_audit_recorder(label, &account_id) {
+            session_config = session_config.recorder(recorder);
+        }
+        self.ensure_strict_cutover_replacement_intent_before_session_open(label)?;
+        let session =
+            AccountDeviceSession::open(session_config).map_err(external_signer_session_error)?;
+
+        let publish_client =
+            self.relay_client_for_account_id(&account.account_id_hex, nostr_signer.clone());
+        let recovery_storage = self.account_storage(label)?;
+        let recovery_label = label.to_owned();
+        let recovery_marker: transport_nostr::AccountDeliveryRecoveryMarker =
+            Arc::new(move |marker_token, dropped, earliest_created_at| {
+                recovery_storage
+                    .app_storage()
+                    .record_account_delivery_loss_bounded(
+                        &recovery_label,
+                        marker_token,
+                        dropped,
+                        unix_now_seconds(),
+                        earliest_created_at,
+                    )
+                    .map_err(|error| {
+                        if error.is_closed() {
+                            transport_nostr::AccountDeliveryRecoveryMarkerError::Closed
+                        } else {
+                            transport_nostr::AccountDeliveryRecoveryMarkerError::Retryable
+                        }
+                    })
+            });
+        let spill_storage = self.account_storage(label)?;
+        let spill_store: transport_nostr::AccountDeliverySpillStore = Arc::new(move |deliveries| {
+            spill_storage
+                .app_storage()
+                .spill_account_deliveries(
+                    deliveries,
+                    client::delivery_spill::ACCOUNT_DELIVERY_SPILL_LIMITS,
+                    unix_now_seconds(),
+                )
+                .map(|dispositions| {
+                    dispositions
+                        .into_iter()
+                        .map(client::delivery_spill::plane_spill_disposition)
+                        .collect()
+                })
+                .map_err(|error| {
+                    if error.is_closed() {
+                        transport_nostr::AccountDeliveryRecoveryMarkerError::Closed
+                    } else {
+                        transport_nostr::AccountDeliveryRecoveryMarkerError::Retryable
+                    }
+                })
+        });
+        let adapter = relay_plane.account_adapter_with_recovery_marker(
+            account_id.clone(),
+            publish_client,
+            Some(recovery_marker),
+            Some(spill_store),
+        );
+        // The router spills what a raised cursor alone stopped a restart from
+        // fetching again, measured from this persisted floor.
+        adapter.open_transport_cursor(state.last_transport_timestamp);
+
+        let key_packages = AppKeyPackagePublisher {
+            app: self.clone(),
+            account_label: label.to_owned(),
+            signer: signer.clone(),
+        };
+        let routing = self.routing_for(&state)?;
+        let mut runtime =
+            AccountDeviceRuntime::new(session, adapter.clone(), routing.clone(), key_packages);
+        if let Some(timing) = dev_maintenance_timing(&self.config) {
+            runtime = runtime.with_maintenance_timing(timing);
+        }
+        Ok(OpenAppAccount {
+            runtime,
+            audit_v5_peel_slot,
+            session_guard,
+            adapter,
+            routing,
+            state,
+            delivery_overflow_recovery_pending,
+            delivery_overflow_recovery_marker_token,
+            recovery_loss_imports,
+            signer: nostr_signer,
+        })
+    }
+
+    fn acquire_account_session(&self, label: &str) -> Result<AppAccountSessionGuard, AppError> {
+        let mut owners = self
+            .account_session_owners
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !owners.insert(label.to_owned()) {
+            return Err(AppError::AccountSessionBusy);
+        }
+        Ok(AppAccountSessionGuard {
+            label: label.to_owned(),
+            owners: self.account_session_owners.clone(),
+        })
+    }
+
+    fn routing_for(&self, state: &AccountState) -> Result<AppTransportRouting, AppError> {
+        let mut inbox_routes = HashMap::new();
+        for profile in self.profiles()? {
+            inbox_routes.insert(
+                MemberId::new(hex::decode(profile.account_id_hex)?),
+                profile
+                    .inbox_endpoints
+                    .into_iter()
+                    .map(TransportEndpoint)
+                    .collect(),
+            );
+        }
+        for entry in self.directory().directory_entries()? {
+            let endpoints = self.retain_safe_discovered_endpoints(
+                entry
+                    .relay_lists
+                    .inbox
+                    .relays
+                    .into_iter()
+                    .map(TransportEndpoint)
+                    .collect(),
+                "directory inbox routing",
+            );
+            if !endpoints.is_empty() {
+                inbox_routes
+                    .entry(MemberId::new(hex::decode(entry.account_id_hex)?))
+                    .or_insert(endpoints);
+            }
+        }
+
+        let account = self.account_home().account(&state.label)?;
+        let account_storage = self.account_storage(&state.label)?;
+        let disbanded_group_ids = account_storage
+            .list_disband_tombstones()?
+            .into_iter()
+            .map(|(group_id, _)| hex::encode(group_id.as_slice()))
+            .collect::<HashSet<_>>();
+        let relay_lists = self
+            .directory()
+            .account_relay_list_status_for_account_id(&account.account_id_hex)?;
+        let mut group_routes = Vec::new();
+        for group in &state.groups {
+            let Ok(group_id_bytes) = hex::decode(&group.group_id_hex) else {
+                tracing::warn!(
+                    target: "marmot_app",
+                    method = "routing_for",
+                    error_kind = "invalid_persisted_route_identifier",
+                    "skipping malformed persisted group route",
+                );
+                continue;
+            };
+            let group_id = GroupId::new(group_id_bytes);
+            // Live MLS state is deleted on disband, so the app-owned tombstone
+            // is the only readable terminal marker here: at a deferred open
+            // (mdk#1161) every engine group record answers `GroupNotHydrated`.
+            // Departures are reconciled against the engine record instead, in
+            // `reconcile_hydrated_account_state`.
+            if disbanded_group_ids.contains(&hex::encode(group_id.as_slice())) {
+                continue;
+            }
+            match group.transport_subscriptions(&group_id) {
+                Ok(subscriptions) => group_routes.extend(subscriptions),
+                Err(_) => tracing::warn!(
+                    target: "marmot_app",
+                    method = "routing_for",
+                    error_kind = "invalid_persisted_group_route",
+                    "skipping malformed persisted group route",
+                ),
+            }
+        }
+
+        Ok(AppTransportRouting::new(AppRoutingState {
+            local_inbox_endpoints: self.account_inbox_endpoints(&state.label, &relay_lists),
+            key_package_endpoints: self.key_package_endpoints(&state.label, &relay_lists)?,
+            inbox_routes,
+            group_routes,
+            required_acks: 1,
+        }))
+    }
+
+    /// One member's inbox route, by the same precedence as `routing_for`: a
+    /// local account's own inbox, else the safe inbox of its directory entry.
+    fn member_inbox_route(
+        &self,
+        account_id_hex: &str,
+    ) -> Result<Option<Vec<TransportEndpoint>>, AppError> {
+        let local = self
+            .account_home()
+            .accounts()?
+            .into_iter()
+            .find(|account| account.account_id_hex == account_id_hex);
+        if let Some(account) = local {
+            let profile = self.profile_for_account(account);
+            return Ok(Some(
+                profile
+                    .inbox_endpoints
+                    .into_iter()
+                    .map(TransportEndpoint)
+                    .collect(),
+            ));
+        }
+        let Some(entry) = self
+            .directory()
+            .directory_entry_for_account_id(account_id_hex)?
+        else {
+            return Ok(None);
+        };
+        let endpoints = self.retain_safe_discovered_endpoints(
+            entry
+                .relay_lists
+                .inbox
+                .relays
+                .into_iter()
+                .map(TransportEndpoint)
+                .collect(),
+            "directory inbox routing",
+        );
+        Ok((!endpoints.is_empty()).then_some(endpoints))
+    }
+
+    fn latest_key_package(&self, label: &str) -> Result<KeyPackage, AppError> {
+        let path = self.key_package_record_path(label);
+        if !path.exists() {
+            return Err(AppError::MissingKeyPackage {
+                account: label.to_owned(),
+                reason: MissingKeyPackageReason::NotFound,
+            });
+        }
+        let record: KeyPackageRecord = read_json(path)?;
+        let key_package = key_package_from_hex_with_optional_source(
+            &record.key_package_hex,
+            &record.key_package_event_id,
+        )?;
+        let metadata = key_package_metadata(&key_package)
+            .map_err(|error| AppError::InvalidKeyPackageEvent(error.to_string()))?;
+        Ok(key_package.with_protocol_profile(metadata.protocol_profile))
+    }
+
+    /// Best-effort public-event cleanup after the session has already
+    /// transactionally removed the matching non-current private bundle.
+    ///
+    /// A failed relay deletion deliberately leaves the cache record in place:
+    /// the current replacement then reuses the same replaceable-event `d`
+    /// slot, superseding the legacy event wherever the deletion was missed.
+    /// If replacement publication also fails, the next account open retries
+    /// from the unchanged cache.
+    async fn retire_cached_non_current_key_package(&self, label: &str) -> bool {
+        let path = self.key_package_record_path(label);
+        let record = match read_json::<KeyPackageRecord>(&path) {
+            Ok(record) => record,
+            Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return false;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "marmot_app::key_packages",
+                    method = "retire_cached_non_current_key_package",
+                    error_kind = error.privacy_safe_kind(),
+                    "could not classify cached key package after strict cutover"
+                );
+                if !self.mark_key_package_cutover_replacement_pending(label) {
+                    return false;
+                }
+                match fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(remove_error) if remove_error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(remove_error) => tracing::warn!(
+                        target: "marmot_app::key_packages",
+                        method = "retire_cached_non_current_key_package",
+                        error_kind = AppError::from(remove_error).privacy_safe_kind(),
+                        "could not remove invalid key package cache"
+                    ),
+                }
+                return true;
+            }
+        };
+        let is_current = key_package_from_hex_with_optional_source(
+            &record.key_package_hex,
+            &record.key_package_event_id,
+        )
+        .ok()
+        .and_then(|key_package| key_package_metadata(&key_package).ok())
+        .is_some_and(|metadata| {
+            self.key_package_metadata_matches_current_support(&metadata)
+                && metadata.credential_identity_hex == record.account_id_hex
+        });
+        if is_current {
+            return false;
+        }
+        if !self.mark_key_package_cutover_replacement_pending(label) {
+            return false;
+        }
+
+        if record.key_package_event_id.is_empty() {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => tracing::warn!(
+                    target: "marmot_app::key_packages",
+                    method = "retire_cached_non_current_key_package",
+                    error_kind = AppError::from(error).privacy_safe_kind(),
+                    "could not remove unpublished non-current key package cache"
+                ),
+            }
+            return true;
+        }
+
+        match self
+            .delete_key_package_event(label, &record.key_package_event_id, Vec::new())
+            .await
+        {
+            Ok(accepted) => tracing::info!(
+                target: "marmot_app::key_packages",
+                method = "retire_cached_non_current_key_package",
+                relay_accept_count = accepted,
+                "retired cached non-current key package event"
+            ),
+            Err(error) => tracing::warn!(
+                target: "marmot_app::key_packages",
+                method = "retire_cached_non_current_key_package",
+                error_kind = error.privacy_safe_kind(),
+                "could not delete cached non-current key package event; current replacement will supersede its slot"
+            ),
+        }
+        true
+    }
+
+    /// Scan the account's authoritative KeyPackage relays and best-effort
+    /// delete every still-discoverable legacy event. This runs on each account
+    /// open, so a crash or partial relay outage simply leaves work for the next
+    /// restart. Local private bundles have already been retired synchronously.
+    async fn retire_relay_non_current_key_packages(&self, label: &str) -> bool {
+        if self.key_package_cutover_scan_complete(label)
+            && !self.key_package_cutover_replacement_pending(label)
+        {
+            return false;
+        }
+        let account = match self.account_home().account(label) {
+            Ok(account) => account,
+            Err(error) => {
+                tracing::warn!(
+                    target: "marmot_app::key_packages",
+                    method = "retire_relay_non_current_key_packages",
+                    error_kind = AppError::from(error).privacy_safe_kind(),
+                    "could not resolve account for relay key package retirement"
+                );
+                return false;
+            }
+        };
+        let relay_lists = match self
+            .directory()
+            .account_relay_list_status_for_account_id(&account.account_id_hex)
+        {
+            Ok(relay_lists) => relay_lists,
+            Err(error) => {
+                tracing::warn!(
+                    target: "marmot_app::key_packages",
+                    method = "retire_relay_non_current_key_packages",
+                    error_kind = error.privacy_safe_kind(),
+                    "could not resolve relays for key package retirement"
+                );
+                return false;
+            }
+        };
+        let source_relays = relay_lists
+            .nip65
+            .relays
+            .iter()
+            .cloned()
+            .map(TransportEndpoint)
+            .collect::<Vec<_>>();
+        if source_relays.is_empty() {
+            return false;
+        }
+        let records = match self
+            .directory()
+            .fetch_key_package_events_for_account_id_with_limit(
+                &account.account_id_hex,
+                &source_relays,
+                KEY_PACKAGE_CUTOVER_RELAY_SCAN_LIMIT,
+            )
+            .await
+        {
+            Ok(records) => records,
+            Err(error) => {
+                tracing::warn!(
+                    target: "marmot_app::key_packages",
+                    method = "retire_relay_non_current_key_packages",
+                    error_kind = error.privacy_safe_kind(),
+                    "deferred relay key package retirement scan"
+                );
+                return false;
+            }
+        };
+
+        let mut non_current_event_count = 0usize;
+        let mut accepted_delete_count = 0usize;
+        let mut delete_failure_count = 0usize;
+        for record in records {
+            let event_id = record.event.id.clone();
+            let endpoints = record.endpoints.clone();
+            let is_current = key_package_from_record(record)
+                .ok()
+                .and_then(|fetched| key_package_metadata(&fetched.key_package).ok())
+                .is_some_and(|metadata| {
+                    self.key_package_metadata_matches_current_support(&metadata)
+                });
+            if is_current {
+                continue;
+            }
+            if !self.mark_key_package_cutover_replacement_pending(label) {
+                delete_failure_count += 1;
+                continue;
+            }
+            non_current_event_count += 1;
+            match self
+                .delete_key_package_event(label, &event_id, endpoints)
+                .await
+            {
+                Ok(accepted) => accepted_delete_count += accepted,
+                Err(_) => delete_failure_count += 1,
+            }
+        }
+        if delete_failure_count == 0 {
+            // The marker helper emits its own privacy-safe warning. It is not
+            // a relay deletion failure, so do not fold it into this counter.
+            let _ = self.mark_key_package_cutover_scan_complete(label);
+        }
+        if non_current_event_count > 0 {
+            tracing::info!(
+                target: "marmot_app::key_packages",
+                method = "retire_relay_non_current_key_packages",
+                non_current_event_count,
+                accepted_delete_count,
+                delete_failure_count,
+                "completed relay key package retirement scan"
+            );
+        }
+        non_current_event_count > 0
+    }
+
+    fn key_package_cutover_replacement_pending_path(&self, label: &str) -> PathBuf {
+        self.key_package_cache_dir()
+            .join(KEY_PACKAGE_DIR)
+            .join(format!("{label}.capability-refresh-v1-replacement-pending"))
+    }
+
+    fn key_package_cutover_scan_complete_path(&self, label: &str) -> PathBuf {
+        self.key_package_cache_dir()
+            .join(KEY_PACKAGE_DIR)
+            .join(format!("{label}.capability-refresh-v1-relay-scan-complete"))
+    }
+
+    fn key_package_cutover_replacement_pending(&self, label: &str) -> bool {
+        self.key_package_cutover_replacement_pending_path(label)
+            .exists()
+    }
+
+    fn mark_key_package_cutover_replacement_pending(&self, label: &str) -> bool {
+        let path = self.key_package_cutover_replacement_pending_path(label);
+        let result = path
+            .parent()
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "cutover marker has no parent directory",
+                )
+            })
+            .and_then(fs_private::create_dir_all_private)
+            .and_then(|()| fs_private::write_private(&path, b"pending\n"));
+        match result {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(
+                    target: "marmot_app::key_packages",
+                    method = "mark_key_package_cutover_replacement_pending",
+                    error_kind = AppError::from(error).privacy_safe_kind(),
+                    "could not persist key package cutover replacement intent"
+                );
+                false
+            }
+        }
+    }
+
+    fn clear_key_package_cutover_replacement_pending(&self, label: &str) {
+        let path = self.key_package_cutover_replacement_pending_path(label);
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(
+                target: "marmot_app::key_packages",
+                method = "clear_key_package_cutover_replacement_pending",
+                error_kind = AppError::from(error).privacy_safe_kind(),
+                "could not clear completed key package replacement intent"
+            ),
+        }
+    }
+
+    /// Remove compatibility artifacts that live outside the account directory.
+    /// Account-home deletion cannot otherwise make setup rollback complete.
+    fn remove_account_key_package_artifacts(&self, label: &str) -> Result<(), AppError> {
+        for path in [
+            self.key_package_record_path(label),
+            self.key_package_cutover_replacement_pending_path(label),
+            self.key_package_cutover_scan_complete_path(label),
+        ] {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
+    fn key_package_cutover_scan_complete(&self, label: &str) -> bool {
+        self.key_package_cutover_scan_complete_path(label).exists()
+    }
+
+    fn mark_key_package_cutover_scan_complete(&self, label: &str) -> Result<(), AppError> {
+        let path = self.key_package_cutover_scan_complete_path(label);
+        let result = path
+            .parent()
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "cutover marker has no parent directory",
+                )
+            })
+            .and_then(fs_private::create_dir_all_private)
+            .and_then(|()| fs_private::write_private(&path, b"complete\n"))
+            .map_err(AppError::from);
+        if let Err(error) = &result {
+            tracing::warn!(
+                target: "marmot_app::key_packages",
+                method = "mark_key_package_cutover_scan_complete",
+                error_kind = error.privacy_safe_kind(),
+                "could not persist completed key package relay scan"
+            );
+        }
+        result
+    }
+
+    pub fn local_key_package_records(
+        &self,
+        label: &str,
+        owned_key_packages: Vec<KeyPackage>,
+    ) -> Result<Vec<AccountKeyPackageRecord>, AppError> {
+        let lifecycle = self.account_storage(label)?.key_package_lifecycle()?;
+        Ok(self
+            .project_local_account_key_package_inventory(label, owned_key_packages, lifecycle)?
+            .into_iter()
+            .map(|entry| entry.record)
+            .collect())
+    }
+
+    /// Local inventory from one consistent ownership-and-lifecycle snapshot.
+    ///
+    /// Both new inventory entrypoints use this so a concurrent rotation cannot
+    /// pair a pre-rotation owned set with a post-rotation lifecycle.
+    pub(crate) fn local_account_key_package_inventory_snapshot(
+        &self,
+        label: &str,
+    ) -> Result<Vec<AccountKeyPackageInventoryEntry>, AppError> {
+        let (owned_key_packages, lifecycle) =
+            self.capture_local_key_package_ownership_and_lifecycle(label)?;
+        self.project_local_account_key_package_inventory(label, owned_key_packages, lifecycle)
+    }
+
+    fn capture_local_key_package_ownership_and_lifecycle(
+        &self,
+        label: &str,
+    ) -> Result<
+        (
+            Vec<KeyPackage>,
+            Option<cgka_traits::KeyPackageLifecycleState>,
+        ),
+        AppError,
+    > {
+        let storage = self.account_storage(label)?;
+        cgka_traits::StorageProvider::with_read_snapshot(&storage, |storage| {
+            let owned = cgka_engine::key_package::durably_owned_key_packages(
+                storage,
+                cgka_traits::group::ProtocolProfile::Current,
+            )
+            .map_err(cgka_session::SessionError::from)?;
+            #[cfg(test)]
+            self.run_inventory_snapshot_between_reads_for_test();
+            let lifecycle = storage.key_package_lifecycle()?;
+            Ok((owned, lifecycle))
+        })
+    }
+
+    fn project_local_account_key_package_inventory(
+        &self,
+        label: &str,
+        owned_key_packages: Vec<KeyPackage>,
+        lifecycle: Option<cgka_traits::KeyPackageLifecycleState>,
+    ) -> Result<Vec<AccountKeyPackageInventoryEntry>, AppError> {
+        let account = self.account_home().account(label)?;
+        let legacy_record = read_json::<KeyPackageRecord>(self.key_package_record_path(label)).ok();
+        let source_relays = self.account_nip65_relays(label).unwrap_or_default();
+        let mut entries = Vec::with_capacity(owned_key_packages.len());
+
+        for key_package in owned_key_packages {
+            let metadata = key_package_metadata(&key_package)
+                .map_err(|error| AppError::InvalidKeyPackageEvent(error.to_string()))?;
+            let key_package_ref = hex::decode(&metadata.key_package_ref_hex)?;
+            let local_state = crate::key_package_records::owned_key_package_local_state(
+                &key_package_ref,
+                lifecycle.as_ref(),
+            );
+            let mut key_package_id = metadata.key_package_ref_hex.clone();
+            let mut key_package_event_id = String::new();
+            let mut published_at = 0;
+
+            if let Some(lifecycle) = lifecycle.as_ref() {
+                if lifecycle.current_key_package_ref.as_deref() == Some(&key_package_ref) {
+                    key_package_id = lifecycle.stable_slot_id.clone();
+                    key_package_event_id = lifecycle
+                        .authored_event_id
+                        .as_ref()
+                        .map(|id| hex::encode(id.as_slice()))
+                        .unwrap_or_default();
+                    published_at = lifecycle
+                        .authored_event_created_at
+                        .map(|created_at| created_at.0)
+                        .unwrap_or_default();
+                } else if let Some(pending) = lifecycle
+                    .pending_replacement
+                    .as_ref()
+                    .filter(|pending| pending.key_package_ref == key_package_ref)
+                {
+                    key_package_id = lifecycle.stable_slot_id.clone();
+                    key_package_event_id = pending
+                        .signed_event
+                        .as_ref()
+                        .map(|event| hex::encode(event.id.as_slice()))
+                        .unwrap_or_default();
+                    published_at = pending
+                        .signed_event
+                        .as_ref()
+                        .map(|event| event.created_at.0)
+                        .unwrap_or(pending.authored_created_at.0);
+                } else if let Some(retained) = lifecycle
+                    .retained_private_material
+                    .iter()
+                    .find(|retained| retained.key_package_ref == key_package_ref)
+                {
+                    key_package_id = lifecycle.stable_slot_id.clone();
+                    published_at = retained.replaced_at.0;
+                }
+            }
+
+            if let Some(legacy) = legacy_record
+                .as_ref()
+                .filter(|legacy| legacy.key_package_ref_hex == metadata.key_package_ref_hex)
+            {
+                if key_package_id == metadata.key_package_ref_hex {
+                    key_package_id = legacy.key_package_id.clone();
+                }
+                if key_package_event_id.is_empty() {
+                    key_package_event_id = legacy.key_package_event_id.clone();
+                }
+                if published_at == 0 {
+                    published_at = legacy.published_at;
+                }
+            }
+
+            entries.push(AccountKeyPackageInventoryEntry {
+                record: AccountKeyPackageRecord {
+                    account_label: Some(account.label.clone()),
+                    account_id_hex: account.account_id_hex.clone(),
+                    key_package_id,
+                    key_package_ref_hex: metadata.key_package_ref_hex,
+                    key_package_event_id,
+                    published_at,
+                    key_package_bytes: key_package.bytes().len(),
+                    source_relays: source_relays.clone(),
+                    local: true,
+                    relay: false,
+                },
+                local_state,
+            });
+        }
+        Ok(entries)
+    }
+
+    pub(crate) async fn fetch_validated_account_key_package_records(
+        &self,
+        label: &str,
+        bootstrap_relays: Vec<TransportEndpoint>,
+        method: &'static str,
+    ) -> Result<Vec<AccountKeyPackageRecord>, AppError> {
+        let account = self.account_home().account(label)?;
+        let account_id_hex = account.account_id_hex;
+
+        let has_explicit_bootstrap_relays = !bootstrap_relays.is_empty();
+        let mut relay_lists = if has_explicit_bootstrap_relays {
+            self.directory()
+                .fetch_account_relay_list_status_for_account_id(&account_id_hex, bootstrap_relays)
+                .await?
+        } else {
+            self.directory()
+                .account_relay_list_status_for_account_id(&account_id_hex)?
+        };
+        // Discover the account's NIP-65 list via default relays when it is not
+        // cached yet, mirroring fetch_latest_key_package_for_account_id. We never
+        // normally pull KeyPackage events from the account's own NIP-65 relays.
+        // When that published route exists but every endpoint is unusable, use
+        // the configured directory relays as the same operational fallback used
+        // when local accounts publish a KeyPackage without rewriting NIP-65.
+        if !has_explicit_bootstrap_relays && relay_lists.nip65.relays.is_empty() {
+            let discovery_relays = self.directory().directory_source_relays(&[]);
+            if !discovery_relays.is_empty() {
+                relay_lists = self
+                    .directory()
+                    .fetch_account_relay_list_status_for_account_id(
+                        &account_id_hex,
+                        discovery_relays,
+                    )
+                    .await?;
+            }
+        }
+        let mut source_relays = self.retain_safe_discovered_endpoints(
+            relay_lists
+                .nip65
+                .relays
+                .iter()
+                .cloned()
+                .map(TransportEndpoint)
+                .collect(),
+            "account key package listing",
+        );
+        if source_relays.is_empty() {
+            source_relays = self.directory().directory_source_relays(&[]);
+        }
+        if source_relays.is_empty() {
+            return Err(AppError::MissingRelayLists(vec![
+                MissingRelayListKind::Nip65,
+            ]));
+        }
+
+        let mut relay_records = self
+            .directory()
+            .fetch_key_package_events_for_account_id(&account_id_hex, &source_relays)
+            .await?;
+        sort_directory_records(&mut relay_records);
+        let mut packages = Vec::new();
+        for record in relay_records {
+            match key_package_from_record(record) {
+                Ok(fetched) => {
+                    packages.push(account_key_package_record_from_fetched(fetched));
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        target: "marmot_app::key_packages",
+                        method = method,
+                        error_kind = err.privacy_safe_kind(),
+                        "skipping invalid key package event while listing account packages"
+                    );
+                }
+            }
+        }
+        Ok(packages)
+    }
+
+    pub async fn account_key_package_records(
+        &self,
+        label: &str,
+        bootstrap_relays: Vec<TransportEndpoint>,
+        owned_key_packages: Vec<KeyPackage>,
+    ) -> Result<Vec<AccountKeyPackageRecord>, AppError> {
+        let mut packages = self.local_key_package_records(label, owned_key_packages)?;
+        packages.extend(
+            self.fetch_validated_account_key_package_records(
+                label,
+                bootstrap_relays,
+                "account_key_package_records",
+            )
+            .await?,
+        );
+        Ok(merge_key_package_records(packages))
+    }
+
+    pub async fn account_key_package_relay_events(
+        &self,
+        label: &str,
+        bootstrap_relays: Vec<TransportEndpoint>,
+    ) -> Result<Vec<AccountKeyPackageRelayEvent>, AppError> {
+        let packages = self
+            .fetch_validated_account_key_package_records(
+                label,
+                bootstrap_relays,
+                "account_key_package_relay_events",
+            )
+            .await?;
+        Ok(account_key_package_relay_events_from_records(packages))
+    }
+
+    pub async fn delete_key_package_event(
+        &self,
+        label: &str,
+        event_id_hex: &str,
+        source_relays: Vec<TransportEndpoint>,
+    ) -> Result<usize, AppError> {
+        let mut outcomes = self
+            .delete_key_package_events(
+                label,
+                vec![KeyPackageDeletionTarget {
+                    event_id_hex: event_id_hex.to_owned(),
+                    source_relays,
+                }],
+            )
+            .await?;
+        outcomes
+            .pop()
+            .expect("single-event deletion batch returns one outcome")
+            .result
+    }
+
+    pub(crate) async fn delete_key_package_events(
+        &self,
+        label: &str,
+        targets: Vec<KeyPackageDeletionTarget>,
+    ) -> Result<Vec<KeyPackageDeletionResult>, AppError> {
+        let account = self.account_home().account(label)?;
+        let signer = self.account_signer_for_summary(&account)?;
+        let account_id_hex = account.account_id_hex;
+        let account_id = MemberId::new(hex::decode(&account_id_hex)?);
+        let mut results = targets
+            .iter()
+            .map(|target| KeyPackageDeletionResult {
+                event_id_hex: target.event_id_hex.clone(),
+                result: Err(AppError::Publish("deletion was not attempted".to_owned())),
+            })
+            .collect::<Vec<_>>();
+        let mut requests = Vec::new();
+        let mut request_indices = Vec::new();
+
+        for (index, target) in targets.into_iter().enumerate() {
+            let event_id_hex = match parse_key_package_event_id_hex(&target.event_id_hex) {
+                Ok(event_id_hex) => event_id_hex,
+                Err(error) => {
+                    results[index].result = Err(error);
+                    continue;
+                }
+            };
+            let endpoints = if target.source_relays.is_empty() {
+                match self
+                    .directory()
+                    .account_relay_list_status_for_account_id(&account_id_hex)
+                    .map_err(AppError::from)
+                    .and_then(|relay_lists| self.key_package_endpoints(label, &relay_lists))
+                {
+                    Ok(endpoints) => endpoints,
+                    Err(error) => {
+                        results[index].result = Err(error);
+                        continue;
+                    }
+                }
+            } else {
+                target.source_relays
+            };
+            if endpoints.is_empty() {
+                results[index].result = Err(AppError::MissingRelayLists(vec![
+                    MissingRelayListKind::Nip65,
+                ]));
+                continue;
+            }
+            let endpoints = match self
+                .relay_plane
+                .sanitize_relay_endpoints(endpoints, "key package deletion publish")
+            {
+                Ok(endpoints) => endpoints,
+                Err(error) => {
+                    results[index].result = Err(AppError::Transport(
+                        cgka_traits::TransportAdapterError::Publish(error),
+                    ));
+                    continue;
+                }
+            };
+            requests.push(NostrEventPublishRequest {
+                endpoints,
+                event: NostrTransportEvent::new_unsigned(
+                    account_id_hex.clone(),
+                    5,
+                    vec![
+                        vec!["e".into(), event_id_hex],
+                        vec!["k".into(), KIND_MARMOT_KEY_PACKAGE.to_string()],
+                    ],
+                    String::new(),
+                ),
+                required_acks: 1,
+            });
+            request_indices.push(index);
+        }
+
+        if !requests.is_empty() {
+            let relay_client =
+                self.relay_client_for_account_id(&account_id_hex, signer.as_nostr_signer());
+            let outcomes = relay_client
+                .publish_events_for_account(&account_id, &requests)
+                .await;
+            for (index, outcome) in request_indices.into_iter().zip(outcomes) {
+                results[index].result = match outcome {
+                    Ok(outcome) if !outcome.accepted.is_empty() => Ok(outcome.accepted.len()),
+                    Ok(_) => Err(AppError::Publish(
+                        "relay acknowledged zero key package deletions".to_owned(),
+                    )),
+                    Err(error) => Err(error.into()),
+                };
+            }
+        }
+
+        let path = self.key_package_record_path(label);
+        for result in &mut results {
+            if result.result.is_err() {
+                continue;
+            }
+            if let Ok(record) = read_json::<KeyPackageRecord>(&path)
+                && record.key_package_event_id == result.event_id_hex
+            {
+                match fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => result.result = Err(err.into()),
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    fn key_package_record_path(&self, label: &str) -> PathBuf {
+        self.key_package_cache_dir()
+            .join(KEY_PACKAGE_DIR)
+            .join(format!("{label}.json"))
+    }
+
+    fn reusable_key_package_slot_id(
+        &self,
+        label: &str,
+        account_id_hex: &str,
+    ) -> Result<Option<String>, AppError> {
+        let path = self.key_package_record_path(label);
+        let record: KeyPackageRecord = match read_json(&path) {
+            Ok(record) => record,
+            Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                if self.key_package_cutover_replacement_pending(label) {
+                    return Err(AppError::Publish(
+                        "legacy key package replacement is pending but its stable slot is unavailable"
+                            .into(),
+                    ));
+                }
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        if record.account_id_hex != account_id_hex || record.key_package_id.is_empty() {
+            return Err(AppError::Publish(
+                "legacy key package slot record does not match the local account".into(),
+            ));
+        }
+        let bytes = hex::decode(&record.key_package_hex)?;
+        // This helper only preserves the replaceable-event `d` slot. Classify
+        // either deployed legacy bytes or current bytes so a strict-cutover
+        // replacement can supersede the same slot; the publication boundary
+        // below still rejects anything except a current KeyPackage.
+        let key_package = KeyPackage::new(bytes);
+        let metadata = [
+            cgka_traits::group::ProtocolProfile::Current,
+            cgka_traits::group::ProtocolProfile::Legacy,
+        ]
+        .into_iter()
+        .find_map(|profile| {
+            key_package_metadata(&key_package.clone().with_protocol_profile(profile)).ok()
+        })
+        .ok_or_else(|| AppError::Publish("legacy key package record is invalid".into()))?;
+        if metadata.credential_identity_hex != account_id_hex {
+            return Err(AppError::Publish(
+                "legacy key package credential does not match the local account".into(),
+            ));
+        }
+        Ok(Some(record.key_package_id))
+    }
+
+    fn validated_current_local_key_package(&self, label: &str) -> Option<KeyPackage> {
+        let account = self.account_home().account(label).ok()?;
+        let key_package = self.latest_key_package(label).ok()?;
+        let metadata = key_package_metadata(&key_package).ok()?;
+        (metadata.protocol_profile == cgka_traits::group::ProtocolProfile::Current
+            && metadata.credential_identity_hex == account.account_id_hex)
+            .then_some(key_package)
+    }
+
+    /// Persist strict-cutover replacement intent before the session layer can
+    /// delete unpublished non-current private bundles during open.
+    fn ensure_strict_cutover_replacement_intent_before_session_open(
+        &self,
+        label: &str,
+    ) -> Result<(), AppError> {
+        let account_storage_preexisted = self.account_storage_path(label).exists();
+        let setup_in_progress = self.account_home().account_setup_state(label)?.is_some();
+        let storage = self.account_storage(label)?;
+        let existing_lifecycle = storage.key_package_lifecycle()?;
+        if existing_lifecycle
+            .as_ref()
+            .is_some_and(|lifecycle| !lifecycle.stable_slot_id.is_empty())
+        {
+            return Ok(());
+        }
+        let current_cache = self.validated_current_local_key_package(label).is_some();
+        match self.reusable_key_package_slot_id(
+            label,
+            &self.account_home().account(label)?.account_id_hex,
+        ) {
+            Ok(Some(stable_slot_id)) => {
+                let mut lifecycle = existing_lifecycle
+                    .clone()
+                    .unwrap_or_else(|| empty_key_package_lifecycle(String::new()));
+                lifecycle.stable_slot_id = stable_slot_id;
+                storage.put_key_package_lifecycle(&lifecycle)?;
+                if current_cache || self.mark_key_package_cutover_replacement_pending(label) {
+                    return Ok(());
+                }
+            }
+            Ok(None)
+                if (!account_storage_preexisted || setup_in_progress)
+                    && storage.stored_key_package_bundles()?.is_empty() =>
+            {
+                // Only a newly-created or durably journaled account setup can
+                // mint the first slot without migration evidence. Other
+                // existing databases fail closed even when no private bundles
+                // remain: they may have published under an unrecoverable `d`.
+                let mut slot = [0u8; 32];
+                OsRng.fill_bytes(&mut slot);
+                storage
+                    .put_key_package_lifecycle(&empty_key_package_lifecycle(hex::encode(slot)))?;
+                if self.mark_key_package_cutover_replacement_pending(label) {
+                    return Ok(());
+                }
+            }
+            Ok(None) | Err(_) if account_storage_preexisted && !setup_in_progress => {
+                // A database created before the durable setup journal is
+                // ambiguous: it may be an interrupted fresh setup, or an
+                // upgraded device whose published stable slot was lost. Do not
+                // mint a second slot. Keep normal account reads available; the
+                // setup publication boundary surfaces the typed recovery state.
+                if self.mark_key_package_cutover_replacement_pending(label) {
+                    return Ok(());
+                }
+            }
+            Ok(None) | Err(_) => {
+                // Preserve an explicit fail-closed marker. The publisher will
+                // refuse to mint a second slot until migration can recover the
+                // original `d` value.
+                if self.mark_key_package_cutover_replacement_pending(label) {
+                    return Ok(());
+                }
+            }
+        }
+        if self.key_package_cutover_replacement_pending(label) {
+            return Ok(());
+        }
+        Err(AppError::Io(std::io::Error::other(
+            "could not persist strict cutover replacement intent before session open",
+        )))
+    }
+
+    fn legacy_incomplete_setup_requires_recovery(&self, label: &str) -> Result<bool, AppError> {
+        if !self.account_storage_path(label).exists()
+            || self.account_home().account_setup_state(label)?.is_some()
+            || self.key_package_record_path(label).exists()
+        {
+            return Ok(false);
+        }
+        let storage = self.account_storage(label)?;
+        Ok(storage.key_package_lifecycle()?.is_none()
+            && storage.stored_key_package_bundles()?.is_empty())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn member_key_package(
+        &self,
+        member_ref: &str,
+    ) -> Result<KeyPackage, AppError> {
+        // Local accounts: cache files are keyed by the account's canonical
+        // label, so resolve the ref (which may be an npub or hex pubkey)
+        // before looking up the cached key package. Using the raw ref here
+        // would miss the file when inviting a local account by npub.
+        let local_account = self.account_home().account(member_ref).ok();
+        if let Some(account) = &local_account
+            && let Some(key_package) = self.validated_current_local_key_package(&account.label)
+        {
+            return Ok(key_package);
+        }
+        let account_id = if let Some(account) = local_account {
+            account.account_id_hex
+        } else {
+            PublicKey::parse(member_ref)
+                .map_err(|_| AppError::InvalidPublicKey)?
+                .to_hex()
+        };
+        if let Some(entry) = self
+            .directory()
+            .directory_entry_for_account_id(&account_id)?
+        {
+            if let Some(key_package) = entry.key_package {
+                return Ok(validated_cached_key_package(&account_id, &key_package)?);
+            }
+            let source_relays = self.retain_safe_discovered_endpoints(
+                entry
+                    .relay_lists
+                    .nip65
+                    .relays
+                    .iter()
+                    .cloned()
+                    .map(TransportEndpoint)
+                    .collect(),
+                "member key package fetch",
+            );
+            if !source_relays.is_empty() {
+                let records = self
+                    .directory()
+                    .fetch_key_package_events_for_account_id(&account_id, &source_relays)
+                    .await?;
+                let mut fetched = fresh_or_cached_key_package(
+                    &account_id,
+                    latest_fresh_key_package_from_records(
+                        &account_id,
+                        records,
+                        self.directory().directory_freshness_for_test(),
+                        &self.deployment().key_package_client_preference,
+                    )?,
+                    Some(entry.clone()),
+                )?;
+                fetched.relay_lists = entry.relay_lists;
+                self.directory().remember_directory_key_package(&fetched)?;
+                return Ok(fetched.key_package);
+            }
+        }
+
+        let fetched = self
+            .directory()
+            .fetch_latest_key_package_for_account_id(&account_id, Vec::new())
+            .await?;
+        Ok(fetched.key_package)
+    }
+
+    fn member_id(&self, member_ref: &str) -> Result<MemberId, AppError> {
+        if let Ok(account) = self.account_home().account(member_ref) {
+            return Ok(MemberId::new(hex::decode(account.account_id_hex)?));
+        }
+        let account_id = PublicKey::parse(member_ref)
+            .map_err(|_| AppError::InvalidPublicKey)?
+            .to_hex();
+        Ok(MemberId::new(hex::decode(account_id)?))
+    }
+
+    fn profiles(&self) -> Result<Vec<AccountProfile>, AppError> {
+        self.account_home()
+            .accounts()?
+            .into_iter()
+            .map(|account| Ok(self.profile_for_account(account)))
+            .collect()
+    }
+
+    fn profiles_by_id(&self) -> Result<HashMap<String, String>, AppError> {
+        let account_ids = self
+            .account_home()
+            .accounts()?
+            .into_iter()
+            .map(|account| account.account_id_hex)
+            .collect::<Vec<_>>();
+        Ok(self
+            .directory()
+            .display_names_for_account_ids(&account_ids)?)
+    }
+
+    fn display_name_for_account_id(
+        &self,
+        account_id_hex: &str,
+    ) -> Result<Option<String>, AppError> {
+        let entry = self
+            .directory()
+            .directory_entry_for_account_id(account_id_hex)?;
+        self.display_name_from_directory_entry(account_id_hex, entry.as_ref())
+    }
+
+    /// Resolve a display name from an ALREADY-FETCHED directory entry, falling
+    /// back to a local account's label. Split out so callers that already hold
+    /// the entry (e.g. notification building, #639) don't re-query
+    /// `directory_entry_for_account_id`.
+    /// Preserve its first-alias fallback; batched name reads historically use the last alias.
+    pub(crate) fn display_name_from_directory_entry(
+        &self,
+        account_id_hex: &str,
+        entry: Option<&UserDirectoryRecord>,
+    ) -> Result<Option<String>, AppError> {
+        if let Some(name) = display_name_for_profile(entry.and_then(|entry| entry.profile.as_ref()))
+        {
+            return Ok(Some(name));
+        }
+        Ok(self
+            .account_home()
+            .accounts()?
+            .into_iter()
+            .find(|account| account.account_id_hex == account_id_hex)
+            .map(|account| account.label))
+    }
+
+    /// Kind-1210 rows are locally synthesized state projections, not authored
+    /// Nostr events. Their sender is the authenticated MLS actor when one is
+    /// available and is intentionally empty otherwise, so it is not a stable
+    /// Nostr identity input. The chat-list preview renders the structured
+    /// group-system payload and never consumes a sender display name.
+    fn chat_list_sender_for_profile_hydration(message: &ChatListMessagePreview) -> Option<&str> {
+        (message.kind != MARMOT_APP_EVENT_KIND_GROUP_SYSTEM).then_some(message.sender.as_str())
+    }
+
+    fn hydrate_chat_system_names(&self, rows: &mut [ChatListRow]) -> Result<(), AppError> {
+        use chat_presentation::canonical_identity;
+        let ids = rows
+            .iter()
+            .filter_map(|r| r.last_message.as_ref())
+            .filter_map(|m| m.group_system.as_ref())
+            .filter(|e| e.provenance == GroupSystemEventProvenance::AuthenticatedGroupState)
+            .flat_map(|e| {
+                [
+                    e.actor_account_id_hex.as_deref(),
+                    e.subject_account_id_hex.as_deref(),
+                ]
+            })
+            .flatten()
+            .filter_map(canonical_identity)
+            .collect::<HashSet<_>>();
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let caches = self.directory_caches()?;
+        let shared = self.shared_storage()?;
+        let local_accounts = self.directory().local_accounts_by_id()?;
+        let mut names = HashMap::new();
+        for id in ids {
+            let profile = self
+                .directory()
+                .directory_entry_for_account_id_with_handles(
+                    &id,
+                    &caches,
+                    &shared,
+                    &local_accounts,
+                )?
+                .and_then(|entry| entry.profile);
+            let name = conversation_presentation::identity_display_name(
+                &id,
+                profile.as_ref(),
+                local_accounts
+                    .get(&id)
+                    .map(|account| account.label.as_str()),
+            );
+            names.insert(id, name);
+        }
+        for event in rows
+            .iter_mut()
+            .filter_map(|r| r.last_message.as_mut())
+            .filter_map(|m| m.group_system.as_mut())
+        {
+            if event.provenance != GroupSystemEventProvenance::AuthenticatedGroupState {
+                continue;
+            }
+            event.actor_display_name = event
+                .actor_account_id_hex
+                .as_deref()
+                .and_then(canonical_identity)
+                .and_then(|id| names.get(&id).cloned());
+            event.subject_display_name = event
+                .subject_account_id_hex
+                .as_deref()
+                .and_then(canonical_identity)
+                .and_then(|id| names.get(&id).cloned());
+        }
+        Ok(())
+    }
+
+    fn hydrate_chat_list_rows(&self, rows: &mut [ChatListRow]) -> Result<(), AppError> {
+        self.hydrate_chat_system_names(rows)?;
+        let senders = rows
+            .iter()
+            .filter_map(|row| {
+                row.last_message
+                    .as_ref()
+                    .and_then(Self::chat_list_sender_for_profile_hydration)
+                    .map(ToOwned::to_owned)
+            })
+            .collect::<HashSet<_>>();
+        let senders = senders.into_iter().collect::<Vec<_>>();
+        let names = self.directory().display_names_for_account_ids(&senders)?;
+        for row in rows {
+            let Some(message) = row.last_message.as_mut() else {
+                continue;
+            };
+            (message.attachment_kind, message.attachment_count) =
+                media::classify_chat_list_attachments(message.media_json.as_deref());
+            if let Some(name) = names.get(&message.sender) {
+                message.sender_display_name = Some(name.clone());
+            }
+        }
+        Ok(())
+    }
+
+    fn hydrate_chat_list_row(&self, row: Option<&mut ChatListRow>) {
+        let Some(row) = row else {
+            return;
+        };
+        if let Err(error) = self.hydrate_chat_system_names(std::slice::from_mut(row)) {
+            tracing::warn!(target: "marmot_app::client", method = "hydrate_chat_list_row", error_kind = error.privacy_safe_kind(), "projecting system preview without display names");
+        }
+        let Some(message) = row.last_message.as_mut() else {
+            return;
+        };
+        (message.attachment_kind, message.attachment_count) =
+            media::classify_chat_list_attachments(message.media_json.as_deref());
+        let Some(sender) = Self::chat_list_sender_for_profile_hydration(message) else {
+            return;
+        };
+        // Optional names must not roll back the enclosing message projection.
+        match self.display_name_for_account_id(sender) {
+            Ok(Some(name)) => message.sender_display_name = Some(name),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    target: "marmot_app::client",
+                    method = "hydrate_chat_list_row",
+                    error_kind = error.privacy_safe_kind(),
+                    "projecting chat preview without display name",
+                );
+            }
+        }
+    }
+
+    fn load_state(&self, label: &str) -> Result<AccountState, AppError> {
+        self.ensure_account_state(label)?;
+        let storage = self.account_storage(label)?.app_storage();
+        // A retained route stored before switch times were kept is anchored
+        // at the first load that finds it, persisted at once so the anchor
+        // stays fixed across later loads. Sessions before the upgrade already
+        // fetched its older traffic, and the comparison covers the rest of the
+        // retained window. A failed stamp leaves the route backfilled in full
+        // and is retried on the next load.
+        if let Err(error) = storage.stamp_unrecorded_prior_route_switches(unix_now_seconds()) {
+            tracing::warn!(
+                target: "marmot_app",
+                method = "load_state",
+                error_kind = AppError::from(error).privacy_safe_kind(),
+                "could not record switch times for retained routes"
+            );
+        }
+        account_state_from_stored(storage.load_account_projection_state(label, MAX_SEEN_EVENT_IDS)?)
+    }
+
+    /// Persist the account snapshot. Concurrent runtimes (the main app and a
+    /// short-lived notification-wake process) may save over the same account
+    /// database; the durable transport cursor is merged clamp-then-max inside
+    /// the save transaction (see `save_account_projection_state` in
+    /// storage-sqlite for the full cross-process semantics), so a stale or
+    /// cursor-less save can never lower or wipe an advanced cursor, and a
+    /// stored value poisoned above `now + TRANSPORT_CURSOR_MAX_FUTURE_SKEW` is
+    /// healed down on the next save that learned a cursor. Known residual: a
+    /// skew-inflated but within-clamp cursor persists until wall clock passes
+    /// it — bounded exposure, ~180s beyond the 120s
+    /// `APP_RUNTIME_RELAY_REBUILD_LOOKBACK`. A deliberate cursor reset must be
+    /// a dedicated named API; a raw save cannot lower the merged value.
+    #[cfg(test)]
+    fn save_state(&self, state: &AccountState) -> Result<(), AppError> {
+        self.account_storage(&state.label)?
+            .app_storage()
+            .save_account_projection_state(
+                &stored_state_from_account_state(state),
+                MAX_SEEN_EVENT_IDS,
+                TRANSPORT_CURSOR_MAX_FUTURE_SKEW.as_secs(),
+            )?;
+        self.chat_list_projection_stale
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(state.label.clone());
+        Ok(())
+    }
+
+    fn save_state_delta_clearing_local_group_deletion_frontiers_and_acking_application_events(
+        &self,
+        delta: &AccountState,
+        frontiers_to_clear: &[(String, u64)],
+        application_event_ids_to_ack: &[MessageId],
+    ) -> Result<(), AppError> {
+        self.account_storage(&delta.label)?
+            .app_storage().save_account_projection_delta_clearing_local_group_deletion_frontiers_and_acking_application_events(
+                &stored_state_from_account_state(delta),
+                MAX_SEEN_EVENT_IDS,
+                TRANSPORT_CURSOR_MAX_FUTURE_SKEW.as_secs(),
+                frontiers_to_clear,
+                application_event_ids_to_ack,
+            )?;
+        self.chat_list_projection_stale
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(delta.label.clone());
+        self.presentation_signals.wake();
+        Ok(())
+    }
+
+    fn save_state_delta_and_refresh_created_chat_list_row(
+        &self,
+        delta: &AccountState,
+        frontiers_to_clear: &[(String, u64)],
+        application_event_ids_to_ack: &[MessageId],
+        group_id_hex: &str,
+    ) -> Result<ChatListRow, AppError> {
+        let account = self.account_home().account(&delta.label)?;
+        let classifier = Self::chat_list_mention_classifier(&account.account_id_hex);
+        let has_other_dirty_groups = delta
+            .groups
+            .iter()
+            .any(|group| group.group_id_hex != group_id_hex);
+        let mut row = self
+            .account_storage(&delta.label)?
+            .app_storage()
+            .save_account_projection_delta_and_refresh_chat_list_row(
+                &stored_state_from_account_state(delta),
+                MAX_SEEN_EVENT_IDS,
+                TRANSPORT_CURSOR_MAX_FUTURE_SKEW.as_secs(),
+                frontiers_to_clear,
+                application_event_ids_to_ack,
+                &account.account_id_hex,
+                group_id_hex,
+                &classifier,
+            )?
+            .ok_or_else(|| AppError::UnknownGroup(group_id_hex.to_owned()))?;
+        self.presentation_signals.wake();
+        self.hydrate_chat_list_row(Some(&mut row));
+
+        // Only the created row belongs on the response tail. Preserve any
+        // pre-existing stale marker, and add one if this delta also persisted
+        // another dirty group; a later full-list query performs that rebuild.
+        // A single-row refresh does not prove the full projection is warmed.
+        if has_other_dirty_groups {
+            self.chat_list_projection_stale
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(delta.label.clone());
+        }
+        Ok(row)
+    }
+
+    pub(crate) fn delete_group_local_data(
+        &self,
+        label: &str,
+        group_id_hex: &str,
+    ) -> Result<bool, AppError> {
+        self.ensure_account_state(label)?;
+        let storage = self.account_storage(label)?;
+        let group_id = GroupId::new(hex::decode(group_id_hex)?);
+        let normalized_group_id_hex = hex::encode(group_id.as_slice());
+        if storage
+            .disbanding_group_ids_hex()?
+            .contains(&normalized_group_id_hex)
+        {
+            return Err(AppError::GroupDisbanding(group_id_hex.to_owned()));
+        }
+        let deleted = storage.delete_local_group_data(group_id_hex)?.did_delete();
+        self.presentation_signals.wake();
+        self.chat_list_projection_stale
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(label.to_owned());
+        self.chat_list_projection_warmed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(label);
+        Ok(deleted)
+    }
+
+    fn ensure_account_state(&self, label: &str) -> Result<(), AppError> {
+        let _span = tracing::debug_span!(
+            target: "marmot_app::storage",
+            "ensure_account_state",
+            method = "ensure_account_state"
+        )
+        .entered();
+        let account = self.account_home().account(label)?;
+        let mut ready = self
+            .account_state_ready
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if ready.contains(label) {
+            return Ok(());
+        }
+        #[cfg(test)]
+        self.local_open_gates
+            .wait(label, AccountStartupStage::AccountState);
+        // Run KeyPackage cutover before any other account-storage access. The
+        // cutover uses pre-existence of the encrypted account database as the
+        // durable distinction between a fresh local account and an upgraded
+        // device whose missing JSON slot must fail closed.
+        self.ensure_strict_cutover_replacement_intent_before_session_open(label)?;
+        self.migrate_legacy_account_projection_if_needed(label)?;
+        self.account_storage(label)?
+            .app_storage()
+            .ensure_account_projection_with_identity(label, &account.account_id_hex)?;
+        ready.insert(label.to_owned());
+        Ok(())
+    }
+
+    /// Build the unread-mention classifier injected into the chat-list
+    /// projection. The storage layer never parses nostr/NIP-21, so it calls back
+    /// into the same notification mention classification (`p`-tag + inline nostr
+    /// pubkey references, i.e. bare `@npub1…` handles and explicit `nostr:`
+    /// URIs) used for push notifications, scoped to the local account. The
+    /// unread window is already kind-9 filtered, but the real chat kind is
+    /// passed for correctness.
+    fn chat_list_mention_classifier(
+        account_id_hex: &str,
+    ) -> impl Fn(&str, &[Vec<String>]) -> bool + use<> {
+        let account_id_hex = account_id_hex.to_owned();
+        move |plaintext, tags| {
+            crate::notifications::message_text_mentions_account(
+                MARMOT_APP_EVENT_KIND_CHAT,
+                plaintext,
+                tags,
+                &account_id_hex,
+            )
+        }
+    }
+
+    fn ensure_chat_list_projection(&self, account: &AccountSummary) -> Result<(), AppError> {
+        let stale = self
+            .chat_list_projection_stale
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&account.label);
+        let warmed = self
+            .chat_list_projection_warmed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&account.label);
+        if warmed && !stale {
+            return Ok(());
+        }
+        let storage = self.account_storage(&account.label)?.app_storage();
+        let classifier = Self::chat_list_mention_classifier(&account.account_id_hex);
+        if stale {
+            storage.refresh_chat_list_rows(&account.account_id_hex, &classifier)?;
+        } else {
+            storage.ensure_chat_list_rows(&account.account_id_hex, &classifier)?;
+        }
+        self.chat_list_projection_warmed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(account.label.clone());
+        self.chat_list_projection_stale
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&account.label);
+        Ok(())
+    }
+
+    fn profile_for_account(&self, account: AccountSummary) -> AccountProfile {
+        let relay_lists = self
+            .directory()
+            .account_relay_list_status_for_account_id(&account.account_id_hex)
+            .unwrap_or_else(|_| AccountRelayListStatus::empty());
+        AccountProfile {
+            inbox_endpoints: self
+                .account_inbox_endpoints(&account.label, &relay_lists)
+                .into_iter()
+                .map(|endpoint| endpoint.0)
+                .collect(),
+            account_id_hex: account.account_id_hex,
+        }
+    }
+
+    fn account_inbox_endpoints(
+        &self,
+        _label: &str,
+        relay_lists: &AccountRelayListStatus,
+    ) -> Vec<TransportEndpoint> {
+        let offered = relay_lists.inbox.relays.len();
+        let safe = self.retain_safe_discovered_endpoints(
+            relay_lists
+                .inbox
+                .relays
+                .iter()
+                .cloned()
+                .map(TransportEndpoint)
+                .collect(),
+            "local account inbox activation",
+        );
+        if !safe.is_empty() {
+            return safe;
+        }
+        let fallback = self.relay_endpoints();
+        if offered > 0 {
+            tracing::warn!(
+                target: "marmot_app::relay_plane",
+                method = "account_inbox_endpoints",
+                offered = offered,
+                fallback = fallback.len(),
+                "published account inbox has no usable endpoints; using configured defaults"
+            );
+        }
+        fallback
+    }
+
+    fn key_package_endpoints(
+        &self,
+        label: &str,
+        relay_lists: &AccountRelayListStatus,
+    ) -> Result<Vec<TransportEndpoint>, AppError> {
+        // KeyPackages publish to (and are fetched from) the account's NIP-65
+        // (kind 10002) outbox relays; there is no dedicated KeyPackage relay
+        // list. Fall back to the configured default relays when the account has
+        // no usable NIP-65 relay. This runtime fallback is not published as a
+        // replacement for the account's relay list.
+        let mut outbox = relay_lists
+            .nip65
+            .relays
+            .iter()
+            .cloned()
+            .map(TransportEndpoint)
+            .collect::<Vec<_>>();
+        if outbox.is_empty() {
+            // An open generated setup has not projected the NIP-65 list its
+            // bootstrap publishes yet. Route to the relays that list declares,
+            // not to the app's (mdk#2359).
+            outbox = match self.generated_setup_outbox_relays(label)? {
+                Some(relays) => relays,
+                // Setup removes its journal and context only after projecting
+                // its lists, so one that completed since `relay_lists` was
+                // read shows them in a fresh read.
+                None => self
+                    .account_relay_list_status(label)?
+                    .nip65
+                    .relays
+                    .into_iter()
+                    .map(TransportEndpoint)
+                    .collect(),
+            };
+        }
+        let offered = outbox.len();
+        let safe =
+            self.retain_safe_discovered_endpoints(outbox, "local account key package routing");
+        if !safe.is_empty() {
+            return Ok(safe);
+        }
+        let fallback = self.relay_endpoints();
+        if offered > 0 {
+            tracing::warn!(
+                target: "marmot_app::relay_plane",
+                method = "key_package_endpoints",
+                offered = offered,
+                fallback = fallback.len(),
+                "published account outbox has no usable endpoints; using configured defaults"
+            );
+        }
+        Ok(fallback)
+    }
+
+    /// The NIP-65 relays an open generated setup declares. `None` once setup
+    /// completes, or when its context is missing or unreadable.
+    fn generated_setup_outbox_relays(
+        &self,
+        label: &str,
+    ) -> Result<Option<Vec<TransportEndpoint>>, AppError> {
+        let home = self.account_home();
+        if !home
+            .account_setup_state(label)?
+            .is_some_and(|state| state.kind == AccountSetupKind::GeneratedIdentity)
+        {
+            return Ok(None);
+        }
+        Ok(home
+            .account_setup_context(label)?
+            .and_then(|bytes| {
+                serde_json::from_slice::<runtime::GeneratedAccountSetupContext>(&bytes).ok()
+            })
+            .map(|context| context.outbox_relays()))
+    }
+
+    fn transport_label(&self) -> &'static str {
+        "relay"
+    }
+
+    fn account_dir(&self, label: &str) -> PathBuf {
+        self.account_home().account_dir(label)
+    }
+
+    fn legacy_account_projection_path(&self, label: &str) -> PathBuf {
+        self.account_dir(label).join(LEGACY_ACCOUNT_APP_DB_FILE)
+    }
+
+    fn account_storage_path(&self, label: &str) -> PathBuf {
+        self.account_dir(label).join(SESSION_DB_FILE)
+    }
+
+    /// Close every SQLite database this app has open and release the root
+    /// runtime lease, so nothing this process owns holds a file lock inside the
+    /// Marmot root.
+    ///
+    /// This closes databases out from under any work still running, including
+    /// a running account engine (see [`SqliteAccountStorage::close`] for what
+    /// that does to in-flight transactions).
+    /// [`MarmotAppRuntime::shutdown_and_close`] is the sequenced entry point
+    /// host apps should use; it stops admitting runtime work before calling
+    /// this and drains the workers afterwards.
+    ///
+    /// **Terminal.** [`Self::storage_is_closed`] latches, and every database
+    /// accessor then fails with
+    /// [`StorageError::Closed`][cgka_traits::storage::StorageError::Closed]
+    /// rather than reopening;
+    /// otherwise a stray background read would re-lock the container a host has
+    /// just been told is lock-free. Construct a new [`MarmotApp`] to use the
+    /// root again. Idempotent.
+    ///
+    /// This exists for hosts that share the Marmot root across processes
+    /// through a container the OS polices. On iOS the root lives in an App
+    /// Group container shared with the Notification Service Extension, and a
+    /// process suspended while holding *any* lock there is killed with
+    /// `0xdead10cc` — which a WAL connection does for its whole lifetime, and
+    /// the root lease does by design. Dropping handles cannot fix that: a
+    /// connection sits behind `Arc`s shared with the OpenMLS adapter and
+    /// projections, so the host can neither observe nor await the last clone
+    /// going away. And the app's caches do not hold every connection: each
+    /// account engine opens its own connection to `session.sqlite`. So every
+    /// lock-holding resource registers a closer when it opens, and this closes
+    /// all of them.
+    ///
+    /// Every database is attempted even if an earlier one fails; the first
+    /// error is returned once all of them have been closed.
+    pub fn close_storage(&self) -> Result<(), AppError> {
+        let started_at = Instant::now();
+        // Exclusive for the whole teardown. The `storage_closed` flag alone
+        // would not make this atomic: two concurrent closes could interleave so
+        // that one released the root lease and returned while the other was
+        // still closing connections, and an open already in flight could finish
+        // creating its connection after this method returned. Either way the
+        // host would be told the container is lock-free while a lock still
+        // existed. Holding the writer means every opener has either published
+        // (so the drain below closes it) or has not yet checked the flag (so it
+        // will refuse).
+        let _lifecycle = self
+            .storage_lifecycle
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.storage_closed.store(true, Ordering::Release);
+        let _ = self.abort_all_public_indexer_copies();
+        self.presentation_signals.catalog_changed();
+
+        // Empty the lookup caches so nothing reaches a closed handle through
+        // them, but keep their handles alive until the closers below have
+        // closed them explicitly rather than by a last drop.
+        let account_storages = self
+            .account_storages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain()
+            .map(|(label, storage)| {
+                let _ = self.presentation_signals.account_resets.send(label);
+                storage
+            })
+            .collect::<Vec<_>>();
+        // Latch every database closed first: a media sweep waiting on a
+        // compacting account's connection holds its store's sweep lock, which
+        // the media close below takes. The VACUUM polls the latch, stops and
+        // rolls back, and the sweep then fails as closed.
+        self.root_closers.begin_close_all();
+        // Registered handles (media stores) close with the databases. Media
+        // files hold no locks; closing stops media I/O at the same instant.
+        let registered_closed = self.close_registry.close_all();
+        self.account_media_stores
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        self.legacy_media_migrations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        let directory_caches = self
+            .directory_caches
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain()
+            .map(|(_, cache)| cache)
+            .collect::<Vec<_>>();
+        let shared_storage = self
+            .shared_storage
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+
+        // Every lock-holding resource in the root registered a closer when it
+        // opened, including each account engine's own `session.sqlite`
+        // connection, which no cache holds (mdk#2323).
+        let (closed, first_error) = self.root_closers.close_all();
+        let closed = closed + registered_closed;
+        drop((account_storages, directory_caches, shared_storage));
+
+        // Last: the lease guards the databases, so it outlives them.
+        drop(
+            self.root_runtime_lease
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take(),
+        );
+        self.storage_close_completed.store(true, Ordering::Release);
+
+        tracing::debug!(
+            target: "marmot_app::storage",
+            method = "close_storage",
+            databases_closed = closed,
+            elapsed_ms = started_at.elapsed().as_millis() as u64,
+            failed = first_error.is_some(),
+            "app storage closed",
+        );
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    /// Whether [`Self::close_storage`] has finished closing every database and
+    /// releasing the root lease. Databases are unreachable from this handle
+    /// once it returns true.
+    #[must_use]
+    pub fn storage_is_closed(&self) -> bool {
+        self.storage_close_completed.load(Ordering::Acquire)
+    }
+
+    /// Fail rather than reopen a database after [`Self::close_storage`].
+    fn ensure_storage_open(&self, database: &'static str) -> Result<(), AppError> {
+        if self.storage_closed.load(Ordering::Acquire) {
+            return Err(AppError::from(cgka_traits::StorageError::Closed(format!(
+                "{database} unavailable: app storage is closed"
+            ))));
+        }
+        Ok(())
+    }
+
+    /// Admission for a database *open*, held from the closed check through
+    /// publication into the handle cache.
+    ///
+    /// Opens are readers, so they still run concurrently with each other;
+    /// [`Self::close_storage`] is the writer. That is what makes the close's
+    /// promise true: an open holding this guard either publishes before the
+    /// close can start draining, or has not yet checked the flag and will
+    /// refuse. No connection can be created after the close returns.
+    ///
+    /// Cache *hits* deliberately skip this — a handle already in the cache is
+    /// one the close will drain and shut, so returning a clone of it cannot
+    /// leak a lock, and the hot read path stays uncontended.
+    fn begin_storage_open(
+        &self,
+        database: &'static str,
+    ) -> Result<RwLockReadGuard<'_, ()>, AppError> {
+        let guard = self
+            .storage_lifecycle
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.ensure_storage_open(database)?;
+        Ok(guard)
+    }
+
+    /// Local audit cursor work is admitted under the root owner's storage
+    /// lifecycle. The closure must finish before any HTTP await.
+    pub(crate) fn with_audit_export_admission<T>(
+        &self,
+        attempt: &audit_export_lifecycle::AuditExportAttempt,
+        work: impl FnOnce() -> Result<T, AppError>,
+    ) -> Result<Option<T>, AppError> {
+        let _storage = self.begin_storage_open("audit export")?;
+        if self
+            .root_runtime_lease
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none()
+        {
+            return Err(AppError::AuditLogUpload(
+                "audit export requires exclusive root ownership".into(),
+            ));
+        }
+        self.audit_export_lifecycle.admit(attempt, work).transpose()
+    }
+
+    /// This process's record of the account's legacy attachment migration
+    /// (mdk#2314 step 6), shared by the worker's batches and usage reads.
+    pub(crate) fn legacy_media_migration(
+        &self,
+        label: &str,
+    ) -> media::legacy_migration::SharedLegacyMigration {
+        self.legacy_media_migrations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(label.to_owned())
+            .or_default()
+            .clone()
+    }
+
+    /// The account's encrypted media store over `storage`, the caller's
+    /// handle on that account's database, in `<account>/media`. It never
+    /// opens a database itself, and `storage` must be the account's current
+    /// cached handle: an evicted one is refused.
+    /// Creation is admitted like a database open: under the storage
+    /// lifecycle guard, so a store either exists before `close_storage`
+    /// closes them all or is refused afterwards. Blocking callers only.
+    pub(crate) fn account_media_store(
+        &self,
+        label: &str,
+        storage: &SqliteAccountStorage,
+    ) -> Result<AccountMediaStore, AppError> {
+        let _lifecycle = self.begin_storage_open("media store")?;
+        let mut stores = self
+            .account_media_stores
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Only the account's current handle may own its store. Removal drops
+        // the cached handle before it evicts the store under this lock, so a
+        // caller still holding an evicted handle can neither recreate a store
+        // after removal nor replace (and close) a reopened account's store.
+        let current = self
+            .account_storages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(label)
+            .is_some_and(|cached| cached.shares_connection_with(storage));
+        if !current {
+            return Err(AppError::from(cgka_traits::StorageError::Closed(
+                "media store unavailable: account storage handle was evicted".into(),
+            )));
+        }
+        if let Some(store) = stores.get(label).filter(|store| {
+            !store.is_closed()
+                && store
+                    .catalog()
+                    .storage()
+                    .shares_connection_with(&storage.app_storage())
+        }) {
+            return Ok(store.clone());
+        }
+        let store = media_store::MediaStore::new(
+            self.account_dir(label).join(media_store::MEDIA_DIRECTORY),
+            storage_sqlite::SqliteMediaCatalog::new(storage.app_storage()),
+        );
+        // Replacing a store for an older handle closes that one first.
+        let closing = store.clone();
+        self.close_registry
+            .register(media_close_key(label), move || closing.close());
+        stores.insert(label.to_owned(), store.clone());
+        Ok(store)
+    }
+
+    /// Observe account-open admission before analytics or cache locks; preserve the original storage result.
+    fn account_storage(&self, label: &str) -> Result<SqliteAccountStorage, AppError> {
+        let probe = self
+            .startup_diagnostics
+            .observe_pending_open(NativeStartupStage::ProductAnalyticsAdmission);
+        let result = self.account_storage_observed(label, &probe);
+        probe.finish(result.is_ok());
+        result
+    }
+
+    /// Reuse the caller's scope across analytics admission and native open work; the caller owns retirement.
+    fn account_storage_observed(
+        &self,
+        label: &str,
+        probe: &startup_diagnostics::NativeStartupProbe,
+    ) -> Result<SqliteAccountStorage, AppError> {
+        probe.phase(NativeStartupStage::ProductAnalyticsAdmission);
+        let permit = self.product_analytics.permit();
+        probe.phase(NativeStartupStage::AccountStorageCache);
+        let result = self.account_storage_unobserved(label, probe);
+        if let Err(error) = &result {
+            self.product_analytics
+                .storage_failure(permit.as_ref(), error);
+        }
+        result
+    }
+
+    /// Reuse a cached store or perform the guarded key/open path, reporting only fixed phases to the probe.
+    fn account_storage_unobserved(
+        &self,
+        label: &str,
+        probe: &startup_diagnostics::NativeStartupProbe,
+    ) -> Result<SqliteAccountStorage, AppError> {
+        self.ensure_storage_open("account storage")?;
+        if let Some(storage) = self
+            .account_storages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(label)
+            .cloned()
+        {
+            return Ok(storage);
+        }
+        probe.record_history();
+        probe.phase(NativeStartupStage::StorageAdmission);
+        let lifecycle = self.begin_storage_open("account storage")?;
+        let _span = tracing::debug_span!(
+            target: "marmot_app::storage",
+            "account_storage_open",
+            method = "account_storage"
+        )
+        .entered();
+        let path = self.account_storage_path(label);
+        let lock = sqlcipher::database_open_lock(&path);
+        probe.phase(NativeStartupStage::DatabaseOpenLock);
+        let database = lock.lock();
+        // Another opener may have filled the cache while we waited. Hold the
+        // database guard through key selection, migrations and publication.
+        if let Some(storage) = self
+            .account_storages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(label)
+            .cloned()
+        {
+            return Ok(storage);
+        }
+        probe.phase(NativeStartupStage::AccountResolution);
+        let account = self.account_home().account(label)?;
+        let key = if account.local_signing {
+            probe.phase(NativeStartupStage::SigningKeys);
+            let keys = self.account_home().load_signing_keys(label)?;
+            probe.phase(NativeStartupStage::KeyDerivation);
+            self.sqlcipher_key_locked(label, &keys, &database, SqlcipherDatabaseKind::Session)?
+        } else {
+            probe.phase(NativeStartupStage::ExternalDatabaseSecret);
+            self.external_sqlcipher_key(
+                label,
+                &account.account_id_hex,
+                &database,
+                SqlcipherDatabaseKind::Session,
+            )?
+        };
+        let migration_observation =
+            self.product_analytics
+                .begin(ProductFamily::Storage, "migration", ProductUnit::Attempt);
+        probe.phase(NativeStartupStage::EncryptedStoreOpen);
+        let observer = |progress| {
+            use storage_sqlite::{StorageOpenPhase as Phase, StorageOpenProgress as Progress};
+            match progress {
+                Progress::Phase(phase) => probe.phase(match phase {
+                    Phase::CipherConfiguration => NativeStartupStage::CipherConfiguration,
+                    Phase::CipherKeyApplication => NativeStartupStage::CipherKeyApplication,
+                    Phase::OperationalPragmas => NativeStartupStage::OperationalPragmas,
+                    Phase::MigrationInspection => NativeStartupStage::MigrationInspection,
+                }),
+                Progress::MigrationStarted(version) => {
+                    probe.progress(NativeStartupStage::MigrationApply, Some(version), false)
+                }
+                Progress::MigrationFinished { version, success } => probe.progress(
+                    if success {
+                        NativeStartupStage::MigrationInspection
+                    } else {
+                        NativeStartupStage::MigrationApply
+                    },
+                    Some(version),
+                    success,
+                ),
+            }
+        };
+        let opened = SqliteAccountStorage::open_encrypted_observed(&path, &key, &observer);
+        if let Some(observation) = migration_observation {
+            match &opened {
+                Ok(storage) if storage.migration_summary().0 > 0 => {
+                    let (applied, duration) = storage.migration_summary();
+                    observation.count("success", ProductUnit::Transition, applied as u64);
+                    observation.finish_with_duration("success", duration);
+                }
+                Err(cgka_traits::StorageError::UnsupportedSchemaVersion { .. }) => {
+                    observation.finish("unsupported")
+                }
+                _ => observation.discard(),
+            }
+        }
+        let storage = opened?;
+        // Registering under `lifecycle` is what keeps this connection
+        // reachable by a later `close_storage`; see `begin_storage_open`.
+        self.root_closers.register(&lifecycle, storage.closer());
+        let mut storages = self
+            .account_storages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Ok(storages
+            .entry(label.to_owned())
+            .or_insert_with(|| storage.clone())
+            .clone())
+    }
+
+    pub(crate) fn record_account_app_event(
+        &self,
+        label: &str,
+        message: &AppMessageProjection,
+    ) -> Result<AppProjectionUpdate, AppError> {
+        self.record_account_app_event_at(label, message, unix_now_seconds())
+    }
+
+    /// Commit source projection atomically; optional outgoing retention runs
+    /// after the outermost commit and cannot reject accepted publication.
+    pub(crate) fn record_account_app_event_at(
+        &self,
+        label: &str,
+        message: &AppMessageProjection,
+        received_at: u64,
+    ) -> Result<AppProjectionUpdate, AppError> {
+        // Keep source/retention and chat-list refresh atomic: a refresh failure
+        // must leave the accepted fanout able to reconstruct its completion.
+        let storage = self.account_storage(label)?;
+        let update = cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
+            let storage_update = storage.app_storage().record_app_event_with_source(
+                &stored_app_event_from_projection(message, received_at),
+                message.retention,
+                message.authority,
+            )?;
+            if message.direction == "sent" {
+                storage
+                    .app_storage()
+                    .retain_attachment_uploads_after_commit(
+                        &message.group_id_hex,
+                        &message.message_id_hex,
+                        received_at,
+                        runtime::attachment_controls::default_policy(&self.config).retained_bytes,
+                    );
+            }
+            self.app_projection_update(label, storage_update)
+        })?;
+        if message.direction == "sent" {
+            // The worker promotes the message's staged uploads.
+            self.presentation_signals.wake();
+        }
+        Ok(update)
+    }
+
+    /// Reconcile a local publication with its engine-stamped source authority.
+    /// A resolved verdict stays immutable across later echoes and admin changes.
+    pub(crate) fn record_account_app_event_refreshing_moderation_grant(
+        &self,
+        label: &str,
+        message: &AppMessageProjection,
+    ) -> Result<AppProjectionUpdate, AppError> {
+        let now = unix_now_seconds();
+        let storage = self.account_storage(label)?;
+        let update = cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
+            let storage_update = storage.app_storage().record_app_event_with_source(
+                &stored_app_event_from_projection(message, now),
+                message.retention,
+                message.authority,
+            )?;
+            if message.direction == "sent" {
+                storage
+                    .app_storage()
+                    .retain_attachment_uploads_after_commit(
+                        &message.group_id_hex,
+                        &message.message_id_hex,
+                        now,
+                        runtime::attachment_controls::default_policy(&self.config).retained_bytes,
+                    );
+            }
+            self.app_projection_update(label, storage_update)
+        })?;
+        if message.direction == "sent" {
+            // The worker promotes the message's staged uploads.
+            self.presentation_signals.wake();
+        }
+        Ok(update)
+    }
+
+    /// Finalize accepted source authority and retry outgoing byte promotion even
+    /// when retention metadata was already committed by an earlier fanout pass.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn finalize_account_app_event_source_retention(
+        &self,
+        label: &str,
+        group_id_hex: &str,
+        message_id_hex: &str,
+        source_message_id_hex: Option<&str>,
+        source_epoch: u64,
+        retention: AppMessageRetentionDecision,
+        authority: Option<cgka_traits::app_event::AppMessageAuthority>,
+    ) -> Result<Option<AppProjectionUpdate>, AppError> {
+        let observation = self
+            .product_analytics
+            .begin(
+                ProductFamily::MessageAction,
+                "publication",
+                ProductUnit::Transition,
+            )
+            .map(ProductObservation::counts_only);
+        let storage = self.account_storage(label)?;
+        let update = cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
+            let authority_update = storage.app_storage().finalize_app_event_authority(
+                group_id_hex,
+                message_id_hex,
+                authority,
+            )?;
+            let retention_update = storage.app_storage().finalize_app_event_source_retention(
+                group_id_hex,
+                message_id_hex,
+                source_message_id_hex,
+                source_epoch,
+                retention,
+            )?;
+            storage
+                .app_storage()
+                .retain_attachment_uploads_after_commit(
+                    group_id_hex,
+                    message_id_hex,
+                    unix_now_seconds(),
+                    runtime::attachment_controls::default_policy(&self.config).retained_bytes,
+                );
+            retention_update
+                .or(authority_update)
+                .map(|update| self.app_projection_update(label, update))
+                .transpose()
+        })?;
+        // The worker promotes the message's staged uploads.
+        self.presentation_signals.wake();
+        if update.is_some()
+            && let Some(observation) = observation
+        {
+            observation.count("confirmed", ProductUnit::Transition, 1);
+        }
+        Ok(update)
+    }
+
+    pub(crate) fn invalidate_timeline_source_message(
+        &self,
+        label: &str,
+        source_message_id_hex: &str,
+        reason: &str,
+    ) -> Result<Option<AppProjectionUpdate>, AppError> {
+        let update = self
+            .account_storage(label)?
+            .app_storage()
+            .invalidate_app_event_by_source(source_message_id_hex, reason)?;
+        update
+            .map(|update| self.app_projection_update(label, update))
+            .transpose()
+    }
+
+    pub(crate) fn invalidate_timeline_app_event(
+        &self,
+        label: &str,
+        group_id_hex: &str,
+        message_id_hex: &str,
+        reason: &str,
+    ) -> Result<Option<AppProjectionUpdate>, AppError> {
+        let update = self
+            .account_storage(label)?
+            .app_storage()
+            .invalidate_app_event_by_message_id(group_id_hex, message_id_hex, reason)?;
+        update
+            .map(|update| self.app_projection_update(label, update))
+            .transpose()
+    }
+
+    /// Clear a `local_publish_failed` retraction on one locally-sent row, so a
+    /// fresh send intent for an id a failed send already retracted starts from a
+    /// live pending row instead of a permanent tombstone, and so a retracted
+    /// send that a relay later accepted stops claiming it reached no one.
+    ///
+    /// An exact retained-event retry reuses the failed send's id; identical
+    /// independently authored chat messages within one second also share an id.
+    /// `record_app_event`'s upsert keeps
+    /// invalidation terminal, so the revival has to be explicit and has to carry
+    /// evidence. Two callers hold some: the send path holds a fresh send intent,
+    /// and publish finalization holds a relay acceptance of the row's own
+    /// fanout. Replay seams (`observe_drained_session_events`, backfill, rejoin
+    /// reprocessing) re-record rows without either and never call this.
+    pub(crate) fn clear_timeline_local_publish_failure(
+        &self,
+        label: &str,
+        group_id_hex: &str,
+        message_id_hex: &str,
+    ) -> Result<Option<AppProjectionUpdate>, AppError> {
+        let update = self
+            .account_storage(label)?
+            .app_storage()
+            .clear_local_publish_failure(group_id_hex, message_id_hex)?;
+        update
+            .map(|update| self.app_projection_update(label, update))
+            .transpose()
+    }
+
+    /// Invalidate every synthesized group system row produced by a commit that
+    /// fork recovery rolled back. One commit can have synthesized several rows
+    /// (1:N), so this is a multi-row invalidation keyed on `origin_commit_id`.
+    pub(crate) fn invalidate_timeline_origin_commit(
+        &self,
+        label: &str,
+        origin_commit_id_hex: &str,
+        reason: &str,
+    ) -> Result<Option<AppProjectionUpdate>, AppError> {
+        let update = self
+            .account_storage(label)?
+            .app_storage()
+            .invalidate_app_events_by_origin_commit(origin_commit_id_hex, reason)?;
+        update
+            .map(|update| self.app_projection_update(label, update))
+            .transpose()
+    }
+
+    /// Restore every synthesized group system row a branch-selection withdrawal
+    /// tombstoned, after convergence re-adopted the commit that produced them.
+    ///
+    /// The inverse of [`Self::invalidate_timeline_origin_commit`], and scoped
+    /// the same way `clear_timeline_local_publish_failure` is: only the one
+    /// reason whose decision a later convergence pass can reverse is cleared,
+    /// and only for the named commit. The engine's
+    /// [`GroupEvent::GroupStateRevalidated`] is the evidence — re-recording the
+    /// rows is not, which is why the upsert keeps them tombstoned.
+    ///
+    /// [`GroupEvent::GroupStateRevalidated`]: cgka_traits::engine::GroupEvent::GroupStateRevalidated
+    pub(crate) fn revalidate_timeline_origin_commit(
+        &self,
+        label: &str,
+        origin_commit_id_hex: &str,
+    ) -> Result<Option<AppProjectionUpdate>, AppError> {
+        let update = self
+            .account_storage(label)?
+            .app_storage()
+            .clear_branch_selection_withdrawal_by_origin_commit(origin_commit_id_hex)?;
+        update
+            .map(|update| self.app_projection_update(label, update))
+            .transpose()
+    }
+
+    /// Withdraw every accepted-but-unpublished send in a group whose outbound
+    /// queue the engine has permanently discarded.
+    ///
+    /// A retained send derives as `pending`, which stays truthful for as long as
+    /// convergence can still release it — including across an `Unrecoverable`
+    /// halt, which a verified repair drains. Only the terminal changes named by
+    /// [`terminates_local_outbound_queue`](crate::client) break that promise,
+    /// and there the row would otherwise claim `pending` forever.
+    ///
+    /// The reason is [`LOCAL_PUBLISH_FAILED_REASON`], shared with the send-time
+    /// retraction path: both mean "this send will never reach anyone", the
+    /// app-facing state is identically `Failed`, and a distinct literal would
+    /// have to be added to every derived-state allow-list in SQL to render the
+    /// same thing. Splitting the reasons is a diagnostic-granularity follow-up.
+    pub(crate) fn invalidate_timeline_pending_sends_for_group(
+        &self,
+        label: &str,
+        group_id_hex: &str,
+    ) -> Result<Option<AppProjectionUpdate>, AppError> {
+        let update = self
+            .account_storage(label)?
+            .app_storage()
+            .invalidate_pending_sent_app_events_for_group(
+                group_id_hex,
+                LOCAL_PUBLISH_FAILED_REASON,
+            )?;
+        update
+            .map(|update| self.app_projection_update(label, update))
+            .transpose()
+    }
+
+    /// Timeline-invalidation dispatch for one engine [`GroupEvent`], shared by
+    /// the sync ingest loop and unit-testable without transport plumbing.
+    ///
+    /// - [`GroupEvent::AppMessageInvalidated`] withdraws the delivered app
+    ///   message row addressed by its source message id.
+    /// - [`GroupEvent::GroupStateInvalidated`] is the spec's explicit
+    ///   state-notification withdrawal (convergence.md "Applying the selected
+    ///   branch"): every kind-1210 system row stamped with the superseded
+    ///   commit's `origin_commit_id` is invalidated — including rows the
+    ///   account's own published-and-confirmed commit synthesized. The engine
+    ///   pairs this event with the commit-rollback seam (`CommitRolledBack`),
+    ///   so that commit-level event intentionally does NOT dispatch here: one
+    ///   rollback must tombstone once, with one reason.
+    /// - [`GroupEvent::GroupStateRevalidated`] takes that withdrawal back when
+    ///   a later convergence pass re-adopts the commit. Storage-side
+    ///   invalidation is terminal by default (#1608), so this explicitly
+    ///   evidenced path is the only one that revives a branch-selection
+    ///   tombstone.
+    ///
+    /// Every other event carries no timeline invalidation and returns `None`.
+    pub(crate) fn projection_update_for_invalidation_event(
+        &self,
+        label: &str,
+        event: &cgka_traits::engine::GroupEvent,
+    ) -> Result<Option<AppProjectionUpdate>, AppError> {
+        match event {
+            cgka_traits::engine::GroupEvent::AppMessageInvalidated {
+                message_id, reason, ..
+            } => self.invalidate_timeline_source_message(
+                label,
+                &hex::encode(message_id.as_slice()),
+                &format!("{reason:?}"),
+            ),
+            cgka_traits::engine::GroupEvent::GroupStateInvalidated {
+                invalidated_commit_id,
+                reason,
+                ..
+            } => self.invalidate_timeline_origin_commit(
+                label,
+                &hex::encode(invalidated_commit_id.as_slice()),
+                &format!("{reason:?}"),
+            ),
+            cgka_traits::engine::GroupEvent::GroupStateRevalidated {
+                revalidated_commit_id,
+                ..
+            } => self.revalidate_timeline_origin_commit(
+                label,
+                &hex::encode(revalidated_commit_id.as_slice()),
+            ),
+            _ => Ok(None),
+        }
+    }
+
+    fn app_projection_update(
+        &self,
+        label: &str,
+        storage_update: TimelineProjectionUpdate,
+    ) -> Result<AppProjectionUpdate, AppError> {
+        let changed_message_ids = storage_update
+            .changes
+            .iter()
+            .map(|change| match change {
+                TimelineMessageChange::Upsert { message, .. } => message.message_id_hex.clone(),
+                TimelineMessageChange::Remove { message_id_hex, .. } => message_id_hex.clone(),
+            })
+            .collect::<Vec<_>>();
+        let (chat_list_row, content_changed) = self.refresh_chat_list_row_for_messages(
+            label,
+            &storage_update.group_id_hex,
+            &changed_message_ids,
+        )?;
+        let projects_group_system_activity = chat_list_row
+            .as_ref()
+            .is_some_and(|row| row.conversation_kind == ChatConversationKind::Group);
+        let chat_list_trigger = ChatListUpdateTrigger::from_timeline_changes(
+            &storage_update.changes,
+            projects_group_system_activity,
+        );
+        let chat_list_trigger =
+            if content_changed && chat_list_trigger == ChatListUpdateTrigger::SnapshotRefresh {
+                ChatListUpdateTrigger::LastMessageContentChanged
+            } else {
+                chat_list_trigger
+            };
+        Ok(AppProjectionUpdate {
+            group_id_hex: storage_update.group_id_hex,
+            timeline_messages: storage_update.messages,
+            timeline_changes: storage_update.changes,
+            chat_list_row,
+            chat_list_trigger,
+        })
+    }
+
+    pub(crate) fn secure_prune_expired_account_app_events(
+        &self,
+        label: &str,
+        group_id_hex: &str,
+        now: u64,
+    ) -> Result<SecureDeleteExpiredResult, AppError> {
+        let account = self.account_home().account(label)?;
+        let classifier = Self::chat_list_mention_classifier(&account.account_id_hex);
+        Ok(self
+            .account_storage(&account.label)?
+            .app_storage()
+            .secure_prune_expired_app_events(
+                group_id_hex,
+                now,
+                &account.account_id_hex,
+                &classifier,
+            )?
+            .into())
+    }
+
+    fn migrate_legacy_account_projection_if_needed(&self, label: &str) -> Result<(), AppError> {
+        let path = self.legacy_account_projection_path(label);
+        if !path.exists() {
+            return Ok(());
+        }
+        let storage = self.account_storage(label)?;
+        let app = storage.app_storage();
+        if app.account_import_marker(LEGACY_ACCOUNT_PROJECTION_IMPORT_MARKER)? {
+            return Ok(());
+        }
+
+        // The cached account-storage lookup above releases its open guard before
+        // returning. Take a new lifecycle admission across the raw legacy
+        // connection and the complete import so `close_storage` cannot latch,
+        // release the root lease, and then have this path reopen a database in
+        // the supposedly lock-free root.
+        let _lifecycle = self.begin_storage_open("legacy account projection")?;
+        #[cfg(test)]
+        self.run_legacy_projection_open_hook_for_test();
+        let legacy = self.legacy_account_projection(label)?;
+        let state = legacy.load_state(label)?;
+        app.save_account_projection_state(
+            &stored_state_from_account_state(&state),
+            MAX_SEEN_EVENT_IDS,
+            TRANSPORT_CURSOR_MAX_FUTURE_SKEW.as_secs(),
+        )?;
+        for message in legacy.messages(AppMessageQuery::default())? {
+            if message.message_id_hex.is_empty() {
+                continue;
+            }
+            app.record_app_event(&stored_app_event_from_message_record(&message))?;
+        }
+        if let Some(settings) = legacy.existing_notification_settings(label)? {
+            app.notification_settings(label, &settings.account_id_hex)?;
+            app.set_local_notifications_enabled(
+                label,
+                &settings.account_id_hex,
+                settings.local_notifications_enabled,
+            )?;
+            app.set_native_push_enabled(
+                label,
+                &settings.account_id_hex,
+                settings.native_push_enabled,
+            )?;
+        }
+        if let Some(registration) = legacy.push_registration(label)? {
+            app.upsert_push_registration(
+                account_push_registration_from_app(registration.registration),
+                registration.token_bytes,
+            )?;
+        }
+        for token in legacy.all_group_push_tokens()? {
+            app.upsert_group_push_token(&account_group_push_token_from_app(&token))?;
+        }
+        app.mark_account_import_complete(LEGACY_ACCOUNT_PROJECTION_IMPORT_MARKER)?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn set_legacy_projection_open_hook_for_test(&self, hook: LegacyProjectionOpenHook) {
+        *self
+            .legacy_projection_open_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn run_legacy_projection_open_hook_for_test(&self) {
+        let hook = self
+            .legacy_projection_open_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_inventory_snapshot_between_reads_for_test(
+        &self,
+        hook: Option<LegacyProjectionOpenHook>,
+    ) {
+        *self
+            .inventory_snapshot_between_reads
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+    }
+
+    #[cfg(test)]
+    fn run_inventory_snapshot_between_reads_for_test(&self) {
+        let hook = self
+            .inventory_snapshot_between_reads
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn capture_durably_owned_key_packages_for_test(
+        &self,
+        label: &str,
+    ) -> Result<Vec<KeyPackage>, AppError> {
+        cgka_engine::key_package::durably_owned_key_packages(
+            &self.account_storage(label)?,
+            cgka_traits::group::ProtocolProfile::Current,
+        )
+        .map_err(|error| AppError::from(cgka_session::SessionError::from(error)))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn capture_key_package_lifecycle_for_test(
+        &self,
+        label: &str,
+    ) -> Result<Option<cgka_traits::KeyPackageLifecycleState>, AppError> {
+        Ok(self.account_storage(label)?.key_package_lifecycle()?)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn project_local_account_key_package_inventory_for_test(
+        &self,
+        label: &str,
+        owned_key_packages: Vec<KeyPackage>,
+        lifecycle: Option<cgka_traits::KeyPackageLifecycleState>,
+    ) -> Result<Vec<AccountKeyPackageInventoryEntry>, AppError> {
+        self.project_local_account_key_package_inventory(label, owned_key_packages, lifecycle)
+    }
+
+    fn legacy_account_projection(
+        &self,
+        label: &str,
+    ) -> Result<LegacyAccountProjectionDb, AppError> {
+        let path = self.legacy_account_projection_path(label);
+        let lock = sqlcipher::database_open_lock(&path);
+        let database = lock.lock();
+        let account = self.account_home().account(label)?;
+        let key = if account.local_signing {
+            let keys = self.account_home().load_signing_keys(label)?;
+            self.sqlcipher_key_locked(
+                label,
+                &keys,
+                &database,
+                SqlcipherDatabaseKind::AccountProjection,
+            )?
+        } else {
+            self.external_sqlcipher_key(
+                label,
+                &account.account_id_hex,
+                &database,
+                SqlcipherDatabaseKind::AccountProjection,
+            )?
+        };
+        LegacyAccountProjectionDb::open(path, &key)
+    }
+
+    fn projection_status(&self, label: &str) -> Result<AppProjectionStatus, AppError> {
+        // These probes use short-lived raw SQLite connections rather than the
+        // cached handles. Admit the complete probe through the same lifecycle
+        // gate so a status call already in flight cannot reopen either database
+        // after terminal close has returned.
+        let _lifecycle = self.begin_storage_open("projection status")?;
+        let account_path = self.account_storage_path(label);
+        let shared_path = self.shared_storage_path();
+        Ok(AppProjectionStatus {
+            account: AppDatabaseStatus {
+                path: account_path.display().to_string(),
+                exists: account_path.exists(),
+                encrypted: sqlite_file_requires_key(&account_path),
+            },
+            shared: AppDatabaseStatus {
+                path: shared_path.display().to_string(),
+                exists: shared_path.exists(),
+                encrypted: sqlite_file_requires_key(&shared_path),
+            },
+        })
+    }
+
+    fn relay_endpoints(&self) -> Vec<TransportEndpoint> {
+        self.relay_urls
+            .iter()
+            .cloned()
+            .map(TransportEndpoint)
+            .collect()
+    }
+
+    fn key_package_cache_dir(&self) -> PathBuf {
+        self.root.clone()
+    }
+
+    /// Whether `storage` is still the account's current cached handle:
+    /// account removal evicts it, so a handle held across a removal (and any
+    /// re-import at the same path) is no longer current.
+    pub(crate) fn account_storage_is_current(
+        &self,
+        label: &str,
+        storage: &SqliteAccountStorage,
+    ) -> bool {
+        self.account_storages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(label)
+            .is_some_and(|cached| cached.shares_connection_with(storage))
+    }
+
+    /// Evict every in-memory handle and warm flag bound to `label`.
+    ///
+    /// Must be called before the account directory is deleted on removal or
+    /// setup-failure rollback. Without this, the cached `SqliteAccountStorage`
+    /// connection in `account_storages` (and the `directory_caches` handle)
+    /// keeps pointing at the now-unlinked inode: after the user re-imports the
+    /// same account, the session DB is rebuilt fresh while projection paths
+    /// keep writing through the stale handle, silently losing data. Clearing
+    /// the warm/stale/ready flags forces the rebuilt account to re-warm its
+    /// projections from the fresh database.
+    fn drop_account_caches(&self, label: &str) {
+        // Close live bounded windows before a label can bind to another store.
+        let _ = self
+            .presentation_signals
+            .account_resets
+            .send(label.to_owned());
+        if let Ok(account) = self.account_home().account(label) {
+            let _ = self.abort_public_indexer_copies_for_account(&account.account_id_hex);
+            self.relay_plane
+                .evict_account_publish_client(&account.account_id_hex);
+        }
+        self.account_storages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(label);
+        {
+            // Evict and close under one lock, so no creator can observe the
+            // empty entry before the latch is tripped.
+            let mut stores = self
+                .account_media_stores
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            stores.remove(label);
+            self.close_registry.close(&media_close_key(label));
+        }
+        self.legacy_media_migrations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(label);
+        self.directory_caches
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(label);
+        self.account_state_ready
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(label);
+        self.chat_list_projection_warmed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(label);
+        self.chat_list_projection_stale
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(label);
+    }
+
+    fn shared_storage_path(&self) -> PathBuf {
+        self.root.join(SHARED_DB_FILE)
+    }
+
+    pub(crate) fn shared_storage(&self) -> Result<SqliteSharedStorage, AppError> {
+        self.ensure_storage_open("shared storage")?;
+        if let Some(storage) = self
+            .shared_storage
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .cloned()
+        {
+            return Ok(storage);
+        }
+        let lifecycle = self.begin_storage_open("shared storage")?;
+        let _span = tracing::debug_span!(
+            target: "marmot_app::storage",
+            "shared_storage_open",
+            method = "shared_storage"
+        )
+        .entered();
+        let storage = SqliteSharedStorage::open(self.shared_storage_path())?;
+        self.root_closers.register(&lifecycle, storage.closer());
+        let mut shared = self
+            .shared_storage
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Ok(shared.get_or_insert_with(|| storage.clone()).clone())
+    }
+
+    fn relay_client_for_account_id(
+        &self,
+        account_id_hex: &str,
+        signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner>,
+    ) -> Arc<dyn NostrRelayClient> {
+        #[cfg(test)]
+        if let Some(client) = &self.test_relay_client {
+            return client.clone();
+        }
+        self.relay_plane
+            .account_publish_client(account_id_hex, signer)
+    }
+
+    #[cfg(test)]
+    fn with_test_relay_client<C>(mut self, client: Arc<C>) -> Self
+    where
+        C: NostrRelayClient + transport_nostr::DirectoryRelayFetcher + 'static,
+    {
+        self.relay_plane = MarmotRelayPlane::new_with_directory_fetcher_for_test(
+            None,
+            client.clone(),
+            client.clone(),
+            self.config.allow_loopback_relay_endpoints,
+        );
+        self.test_relay_client = Some(client);
+        self
+    }
+
+    pub async fn register_external_signer<S>(
+        &self,
+        account_ref: &str,
+        signer: S,
+    ) -> Result<(), AppError>
+    where
+        S: ExternalAccountSigner + 'static,
+    {
+        let account = self.account_home().account(account_ref)?;
+        if !account.external_signing {
+            return Err(AppError::ExternalSignerUnavailable(account.account_id_hex));
+        }
+        let signer = Arc::new(signer);
+        let public_key = signer
+            .get_public_key()
+            .await
+            .map_err(external_signer_public_key_error)?;
+        if public_key.to_hex() != account.account_id_hex {
+            return Err(AppError::ExternalSignerMismatch);
+        }
+        let mut signers = self
+            .external_signers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match signers.entry(account.account_id_hex.clone()) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.get().replace(signer),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(RegisteredExternalSigner::new(public_key, signer));
+            }
+        }
+        drop(signers);
+        self.relay_plane
+            .evict_account_publish_client(&account.account_id_hex);
+        Ok(())
+    }
+
+    fn account_signer_for_summary(
+        &self,
+        account: &AccountSummary,
+    ) -> Result<AccountSigner, AppError> {
+        if account.local_signing {
+            return Ok(AccountSigner::Local(
+                self.account_home().load_signing_keys(&account.label)?,
+            ));
+        }
+        if account.external_signing {
+            return self
+                .external_signers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&account.account_id_hex)
+                .map(RegisteredExternalSigner::account_signer)
+                .ok_or_else(|| {
+                    AppError::ExternalSignerUnavailable(account.account_id_hex.clone())
+                });
+        }
+        Err(AccountHomeError::SecretNotFound(account.account_id_hex.clone()).into())
+    }
+
+    /// Drop an account's registered external signer.
+    ///
+    /// Only account *removal* may call this. The registration is what makes an
+    /// external-signer account reconcilable (see `has_external_signer`), so a
+    /// reversible sign-out has to keep it or the account could never be signed
+    /// back in without the host re-attaching its signer.
+    pub(crate) fn forget_external_signer(&self, account_id_hex: &str) {
+        self.external_signers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(account_id_hex);
+    }
+
+    pub(crate) fn has_external_signer(&self, account_id_hex: &str) -> bool {
+        self.external_signers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(account_id_hex)
+    }
+
+    fn account_home(&self) -> AccountHome {
+        self.account_home.clone()
+    }
+
+    fn supported_app_component_ids(&self) -> Vec<u16> {
+        let mut components = default_group_components();
+        components.insert(GROUP_BLOSSOM_IMAGE_COMPONENT_ID);
+        components.insert(NOSTR_ROUTING_COMPONENT_ID);
+        components.insert(GROUP_MESSAGE_RETENTION_COMPONENT_ID);
+        components.insert(AGENT_TEXT_STREAM_QUIC_COMPONENT_ID);
+        components.insert(GROUP_AVATAR_URL_COMPONENT_ID);
+        // Existing legacy groups continue to require V1, while fresh
+        // current-profile groups require V2. Advertising both is support, not
+        // negotiation: each group's required component id selects exactly one.
+        components.insert(GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID);
+        components.insert(GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID);
+        components.into_iter().collect()
+    }
+
+    fn key_package_metadata_matches_current_support(
+        &self,
+        metadata: &cgka_engine::key_package::KeyPackageMetadata,
+    ) -> bool {
+        metadata.protocol_profile == cgka_traits::group::ProtocolProfile::Current
+            && self
+                .supported_app_component_ids()
+                .iter()
+                .all(|component_id| metadata.app_components.contains(component_id))
+    }
+
+    fn new_nostr_routing(&self, relays: Option<Vec<String>>) -> Result<NostrRoutingV1, AppError> {
+        let mut nostr_group_id = [0_u8; 32];
+        OsRng.fill_bytes(&mut nostr_group_id);
+        let relays = transport_nostr::RelaySafetyPolicy::with_allow_loopback(
+            self.config.allow_loopback_relay_endpoints,
+        )
+        .sanitize_endpoints(
+            relays
+                .unwrap_or_else(|| self.relay_urls.clone())
+                .into_iter()
+                .map(TransportEndpoint)
+                .collect(),
+            "group create",
+        )
+        .map_err(AppError::InvalidNostrRouting)?
+        .into_iter()
+        .map(|endpoint| endpoint.0)
+        .collect();
+        NostrRoutingV1::new(nostr_group_id, relays).map_err(AppError::InvalidNostrRouting)
+    }
+}
+
+pub(crate) fn external_signer_public_key_error(
+    error: transport_nostr_peeler::MarmotSignerError,
+) -> AppError {
+    external_signer_error(error, "external signer public key")
+}
+
+pub(crate) fn external_signer_error(
+    error: transport_nostr_peeler::MarmotSignerError,
+    context: &str,
+) -> AppError {
+    if error.to_string().contains(EXTERNAL_SIGNER_REJECTED) {
+        AppError::ExternalSignerRejected
+    } else {
+        AppError::Publish(format!("{context}: {error}"))
+    }
+}
+
+/// Recover a cancelled external-signer proof from a session-open failure.
+///
+/// The account-identity proof is signed synchronously through the external
+/// signer while the device session is opened (the engine builds it during
+/// `AccountDeviceSession::open`). That signing hook returns `String`, so a
+/// user-cancelled Amber prompt travels up as an opaque engine error carrying
+/// the `EXTERNAL_SIGNER_REJECTED` sentinel — recover the typed rejection here so
+/// callers see `AppError::ExternalSignerRejected` instead of a generic session
+/// error, matching `external_signer_error` on the other signer paths.
+pub(crate) fn external_signer_session_error(error: cgka_session::SessionError) -> AppError {
+    if error.to_string().contains(EXTERNAL_SIGNER_REJECTED) {
+        AppError::ExternalSignerRejected
+    } else {
+        AppError::from(error)
+    }
+}
+
+/// The maintenance scheduling override a runtime should apply, if any.
+/// Production always runs [`MaintenanceTiming::default`]: the knob is honored
+/// only in explicit `test-policy-overrides` builds, and a configured value in
+/// any other build is reported and ignored.
+fn dev_maintenance_timing(config: &MarmotAppConfig) -> Option<MaintenanceTiming> {
+    let timing = config.dev_maintenance_timing?;
+    if cfg!(feature = "test-policy-overrides") {
+        Some(timing)
+    } else {
+        tracing::warn!(
+            target: "marmot_app",
+            method = "open_account",
+            "ignoring dev_maintenance_timing without test-policy-overrides; production maintenance windows required"
+        );
+        None
+    }
+}
+
+fn app_feature_registry() -> FeatureRegistry {
+    let mut registry = FeatureRegistry::new();
+    registry.register(
+        Feature("self-remove"),
+        CapabilityRequirement {
+            requires: Capability::Proposal(10),
+            level: RequirementLevel::Required,
+            description: "MIP-03 SelfRemove group departure",
+        },
+    );
+    // Each agent-text-stream-QUIC role maps to its own distinct backing
+    // capability (a private-use MLS extension type), so a member advertises
+    // `receive`/`send`/`fanout` independently and a group's
+    // `required_member_roles` mask is enforceable per role (#177,
+    // agent-text-stream-quic-v1.md). The capability/feature/bit mapping is the
+    // shared `AGENT_TEXT_STREAM_QUIC_ROLES` table so the engine enforcement and
+    // this registration cannot drift.
+    for (feature, capability, description) in [
+        (
+            AGENT_TEXT_STREAM_QUIC_RECEIVE_FEATURE.clone(),
+            AGENT_TEXT_STREAM_QUIC_RECEIVE_CAPABILITY,
+            "receive QUIC-backed agent text stream previews",
+        ),
+        (
+            AGENT_TEXT_STREAM_QUIC_SEND_FEATURE.clone(),
+            AGENT_TEXT_STREAM_QUIC_SEND_CAPABILITY,
+            "send QUIC-backed agent text stream frames",
+        ),
+        (
+            AGENT_TEXT_STREAM_QUIC_FANOUT_FEATURE.clone(),
+            AGENT_TEXT_STREAM_QUIC_FANOUT_CAPABILITY,
+            "fan out QUIC-backed agent text stream frames",
+        ),
+    ] {
+        registry.register(
+            feature,
+            CapabilityRequirement {
+                requires: capability,
+                level: RequirementLevel::Optional,
+                description,
+            },
+        );
+    }
+    registry
+}
+
+#[derive(Clone)]
+struct AppTransportRouting {
+    inner: Arc<RwLock<AppRoutingState>>,
+}
+
+#[derive(Clone, Debug)]
+struct AppRoutingState {
+    local_inbox_endpoints: Vec<TransportEndpoint>,
+    key_package_endpoints: Vec<TransportEndpoint>,
+    inbox_routes: HashMap<MemberId, Vec<TransportEndpoint>>,
+    group_routes: Vec<TransportGroupSubscription>,
+    required_acks: usize,
+}
+
+impl AppTransportRouting {
+    fn new(state: AppRoutingState) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(state)),
+        }
+    }
+
+    /// Atomically replace every current/prior subscription for one group.
+    /// Returns whether the desired route set, or the route leading it,
+    /// differs from the installed one.
+    ///
+    /// The caller's order is kept: the current route leads and the retained
+    /// routes follow, which is how the transport adapter tells them apart, so
+    /// the current route resumes from the account cursor and each retained
+    /// route from its own floor.
+    fn replace_group_routes(
+        &self,
+        group_id: &GroupId,
+        routes: Vec<TransportGroupSubscription>,
+    ) -> bool {
+        let mut state = self.write();
+        let installed = ordered_group_subscriptions(
+            state
+                .group_routes
+                .iter()
+                .filter(|route| route.group_id == *group_id)
+                .cloned()
+                .collect(),
+        );
+        let routes = ordered_group_subscriptions(routes);
+        let mut installed_set = installed.clone();
+        let mut desired_set = routes.clone();
+        normalize_group_subscriptions(&mut installed_set);
+        normalize_group_subscriptions(&mut desired_set);
+        if installed_set == desired_set && installed.first() == routes.first() {
+            return false;
+        }
+        state
+            .group_routes
+            .retain(|route| route.group_id != *group_id);
+        state.group_routes.extend(routes);
+        true
+    }
+
+    fn snapshot(&self) -> AppRoutingState {
+        self.read().clone()
+    }
+
+    /// Replace one member's inbox route; `None` removes it.
+    fn replace_inbox_route(&self, member: MemberId, endpoints: Option<Vec<TransportEndpoint>>) {
+        let mut state = self.write();
+        match endpoints {
+            Some(endpoints) => {
+                state.inbox_routes.insert(member, endpoints);
+            }
+            None => {
+                state.inbox_routes.remove(&member);
+            }
+        }
+    }
+
+    fn replace(&self, state: AppRoutingState) {
+        *self.write() = state;
+    }
+
+    fn read(&self) -> RwLockReadGuard<'_, AppRoutingState> {
+        self.inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn write(&self) -> RwLockWriteGuard<'_, AppRoutingState> {
+        self.inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+fn normalize_group_subscriptions(routes: &mut Vec<TransportGroupSubscription>) {
+    for route in routes.iter_mut() {
+        route.endpoints.sort();
+        route.endpoints.dedup();
+    }
+    routes.sort_by(|left, right| {
+        left.transport_group_id
+            .cmp(&right.transport_group_id)
+            .then_with(|| left.endpoints.cmp(&right.endpoints))
+    });
+    routes.dedup();
+}
+
+/// Canonical endpoints per route and no repeated route, in the caller's order.
+fn ordered_group_subscriptions(
+    routes: Vec<TransportGroupSubscription>,
+) -> Vec<TransportGroupSubscription> {
+    let mut ordered = Vec::<TransportGroupSubscription>::with_capacity(routes.len());
+    for mut route in routes {
+        route.endpoints.sort();
+        route.endpoints.dedup();
+        if !ordered.contains(&route) {
+            ordered.push(route);
+        }
+    }
+    ordered
+}
+
+impl TransportRoutingPolicy for AppTransportRouting {
+    fn local_inbox_endpoints(&self) -> Vec<TransportEndpoint> {
+        self.read().local_inbox_endpoints.clone()
+    }
+
+    fn key_package_endpoints(&self) -> Vec<TransportEndpoint> {
+        self.read().key_package_endpoints.clone()
+    }
+
+    fn group_subscriptions(&self) -> Vec<TransportGroupSubscription> {
+        self.read().group_routes.clone()
+    }
+
+    fn publish_target(
+        &self,
+        message: &TransportMessage,
+    ) -> Result<TransportPublishTarget, TransportRoutingError> {
+        let state = self.read();
+        match &message.envelope {
+            TransportEnvelope::Welcome { recipient } => {
+                let endpoints = state
+                    .inbox_routes
+                    .get(recipient)
+                    .cloned()
+                    .ok_or(TransportRoutingError::MissingInboxRoute)?;
+                Ok(TransportPublishTarget::Inbox {
+                    recipient: recipient.clone(),
+                    endpoints,
+                })
+            }
+            TransportEnvelope::GroupMessage { transport_group_id } => {
+                let route = state
+                    .group_routes
+                    .iter()
+                    .find(|route| route.transport_group_id == *transport_group_id)
+                    .cloned()
+                    .ok_or(TransportRoutingError::MissingGroupRoute)?;
+                Ok(TransportPublishTarget::Group {
+                    group_id: route.group_id,
+                    transport_group_id: route.transport_group_id,
+                    endpoints: route.endpoints,
+                })
+            }
+        }
+    }
+
+    fn required_acks(&self, _target: &TransportPublishTarget) -> usize {
+        self.read().required_acks
+    }
+}
+
+#[derive(Clone)]
+struct AppKeyPackagePublisher {
+    app: MarmotApp,
+    account_label: String,
+    signer: AccountSigner,
+}
+
+impl AppKeyPackagePublisher {
+    fn nostr_publication(
+        &self,
+        publication: &KeyPackagePublication,
+    ) -> Result<NostrKeyPackagePublication, KeyPackagePublishError> {
+        let metadata = key_package_metadata(&publication.key_package)
+            .map_err(|e| KeyPackagePublishError::unexposed(e.to_string()))?;
+        if metadata.protocol_profile != cgka_traits::group::ProtocolProfile::Current {
+            return Err(KeyPackagePublishError::unexposed(
+                "strict cutover forbids publishing a legacy KeyPackage",
+            ));
+        }
+        let account_id_hex = hex::encode(publication.account_id.as_slice());
+        if metadata.credential_identity_hex != account_id_hex {
+            return Err(KeyPackagePublishError::unexposed(
+                "KeyPackage credential identity does not match publication account",
+            ));
+        }
+        Ok(NostrKeyPackagePublication {
+            client_name: self
+                .app
+                .config
+                .key_package_client_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned),
+            account_id: publication.account_id.clone(),
+            key_package: publication.key_package.clone(),
+            key_package_slot_id: publication.slot_id.clone(),
+            key_package_ref: metadata.key_package_ref_hex,
+            mls_ciphersuite: format!("0x{:04x}", metadata.ciphersuite),
+            mls_extensions: metadata
+                .mls_extensions
+                .iter()
+                .map(|id| format!("0x{id:04x}"))
+                .collect(),
+            mls_proposals: metadata
+                .mls_proposals
+                .iter()
+                .map(|id| format!("0x{id:04x}"))
+                .collect(),
+            app_components: metadata
+                .app_components
+                .iter()
+                .filter(|id| {
+                    **id >= cgka_traits::app_components::PRIVATE_USE_APP_COMPONENT_ID_START
+                })
+                .map(|id| format!("0x{id:04x}"))
+                .collect(),
+            publish_endpoints: publication.endpoints.clone(),
+        })
+    }
+}
+
+#[async_trait]
+impl KeyPackagePublisher for AppKeyPackagePublisher {
+    fn legacy_slot_id(
+        &self,
+        account_id: &MemberId,
+    ) -> Result<Option<String>, KeyPackagePublishError> {
+        self.app
+            .reusable_key_package_slot_id(&self.account_label, &hex::encode(account_id.as_slice()))
+            .map_err(|error| KeyPackagePublishError::unexposed(error.to_string()))
+    }
+
+    async fn prepare_key_package(
+        &self,
+        publication: KeyPackagePublication,
+    ) -> Result<cgka_traits::SignedPublicationArtifact, KeyPackagePublishError> {
+        let nostr_publication = self.nostr_publication(&publication)?;
+        let unsigned_dto = nostr_publication
+            .to_event_at(publication.created_at.0)
+            .map_err(|error| KeyPackagePublishError::unexposed(error.to_string()))?;
+        let tags = unsigned_dto
+            .tags
+            .iter()
+            .cloned()
+            .map(Tag::parse)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| KeyPackagePublishError::unexposed(error.to_string()))?;
+        let signer = self.signer.as_nostr_signer();
+        let public_key = signer
+            .get_public_key()
+            .await
+            .map_err(|error| KeyPackagePublishError::unexposed(error.to_string()))?;
+        let mut unsigned = EventBuilder::new(
+            Kind::Custom(KIND_MARMOT_KEY_PACKAGE as u16),
+            unsigned_dto.content,
+        )
+        .tags(tags)
+        .custom_created_at(NostrTimestamp::from_secs(publication.created_at.0))
+        .finalize_unsigned(public_key);
+        unsigned.ensure_id();
+        let signed = signer
+            .sign_event(unsigned)
+            .await
+            .map_err(|error| KeyPackagePublishError::unexposed(error.to_string()))?;
+        let event = NostrTransportEvent::from_nostr_event(&signed)
+            .map_err(|error| KeyPackagePublishError::unexposed(error.to_string()))?;
+        Ok(cgka_traits::SignedPublicationArtifact {
+            id: cgka_traits::MessageId::new(signed.id.to_bytes().to_vec()),
+            created_at: publication.created_at,
+            bytes: serde_json::to_vec(&event)
+                .map_err(|error| KeyPackagePublishError::unexposed(error.to_string()))?,
+        })
+    }
+
+    async fn publish_prepared_key_package(
+        &self,
+        publication: &KeyPackagePublication,
+        artifact: &cgka_traits::SignedPublicationArtifact,
+    ) -> Result<KeyPackagePublishReceipt, KeyPackagePublishError> {
+        let mut nostr_publication = self.nostr_publication(publication)?;
+        let event: NostrTransportEvent = serde_json::from_slice(&artifact.bytes)
+            .map_err(|error| KeyPackagePublishError::unexposed(error.to_string()))?;
+        // A retry belongs to its durable signed artifact, not the current host config.
+        nostr_publication.client_name = event
+            .tag_value(transport_nostr_adapter::CLIENT_TAG)
+            .map(str::to_owned);
+        if event.id != hex::encode(artifact.id.as_slice())
+            || event.created_at != artifact.created_at.0
+        {
+            return Err(KeyPackagePublishError::unexposed(
+                "persisted KeyPackage event identity does not match lifecycle record",
+            ));
+        }
+        let relay_client = self.app.relay_client_for_account_id(
+            &hex::encode(publication.account_id.as_slice()),
+            self.signer.as_nostr_signer(),
+        );
+        let outcome = NostrKeyPackagePublisher::new(relay_client)
+            .publish_prepared_key_package(&nostr_publication, &event)
+            .await
+            .map_err(|e| KeyPackagePublishError::exposed(e.to_string()))?;
+        let accepted = outcome
+            .accepted
+            .into_iter()
+            .map(|receipt| receipt.endpoint)
+            .collect::<Vec<_>>();
+        let failed = outcome
+            .failed
+            .into_iter()
+            .map(|failure| failure.endpoint)
+            .collect::<Vec<_>>();
+
+        // SQLCipher lifecycle state remains authoritative. This directory row
+        // is only a best-effort projection for local invite lookups, which
+        // otherwise could reuse a consumed package until the next relay fetch.
+        if !accepted.is_empty() {
+            let account_id_hex = hex::encode(publication.account_id.as_slice());
+            let relay_lists = self
+                .app
+                .directory()
+                .account_relay_list_status_for_account_id(&account_id_hex)
+                .unwrap_or_else(|_| AccountRelayListStatus::empty());
+            let fetched = FetchedKeyPackage {
+                account_id_hex,
+                key_package: publication.key_package.clone(),
+                key_package_id: publication.slot_id.clone(),
+                key_package_ref_hex: nostr_publication.key_package_ref,
+                key_package_event_id: hex::encode(artifact.id.as_slice()),
+                created_at: artifact.created_at.0,
+                source_relays: accepted.iter().map(|endpoint| endpoint.0.clone()).collect(),
+                relay_lists,
+            };
+            if self
+                .app
+                .directory()
+                .remember_directory_key_package(&fetched)
+                .is_err()
+            {
+                tracing::warn!(
+                    target: "marmot_app::key_packages",
+                    method = "publish_prepared_key_package",
+                    "acknowledged key package directory projection remains stale"
+                );
+            }
+        }
+
+        Ok(KeyPackagePublishReceipt { accepted, failed })
+    }
+}
+
+fn empty_key_package_lifecycle(stable_slot_id: String) -> cgka_traits::KeyPackageLifecycleState {
+    cgka_traits::KeyPackageLifecycleState::slot_only(stable_slot_id)
+}
+
+fn unix_now_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// The relay `since` for group history anchored at `anchor_secs`, a Welcome's
+/// creation or a route switch: the anchor less
+/// [`HISTORY_FLOOR_CLOCK_SKEW_ALLOWANCE`].
+pub(crate) fn history_floor(anchor_secs: u64) -> cgka_traits::transport::Timestamp {
+    cgka_traits::transport::Timestamp(
+        anchor_secs.saturating_sub(HISTORY_FLOOR_CLOCK_SKEW_ALLOWANCE.as_secs()),
+    )
+}
+
+fn sqlite_file_requires_key(path: &Path) -> bool {
+    if !path.exists() {
+        return false;
+    }
+    Connection::open(path)
+        .and_then(|conn| {
+            conn.query_row("SELECT count(*) FROM sqlite_master", [], |row| {
+                row.get::<_, i64>(0)
+            })
+        })
+        .is_err()
+}
+
+fn nip65_relay_set_from_state(state: &AccountRelayListState) -> NostrNip65RelaySet {
+    if state.read_relays.is_empty() && state.write_relays.is_empty() {
+        let legacy_relays = state
+            .relays
+            .iter()
+            .cloned()
+            .map(TransportEndpoint)
+            .collect::<Vec<_>>();
+        return NostrNip65RelaySet {
+            read_relays: legacy_relays.clone(),
+            write_relays: legacy_relays,
+        };
+    }
+    NostrNip65RelaySet {
+        read_relays: state
+            .read_relays
+            .iter()
+            .cloned()
+            .map(TransportEndpoint)
+            .collect(),
+        write_relays: state
+            .write_relays
+            .iter()
+            .cloned()
+            .map(TransportEndpoint)
+            .collect(),
+    }
+}
+
+fn nip65_relay_set_preserving_roles(
+    current: &AccountRelayListState,
+    requested_relays: Vec<TransportEndpoint>,
+) -> NostrNip65RelaySet {
+    let current = nip65_relay_set_from_state(current);
+    let mut next = NostrNip65RelaySet::default();
+    for endpoint in unique_transport_endpoints(requested_relays) {
+        let was_read = current.read_relays.contains(&endpoint);
+        let was_write = current.write_relays.contains(&endpoint);
+        if !was_read && !was_write {
+            next.read_relays.push(endpoint.clone());
+            next.write_relays.push(endpoint);
+            continue;
+        }
+        if was_read {
+            next.read_relays.push(endpoint.clone());
+        }
+        if was_write {
+            next.write_relays.push(endpoint);
+        }
+    }
+    next
+}
+
+fn unique_transport_endpoints(
+    endpoints: impl IntoIterator<Item = TransportEndpoint>,
+) -> Vec<TransportEndpoint> {
+    let mut unique = Vec::new();
+    for endpoint in endpoints {
+        if !unique.contains(&endpoint) {
+            unique.push(endpoint);
+        }
+    }
+    unique
+}
+
+async fn sign_account_publication_event(
+    signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner>,
+    event: &NostrTransportEvent,
+) -> Result<NostrTransportEvent, AppError> {
+    transport_nostr_adapter::sign_transport_event_for_publish(signer, event)
+        .await
+        .map_err(|_| AppError::Publish("could not sign public directory event".into()))
+}
+
+async fn publish_public_indexer_copies(
+    relay_client: &dyn NostrRelayClient,
+    account_id: &MemberId,
+    events: &[NostrTransportEvent],
+    indexers: &[TransportEndpoint],
+) {
+    let mut requests = Vec::with_capacity(events.len() * indexers.len());
+    for indexer in indexers {
+        for event in events {
+            requests.push(NostrEventPublishRequest {
+                endpoints: vec![indexer.clone()],
+                event: event.clone(),
+                required_acks: 1,
+            });
+        }
+    }
+    if requests.is_empty() {
+        return;
+    }
+    let outcomes = relay_client
+        .publish_events_for_account(account_id, &requests)
+        .await;
+    if outcomes.len() != requests.len() {
+        tracing::warn!(
+            target: "marmot_app",
+            method = "publish_public_indexer_copies",
+            expected = requests.len(),
+            actual = outcomes.len(),
+            "public directory indexer publication returned incomplete outcomes"
+        );
+    }
+    observe_public_indexer_outcomes(outcomes);
+}
+
+fn observe_public_indexer_outcomes(
+    outcomes: impl IntoIterator<
+        Item = Result<
+            transport_nostr_adapter::NostrPublishOutcome,
+            cgka_traits::TransportAdapterError,
+        >,
+    >,
+) {
+    let mut accepted = 0_usize;
+    let mut failed = 0_usize;
+    for outcome in outcomes {
+        if outcome.is_ok_and(|result| !result.accepted.is_empty()) {
+            accepted += 1;
+        } else {
+            failed += 1;
+        }
+    }
+    if failed != 0 {
+        tracing::warn!(
+            target: "marmot_app",
+            method = "observe_public_indexer_outcomes",
+            accepted,
+            failed,
+            "public directory indexer publication was incomplete"
+        );
+    }
+}
+
+fn read_json<T: for<'de> Deserialize<'de>>(path: impl AsRef<Path>) -> Result<T, AppError> {
+    let bytes = fs::read(path)?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+#[cfg(test)]
+fn write_json<T: Serialize>(path: impl AsRef<Path>, value: &T) -> Result<(), AppError> {
+    let path = path.as_ref();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let bytes = serde_json::to_vec_pretty(value)?;
+    fs::write(path, bytes)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests;
+
+pub use cgka_traits::reporting::ReportReason;
+pub use runtime::{LocalAvatarRead, MAX_AVATAR_BATCH_BYTES, MAX_AVATAR_BATCH_ITEMS};
+pub use storage_sqlite::{
+    AvatarAcquisitionState, AvatarAssetPresentation, AvatarAssetRef, AvatarAssetStatus,
+    AvatarAssetTarget, AvatarAvailability,
+};
+pub use storage_sqlite::{ContentReport, ContentReportPage, ReportDismissal, ReportDismissalPage};
+
+pub use runtime::{
+    AttachmentAssetRef, AttachmentAutomaticPermission, AttachmentCategory, AttachmentControl,
+    AttachmentDownloadPolicy, AttachmentEntry, AttachmentHistoryCursor, AttachmentHistoryVersion,
+    AttachmentLocalTarget, AttachmentPage, AttachmentPageRead, AttachmentRole,
+    AttachmentTransferState, AttachmentTransferStatus, AutomaticAttachmentRequest,
+    MAX_ATTACHMENT_ASSET_LOOKUPS, MAX_ATTACHMENT_HISTORY_PAGE, MAX_ATTACHMENT_LOCAL_READ_BYTES,
+    RetainedAttachmentAsset, RuntimeAttachmentTransferSubscription,
+};
+pub use runtime::{
+    AttachmentKeepMedia, AttachmentMigrationState, AttachmentStorageUsage, ChatAttachmentUsage,
+    ChatUsageCursor, RetainedAttachmentSummary, RetainedSizeCursor,
+};
+
+pub use runtime::{
+    AccountAttachmentCursor, AccountAttachmentEntry, AccountAttachmentPage,
+    AccountAttachmentPageRead, AccountAttachmentQuery, AccountAttachmentVersion,
+};

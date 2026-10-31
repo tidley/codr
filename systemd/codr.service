@@ -1,0 +1,17 @@
+[Unit]
+Description=codr combined bridge and MDK messaging runtime
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/herdr-white-noise-bridge run --messaging-home %h/.marmot-agents/herdr
+Environment=PATH=%h/.local/bin:%h/.opencode/bin:/usr/local/bin:/usr/bin:/bin
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=120
+# Do not terminate a shared coding-agent server inherited into this cgroup.
+KillMode=process
+UMask=0077
+
+[Install]
+WantedBy=default.target

@@ -1,6 +1,13 @@
 # Install **codr**
 
-**codr** is a **herdr** plugin backed by two per-user services: the Rust bridge and its MDK transport. Linux uses systemd; macOS uses launchd LaunchAgents.
+**0.10.0 targets existing accounts.** Fresh-account examples use
+current stable 0.9.0. For an existing account, use the explicit
+[combined-service handover](COMBINED.md), not the legacy two-service setup flow.
+Fresh identity creation still uses local 0.9 setup before that handover.
+
+The stable 0.9 **codr** plugin uses two per-user services: the Rust bridge and MDK transport.
+The upcoming 0.10 combined runtime uses one executable and one service after an
+explicit handover. Linux uses systemd. macOS uses launchd LaunchAgents.
 
 ## One-prompt installation
 
@@ -37,6 +44,11 @@ herdr plugin action invoke local.white-noise.setup
 ```
 
 **herdr** previews and runs the manifest's installation hook, then registers the plugin. The hook downloads the bridge and dedicated connector for the host architecture and checks their SHA-256 checksums. Users do not need Rust or Cargo.
+
+These are the **0.9 fresh-account instructions**, not a 0.10 setup command.
+After setup, use the [combined handover guide](COMBINED.md) for an explicitly
+approved move to a reviewed 0.10 build. The 0.10 installer alone does not convert
+services, and its Setup action refuses the legacy identity-creation path.
 
 The Setup action opens a **herdr** tab. Enter your own White Noise public `npub` there. Setup:
 
@@ -189,7 +201,9 @@ PLUGIN_ROOT="$(herdr plugin list --plugin local.white-noise --json | python3 -c 
 python3 "$PLUGIN_ROOT/scripts/setup.py" --npub "$OWNER_NPUB" --herdr-socket "$HERDR_SOCKET_PATH"
 ```
 
-Use [Existing installations and upgrades](#existing-installations-and-upgrades) instead of overwriting a local plugin registration. For a local source checkout, the same setup script works after the binary has been installed.
+Use [Existing installations and upgrades](#existing-installations-and-upgrades) instead of overwriting a local plugin registration.
+The commands above require the 0.9 checkout. A 0.10 checkout must use the explicit
+[combined handover](COMBINED.md), not `setup.py --npub`.
 
 For a passive check of an existing configuration:
 
@@ -209,12 +223,17 @@ If a prerequisite or release asset is unavailable, report that blocker precisely
 
 ## Build from source
 
+This fresh-account procedure pins 0.9.0 because 0.10 does not create identities.
+For a reviewed 0.10 source build with an existing account, follow the explicit
+[combined-service handover](COMBINED.md) instead. Do not run legacy setup from a
+0.10 checkout or switch a dirty checkout to follow these examples.
+
 This path requires Rust and Cargo. Use the target host's build/storage policy. Audio setup needs FFmpeg and downloads the CPU or MLX runtime plus the approximately 164 MB model. On Linux its service is capped at 1 GiB RAM; launchd on macOS has no equivalent cap.
 
 ```bash
 git clone https://github.com/tidley/codr.git
 cd codr
-git checkout master
+git checkout v0.9.0
 cargo test --locked --tests
 cargo install --locked --path . --root "$HOME/.local"
 herdr plugin link "$PWD"

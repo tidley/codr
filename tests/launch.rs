@@ -32,10 +32,10 @@ async fn bare_new_begins_a_durable_workspace_prompt_without_side_effects() {
             .last()
             .unwrap()
             .text
-            .contains("Choose a herdr workspace")
+            .contains("Choose workspace")
     );
     assert!(
-        bridge
+        !bridge
             .state
             .outbox
             .last()

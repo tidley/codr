@@ -152,29 +152,26 @@ impl Draft {
             self.visible_models.clone()
         }
     }
-    fn heading(&self, step: usize, title: &str) -> String {
-        if self.mode == Mode::New {
-            format!("[{step}/4] {title}")
-        } else {
-            title.to_string()
-        }
-    }
     fn prompt(&self) -> String {
+        let reply_hint = if self.mode == Mode::New {
+            ""
+        } else {
+            "\nReply with a listed number."
+        };
         let mut text=match self.step {
             Step::Workspace=>{
-                let mut text=self.heading(1,"Choose a herdr workspace:");
+                let mut text="Choose workspace".to_string();
+                if !self.workspace_list_available {text.push_str("\nExisting workspaces are unavailable. Send /new to retry the list, or choose new.");}
                 if self.workspaces.len()>10 {text.push_str(&format!("\npage {} of {}",self.page+1,self.workspaces.len().div_ceil(10)));}
                 for (i,workspace) in self.workspaces.iter().enumerate().skip(self.page*10).take(10) {text.push_str(&format!("\n{}. {}",i+1,workspace.display()));}
-                text.push_str(&format!("\n\n**{}. Create new workspace**\n\n**0. Cancel**",self.workspaces.len()+1));
-                if !self.workspace_list_available {text.push_str("\nExisting workspaces are unavailable. Send /new to retry the list, or choose new.");}
-                text.push_str("\nReply with a listed number.");
+                text.push_str(&format!("\n{}. Create new workspace\n\n**0. Cancel**",self.workspaces.len()+1));
                 if (self.page+1)*10<self.workspaces.len() {text.push_str("\nNext page: next");}
                 if self.page>0 {text.push_str("\nPrevious page: previous");}
                 text
             }
-            Step::Folder=>format!("{}\nReply with your chosen folder name, **`ls`** to list existing folders, or **`ls <part>`** to filter them.\n\n**0. Cancel**\nNothing will be created yet.",self.heading(2,"Folder name:")),
+            Step::Folder=>"Folder name:\nReply with your chosen folder name.\n\n**0. Cancel**\n\n**`ls`** to list existing folders, or **`ls <part>`** to filter them.".to_string(),
             Step::FolderList=>{
-                let mut text=self.heading(2,"Choose a folder:");
+                let mut text="Choose a folder:".to_string();
                 if self.folder_choices.is_empty() {
                     text.push_str("\nNo matching folders. Use ls to show all folders, ls <part> to search, or type a folder name.");
                 } else {
@@ -191,7 +188,7 @@ impl Draft {
                 text
             }
             Step::Conversation=>{
-                let mut text=self.heading(2,"Folder already exists. Choose an existing conversation:");
+                let mut text="Folder already exists. Choose an existing conversation:".to_string();
                 for (i,agent) in self.conversations.iter().enumerate() {
                     text.push_str(&format!("\n{}. {} — {} ({})",i+1,agent.group_name(),catalogue::agent_name(&agent.agent),agent.pane_id));
                 }
@@ -199,22 +196,22 @@ impl Draft {
                 text
             }
             Step::Agent=>{
-                let mut text=self.heading(3,"Choose an installed agent:");
+                let mut text=if self.mode==Mode::New {"Choose agent:"}else{"Choose an installed agent:"}.to_string();
                 for (i,kind) in self.agents.iter().enumerate() {text.push_str(&format!("\n{}. {}",i+1,catalogue::agent_name(kind)));}
-                text.push_str("\n\n**0. Cancel**\nReply with a listed number.");text
+                text.push_str("\n\n**0. Cancel**");text.push_str(reply_hint);text
             }
             Step::ModelGroup=>{
-                let mut text=self.heading(4,&format!("Choose a model for {}:",catalogue::agent_name(self.kind.as_deref().unwrap_or("agent"))));
+                let mut text=format!("Choose a model for {}:",catalogue::agent_name(self.kind.as_deref().unwrap_or("agent")));
                 let offset=usize::from(self.models.first().is_some_and(|m|m.id.is_empty()));
-                text.push_str(if offset==1 {"\nUse the backend default, or view models from a provider."}else{"\nView models from a provider."});
+                if self.mode!=Mode::New {text.push_str(if offset==1 {"\nUse the backend default, or view models from a provider."}else{"\nView models from a provider."});}
                 if offset==1 {text.push_str("\n1. Backend default");}
                 for (i,group) in self.model_groups.iter().enumerate() {text.push_str(&format!("\n{}. View {}",i+offset+1,group.label));}
-                text.push_str("\n\n**0. Cancel**\nReply with a listed number.");text
+                text.push_str("\n\n**0. Cancel**");text.push_str(reply_hint);text
             }
             Step::Model|Step::Variant=>{
-                let mut text=self.heading(4,&if self.step==Step::Variant {
+                let mut text=if self.step==Step::Variant {
                     format!("Choose a variant for {}:",self.selected.as_ref().unwrap().label)
-                } else {format!("Choose a model for {}:",catalogue::agent_name(self.kind.as_deref().unwrap_or("agent")))});
+                } else {format!("Choose a model for {}:",catalogue::agent_name(self.kind.as_deref().unwrap_or("agent")))};
                 let options=self.model_options();
                 let paged=self.model_groups.is_empty(); // Keep numbering in older saved flat menus unchanged.
                 if paged && options.len()>10 {text.push_str(&format!("\npage {} of {}",self.page+1,options.len().div_ceil(10)));}
@@ -223,7 +220,7 @@ impl Draft {
                     let label=if self.step==Step::Variant {model.variant.as_deref().unwrap_or("Model default").to_string()} else {model.display()};
                     text.push_str(&format!("\n{}. {label}",i+1));
                 }
-                text.push_str("\n\n**0. Cancel**\nReply with a listed number.");
+                text.push_str("\n\n**0. Cancel**");text.push_str(reply_hint);
                 if !self.model_groups.is_empty() {text.push_str("\nBack: back");}
                 if paged && (self.page+1)*10<options.len() {text.push_str("\nNext page: next");}
                 if paged && self.page>0 {text.push_str("\nPrevious page: previous");}
@@ -236,7 +233,7 @@ impl Draft {
         if matches!(self.mode, Mode::Fresh(_)) {
             text.push_str("\nThis starts a fresh session in a new tab and separate chat. Old history and queued work stay in the old chat.");
         }
-        if !self.blocks_replacement() {
+        if self.mode != Mode::New && !self.blocks_replacement() {
             text.push_str("\nMenus expire after 10 minutes.");
         }
         text

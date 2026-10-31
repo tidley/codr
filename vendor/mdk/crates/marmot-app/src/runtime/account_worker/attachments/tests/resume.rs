@@ -1,0 +1,2746 @@
+use super::*;
+use crate::media::attachment_resume::AttachmentResume;
+use sha2::{Digest, Sha256};
+use storage_sqlite::SqliteAppStorage;
+use storage_sqlite::{ATTACHMENT_CHECKPOINT_BYTES, AttachmentPartialIdentity};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+async fn client_at(
+    dir: &std::path::Path,
+    reference: &crate::MediaAttachmentReference,
+    create: bool,
+) -> (AppClient, SqliteAccountStorage) {
+    client_at_with_mode(
+        dir,
+        reference,
+        create,
+        crate::AttachmentAcquisitionMode::NativeAutomatic,
+    )
+    .await
+}
+async fn client_at_with_mode(
+    dir: &std::path::Path,
+    reference: &crate::MediaAttachmentReference,
+    create: bool,
+    mode: crate::AttachmentAcquisitionMode,
+) -> (AppClient, SqliteAccountStorage) {
+    if create {
+        AccountHome::open(dir).create_account("alice").unwrap();
+    }
+    let app = MarmotApp::with_relay_and_config(
+        dir,
+        "wss://relay.example",
+        MarmotAppConfig {
+            attachment_acquisition_mode: mode,
+            allow_loopback_blob_endpoints: true,
+            attachment_acquisition: Some(crate::AttachmentAcquisitionPolicy::default()),
+            ..MarmotAppConfig::white_noise()
+        },
+    )
+    .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let store = app.account_storage("alice").unwrap();
+    if create {
+        seed(&store, reference, false);
+    }
+    client.state.groups.retain(|g| g.group_id_hex != GROUP);
+    client.state.groups.push(projection(reference));
+    store
+        .app_storage()
+        .remember_encrypted_media_epoch_secret(
+            GROUP,
+            crate::GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+            3,
+            &[7; 32],
+        )
+        .unwrap();
+    (client, store)
+}
+fn claim(store: &SqliteAccountStorage) -> AttachmentAcquisition {
+    let app = store.app_storage();
+    let now = crate::unix_now_seconds();
+    app.resume_attachment_acquisitions(now, 64).unwrap();
+    admit_demands(&app, now, true).unwrap();
+    let asset = app.due_attachment_acquisitions(now, 1).unwrap().remove(0);
+    app.claim_attachment_acquisition(&asset, now, now + 1200)
+        .unwrap()
+        .unwrap()
+}
+fn resume_context(
+    store: &SqliteAccountStorage,
+    job: &AttachmentAcquisition,
+    dir: &std::path::Path,
+    reference: &crate::MediaAttachmentReference,
+) -> AttachmentResume {
+    AttachmentResume {
+        explicit_permission: Default::default(),
+        automatic: true,
+        permission: None,
+        finishing: Default::default(),
+        updates: None,
+        storage: store.clone(),
+        job: job.clone(),
+        ciphertext_digest: hex::decode(&reference.ciphertext_sha256)
+            .unwrap()
+            .try_into()
+            .unwrap(),
+        media: test_media(&store.app_storage(), dir),
+        directory: dir.into(),
+        policy: storage_sqlite::AttachmentDownloadPolicy {
+            automatic: true,
+            retained_bytes: 128 * 1024 * 1024,
+            disk_reserve: 0,
+            transfer_limit: 64 * 1024 * 1024,
+        },
+    }
+}
+
+/// A media store over the account's own `media/` directory, where the app's
+/// store (which publishes and sweeps) finds the same wire checkpoints.
+fn test_media(store: &SqliteAppStorage, dir: &std::path::Path) -> crate::AccountMediaStore {
+    media_store::MediaStore::new(
+        AccountHome::open(dir)
+            .account_dir("alice")
+            .join(media_store::MEDIA_DIRECTORY),
+        storage_sqlite::SqliteMediaCatalog::new(store.clone()),
+    )
+}
+
+/// `.wire` checkpoint files in the account's media directory.
+fn wire_files(dir: &std::path::Path) -> usize {
+    let root = AccountHome::open(dir)
+        .account_dir("alice")
+        .join(media_store::MEDIA_DIRECTORY);
+    std::fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|shard| shard.path().is_dir())
+        .flat_map(|shard| {
+            std::fs::read_dir(shard.path())
+                .into_iter()
+                .flatten()
+                .flatten()
+        })
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".wire"))
+        .count()
+}
+
+/// Saves `bytes` as a new checkpoint at offset zero, at the time `clock`
+/// reports.
+fn checkpoint(
+    store: &SqliteAccountStorage,
+    dir: &std::path::Path,
+    job: &AttachmentAcquisition,
+    identity: &AttachmentPartialIdentity,
+    bytes: &[u8],
+    clock: fn() -> u64,
+) -> bool {
+    test_media(&store.app_storage(), dir)
+        .checkpoint_append(
+            &store
+                .app_storage()
+                .attachment_checkpoint(job, identity.clone(), clock),
+            0,
+            bytes,
+        )
+        .unwrap()
+}
+
+/// The ciphertext prefix the job's checkpoint holds, read from its wire file.
+fn saved_prefix(
+    store: &SqliteAccountStorage,
+    dir: &std::path::Path,
+    job: &AttachmentAcquisition,
+) -> Option<Vec<u8>> {
+    crate::media::attachment_resume::read_checkpoint(
+        store,
+        &test_media(&store.app_storage(), dir),
+        job,
+        crate::unix_now_seconds(),
+        64 * 1024 * 1024,
+        None,
+    )
+    .unwrap()
+    .map(|(_, bytes)| bytes)
+}
+
+/// Exercise the file sink on small fixtures: the same implementation handles
+/// large explicit transfers without allocating a whole-file array.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn file_attachment_resume_survives_irregular_chunks_and_publishes_authenticated_bytes() {
+    let plain = vec![42; 2 * ATTACHMENT_CHECKPOINT_BYTES + 71];
+    let (listener, reference, cipher) = listener_fixture(&plain).await;
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        assert!(!headers(&mut socket).await.contains("range:"));
+        socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n",cipher.len()).as_bytes()).await.unwrap();
+        let interrupted = ATTACHMENT_CHECKPOINT_BYTES + 123;
+        for part in cipher[..interrupted].chunks(17003) {
+            socket.write_all(part).await.unwrap();
+        }
+        drop(socket);
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let request = headers(&mut socket).await;
+        let prefix = ATTACHMENT_CHECKPOINT_BYTES + 123;
+        assert!(
+            request.contains(&format!("range: bytes={prefix}-\r\n")),
+            "{request}"
+        );
+        assert!(request.contains("if-range: \"v1\""));
+        respond(
+            &mut socket,
+            "206 Partial Content",
+            &format!(
+                "ETag: \"v1\"\r\nContent-Range: bytes {prefix}-{}/{}\r\n",
+                cipher.len() - 1,
+                cipher.len()
+            ),
+            &cipher[prefix..],
+            cipher.len() - prefix,
+        )
+        .await;
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let (client, store) = client_at(dir.path(), &reference, true).await;
+    let job = claim(&store);
+    let mut context = resume_context(&store, &job, dir.path(), &reference);
+    context.automatic = false;
+    let context = Arc::new(context);
+    let url = &reference.locators[0].value;
+    let transport = crate::media::BlossomHttpTransport::new(true);
+    let staging = dir.path().join("media-staging");
+    let fetch = || {
+        crate::media::fetch_blossom_file_with_transport(
+            url,
+            &transport,
+            &staging,
+            context.ciphertext_digest,
+            crate::MAX_FILE_MEDIA_CIPHERTEXT_BYTES,
+            Arc::new(crate::MediaFileTransferControl::default()),
+            context.clone(),
+        )
+    };
+    assert!(fetch().await.is_err());
+    let prefix = context
+        .load_wire(
+            &url::Url::parse(url).unwrap(),
+            crate::MAX_FILE_MEDIA_CIPHERTEXT_BYTES,
+            Arc::default(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    // The interrupted tail is checkpointed too, in the wire file; nothing
+    // is staged.
+    assert_eq!(prefix.received, (ATTACHMENT_CHECKPOINT_BYTES + 123) as u64);
+    assert_eq!(std::fs::read_dir(&staging).map_or(0, |d| d.count()), 0);
+    assert!(
+        read_retained(
+            &store,
+            &client.app,
+            &client.state.label,
+            &job.reference,
+            crate::unix_now_seconds(),
+            0,
+            10
+        )
+        .unwrap()
+        .is_none()
+    );
+    drop(prefix);
+    let downloaded = fetch().await.unwrap();
+    assert_eq!(downloaded.len, plain.len() as u64 + 16);
+    assert!(
+        matches!(
+            downloaded.source,
+            crate::media::file_transfer::CiphertextSource::Wire(_)
+        ),
+        "a validated body stays in its wire file"
+    );
+    assert_eq!(wire_files(dir.path()), 1);
+    let plain_hash = Sha256::digest(&plain).into();
+    let version = crate::EncryptedMediaVersion::V2;
+    let key = crate::media::derive_media_file_key(
+        &[7; 32],
+        version,
+        &plain_hash,
+        &reference.media_type,
+        &reference.file_name,
+    )
+    .unwrap();
+    let aad = crate::media::media_aad(
+        version,
+        &plain_hash,
+        &reference.media_type,
+        &reference.file_name,
+    );
+    let file = crate::media::file_transfer::DownloadedFileBody::new(downloaded, key, [3; 12], aad);
+    // A final ciphertext update precedes decryption on a slow transfer. The
+    // production completion seam must not move that progress backwards.
+    context
+        .progress(file.ciphertext.len, Some(file.ciphertext.len), false)
+        .await
+        .unwrap();
+    context
+        .completed_file_body(file.plaintext_len, file.ciphertext.staged_bytes())
+        .await
+        .unwrap();
+    complete_acquired(
+        &client,
+        &job,
+        Ok(crate::client::AcquiredMediaBody::File(file)),
+    )
+    .unwrap();
+    assert_eq!(
+        store
+            .app_storage()
+            .attachment_acquisition_status(&job.reference)
+            .unwrap()
+            .unwrap()
+            .byte_count,
+        plain.len() as u64
+    );
+    assert_eq!(
+        read_retained(
+            &store,
+            &client.app,
+            &client.state.label,
+            &job.reference,
+            crate::unix_now_seconds(),
+            0,
+            100
+        )
+        .unwrap()
+        .unwrap()
+        .as_slice(),
+        &plain[..100]
+    );
+    // Publication decrypted from the wire file and then removed it; no
+    // plaintext or ciphertext copy was ever staged.
+    assert_eq!(wire_files(dir.path()), 0);
+    assert_eq!(std::fs::read_dir(&staging).map_or(0, |d| d.count()), 0);
+    server.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn file_attachment_complete_checkpoint_is_verified_without_network() {
+    let (listener, reference, cipher) = listener_fixture(b"completed ciphertext").await;
+    let dir = tempfile::tempdir().unwrap();
+    let (_, store) = client_at(dir.path(), &reference, true).await;
+    let job = claim(&store);
+    let context = Arc::new(resume_context(&store, &job, dir.path(), &reference));
+    let url = url::Url::parse(&reference.locators[0].value).unwrap();
+    let identity = AttachmentPartialIdentity {
+        ciphertext_digest: context.ciphertext_digest,
+        locator_digest: Sha256::digest(url.as_str().as_bytes()).into(),
+        etag: "\"v1\"".into(),
+        total: cipher.len() as u64,
+    };
+    assert!(checkpoint(
+        &store,
+        dir.path(),
+        &job,
+        &identity,
+        &cipher,
+        crate::unix_now_seconds
+    ));
+    let result = crate::media::fetch_blossom_file_with_transport(
+        url.as_str(),
+        &crate::media::BlossomHttpTransport::new(true),
+        &dir.path().join("media-staging"),
+        context.ciphertext_digest,
+        crate::MAX_FILE_MEDIA_CIPHERTEXT_BYTES,
+        Arc::new(crate::MediaFileTransferControl::default()),
+        context,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.len, cipher.len() as u64);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn file_attachment_invalid_range_restarts_without_mixing_representations() {
+    const REDIRECT_COUNT: usize = 5;
+    for scenario in ["duplicate", "etag", "416"] {
+        let (listener, reference, cipher) =
+            listener_fixture(b"restart validated representation").await;
+        let len = cipher.len();
+        let url = url::Url::parse(&reference.locators[0].value).unwrap();
+        let final_path = format!("/hop{REDIRECT_COUNT}");
+        let checkpoint_url = url.join(&final_path).unwrap();
+        let server = tokio::spawn(async move {
+            for hop in 1..=REDIRECT_COUNT {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                assert!(!headers(&mut socket).await.contains("\r\nrange:"));
+                respond(
+                    &mut socket,
+                    "302 Found",
+                    &format!("Location: /hop{hop}\r\n"),
+                    b"",
+                    0,
+                )
+                .await;
+            }
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = headers(&mut socket).await;
+            assert!(request.starts_with(&format!("get {final_path} ")));
+            assert!(request.contains("range: bytes=8-"));
+            let range = format!("Content-Range: bytes 8-{}/{}\r\n", len - 1, len);
+            match scenario {
+                "duplicate" => {
+                    respond(
+                        &mut socket,
+                        "206 Partial Content",
+                        &format!("ETag: \"v1\"\r\n{range}{range}"),
+                        &cipher[8..],
+                        len - 8,
+                    )
+                    .await
+                }
+                "etag" => {
+                    respond(
+                        &mut socket,
+                        "206 Partial Content",
+                        &format!("ETag: \"changed\"\r\n{range}"),
+                        &cipher[8..],
+                        len - 8,
+                    )
+                    .await
+                }
+                _ => respond(&mut socket, "416 Range Not Satisfiable", "", b"", 0).await,
+            }
+            drop(socket);
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = headers(&mut socket).await;
+            assert!(request.starts_with(&format!("get {final_path} ")));
+            assert!(!request.contains("\r\nrange:"));
+            respond(&mut socket, "200 OK", "ETag: \"v2\"\r\n", &cipher, len).await;
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let (_, store) = client_at(dir.path(), &reference, true).await;
+        let job = claim(&store);
+        let context = Arc::new(resume_context(&store, &job, dir.path(), &reference));
+        let (_, valid_cipher) =
+            crate::media::tests::attachment_worker_fixture(b"restart validated representation");
+        let identity = AttachmentPartialIdentity {
+            ciphertext_digest: context.ciphertext_digest,
+            locator_digest: Sha256::digest(checkpoint_url.as_str().as_bytes()).into(),
+            etag: "\"v1\"".into(),
+            total: len as u64,
+        };
+        assert!(checkpoint(
+            &store,
+            dir.path(),
+            &job,
+            &identity,
+            &valid_cipher[..8],
+            crate::unix_now_seconds
+        ));
+        let file = crate::media::fetch_blossom_file_with_transport(
+            url.as_str(),
+            &crate::media::BlossomHttpTransport::new(true),
+            &dir.path().join("media-staging"),
+            context.ciphertext_digest,
+            crate::MAX_FILE_MEDIA_CIPHERTEXT_BYTES,
+            Arc::new(crate::MediaFileTransferControl::default()),
+            context,
+        )
+        .await
+        .unwrap();
+        assert_eq!(file.len, len as u64);
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resumed_hash_retries_fresh() {
+    check_resume_failure(ResumeFailure::HashMismatch).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resumed_overflow_clears_prefix() {
+    check_resume_failure(ResumeFailure::Overflow).await;
+}
+
+enum ResumeFailure {
+    HashMismatch,
+    Overflow,
+}
+
+async fn check_resume_failure(failure: ResumeFailure) {
+    let overflow = matches!(failure, ResumeFailure::Overflow);
+    let (listener, reference, cipher) = listener_fixture(b"validated file checkpoint").await;
+    let prefix = cipher[..8].to_vec();
+    let len = cipher.len();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        assert!(headers(&mut socket).await.contains("range: bytes=8-"));
+        let mut suffix = cipher[8..].to_vec();
+        if overflow {
+            suffix.push(0);
+            socket.write_all(format!("HTTP/1.1 206 Partial Content\r\nETag: \"v1\"\r\nContent-Range: bytes 8-{}/{}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n", len - 1, len, suffix.len()).as_bytes()).await.unwrap();
+            socket.write_all(&suffix).await.unwrap();
+            socket.write_all(b"\r\n0\r\n\r\n").await.unwrap();
+            return;
+        }
+        suffix[0] ^= 1;
+        respond(
+            &mut socket,
+            "206 Partial Content",
+            &format!(
+                "ETag: \"v1\"\r\nContent-Range: bytes 8-{}/{}\r\n",
+                len - 1,
+                len
+            ),
+            &suffix,
+            suffix.len(),
+        )
+        .await;
+        drop(socket);
+        let (mut socket, _) = listener.accept().await.unwrap();
+        assert!(!headers(&mut socket).await.contains("\r\nrange:"));
+        respond(&mut socket, "200 OK", "ETag: \"v1\"\r\n", &cipher, len).await;
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let (_, store) = client_at(dir.path(), &reference, true).await;
+    let job = claim(&store);
+    let context = Arc::new(resume_context(&store, &job, dir.path(), &reference));
+    let url = url::Url::parse(&reference.locators[0].value).unwrap();
+    let identity = AttachmentPartialIdentity {
+        ciphertext_digest: context.ciphertext_digest,
+        locator_digest: Sha256::digest(url.as_str().as_bytes()).into(),
+        etag: "\"v1\"".into(),
+        total: len as u64,
+    };
+    assert!(checkpoint(
+        &store,
+        dir.path(),
+        &job,
+        &identity,
+        &prefix,
+        crate::unix_now_seconds
+    ));
+    let staging = dir.path().join("media-staging");
+    let transport = crate::media::BlossomHttpTransport::new(true);
+    let fetch = || {
+        crate::media::fetch_blossom_file_with_transport(
+            url.as_str(),
+            &transport,
+            &staging,
+            context.ciphertext_digest,
+            crate::MAX_FILE_MEDIA_CIPHERTEXT_BYTES,
+            Arc::default(),
+            context.clone(),
+        )
+    };
+    let error = fetch().await.err().unwrap();
+    if overflow {
+        assert!(
+            matches!(error, AttachmentDownloadFailure::Stop(_)),
+            "an oversized Range body is terminal"
+        );
+    } else {
+        assert!(
+            matches!(error, AttachmentDownloadFailure::Retry(_)),
+            "a failed resumed representation must retry without its prefix"
+        );
+    }
+    assert!(
+        context
+            .load_wire(&url, crate::MAX_FILE_MEDIA_CIPHERTEXT_BYTES, Arc::default(),)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .app_storage()
+            .read_retained_attachment(&job.reference, crate::unix_now_seconds(), 0, 10)
+            .unwrap()
+            .is_none()
+    );
+    if !overflow {
+        assert_eq!(fetch().await.unwrap().len, len as u64);
+    }
+    server.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disk_reserve_without_etag() {
+    check_disk_reserve(ResponseLength::Known).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disk_reserve_unknown_length() {
+    check_disk_reserve(ResponseLength::Unknown).await;
+}
+
+enum ResponseLength {
+    Known,
+    Unknown,
+}
+
+async fn check_disk_reserve(length: ResponseLength) {
+    let known_length = matches!(length, ResponseLength::Known);
+    let plain = vec![42; 2 * ATTACHMENT_CHECKPOINT_BYTES + 71];
+    let (listener, reference, cipher) = listener_fixture(&plain).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (_, store) = client_at(dir.path(), &reference, true).await;
+    let job = claim(&store);
+    assert!(
+        store
+            .app_storage()
+            .promote_attachment_demand(&job.reference, crate::unix_now_seconds())
+            .unwrap()
+    );
+    let mut context = resume_context(&store, &job, dir.path(), &reference);
+    context.automatic = false;
+    let (updates, mut progress) = tokio::sync::watch::channel(());
+    context.updates = Some(updates);
+    let server_store = store.app_storage();
+    let mut policy = context.policy.clone();
+    let unavailable_reserve = fs4::total_space(dir.path()).unwrap().saturating_add(1);
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        headers(&mut socket).await;
+        if known_length {
+            policy.disk_reserve = unavailable_reserve;
+            server_store
+                .set_attachment_download_policy(&policy, crate::unix_now_seconds())
+                .unwrap();
+        }
+        let framing = if known_length {
+            format!("Content-Length: {}\r\n", cipher.len())
+        } else {
+            "Transfer-Encoding: chunked\r\n".into()
+        };
+        socket
+            .write_all(format!("HTTP/1.1 200 OK\r\nConnection: close\r\n{framing}\r\n").as_bytes())
+            .await
+            .unwrap();
+        if !known_length {
+            // Initial file admission has passed; pressure arrives while the
+            // body grows without a validator or trustworthy complete size.
+            progress.changed().await.unwrap();
+            policy.disk_reserve = unavailable_reserve;
+            server_store
+                .set_attachment_download_policy(&policy, crate::unix_now_seconds())
+                .unwrap();
+            let _ = socket
+                .write_all(format!("{:x}\r\n", cipher.len()).as_bytes())
+                .await;
+        }
+        // Refusal may close the socket before the scripted body finishes.
+        let _ = socket.write_all(&cipher).await;
+        if !known_length {
+            let _ = socket.write_all(b"\r\n0\r\n\r\n").await;
+        }
+    });
+    let context = Arc::new(context);
+    let staging = dir.path().join("media-staging");
+    let transport = crate::media::BlossomHttpTransport::new(true);
+    let result = crate::media::fetch_blossom_file_with_transport(
+        &reference.locators[0].value,
+        &transport,
+        &staging,
+        context.ciphertext_digest,
+        crate::MAX_FILE_MEDIA_CIPHERTEXT_BYTES,
+        Arc::default(),
+        context,
+    );
+    assert!(
+        matches!(
+            result.await,
+            Err(AttachmentDownloadFailure::StorageBlocked { .. })
+        ),
+        "disk pressure must park the job before private staging consumes the reserve"
+    );
+    assert!(
+        store
+            .app_storage()
+            .read_retained_attachment(&job.reference, crate::unix_now_seconds(), 0, 10)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(std::fs::read_dir(&staging).map_or(0, |dir| dir.count()), 0);
+    server.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn file_attachment_corrupt_ciphertext_is_terminal_and_never_readable() {
+    let (listener, reference, mut cipher) =
+        listener_fixture(&vec![42; ATTACHMENT_CHECKPOINT_BYTES + 71]).await;
+    cipher[0] ^= 1;
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        headers(&mut socket).await;
+        respond(
+            &mut socket,
+            "200 OK",
+            "ETag: \"bad\"\r\n",
+            &cipher,
+            cipher.len(),
+        )
+        .await;
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let (_, store) = client_at(dir.path(), &reference, true).await;
+    let job = claim(&store);
+    let context = Arc::new(resume_context(&store, &job, dir.path(), &reference));
+    let result = crate::media::fetch_blossom_file_with_transport(
+        &reference.locators[0].value,
+        &crate::media::BlossomHttpTransport::new(true),
+        &dir.path().join("media-staging"),
+        context.ciphertext_digest,
+        crate::MAX_FILE_MEDIA_CIPHERTEXT_BYTES,
+        Arc::new(crate::MediaFileTransferControl::default()),
+        context.clone(),
+    )
+    .await;
+    assert!(matches!(result, Err(AttachmentDownloadFailure::Stop(_))));
+    assert!(
+        context
+            .load_wire(
+                &url::Url::parse(&reference.locators[0].value).unwrap(),
+                crate::MAX_FILE_MEDIA_CIPHERTEXT_BYTES,
+                Arc::default(),
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .app_storage()
+            .read_retained_attachment(&job.reference, crate::unix_now_seconds(), 0, 10)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        std::fs::read_dir(dir.path().join("media-staging")).map_or(0, |d| d.count()),
+        0
+    );
+    server.await.unwrap();
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn file_redirect_limit_stops() {
+    let (listener, reference, _) = listener_fixture(b"redirect boundary").await;
+    let server = tokio::spawn(async move {
+        for hop in 1..=6 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            assert!(!headers(&mut socket).await.contains("\r\nrange:"));
+            respond(
+                &mut socket,
+                "302 Found",
+                &format!("Location: /hop{hop}\r\n"),
+                b"",
+                0,
+            )
+            .await;
+        }
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let (_, store) = client_at(dir.path(), &reference, true).await;
+    let job = claim(&store);
+    let context = Arc::new(resume_context(&store, &job, dir.path(), &reference));
+    let result = crate::media::fetch_blossom_file_with_transport(
+        &reference.locators[0].value,
+        &crate::media::BlossomHttpTransport::new(true),
+        &dir.path().join("media-staging"),
+        context.ciphertext_digest,
+        crate::MAX_FILE_MEDIA_CIPHERTEXT_BYTES,
+        Arc::new(crate::MediaFileTransferControl::default()),
+        context,
+    )
+    .await;
+    assert!(matches!(result, Err(AttachmentDownloadFailure::Stop(_))));
+    server.await.unwrap();
+}
+
+async fn headers(socket: &mut tokio::net::TcpStream) -> String {
+    let mut bytes = Vec::new();
+    loop {
+        let byte = socket.read_u8().await.unwrap();
+        bytes.push(byte);
+        assert!(bytes.len() < 16384);
+        if bytes.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+    String::from_utf8(bytes).unwrap().to_ascii_lowercase()
+}
+async fn respond(
+    socket: &mut tokio::net::TcpStream,
+    status: &str,
+    extra: &str,
+    body: &[u8],
+    length: usize,
+) {
+    socket
+        .write_all(
+            format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {length}\r\nConnection: close\r\n{extra}\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    socket.write_all(body).await.unwrap();
+}
+async fn listener_fixture(
+    body: &[u8],
+) -> (
+    tokio::net::TcpListener,
+    crate::MediaAttachmentReference,
+    Vec<u8>,
+) {
+    let (mut reference, cipher) = crate::media::tests::attachment_worker_fixture(body);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    reference.locators = vec![crate::MediaLocator {
+        kind: "blossom-v1".into(),
+        value: format!(
+            "http://{}/{}.bin",
+            listener.local_addr().unwrap(),
+            reference.ciphertext_sha256
+        ),
+    }];
+    (listener, reference, cipher)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attachment_resume_interrupted_transfer_reopens_and_publishes_verified_bytes() {
+    let plaintext = vec![42; 2 * ATTACHMENT_CHECKPOINT_BYTES];
+    let (listener, reference, cipher) = listener_fixture(&plaintext).await;
+    let prefix = ATTACHMENT_CHECKPOINT_BYTES + 123;
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        assert!(!headers(&mut socket).await.contains("\r\nrange:"));
+        respond(
+            &mut socket,
+            "200 OK",
+            "ETag: \"v1\"\r\n",
+            &cipher[..prefix],
+            cipher.len(),
+        )
+        .await;
+        drop(socket);
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let request = headers(&mut socket).await;
+        assert!(
+            request.contains(&format!("range: bytes={prefix}-\r\n")),
+            "{request}"
+        );
+        assert!(request.contains("if-range: \"v1\"\r\n"));
+        respond(
+            &mut socket,
+            "206 Partial Content",
+            &format!(
+                "ETag: \"v1\"\r\nContent-Range: bytes {prefix}-{}/{}\r\n",
+                cipher.len() - 1,
+                cipher.len()
+            ),
+            &cipher[prefix..],
+            cipher.len() - prefix,
+        )
+        .await;
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let (client, store) = client_at(dir.path(), &reference, true).await;
+    let old = claim(&store);
+    let prepared = client
+        .prepare_background_attachment_download(
+            &GroupId::new(vec![0xab; 16]),
+            reference.clone(),
+            64 * 1024 * 1024,
+        )
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        prepared
+            .run_classified(resume_context(&store, &old, dir.path(), &reference))
+            .await,
+        Err(AttachmentDownloadFailure::Retry(_))
+    ));
+    assert_eq!(
+        store
+            .app_storage()
+            .load_attachment_partial(&old, crate::unix_now_seconds(), 64 * 1024 * 1024, None)
+            .unwrap()
+            .unwrap()
+            .received,
+        prefix as u64
+    );
+    assert!(
+        read_retained(
+            &store,
+            &client.app,
+            &client.state.label,
+            &old.reference,
+            crate::unix_now_seconds(),
+            0,
+            10
+        )
+        .unwrap()
+        .is_none()
+    );
+    store.close().unwrap();
+    drop(client);
+    drop(store);
+    let (client, store) = client_at(dir.path(), &reference, false).await;
+    let job = claim(&store);
+    let prepared = client
+        .prepare_background_attachment_download(
+            &GroupId::new(vec![0xab; 16]),
+            reference.clone(),
+            64 * 1024 * 1024,
+        )
+        .unwrap()
+        .unwrap();
+    let result = prepared
+        .run_classified(resume_context(&store, &job, dir.path(), &reference))
+        .await
+        .unwrap();
+    assert_eq!(result.plaintext, plaintext);
+    complete(&client, &job, Ok(result)).unwrap();
+    assert_eq!(
+        store
+            .app_storage()
+            .attachment_acquisition_status(&job.reference)
+            .unwrap()
+            .unwrap()
+            .byte_count,
+        plaintext.len() as u64
+    );
+    assert!(
+        store
+            .app_storage()
+            .load_attachment_partial(&job, crate::unix_now_seconds(), 64 * 1024 * 1024, None)
+            .unwrap()
+            .is_none()
+    );
+    server.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attachment_resume_validates_ranges_and_restarts_incompatible_responses() {
+    for case in [
+        "resume",
+        "ignored",
+        "changed",
+        "unsatisfiable",
+        "malformed",
+        "unknown_total",
+        "oversized",
+        "corrupt",
+        "weak",
+        "unsafe_redirect",
+        "chunked_oversized",
+    ] {
+        let (listener, reference, cipher) =
+            listener_fixture(b"verified bytes from a resumed attachment").await;
+        let saved = cipher[..8].to_vec();
+        let total = cipher.len();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = headers(&mut socket).await;
+            assert!(request.contains("range: bytes=8-\r\n"), "case={case}");
+            match case {
+                "ignored" => {
+                    respond(&mut socket, "200 OK", "ETag: \"v1\"\r\n", &cipher, total).await
+                }
+                "changed" | "weak" | "unsatisfiable" | "unknown_total" | "malformed" => {
+                    if case == "unsatisfiable" {
+                        respond(&mut socket, "416 Range Not Satisfiable", "", &[], 0).await;
+                    } else if case == "unknown_total" || case == "malformed" {
+                        let range = if case == "unknown_total" {
+                            format!("bytes 8-{}/*", total - 1)
+                        } else {
+                            format!("bytes 7-{}/{}", total - 1, total)
+                        };
+                        respond(
+                            &mut socket,
+                            "206 Partial Content",
+                            &format!("ETag: \"v1\"\r\nContent-Range: {range}\r\n"),
+                            &cipher[8..],
+                            total - 8,
+                        )
+                        .await;
+                    } else {
+                        let tag = if case == "weak" { "W/\"v1\"" } else { "\"v2\"" };
+                        respond(
+                            &mut socket,
+                            "206 Partial Content",
+                            &format!(
+                                "ETag: {tag}\r\nContent-Range: bytes 8-{}/{}\r\n",
+                                total - 1,
+                                total
+                            ),
+                            &cipher[8..],
+                            total - 8,
+                        )
+                        .await;
+                    }
+                    drop(socket);
+                    let (mut next, _) = listener.accept().await.unwrap();
+                    assert!(!headers(&mut next).await.contains("\r\nrange:"));
+                    respond(&mut next, "200 OK", "ETag: \"v2\"\r\n", &cipher, total).await;
+                }
+                "unsafe_redirect" => {
+                    respond(
+                        &mut socket,
+                        "302 Found",
+                        "Location: http://169.254.169.254/private\r\n",
+                        &[],
+                        0,
+                    )
+                    .await;
+                }
+                "chunked_oversized" => {
+                    socket.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n100\r\n").await.unwrap();
+                    socket.write_all(&[0; 256]).await.unwrap();
+                    let _ = socket.write_all(b"\r\n0\r\n\r\n").await;
+                }
+                "oversized" => {
+                    respond(
+                        &mut socket,
+                        "200 OK",
+                        "ETag: \"v1\"\r\n",
+                        &[],
+                        70 * 1024 * 1024,
+                    )
+                    .await
+                }
+                _ => {
+                    let begin = if case == "malformed" { 7 } else { 8 };
+                    let mut rest = cipher[8..].to_vec();
+                    if case == "corrupt" {
+                        rest[0] ^= 1;
+                    }
+                    respond(
+                        &mut socket,
+                        "206 Partial Content",
+                        &format!(
+                            "ETag: \"v1\"\r\nContent-Range: bytes {begin}-{}/{}\r\n",
+                            total - 1,
+                            total
+                        ),
+                        &rest,
+                        rest.len(),
+                    )
+                    .await;
+                }
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let (client, store) = client_at(dir.path(), &reference, true).await;
+        let job = claim(&store);
+        let identity = AttachmentPartialIdentity {
+            ciphertext_digest: hex::decode(&reference.ciphertext_sha256)
+                .unwrap()
+                .try_into()
+                .unwrap(),
+            locator_digest: Sha256::digest(reference.locators[0].value.as_bytes()).into(),
+            etag: "\"v1\"".into(),
+            total: total as u64,
+        };
+        checkpoint(
+            &store,
+            dir.path(),
+            &job,
+            &identity,
+            &saved,
+            crate::unix_now_seconds,
+        );
+        let prepared = client
+            .prepare_background_attachment_download(
+                &GroupId::new(vec![0xab; 16]),
+                reference.clone(),
+                if case == "chunked_oversized" {
+                    128
+                } else {
+                    64 * 1024 * 1024
+                },
+            )
+            .unwrap()
+            .unwrap();
+        let result = prepared
+            .run_classified(resume_context(&store, &job, dir.path(), &reference))
+            .await;
+        if ["oversized", "chunked_oversized"].contains(&case) {
+            assert!(
+                matches!(result, Err(AttachmentDownloadFailure::SizeLimit(_, _))),
+                "size failures must be readmitted by a higher policy cap"
+            );
+        }
+        if [
+            "oversized",
+            "corrupt",
+            "chunked_oversized",
+            "unsafe_redirect",
+        ]
+        .contains(&case)
+        {
+            assert!(
+                matches!(
+                    result,
+                    Err(AttachmentDownloadFailure::Stop(_)
+                        | AttachmentDownloadFailure::SizeLimit(_, _))
+                ) || (case == "unsafe_redirect" && result.is_err())
+                    || (case == "corrupt"
+                        && matches!(result, Err(AttachmentDownloadFailure::Retry(_)))),
+                "{case}"
+            );
+            assert_eq!(
+                store
+                    .app_storage()
+                    .load_attachment_partial(
+                        &job,
+                        crate::unix_now_seconds(),
+                        64 * 1024 * 1024,
+                        None
+                    )
+                    .unwrap()
+                    .is_none(),
+                case != "unsafe_redirect",
+                "retryable redirect failure preserves its valid prefix"
+            );
+        } else {
+            assert_eq!(
+                result.unwrap().plaintext,
+                b"verified bytes from a resumed attachment",
+                "{case}"
+            );
+        }
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attachment_resume_cancellation_keeps_only_committed_ciphertext() {
+    let body = vec![17; ATTACHMENT_CHECKPOINT_BYTES * 2];
+    let (listener, reference, cipher) = listener_fixture(&body).await;
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        headers(&mut socket).await;
+        respond(
+            &mut socket,
+            "200 OK",
+            "ETag: \"v1\"\r\n",
+            &cipher[..ATTACHMENT_CHECKPOINT_BYTES],
+            cipher.len(),
+        )
+        .await;
+        std::future::pending::<()>().await;
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let (client, store) = client_at(dir.path(), &reference, true).await;
+    let job = claim(&store);
+    let prepared = client
+        .prepare_background_attachment_download(
+            &GroupId::new(vec![0xab; 16]),
+            reference.clone(),
+            64 * 1024 * 1024,
+        )
+        .unwrap()
+        .unwrap();
+    let task =
+        tokio::spawn(prepared.run_classified(resume_context(&store, &job, dir.path(), &reference)));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if store
+                .app_storage()
+                .load_attachment_partial(&job, crate::unix_now_seconds(), 64 * 1024 * 1024, None)
+                .unwrap()
+                .is_some_and(|p| p.received == ATTACHMENT_CHECKPOINT_BYTES as u64)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    let next = claim(&store);
+    assert_eq!(
+        store
+            .app_storage()
+            .load_attachment_partial(&next, crate::unix_now_seconds(), 64 * 1024 * 1024, None)
+            .unwrap()
+            .unwrap()
+            .received,
+        ATTACHMENT_CHECKPOINT_BYTES as u64
+    );
+    assert!(
+        read_retained(
+            &store,
+            &client.app,
+            &client.state.label,
+            &next.reference,
+            crate::unix_now_seconds(),
+            0,
+            10
+        )
+        .unwrap()
+        .is_none()
+    );
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attachment_resume_without_strong_validator_uses_full_download() {
+    for etag in ["", "ETag: W/\"v1\"\r\n"] {
+        let (listener, reference, cipher) =
+            listener_fixture(b"requires a strong HTTP validator").await;
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            headers(&mut socket).await;
+            respond(&mut socket, "200 OK", etag, &cipher[..8], cipher.len()).await;
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let (client, store) = client_at(dir.path(), &reference, true).await;
+        let job = claim(&store);
+        let prepared = client
+            .prepare_background_attachment_download(
+                &GroupId::new(vec![0xab; 16]),
+                reference.clone(),
+                64 * 1024 * 1024,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(
+            prepared
+                .run_classified(resume_context(&store, &job, dir.path(), &reference))
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .app_storage()
+                .load_attachment_partial(&job, crate::unix_now_seconds(), 64 * 1024 * 1024, None)
+                .unwrap()
+                .is_none()
+        );
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attachment_resume_failover_does_not_mix_locator_validators() {
+    let (listener, mut reference, cipher) =
+        listener_fixture(b"only the complete authenticated object is usable").await;
+    let second = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    reference.locators.push(crate::MediaLocator {
+        kind: "blossom-v1".into(),
+        value: format!(
+            "http://{}/{}.bin",
+            second.local_addr().unwrap(),
+            reference.ciphertext_sha256
+        ),
+    });
+    let total = cipher.len();
+    let saved = cipher[..8].to_vec();
+    let first_server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        assert!(headers(&mut socket).await.contains("range: bytes=8-\r\n"));
+        respond(&mut socket, "404 Not Found", "", &[], 0).await;
+    });
+    let second_server = tokio::spawn(async move {
+        let (mut socket, _) = second.accept().await.unwrap();
+        let request = headers(&mut socket).await;
+        assert!(!request.contains("\r\nrange:"));
+        assert!(!request.contains("\r\nif-range:"));
+        respond(&mut socket, "200 OK", "ETag: \"v1\"\r\n", &cipher, total).await;
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let (client, store) = client_at(dir.path(), &reference, true).await;
+    let job = claim(&store);
+    let identity = AttachmentPartialIdentity {
+        ciphertext_digest: hex::decode(&reference.ciphertext_sha256)
+            .unwrap()
+            .try_into()
+            .unwrap(),
+        locator_digest: Sha256::digest(reference.locators[0].value.as_bytes()).into(),
+        etag: "\"v1\"".into(),
+        total: total as u64,
+    };
+    checkpoint(
+        &store,
+        dir.path(),
+        &job,
+        &identity,
+        &saved,
+        crate::unix_now_seconds,
+    );
+    let prepared = client
+        .prepare_background_attachment_download(
+            &GroupId::new(vec![0xab; 16]),
+            reference.clone(),
+            64 * 1024 * 1024,
+        )
+        .unwrap()
+        .unwrap();
+    let result = prepared
+        .run_classified(resume_context(&store, &job, dir.path(), &reference))
+        .await
+        .unwrap();
+    assert_eq!(
+        result.plaintext,
+        b"only the complete authenticated object is usable"
+    );
+    first_server.await.unwrap();
+    second_server.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attachment_resume_failed_fallback_preserves_prefix_across_reopen() {
+    for case in [
+        "interrupted",
+        "hash_miss",
+        "oversize",
+        "encoded",
+        "unsafe_redirect",
+    ] {
+        let (first, mut reference, cipher) =
+            listener_fixture(b"preserve useful progress on the original locator").await;
+        let second = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        reference.locators.push(crate::MediaLocator {
+            kind: "blossom-v1".into(),
+            value: format!(
+                "http://{}/{}.bin",
+                second.local_addr().unwrap(),
+                reference.ciphertext_sha256
+            ),
+        });
+        let total = cipher.len();
+        let prefix = cipher[..8].to_vec();
+        let fallback_cipher = cipher.clone();
+        let a = tokio::spawn(async move {
+            let (mut socket, _) = first.accept().await.unwrap();
+            assert!(headers(&mut socket).await.contains("range: bytes=8-\r\n"));
+            // Transient: 404/410 would end this locator permanently.
+            respond(&mut socket, "429 Too Many Requests", "", &[], 0).await;
+            drop(socket);
+            let (mut socket, _) = first.accept().await.unwrap();
+            assert!(headers(&mut socket).await.contains("range: bytes=8-\r\n"));
+            respond(
+                &mut socket,
+                "206 Partial Content",
+                &format!(
+                    "ETag: \"v1\"\r\nContent-Range: bytes 8-{}/{}\r\n",
+                    total - 1,
+                    total
+                ),
+                &cipher[8..],
+                total - 8,
+            )
+            .await;
+        });
+        let b = tokio::spawn(async move {
+            let (mut socket, _) = second.accept().await.unwrap();
+            assert!(!headers(&mut socket).await.contains("\r\nrange:"));
+            match case {
+                "interrupted" => {
+                    respond(&mut socket, "200 OK", "ETag: \"v1\"\r\n", &[], total).await
+                }
+                "hash_miss" => {
+                    let mut wrong = fallback_cipher;
+                    wrong[0] ^= 1;
+                    respond(&mut socket, "200 OK", "ETag: \"v1\"\r\n", &wrong, total).await;
+                }
+                "oversize" => respond(&mut socket, "200 OK", "", &[], 70 * 1024 * 1024).await,
+                "encoded" => {
+                    respond(
+                        &mut socket,
+                        "200 OK",
+                        "Content-Encoding: gzip\r\n",
+                        &[],
+                        total,
+                    )
+                    .await
+                }
+                "unsafe_redirect" => {
+                    respond(
+                        &mut socket,
+                        "302 Found",
+                        "Location: http://169.254.169.254/private\r\n",
+                        &[],
+                        0,
+                    )
+                    .await
+                }
+                _ => unreachable!(),
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let (client, store) = client_at(dir.path(), &reference, true).await;
+        let job = claim(&store);
+        let context = resume_context(&store, &job, dir.path(), &reference);
+        assert!(checkpoint(
+            &store,
+            dir.path(),
+            &job,
+            &AttachmentPartialIdentity {
+                ciphertext_digest: context.ciphertext_digest,
+                locator_digest: Sha256::digest(reference.locators[0].value.as_bytes()).into(),
+                etag: "\"v1\"".into(),
+                total: total as u64,
+            },
+            &prefix,
+            crate::unix_now_seconds
+        ));
+        let prepared = client
+            .prepare_background_attachment_download(
+                &GroupId::new(vec![0xab; 16]),
+                reference.clone(),
+                64 * 1024 * 1024,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            prepared.run_classified(context).await,
+            Err(AttachmentDownloadFailure::Retry(_))
+        ));
+        assert_eq!(
+            saved_prefix(&store, dir.path(), &job),
+            Some(prefix),
+            "failed fallback must preserve A: {case}"
+        );
+        store.close().unwrap();
+        drop(client);
+        drop(store);
+        let (client, store) = client_at(dir.path(), &reference, false).await;
+        let job = claim(&store);
+        let prepared = client
+            .prepare_background_attachment_download(
+                &GroupId::new(vec![0xab; 16]),
+                reference.clone(),
+                64 * 1024 * 1024,
+            )
+            .unwrap()
+            .unwrap();
+        let result = prepared
+            .run_classified(resume_context(&store, &job, dir.path(), &reference))
+            .await
+            .unwrap();
+        assert_eq!(
+            result.plaintext,
+            b"preserve useful progress on the original locator"
+        );
+        a.await.unwrap();
+        b.await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attachment_resume_cleanup_error_preserves_terminal_integrity_failure() {
+    let (listener, reference, mut cipher) =
+        listener_fixture(b"must remain a terminal hash failure").await;
+    let dir = tempfile::tempdir().unwrap();
+    let (client, store) = client_at(dir.path(), &reference, true).await;
+    let job = claim(&store);
+    let closing = store.clone();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        headers(&mut socket).await;
+        closing.close().unwrap();
+        cipher[0] ^= 1;
+        respond(
+            &mut socket,
+            "200 OK",
+            "ETag: \"v1\"\r\n",
+            &cipher,
+            cipher.len(),
+        )
+        .await;
+    });
+    let prepared = client
+        .prepare_background_attachment_download(
+            &GroupId::new(vec![0xab; 16]),
+            reference.clone(),
+            64 * 1024 * 1024,
+        )
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        prepared
+            .run_classified(resume_context(&store, &job, dir.path(), &reference))
+            .await,
+        Err(AttachmentDownloadFailure::Stop(_))
+    ));
+    server.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attachment_resume_complete_small_body_does_not_write_checkpoint() {
+    let (listener, reference, cipher) = listener_fixture(b"small complete attachment").await;
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        headers(&mut socket).await;
+        respond(
+            &mut socket,
+            "200 OK",
+            "ETag: \"v1\"\r\n",
+            &cipher,
+            cipher.len(),
+        )
+        .await;
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let (client, store) = client_at(dir.path(), &reference, true).await;
+    let job = claim(&store);
+    let context = resume_context(&store, &job, dir.path(), &reference);
+    let prepared = client
+        .prepare_background_attachment_download(
+            &GroupId::new(vec![0xab; 16]),
+            reference.clone(),
+            64 * 1024 * 1024,
+        )
+        .unwrap()
+        .unwrap();
+    let result = prepared.run_classified(context).await.unwrap();
+    assert_eq!(result.plaintext, b"small complete attachment");
+    assert!(
+        store
+            .app_storage()
+            .load_attachment_partial(&job, crate::unix_now_seconds(), 64 * 1024 * 1024, None)
+            .unwrap()
+            .is_none()
+    );
+    server.await.unwrap();
+}
+
+/// A checkpoint write the volume refuses after free space was measured parks
+/// the job for the rest of the body and its store file, like a refusal at the
+/// measurement, instead of a timer retry that admission would keep refusing.
+/// The part of the chunk that reached the file before the refusal is cut off
+/// again, so the park's target is what the disk really holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attachment_resume_full_disk_during_checkpoint_write_parks() {
+    let plain = vec![0x4e; ATTACHMENT_CHECKPOINT_BYTES + 71];
+    let (listener, reference, cipher) = listener_fixture(&plain).await;
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        headers(&mut socket).await;
+        // The parked client may close before reading the whole body.
+        let _ = socket
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n",
+                    cipher.len()
+                )
+                .as_bytes(),
+            )
+            .await;
+        let _ = socket.write_all(&cipher).await;
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let (client, store) = client_at(dir.path(), &reference, true).await;
+    let job = claim(&store);
+    let context = resume_context(&store, &job, dir.path(), &reference);
+    context.media.simulate_full_wire_for_test(true);
+    let media = context.media.clone();
+    let prepared = client
+        .prepare_background_attachment_download(
+            &GroupId::new(vec![0xab; 16]),
+            reference.clone(),
+            64 * 1024 * 1024,
+        )
+        .unwrap()
+        .unwrap();
+    let result = prepared.run_classified(context).await;
+    assert!(
+        matches!(
+            &result,
+            Err(AttachmentDownloadFailure::StorageBlocked { headroom, .. })
+                if *headroom == 2 * plain.len() as u64
+        ),
+        "{:?}",
+        result.as_ref().err()
+    );
+    let part = store
+        .app_storage()
+        .load_attachment_partial(&job, crate::unix_now_seconds(), 64 * 1024 * 1024, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(part.received, 0);
+    assert_eq!(
+        std::fs::metadata(media.wire_path(&part.wire_file))
+            .unwrap()
+            .len(),
+        0,
+        "the refused partial write is cut off"
+    );
+    server.await.unwrap();
+}
+
+/// A day and a second ago: a checkpoint saved then has expired.
+fn earlier_clock() -> u64 {
+    crate::unix_now_seconds() - 86401
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attachment_resume_disabled_acquisition_still_prunes_expired_checkpoints() {
+    let (dir, mut client, store, reference) = offline_fixture().await;
+    let job = claim(&store);
+    let earlier = crate::unix_now_seconds() - 86401;
+    let identity = AttachmentPartialIdentity {
+        ciphertext_digest: hex::decode(&reference.ciphertext_sha256)
+            .unwrap()
+            .try_into()
+            .unwrap(),
+        locator_digest: Sha256::digest(reference.locators[0].value.as_bytes()).into(),
+        etag: "\"v1\"".into(),
+        total: 10,
+    };
+    assert!(checkpoint(
+        &store,
+        dir.path(),
+        &job,
+        &identity,
+        b"abc",
+        earlier_clock
+    ));
+    assert!(
+        store
+            .app_storage()
+            .load_attachment_partial(&job, earlier, 10, None)
+            .unwrap()
+            .is_some()
+    );
+    client.app.config.attachment_acquisition = None;
+    let (http, _rx) = context();
+    schedule(
+        &client,
+        &RuntimeSharedServices::default(),
+        &http,
+        &mut Admission::default(),
+    )
+    .unwrap();
+    assert!(
+        store
+            .app_storage()
+            .load_attachment_partial(&job, earlier, 10, None)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attachment_resume_hash_failure_clears_redirected_replacement() {
+    let body = vec![17; ATTACHMENT_CHECKPOINT_BYTES * 2];
+    let (first, mut reference, mut cipher) = listener_fixture(&body).await;
+    let second = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    reference.locators.push(crate::MediaLocator {
+        kind: "blossom-v1".into(),
+        value: format!(
+            "http://{}/{}.bin",
+            second.local_addr().unwrap(),
+            reference.ciphertext_sha256
+        ),
+    });
+    let total = cipher.len();
+    let prefix = cipher[..8].to_vec();
+    let a = tokio::spawn(async move {
+        let (mut socket, _) = first.accept().await.unwrap();
+        assert!(headers(&mut socket).await.contains("range: bytes=8-\r\n"));
+        respond(&mut socket, "429 Too Many Requests", "", &[], 0).await;
+    });
+    let b = tokio::spawn(async move {
+        let (mut socket, _) = second.accept().await.unwrap();
+        assert!(!headers(&mut socket).await.contains("\r\nrange:"));
+        respond(
+            &mut socket,
+            "302 Found",
+            "Location: /redirected.bin\r\n",
+            &[],
+            0,
+        )
+        .await;
+        drop(socket);
+        let (mut socket, _) = second.accept().await.unwrap();
+        let request = headers(&mut socket).await;
+        assert!(request.starts_with("get /redirected.bin "));
+        assert!(!request.contains("\r\nrange:"));
+        cipher[0] ^= 1;
+        respond(&mut socket, "200 OK", "ETag: \"v2\"\r\n", &cipher, total).await;
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let (client, store) = client_at(dir.path(), &reference, true).await;
+    let job = claim(&store);
+    let context = resume_context(&store, &job, dir.path(), &reference);
+    assert!(checkpoint(
+        &store,
+        dir.path(),
+        &job,
+        &AttachmentPartialIdentity {
+            ciphertext_digest: context.ciphertext_digest,
+            locator_digest: Sha256::digest(reference.locators[0].value.as_bytes()).into(),
+            etag: "\"v1\"".into(),
+            total: total as u64,
+        },
+        &prefix,
+        crate::unix_now_seconds
+    ));
+    let prepared = client
+        .prepare_background_attachment_download(
+            &GroupId::new(vec![0xab; 16]),
+            reference,
+            64 * 1024 * 1024,
+        )
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        prepared.run_classified(context).await,
+        Err(AttachmentDownloadFailure::Retry(_))
+    ));
+    // B's large replacement was checkpointed at its final URL. Hash failure
+    // must discard that representation even though the candidate URL differs.
+    assert!(
+        store
+            .app_storage()
+            .load_attachment_partial(&job, crate::unix_now_seconds(), 64 * 1024 * 1024, None)
+            .unwrap()
+            .is_none()
+    );
+    a.await.unwrap();
+    b.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attachment_resume_hash_miss_retries_from_zero_after_reopen() {
+    for complete_prefix in [false, true] {
+        for fresh_is_valid in [false, true] {
+            let plaintext = b"authenticate a clean download after a bad resume";
+            let (listener, reference, cipher) = listener_fixture(plaintext).await;
+            let total = cipher.len();
+            let saved = if complete_prefix {
+                let mut saved = cipher.clone();
+                saved[0] ^= 1;
+                saved
+            } else {
+                cipher[..8].to_vec()
+            };
+            let server = tokio::spawn(async move {
+                if !complete_prefix {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    assert!(headers(&mut socket).await.contains("range: bytes=8-\r\n"));
+                    let mut rest = cipher[8..].to_vec();
+                    rest[0] ^= 1;
+                    respond(
+                        &mut socket,
+                        "206 Partial Content",
+                        &format!(
+                            "ETag: \"v1\"\r\nContent-Range: bytes 8-{}/{}\r\n",
+                            total - 1,
+                            total
+                        ),
+                        &rest,
+                        rest.len(),
+                    )
+                    .await;
+                }
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = headers(&mut socket).await;
+                assert!(!request.contains("\r\nrange:"));
+                assert!(!request.contains("\r\nif-range:"));
+                let mut body = cipher;
+                if !fresh_is_valid {
+                    body[0] ^= 1;
+                }
+                respond(&mut socket, "200 OK", "ETag: \"v1\"\r\n", &body, total).await;
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let (client, store) = client_at(dir.path(), &reference, true).await;
+            let job = claim(&store);
+            let identity = AttachmentPartialIdentity {
+                ciphertext_digest: hex::decode(&reference.ciphertext_sha256)
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+                locator_digest: Sha256::digest(reference.locators[0].value.as_bytes()).into(),
+                etag: "\"v1\"".into(),
+                total: total as u64,
+            };
+            assert!(checkpoint(
+                &store,
+                dir.path(),
+                &job,
+                &identity,
+                &saved,
+                crate::unix_now_seconds
+            ));
+            let prepared = client
+                .prepare_background_attachment_download(
+                    &GroupId::new(vec![0xab; 16]),
+                    reference.clone(),
+                    64 * 1024 * 1024,
+                )
+                .unwrap()
+                .unwrap();
+            let result = prepared
+                .run_classified(resume_context(&store, &job, dir.path(), &reference))
+                .await;
+            assert!(matches!(result, Err(AttachmentDownloadFailure::Retry(_))));
+            assert!(
+                store
+                    .app_storage()
+                    .load_attachment_partial(
+                        &job,
+                        crate::unix_now_seconds(),
+                        64 * 1024 * 1024,
+                        None,
+                    )
+                    .unwrap()
+                    .is_none()
+            );
+            complete(&client, &job, result).unwrap();
+            let status = store
+                .app_storage()
+                .attachment_acquisition_status(&job.reference)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                status.state,
+                storage_sqlite::AttachmentAcquisitionState::RetryScheduled
+            );
+            assert_eq!(
+                store
+                    .app_storage()
+                    .retained_attachment_byte_count()
+                    .unwrap(),
+                0
+            );
+            store.close().unwrap();
+            drop(client);
+            drop(store);
+            let (client, store) = client_at(dir.path(), &reference, false).await;
+            let now = status.due.unwrap();
+            let job = store
+                .app_storage()
+                .claim_attachment_acquisition(&job.reference, now, now + 1200)
+                .unwrap()
+                .unwrap();
+            let prepared = client
+                .prepare_background_attachment_download(
+                    &GroupId::new(vec![0xab; 16]),
+                    reference.clone(),
+                    64 * 1024 * 1024,
+                )
+                .unwrap()
+                .unwrap();
+            let result = prepared
+                .run_classified(resume_context(&store, &job, dir.path(), &reference))
+                .await;
+            if fresh_is_valid {
+                assert_eq!(result.as_ref().unwrap().plaintext, plaintext);
+            } else {
+                assert!(matches!(result, Err(AttachmentDownloadFailure::Stop(_))));
+            }
+            complete(&client, &job, result).unwrap();
+            assert_eq!(
+                store
+                    .app_storage()
+                    .attachment_acquisition_status(&job.reference)
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                if fresh_is_valid {
+                    storage_sqlite::AttachmentAcquisitionState::Ready
+                } else {
+                    storage_sqlite::AttachmentAcquisitionState::Blocked
+                }
+            );
+            server.await.unwrap();
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attachment_controls_interrupt_http_and_release_capacity_without_publishing() {
+    for disable in [false, true] {
+        let (listener, reference, cipher) =
+            listener_fixture(&vec![42; 2 * ATTACHMENT_CHECKPOINT_BYTES]).await;
+        let (sent, started) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            headers(&mut socket).await;
+            respond(
+                &mut socket,
+                "200 OK",
+                "ETag: \"stable\"\r\n",
+                &cipher[..ATTACHMENT_CHECKPOINT_BYTES],
+                cipher.len(),
+            )
+            .await;
+            sent.send(()).unwrap();
+            let mut byte = [0];
+            let _ = socket.read(&mut byte).await;
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let (mut client, store) = client_at(dir.path(), &reference, true).await;
+        let shared = RuntimeSharedServices::default();
+        let (http, mut completions) = context();
+        let mut admission = Admission::default();
+        schedule(&client, &shared, &http, &mut admission).unwrap();
+        admission.ready().await;
+        schedule(&client, &shared, &http, &mut admission).unwrap();
+        started.await.unwrap();
+        let entry = store
+            .app_storage()
+            .attachment_history_page(GROUP, 1, None)
+            .unwrap()
+            .entries
+            .remove(0);
+        let asset = store
+            .app_storage()
+            .attachment_transfer_status(
+                GROUP,
+                &entry.message_id_hex,
+                &entry.source_message_id_hex,
+                0,
+                crate::unix_now_seconds(),
+                true,
+            )
+            .unwrap()
+            .unwrap()
+            .reference
+            .unwrap();
+        if disable {
+            let mut policy =
+                super::super::super::super::attachment_controls::default_policy(&client.app.config);
+            policy.automatic = false;
+            store
+                .app_storage()
+                .set_attachment_download_policy(&policy, crate::unix_now_seconds())
+                .unwrap();
+        } else {
+            store
+                .app_storage()
+                .cancel_attachment_acquisition(&asset)
+                .unwrap();
+        }
+        shared.attachment_cancellations.send_modify(|_| {});
+        let done = tokio::time::timeout(Duration::from_secs(3), completions.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        complete_and_settle(&mut client, done, &shared, &http, &mut completions).await;
+        assert_eq!(shared.attachment_transfer.available_permits(), 1);
+        assert!(
+            read_retained(
+                &store,
+                &client.app,
+                &client.state.label,
+                &asset,
+                crate::unix_now_seconds(),
+                0,
+                1
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(
+            store
+                .app_storage()
+                .attachment_transfer_status(
+                    GROUP,
+                    &entry.message_id_hex,
+                    &entry.source_message_id_hex,
+                    0,
+                    crate::unix_now_seconds(),
+                    !disable
+                )
+                .unwrap()
+                .unwrap()
+                .state,
+            if disable {
+                storage_sqlite::AttachmentTransferState::Paused
+            } else {
+                storage_sqlite::AttachmentTransferState::Cancelled
+            }
+        );
+        server.abort();
+        let _ = server.await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attachment_body_idle_deadline_releases_global_capacity_and_retries() {
+    let (listener, reference, cipher) =
+        listener_fixture(&vec![42; 2 * ATTACHMENT_CHECKPOINT_BYTES]).await;
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        headers(&mut socket).await;
+        respond(
+            &mut socket,
+            "200 OK",
+            "ETag: \"stable\"\r\n",
+            &cipher[..ATTACHMENT_CHECKPOINT_BYTES],
+            cipher.len(),
+        )
+        .await;
+        let mut byte = [0];
+        let _ = socket.read(&mut byte).await;
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let (mut client, store) = client_at(dir.path(), &reference, true).await;
+    let shared = RuntimeSharedServices::default();
+    let (http, mut completions) = context();
+    let mut admission = Admission::default();
+    schedule(&client, &shared, &http, &mut admission).unwrap();
+    admission.ready().await;
+    schedule(&client, &shared, &http, &mut admission).unwrap();
+    let done = tokio::time::timeout(Duration::from_secs(40), completions.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let asset = match &done.completion {
+        MediaHttpCompletion::Attachment { job, result, .. } => {
+            assert!(matches!(result, Err(AttachmentDownloadFailure::Retry(_))));
+            job.reference.clone()
+        }
+        _ => panic!("attachment completion"),
+    };
+    complete_and_settle(&mut client, done, &shared, &http, &mut completions).await;
+    assert_eq!(shared.attachment_transfer.available_permits(), 1);
+    assert_eq!(
+        store
+            .app_storage()
+            .attachment_acquisition_status(&asset)
+            .unwrap()
+            .unwrap()
+            .state,
+        storage_sqlite::AttachmentAcquisitionState::RetryScheduled
+    );
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attachment_http_attempt_budget_includes_transport_retries() {
+    let (mut reference, _) = crate::media::tests::attachment_worker_fixture(b"bounded network");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    reference.locators = vec![crate::MediaLocator {
+        kind: "blossom-v1".to_owned(),
+        value: format!(
+            "http://{}/{}",
+            listener.local_addr().unwrap(),
+            reference.ciphertext_sha256
+        ),
+    }];
+    let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = count.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            headers(&mut socket).await;
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            socket
+                .write_all(
+                    b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        }
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let (client, store) = client_at_with_mode(
+        dir.path(),
+        &reference,
+        true,
+        crate::AttachmentAcquisitionMode::HostManaged,
+    )
+    .await;
+    opt_in(&client).await;
+    let mut job = claim(&store);
+    let asset = job.reference.clone();
+    for _ in 0..4 {
+        let prepared = client
+            .prepare_background_attachment_download(
+                &GroupId::new(vec![0xab; 16]),
+                reference.clone(),
+                64 * 1024 * 1024,
+            )
+            .unwrap()
+            .unwrap();
+        assert!(
+            prepared
+                .run_classified(resume_context(&store, &job, dir.path(), &reference))
+                .await
+                .is_err()
+        );
+        let now = crate::unix_now_seconds();
+        store
+            .app_storage()
+            .fail_attachment_acquisition(&job, Some(now))
+            .unwrap();
+        match store
+            .app_storage()
+            .claim_attachment_acquisition(&asset, now, now + 1200)
+            .unwrap()
+        {
+            Some(next) => job = next,
+            None => break,
+        }
+    }
+    assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 16);
+    assert!(
+        store
+            .app_storage()
+            .attachment_transfer_candidates(crate::unix_now_seconds(), 64, true)
+            .unwrap()
+            .is_empty()
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attachment_revocation_prevents_retry_and_old_approval_cannot_restore_it() {
+    let (mut reference, _) = crate::media::tests::attachment_worker_fixture(b"permission race");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    reference.locators = vec![crate::MediaLocator {
+        kind: "blossom-v1".to_owned(),
+        value: format!(
+            "http://{}/{}",
+            listener.local_addr().unwrap(),
+            reference.ciphertext_sha256
+        ),
+    }];
+    let (received, first) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        headers(&mut socket).await;
+        received.send(()).unwrap();
+        released.await.unwrap();
+        socket
+            .write_all(
+                b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        drop(socket);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), listener.accept())
+                .await
+                .is_err(),
+            "revocation must prevent subsequent HTTP attempts"
+        );
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let (mut client, store) = client_at(dir.path(), &reference, true).await;
+    client.app.config.attachment_acquisition_mode = crate::AttachmentAcquisitionMode::HostManaged;
+    let runtime = client.app.runtime();
+    let generation = runtime
+        .begin_attachment_permission_update("alice")
+        .await
+        .unwrap();
+    assert!(
+        runtime
+            .set_attachment_automatic_permission(
+                "alice",
+                generation.clone(),
+                all_attachment_permission()
+            )
+            .await
+            .unwrap()
+    );
+    let job = claim(&store);
+    let mut resume = resume_context(&store, &job, dir.path(), &reference);
+    resume.permission = runtime.shared.attachment_permissions.lease(
+        &store.app_storage().attachment_store_identity().unwrap(),
+        &reference.media_type,
+    );
+    assert!(resume.permission.is_some());
+    let prepared = client
+        .prepare_background_attachment_download(
+            &GroupId::new(vec![0xab; 16]),
+            reference,
+            64 * 1024 * 1024,
+        )
+        .unwrap()
+        .unwrap();
+    let transfer = tokio::spawn(prepared.run_classified(resume));
+    first.await.unwrap();
+    let next = runtime
+        .begin_attachment_permission_update("alice")
+        .await
+        .unwrap();
+    assert!(
+        !runtime
+            .set_attachment_automatic_permission("alice", generation, all_attachment_permission())
+            .await
+            .unwrap()
+    );
+    // Even reapproval cannot revive the old in-flight lease or its fallback loop.
+    assert!(
+        runtime
+            .set_attachment_automatic_permission("alice", next, all_attachment_permission())
+            .await
+            .unwrap()
+    );
+    release.send(()).unwrap();
+    assert!(transfer.await.unwrap().is_err());
+    server.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attachment_retained_media_body_is_not_downloaded_again() {
+    let (mut reference, ciphertext) =
+        crate::media::tests::attachment_worker_fixture(b"one completed body");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    reference.locators = vec![crate::MediaLocator {
+        kind: "blossom-v1".to_owned(),
+        value: format!(
+            "http://{}/{}",
+            listener.local_addr().unwrap(),
+            reference.ciphertext_sha256
+        ),
+    }];
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        headers(&mut socket).await;
+        socket
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    ciphertext.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        socket.write_all(&ciphertext).await.unwrap();
+        drop(socket);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), listener.accept())
+                .await
+                .is_err()
+        );
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let (client, store) = client_at_with_mode(
+        dir.path(),
+        &reference,
+        true,
+        crate::AttachmentAcquisitionMode::HostManaged,
+    )
+    .await;
+    opt_in(&client).await;
+    let job = claim(&store);
+    let group = GroupId::new(vec![0xab; 16]);
+    let prepared = client
+        .prepare_background_attachment_download(&group, reference.clone(), 64 * 1024 * 1024)
+        .unwrap()
+        .unwrap();
+    let result = prepared
+        .run_classified(resume_context(&store, &job, dir.path(), &reference))
+        .await;
+    assert!(result.is_ok());
+    complete(&client, &job, result).unwrap();
+    let runtime = client.app.runtime();
+    let (http, _completions) = context();
+    let mut admission = Admission::default();
+    for _ in 0..10 {
+        let request = runtime
+            .request_automatic_attachment("alice", &group, automatic_target())
+            .await
+            .unwrap();
+        assert!(!request.newly_queued);
+        assert_eq!(
+            request.status.unwrap().state,
+            storage_sqlite::AttachmentTransferState::Ready
+        );
+        schedule(&client, &runtime.shared, &http, &mut admission).unwrap();
+    }
+    // Retained in the media store, not the database's byte tables.
+    assert_eq!(
+        store
+            .app_storage()
+            .retained_attachment_byte_count()
+            .unwrap(),
+        0
+    );
+    assert!(!admission.is_waiting());
+    server.await.unwrap();
+}
+
+async fn opt_in(client: &AppClient) {
+    let runtime = client.app.runtime();
+    let generation = runtime
+        .begin_attachment_permission_update("alice")
+        .await
+        .unwrap();
+    assert!(
+        runtime
+            .set_attachment_automatic_permission("alice", generation, all_attachment_permission())
+            .await
+            .unwrap()
+    );
+    assert!(
+        runtime
+            .request_automatic_attachment(
+                "alice",
+                &GroupId::new(vec![0xab; 16]),
+                automatic_target()
+            )
+            .await
+            .unwrap()
+            .newly_queued
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attachment_verified_http_body_publishes_after_permission_and_policy_revocation() {
+    let body = b"verified before revocation";
+    let (mut reference, ciphertext) = crate::media::tests::attachment_worker_fixture(body);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    reference.locators = vec![crate::MediaLocator {
+        kind: "blossom-v1".to_owned(),
+        value: format!(
+            "http://{}/{}",
+            listener.local_addr().unwrap(),
+            reference.ciphertext_sha256
+        ),
+    }];
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        headers(&mut socket).await;
+        respond(&mut socket, "200 OK", "", &ciphertext, ciphertext.len()).await;
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let (client, store) = client_at_with_mode(
+        dir.path(),
+        &reference,
+        true,
+        crate::AttachmentAcquisitionMode::HostManaged,
+    )
+    .await;
+    opt_in(&client).await;
+    let job = claim(&store);
+    let group = GroupId::new(vec![0xab; 16]);
+    let prepared = client
+        .prepare_background_attachment_download(&group, reference.clone(), 64 * 1024 * 1024)
+        .unwrap()
+        .unwrap();
+    let resume = resume_context(&store, &job, dir.path(), &reference);
+    let finishing = resume.finishing.clone();
+    let result = prepared.run_classified(resume).await;
+    assert!(result.is_ok());
+    assert!(finishing.load(std::sync::atomic::Ordering::Acquire));
+    store
+        .app_storage()
+        .pause_automatic_attachments(crate::unix_now_seconds())
+        .unwrap();
+    let mut policy = store
+        .app_storage()
+        .attachment_download_policy(
+            &super::super::super::super::attachment_controls::default_policy(&client.app.config),
+        )
+        .unwrap();
+    policy.automatic = false;
+    store
+        .app_storage()
+        .set_attachment_download_policy(&policy, crate::unix_now_seconds())
+        .unwrap();
+    // Both completion and cancellation are ready. Completion owns the body.
+    let result = finish_or_cancel(
+        std::future::ready(result),
+        std::future::ready(()),
+        finishing,
+    )
+    .await;
+    complete(&client, &job, result).unwrap();
+    assert_eq!(
+        &*read_retained(
+            &store,
+            &client.app,
+            &client.state.label,
+            &job.reference,
+            crate::unix_now_seconds(),
+            0,
+            100
+        )
+        .unwrap()
+        .unwrap(),
+        body
+    );
+    server.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attachment_revocation_waits_for_in_progress_verified_receipt() {
+    let finishing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let started = finishing.clone();
+    let (ready, cancelled) = tokio::sync::oneshot::channel();
+    let (release, committed) = tokio::sync::oneshot::channel();
+    let (observed, cancellation_observed) = tokio::sync::oneshot::channel();
+    let download = async move {
+        started.store(true, std::sync::atomic::Ordering::Release);
+        ready.send(()).unwrap();
+        committed.await.unwrap();
+        Ok(MediaDownloadResult {
+            plaintext: b"verified".to_vec(),
+            size_bytes: 8,
+            file_name: "test.bin".to_owned(),
+            media_type: "application/octet-stream".to_owned(),
+        })
+    };
+    let task = tokio::spawn(finish_or_cancel(
+        download,
+        async {
+            cancelled.await.unwrap();
+            observed.send(()).unwrap();
+        },
+        finishing,
+    ));
+    cancellation_observed.await.unwrap();
+    assert!(!task.is_finished());
+    release.send(()).unwrap();
+    assert_eq!(task.await.unwrap().unwrap().plaintext, b"verified");
+}
+
+/// Disk pressure on an opted-in body is not a timer retry (mdk#2239): the job
+/// parks as storage-blocked without a receipt, and readmits once the reserve fits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attachment_disk_pressure_parks_before_receipt_and_readmits_when_space_frees() {
+    let body = b"disk pressure can recover";
+    let (listener, reference, cipher) = listener_fixture(body).await;
+    let server = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            headers(&mut socket).await;
+            // The parked client may close before reading this small body.
+            let _ = socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        cipher.len()
+                    )
+                    .as_bytes(),
+                )
+                .await;
+            let _ = socket.write_all(&cipher).await;
+        }
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let (client, store) = client_at_with_mode(
+        dir.path(),
+        &reference,
+        true,
+        crate::AttachmentAcquisitionMode::HostManaged,
+    )
+    .await;
+    opt_in(&client).await;
+    let job = claim(&store);
+    let mut context = resume_context(&store, &job, dir.path(), &reference);
+    let unavailable_reserve = i64::MAX as u64 / 2;
+    context.policy.disk_reserve = unavailable_reserve;
+    let group = GroupId::new(vec![0xab; 16]);
+    let prepared = client
+        .prepare_background_attachment_download(&group, reference.clone(), 64 * 1024 * 1024)
+        .unwrap()
+        .unwrap();
+    let result = prepared.run_classified(context).await;
+    // No validator, so the park target is the publication reserve alone.
+    assert!(matches!(
+        &result,
+        Err(AttachmentDownloadFailure::StorageBlocked { headroom, .. }) if *headroom == 2 * body.len() as u64
+    ));
+    complete(&client, &job, result).unwrap();
+    let status = store
+        .app_storage()
+        .attachment_acquisition_status(&job.reference)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        status.state,
+        storage_sqlite::AttachmentAcquisitionState::Blocked
+    );
+    assert_eq!(status.due, None, "no timer runs while parked");
+    assert_eq!(
+        store
+            .app_storage()
+            .attachment_transfer_status(GROUP, &"11".repeat(32), &"22".repeat(32), 0, 20, true)
+            .unwrap()
+            .unwrap()
+            .state,
+        storage_sqlite::AttachmentTransferState::StorageBlocked
+    );
+    let now = crate::unix_now_seconds();
+    let free = fs4::available_space(dir.path()).unwrap();
+    assert_eq!(
+        store
+            .app_storage()
+            .readmit_storage_blocked_attachments(
+                now,
+                unavailable_reserve,
+                free,
+                true,
+                storage_sqlite::ReadmitAdmission::NONE,
+            )
+            .unwrap(),
+        0,
+        "still parked while the reserve stays out of reach"
+    );
+    assert_eq!(
+        store
+            .app_storage()
+            .readmit_storage_blocked_attachments(
+                now,
+                0,
+                free,
+                true,
+                storage_sqlite::ReadmitAdmission {
+                    checkpointed_at_least: 0,
+                    uncheckpointed: true,
+                },
+            )
+            .unwrap(),
+        1
+    );
+    let status = store
+        .app_storage()
+        .attachment_acquisition_status(&job.reference)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        status.state,
+        storage_sqlite::AttachmentAcquisitionState::Queued
+    );
+    let due = status.due.unwrap();
+    let next = store
+        .app_storage()
+        .claim_attachment_acquisition(&job.reference, due, due + 180)
+        .unwrap()
+        .unwrap();
+    let prepared = client
+        .prepare_background_attachment_download(&group, reference.clone(), 64 * 1024 * 1024)
+        .unwrap()
+        .unwrap();
+    let result = prepared
+        .run_classified(resume_context(&store, &next, dir.path(), &reference))
+        .await;
+    assert!(result.is_ok());
+    complete(&client, &next, result).unwrap();
+    assert_eq!(
+        store
+            .app_storage()
+            .attachment_acquisition_status(&next.reference)
+            .unwrap()
+            .unwrap()
+            .byte_count,
+        body.len() as u64
+    );
+    server.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attachment_missing_on_every_locator_fails_without_retry() {
+    let (first, mut reference, _) = listener_fixture(b"deleted from every server").await;
+    let second = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    reference.locators.push(crate::MediaLocator {
+        kind: "blossom-v1".into(),
+        value: format!(
+            "http://{}/{}.bin",
+            second.local_addr().unwrap(),
+            reference.ciphertext_sha256
+        ),
+    });
+    let servers = tokio::spawn(async move {
+        for (listener, status) in [(first, "404 Not Found"), (second, "410 Gone")] {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            headers(&mut socket).await;
+            respond(&mut socket, status, "", &[], 0).await;
+        }
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let (client, store) = client_at(dir.path(), &reference, true).await;
+    let job = claim(&store);
+    let prepared = client
+        .prepare_background_attachment_download(
+            &GroupId::new(vec![0xab; 16]),
+            reference.clone(),
+            64 * 1024 * 1024,
+        )
+        .unwrap()
+        .unwrap();
+    let result = prepared
+        .run_classified(resume_context(&store, &job, dir.path(), &reference))
+        .await;
+    assert!(matches!(&result, Err(AttachmentDownloadFailure::Stop(_))));
+    complete(&client, &job, result).unwrap();
+    let status = store
+        .app_storage()
+        .attachment_acquisition_status(&job.reference)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        status.state,
+        storage_sqlite::AttachmentAcquisitionState::Blocked
+    );
+    assert!(status.due.is_none());
+    let now = crate::unix_now_seconds();
+    assert_eq!(
+        store
+            .app_storage()
+            .attachment_transfer_status(GROUP, &"11".repeat(32), &"22".repeat(32), 0, now, true)
+            .unwrap()
+            .unwrap()
+            .state,
+        storage_sqlite::AttachmentTransferState::Failed
+    );
+    assert!(
+        store
+            .app_storage()
+            .explicitly_retry_attachment(&job.reference, now)
+            .unwrap()
+    );
+    servers.await.unwrap();
+}
+
+/// A tap during a held HTTP body preserves its owner and deadline after revoking
+/// automatic permission; completion consumes exactly the original response.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attachment_promoted_http_body_survives_automatic_revocation() {
+    for pause_first in [false, true] {
+        promoted_body_revocation_order(pause_first).await;
+    }
+}
+
+/// Exercise both serialized pause/promotion orders while one HTTP body is held.
+async fn promoted_body_revocation_order(pause_first: bool) {
+    let body = b"explicit retained streamed body";
+    let (mut reference, ciphertext) = crate::media::tests::attachment_worker_fixture(body);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    reference.locators = vec![crate::MediaLocator {
+        kind: "blossom-v1".into(),
+        value: format!(
+            "http://{}/{}",
+            listener.local_addr().unwrap(),
+            reference.ciphertext_sha256
+        ),
+    }];
+    let (started, start) = oneshot::channel();
+    let (release, released) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        headers(&mut socket).await;
+        socket
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    ciphertext.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        started.send(()).unwrap();
+        released.await.unwrap();
+        socket.write_all(&ciphertext).await.unwrap();
+        drop(socket);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err(),
+            "no duplicate HTTP body"
+        );
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let (mut client, store) = client_at(dir.path(), &reference, true).await;
+    client.app.config.attachment_acquisition_mode = crate::AttachmentAcquisitionMode::HostManaged;
+    let runtime = client.app.runtime();
+    let generation = runtime
+        .begin_attachment_permission_update("alice")
+        .await
+        .unwrap();
+    assert!(
+        runtime
+            .set_attachment_automatic_permission("alice", generation, all_attachment_permission())
+            .await
+            .unwrap()
+    );
+    let job = claim(&store);
+    let deadline = store
+        .app_storage()
+        .attachment_acquisition_status(&job.reference)
+        .unwrap()
+        .unwrap()
+        .due;
+    let mut resume = resume_context(&store, &job, dir.path(), &reference);
+    resume.permission = runtime.shared.attachment_permissions.lease(
+        &store.app_storage().attachment_store_identity().unwrap(),
+        &reference.media_type,
+    );
+    let (updates, mut progress) = tokio::sync::watch::channel(());
+    resume.updates = Some(updates);
+    let prepared = client
+        .prepare_background_attachment_download(
+            &GroupId::new(vec![0xab; 16]),
+            reference,
+            64 * 1024 * 1024,
+        )
+        .unwrap()
+        .unwrap();
+    let transfer = tokio::spawn(prepared.run_classified(resume));
+    start.await.unwrap();
+    // The body's restart checkpoint is the transfer's last durable write until
+    // the server sends bytes; storage changes before it would race it.
+    tokio::time::timeout(Duration::from_secs(5), progress.changed())
+        .await
+        .expect("transfer records its body restart")
+        .unwrap();
+    if pause_first {
+        // Freeze the durable pause before upgrading intent; the HTTP poll stays
+        // held so the test controls the storage race rather than timer ordering.
+        store
+            .app_storage()
+            .pause_automatic_attachments(crate::unix_now_seconds())
+            .unwrap();
+    }
+    assert!(
+        store
+            .app_storage()
+            .promote_attachment_demand(&job.reference, crate::unix_now_seconds())
+            .unwrap()
+    );
+    runtime
+        .begin_attachment_permission_update("alice")
+        .await
+        .unwrap();
+    release.send(()).unwrap();
+    let result = transfer.await.unwrap().unwrap();
+    assert_eq!(result.plaintext, body);
+    assert_eq!(
+        store
+            .app_storage()
+            .attachment_acquisition_status(&job.reference)
+            .unwrap()
+            .unwrap()
+            .due,
+        deadline
+    );
+    assert_eq!(
+        store
+            .app_storage()
+            .complete_attachment_acquisition(
+                &job,
+                &result.plaintext,
+                crate::unix_now_seconds(),
+                128 * 1024 * 1024
+            )
+            .unwrap(),
+        storage_sqlite::AttachmentPublishResult::Published
+    );
+    server.await.unwrap();
+}

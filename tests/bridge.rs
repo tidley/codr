@@ -5520,29 +5520,155 @@ async fn custom_question_text_uses_the_request_bound_form_api_once_without_promp
 
 #[tokio::test]
 async fn custom_question_answers_fail_closed_for_changed_requests_foreign_input_and_failed_saves() {
-    for scenario in [
-        "custom-disabled",
-        "changed-form",
-        "foreign",
-        "changed-session",
-        "stale-code",
-        "truncated",
-        "attachment",
-        "prepared-file",
-        "failed-save",
+    for choice in [false, true] {
+        for scenario in [
+            "custom-disabled",
+            "changed-form",
+            "changed-options",
+            "multiple",
+            "no-longer-blocked",
+            "foreign",
+            "changed-session",
+            "stale-code",
+            "truncated",
+            "attachment",
+            "prepared-file",
+            "failed-save",
+        ] {
+            if choice && matches!(scenario, "custom-disabled" | "prepared-file") {
+                // Both cases restrict custom text, not existing choice routing.
+                continue;
+            }
+            let root = tempfile::tempdir().unwrap();
+            let config = editable_config(root.path());
+            let form_path = custom_decision_export(&config.opencode_bin);
+            let mut blocked = agent();
+            blocked.agent_status = "blocked".into();
+            blocked.state_change_seq = 2;
+            let current = Arc::new(Mutex::new(blocked.clone()));
+            let calls = Arc::new(Mutex::new(vec![]));
+            let herdr = decision_herdr(
+                &config.herdr_socket,
+                current.clone(),
+                Arc::new(Mutex::new(String::new())),
+                calls.clone(),
+            )
+            .await;
+            let mut bridge = Bridge::open(config.clone()).unwrap();
+            let key = blocked.key();
+            bridge.state.mappings.insert(
+                key.clone(),
+                activity_mapping(blocked.clone(), &"bb".repeat(16)),
+            );
+            if scenario == "custom-disabled" {
+                let mut form: Value =
+                    serde_json::from_slice(&std::fs::read(&form_path).unwrap()).unwrap();
+                form["fields"][0]["custom"] = json!(false);
+                std::fs::write(&form_path, form.to_string()).unwrap();
+            }
+            bridge.reconcile(vec![blocked]).await.unwrap();
+            let mut event = inbound(HEX, "unsafe-custom");
+            let answer = if choice { "1" } else { "v6.6.6" };
+            event["message"]["text"] = json!(answer);
+            match scenario {
+                "changed-form" => {
+                    let mut form: Value =
+                        serde_json::from_slice(&std::fs::read(&form_path).unwrap()).unwrap();
+                    form["id"] = json!("frm_replaced");
+                    std::fs::write(&form_path, form.to_string()).unwrap();
+                }
+                "changed-options" | "multiple" => {
+                    let mut form: Value =
+                        serde_json::from_slice(&std::fs::read(&form_path).unwrap()).unwrap();
+                    if scenario == "multiple" {
+                        form["fields"][0]["type"] = json!("multiselect");
+                    } else {
+                        form["fields"][0]["options"][0] =
+                            json!({"value":"Different option","label":"Different option"});
+                    }
+                    std::fs::write(&form_path, form.to_string()).unwrap();
+                }
+                "no-longer-blocked" => current.lock().unwrap().agent_status = "working".into(),
+                "foreign" => event["message"]["sender"]["account_id_hex"] = json!("22".repeat(32)),
+                "changed-session" => {
+                    current
+                        .lock()
+                        .unwrap()
+                        .agent_session
+                        .as_mut()
+                        .unwrap()
+                        .value = "ses_replaced".into()
+                }
+                "stale-code" => event["message"]["text"] = json!(format!("qold001 {answer}")),
+                "truncated" => event["message"]["text_truncated"] = json!(true),
+                "attachment" => {
+                    event["message"]["attachments"] = json!([{"file_name":"version.txt"}])
+                }
+                "failed-save" => {
+                    std::fs::remove_file(&config.state_path).unwrap();
+                    std::fs::create_dir(&config.state_path).unwrap();
+                }
+                _ => {}
+            }
+            if scenario == "prepared-file" {
+                event["_codr_prepared_text"] = json!(answer);
+                bridge.state.media_pending.push(event);
+                let _ = bridge.process_media().await;
+                assert_eq!(
+                    bridge.state.media_pending.len(),
+                    1,
+                    "Prepared media is not a custom decision answer"
+                );
+            } else {
+                let _ = bridge.inbound(&event).await;
+            }
+            assert!(
+                !root.path().join("question-posts.jsonl").exists(),
+                "Unsafe native form submission: {scenario}"
+            );
+            if scenario == "failed-save" {
+                assert!(
+                    !bridge.state.mappings[&key]
+                        .decision
+                        .as_ref()
+                        .unwrap()
+                        .submitted
+                );
+            }
+            assert!(!calls.lock().unwrap().iter().any(|r| matches!(
+                r["method"].as_str(),
+                Some("agent.prompt" | "agent.send_keys")
+            )));
+            herdr.abort();
+        }
+    }
+}
+
+#[tokio::test]
+async fn native_question_choices_use_the_bound_form_without_terminal_keys() {
+    for (answer, expected, custom_allowed, lost_ack) in [
+        ("1", "I can check", true, false),
+        ("I can check", "I can check", true, false),
+        ("2", "Not sure", false, false),
+        ("Not sure", "Not sure", false, true),
     ] {
         let root = tempfile::tempdir().unwrap();
         let config = editable_config(root.path());
         let form_path = custom_decision_export(&config.opencode_bin);
+        let mut form: Value = serde_json::from_slice(&std::fs::read(&form_path).unwrap()).unwrap();
+        form["fields"][0]["custom"] = json!(custom_allowed);
+        std::fs::write(form_path, form.to_string()).unwrap();
+        if lost_ack {
+            std::fs::write(root.path().join("drop-question-ack"), "").unwrap();
+        }
         let mut blocked = agent();
         blocked.agent_status = "blocked".into();
         blocked.state_change_seq = 2;
-        let current = Arc::new(Mutex::new(blocked.clone()));
         let calls = Arc::new(Mutex::new(vec![]));
         let herdr = decision_herdr(
             &config.herdr_socket,
-            current.clone(),
-            Arc::new(Mutex::new(String::new())),
+            Arc::new(Mutex::new(blocked.clone())),
+            Arc::new(Mutex::new("A differently rendered native question".into())),
             calls.clone(),
         )
         .await;
@@ -5552,69 +5678,36 @@ async fn custom_question_answers_fail_closed_for_changed_requests_foreign_input_
             key.clone(),
             activity_mapping(blocked.clone(), &"bb".repeat(16)),
         );
-        if scenario == "custom-disabled" {
-            let mut form: Value =
-                serde_json::from_slice(&std::fs::read(&form_path).unwrap()).unwrap();
-            form["fields"][0]["custom"] = json!(false);
-            std::fs::write(&form_path, form.to_string()).unwrap();
-        }
-        bridge.reconcile(vec![blocked]).await.unwrap();
-        let mut event = inbound(HEX, "unsafe-custom");
-        event["message"]["text"] = json!("v6.6.6");
-        match scenario {
-            "changed-form" => {
-                let mut form: Value =
-                    serde_json::from_slice(&std::fs::read(&form_path).unwrap()).unwrap();
-                form["id"] = json!("frm_replaced");
-                std::fs::write(&form_path, form.to_string()).unwrap();
-            }
-            "foreign" => event["message"]["sender"]["account_id_hex"] = json!("22".repeat(32)),
-            "changed-session" => {
-                current
-                    .lock()
-                    .unwrap()
-                    .agent_session
-                    .as_mut()
-                    .unwrap()
-                    .value = "ses_replaced".into()
-            }
-            "stale-code" => event["message"]["text"] = json!("qold001 v6.6.6"),
-            "truncated" => event["message"]["text_truncated"] = json!(true),
-            "attachment" => event["message"]["attachments"] = json!([{"file_name":"version.txt"}]),
-            "failed-save" => {
-                std::fs::remove_file(&config.state_path).unwrap();
-                std::fs::create_dir(&config.state_path).unwrap();
-            }
-            _ => {}
-        }
-        if scenario == "prepared-file" {
-            event["_codr_prepared_text"] = json!("v6.6.6");
-            bridge.state.media_pending.push(event);
-            let _ = bridge.process_media().await;
-            assert_eq!(
-                bridge.state.media_pending.len(),
-                1,
-                "Prepared media is not a custom decision answer"
-            );
-        } else {
-            let _ = bridge.inbound(&event).await;
-        }
+        bridge.reconcile(vec![blocked.clone()]).await.unwrap();
+        let mut event = inbound(HEX, "native-choice");
+        event["message"]["text"] = json!(answer);
+        bridge.inbound(&event).await.unwrap();
         assert!(
-            !root.path().join("question-posts.jsonl").exists(),
-            "Unsafe native form submission: {scenario}"
+            bridge.state.mappings[&key]
+                .decision
+                .as_ref()
+                .unwrap()
+                .submitted
         );
-        if scenario == "failed-save" {
-            assert!(
-                !bridge.state.mappings[&key]
-                    .decision
-                    .as_ref()
-                    .unwrap()
-                    .submitted
-            );
-        }
+        bridge.inbound(&event).await.unwrap();
+        drop(bridge);
+        let mut bridge = Bridge::open(config).unwrap();
+        bridge.agents.insert(key.clone(), blocked);
+        bridge.herdr_available = true;
+        event["message"]["message_id_hex"] = json!("same-choice-again");
+        bridge.inbound(&event).await.unwrap();
+        let posts: Vec<Value> = std::fs::read_to_string(root.path().join("question-posts.jsonl"))
+            .expect("Native choices must use the form API")
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0]["path"], "/api/session/ses_1/form/frm_amber/reply");
+        assert_eq!(posts[0]["body"], json!({"answer":{"q0":expected}}));
+        assert!(bridge.state.mappings[&key].prompt_queue.is_empty());
         assert!(!calls.lock().unwrap().iter().any(|r| matches!(
             r["method"].as_str(),
-            Some("agent.prompt" | "agent.send_keys")
+            Some("agent.prompt" | "agent.send_keys" | "agent.read")
         )));
         herdr.abort();
     }
@@ -8347,7 +8440,7 @@ async fn ended_groups_do_not_route_to_a_replacement_agent() {
 }
 
 #[tokio::test]
-async fn session_change_on_an_established_terminal_pauses_before_creating_a_group() {
+async fn session_change_on_an_established_terminal_creates_a_separate_chat_without_moving_work() {
     let dir = tempfile::tempdir().unwrap();
     let config = config(dir.path());
     export_script(&config.opencode_bin, "old", "old");
@@ -8357,14 +8450,18 @@ async fn session_change_on_an_established_terminal_pauses_before_creating_a_grou
     let mut replacement = original.clone();
     replacement.agent_session.as_mut().unwrap().value = "ses_replacement".into();
     let mut bridge = Bridge::open(config.clone()).unwrap();
-    let mut mapping = activity_mapping(original.clone(), &"bb".repeat(16));
+    // The connector fixture creates "bb"; seed a distinct original group.
+    let mut mapping = activity_mapping(original.clone(), &"cc".repeat(16));
     mapping.pending_prompt = true;
     mapping.final_ids.push("old".into());
+    mapping
+        .seen_messages
+        .push("original-delivery-receipt".into());
     mapping
         .prompt_queue
         .push(herdr_white_noise_bridge::state::QueuedPrompt {
             id: "accepted-original-delivery".into(),
-            group: "bb".repeat(16),
+            group: "cc".repeat(16),
             text: "Accepted work for the original session only".into(),
             media: None,
         });
@@ -8376,47 +8473,82 @@ async fn session_change_on_an_established_terminal_pauses_before_creating_a_grou
     let flight = mapping.queue_flight.clone();
     bridge.state.mappings.insert(original.key(), mapping);
     bridge.reconcile(vec![replacement.clone()]).await.unwrap();
-    assert!(calls.lock().unwrap().iter().all(|call| {
-        call["type"] != "group_create_with_admins" && call["type"] != "group_create_capabilities"
-    }));
-    assert!(!bridge.agents.contains_key(&replacement.key()));
-    assert!(bridge.state.mappings[&original.key()].active);
-    let paused = &bridge.state.mappings[&replacement.key()];
-    assert!(paused.group_id_hex.is_none());
-    assert_eq!(
-        serde_json::to_value(paused).unwrap()["session_change_from"],
-        original.key()
+    assert!(bridge.agents.contains_key(&replacement.key()));
+    let new_group = bridge.state.mappings[&replacement.key()]
+        .group_id_hex
+        .clone()
+        .unwrap();
+    assert_ne!(new_group, "cc".repeat(16));
+    assert!(
+        bridge.state.mappings[&replacement.key()]
+            .session_change_from
+            .is_none()
     );
+    assert!(
+        bridge.state.mappings[&replacement.key()]
+            .prompt_queue
+            .is_empty()
+    );
+    assert!(
+        bridge.state.mappings[&replacement.key()]
+            .queue_flight
+            .is_none()
+    );
+    assert!(
+        !bridge.state.mappings[&replacement.key()]
+            .seen_messages
+            .contains(&"original-delivery-receipt".into())
+    );
+    assert!(!bridge.state.mappings[&original.key()].active);
     bridge.save().unwrap();
     drop(bridge);
     let mut bridge = Bridge::open(config).unwrap();
-    bridge.reconcile(vec![replacement]).await.unwrap();
-    assert!(
+    bridge.reconcile(vec![replacement.clone()]).await.unwrap();
+    assert_eq!(
+        bridge.state.mappings[&replacement.key()]
+            .group_id_hex
+            .as_deref(),
+        Some(new_group.as_str())
+    );
+    assert_eq!(
         calls
             .lock()
             .unwrap()
             .iter()
-            .all(|call| call["type"] != "group_create_with_admins")
+            .filter(|call| call["type"] == "group_create_with_admins")
+            .count(),
+        1
     );
     let mut text = inbound(HEX, "paused-phone-prompt");
+    text["group_id_hex"] = json!("cc".repeat(16));
     text["message"]["text"] = json!("Do not send this to the replacement");
-    assert!(bridge.inbound(&text).await.is_err());
-    assert!(bridge.state.mappings[&original.key()].pending_prompt);
+    bridge.inbound(&text).await.unwrap();
+    assert!(
+        bridge
+            .state
+            .outbox
+            .iter()
+            .any(|m| m.text.contains("No prompt was sent"))
+    );
     assert_eq!(
         bridge.state.mappings[&original.key()].prompt_queue,
         accepted
     );
     assert_eq!(bridge.state.mappings[&original.key()].queue_flight, flight);
     assert!(
-        !bridge.state.mappings[&original.key()]
+        bridge.state.mappings[&original.key()]
             .seen_messages
-            .contains(&"paused-phone-prompt".into())
+            .contains(&"original-delivery-receipt".into())
     );
     bridge.reconcile(vec![original.clone()]).await.unwrap();
     assert!(bridge.agents.contains_key(&original.key()));
     assert_eq!(
         bridge.state.mappings[&original.key()].group_id_hex,
-        Some("bb".repeat(16))
+        Some("cc".repeat(16))
+    );
+    assert_eq!(
+        bridge.state.mappings[&replacement.key()].group_id_hex,
+        Some(new_group)
     );
     server.abort();
 }
@@ -8456,6 +8588,63 @@ async fn session_change_guard_allows_an_intentional_new_terminal() {
             .any(|call| call["type"] == "group_create_with_admins")
     );
     server.abort();
+}
+
+#[tokio::test]
+async fn session_change_creates_a_chat_while_muted_but_not_without_a_native_identity() {
+    for verified in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config(dir.path());
+        export_script(&config.opencode_bin, "old", "old");
+        herdr_white_noise_bridge::forwarding::set(&config.state_path, false).unwrap();
+        let calls = Arc::new(Mutex::new(vec![]));
+        let server = peer(&config.wn_agent_socket, true, calls.clone()).await;
+        let original = agent();
+        let mut replacement = original.clone();
+        replacement.tab_label = Some("new-task".into());
+        replacement.workspace_label = Some("work".into());
+        if verified {
+            replacement.agent_session.as_mut().unwrap().value = "ses_new".into();
+        } else {
+            replacement.agent_session = None;
+            replacement.agent_status = "unknown".into();
+        }
+        let mut bridge = Bridge::open(config).unwrap();
+        bridge.state.mappings.insert(
+            original.key(),
+            activity_mapping(original.clone(), &"cc".repeat(16)),
+        );
+        bridge.reconcile(vec![replacement.clone()]).await.unwrap();
+        assert!(!bridge.state.forwarding_enabled);
+        assert_eq!(
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r["type"] == "group_create_with_admins")
+                .count(),
+            usize::from(verified)
+        );
+        if verified {
+            assert_eq!(
+                bridge.state.mappings[&replacement.key()]
+                    .group_name
+                    .as_deref(),
+                Some("new-task (work)")
+            );
+            assert!(!bridge.state.mappings[&original.key()].active);
+        } else {
+            assert!(!bridge.state.mappings.contains_key(&replacement.key()));
+            assert!(bridge.state.mappings[&original.key()].active);
+        }
+        assert_eq!(
+            bridge.state.mappings[&original.key()]
+                .group_id_hex
+                .as_deref(),
+            Some("cccccccccccccccccccccccccccccccc")
+        );
+        server.abort();
+    }
 }
 
 #[tokio::test]
@@ -8507,6 +8696,15 @@ async fn session_change_confirmation_rechecks_live_identity_and_seeds_history() 
     let mut mapping = activity_mapping(original.clone(), &"bb".repeat(16));
     mapping.final_ids.push("prior-replacement-final".into());
     bridge.state.mappings.insert(original.key(), mapping);
+    // Old saved holds remain explicit approvals; new discoveries no longer make holds.
+    bridge.state.mappings.insert(
+        replacement.key(),
+        Mapping {
+            agent_record: Some(replacement.clone()),
+            session_change_from: Some(original.key()),
+            ..Mapping::default()
+        },
+    );
     bridge.reconcile(vec![replacement.clone()]).await.unwrap();
     // Restoring the original before confirmation must reject the stale candidate.
     let native = peer_for_agent(

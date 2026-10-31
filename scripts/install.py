@@ -150,12 +150,19 @@ def main():
         asset = f"codr-v{release}-{platform_name()}.tar.gz"
         url = f"https://github.com/tidley/codr/releases/download/v{release}/{asset}"
         destination = Path.home() / ".local/bin/herdr-white-noise-bridge"
-        connector = install_connector(release)
+        combined = tuple(map(int, release.split("."))) >= (0, 10, 0)
+        connector = None if combined else install_connector(release)
         install_bundle(url, "herdr-white-noise-bridge", destination)
         print(f"Installed codr {release}: {destination}")
-        print(f"Dedicated connector: {connector}")
-        print("Next: run the plugin's Setup action, or follow docs/INSTALL.md for non-interactive setup.")
-        print("For an existing installation, run Setup to select the matching connector and preserve account state.")
+        if connector:
+            print(f"Dedicated connector: {connector}")
+            print("Next: run the plugin's Setup action, or follow docs/INSTALL.md for non-interactive setup.")
+            print("For an existing installation, run Setup to select the matching connector and preserve account state.")
+        else:
+            print("One executable contains the bridge and MDK messaging runtime.")
+            print("Existing accounts require the explicit stopped-backup combined-service handover; installation does not migrate services.")
+            print("Next: follow docs/COMBINED.md for the approved local handover, not the legacy Setup action.")
+            print("Fresh accounts require 0.9 setup before handover. Do not start the combined runtime on unapproved storage.")
     except (InstallError, OSError, tarfile.TarError) as error:
         print(f"codr install: {error}", file=sys.stderr)
         return 1

@@ -17,7 +17,8 @@ The bridge uses one dedicated MDK identity across all mapped groups. Setup keeps
 - `/status` reports the mapped session state.
 - `unmute` or `/unmute` resumes forwarding for all chats without sending a prompt or answering an agent question.
 - Ended sessions retain their group. A restored native session reuses its group.
-- A previously unseen native session on a terminal with a retained chat pauses that connection before creating another group. The original chat, history and accepted deliveries are retained. Local `status` shows the candidate's `session_change_from`; returning to the original native session reconnects its existing chat. Confirmed `/new` and `/agent` launches in new terminals are unchanged.
+- Each newly discovered native session gets its own chat automatically, including on a reused terminal. The original chat, history, receipts and queued work stay bound to the original session. Restoring a known native session reconnects its existing chat. Missing or duplicate identities still prevent discovery. Group names follow tab and workspace labels, not an agent's optional nickname.
+- A plain SSH shell does not register the remote agent with local Herdr. If SSH replaces an agent in its pane, the original chat loses its local agent connection even when a remote agent UI remains visible. Codr does not guess the remote identity, forward local session hooks over SSH, or start another agent automatically in an occupied pane. Keep the local controller and interactive SSH terminal in separate panes. Restoring the exact original native session reconnects its existing chat without changing its history or delivery records. A different remote native session must not silently inherit that chat.
 - Images and audio use the media route below. Other attachment types and arbitrary terminal key commands are not supported.
 - Other detected agent backends get groups, prompts, and state notices. Structured final-reply extraction supports **OpenCode, Codex, and Claude Code**.
 
@@ -207,7 +208,7 @@ Recognition ignores capitalization and surrounding whitespace for standalone con
 
 ### Confirmed updates from ngit
 
-Send `/update` as standalone owner text. A background, read-only check selects
+Send `/update` as standalone owner text. In combined mode a background, read-only check selects
 the newest stable numeric codr release published by the pinned maintainer:
 `npub19at4nqjjymca2lh3v546vcg5ktun3al4c5xu2pts3ewckv0y70ys0gupzr`.
 It uses the existing ngit repository and the author's `codr` application records.
@@ -215,11 +216,22 @@ The host needs ngit v3 and Git in its service PATH. No Nostr signing credentials
 or GitHub access are needed for this command. Release signatures are checked by
 ngit; the updater also checks the pinned author/application and asset metadata.
 
-The offer displays the running and available versions. Reply with the exact
-`/update confirm CODE` shown in that chat within ten minutes, or `/update cancel`.
+In 0.10, the offer displays the running and available versions. Reply with
+`/update confirm` within ten minutes, with no code, or `/update cancel`.
+The confirmation's transport timestamp must be newer than the offer and not
+implausibly future-dated. Missing/stale timestamps refuse installation. A
+confirmation from a previously replaced offer cannot use its old transport time.
+Released 0.9 workers still require the confirmation code shown by that version.
+Their first 0.10 update keeps messaging external. In a 0.10 external worker,
+`/update` instead offers a local cold-backup/service handover of the already
+installed executable. Confirm it separately with `/update confirm`. Standard
+managed installations do not need terminal commands for this second step.
 There is no installation from plain numbers, another chat, attachment captions,
 voice transcripts, or another participant. Confirmation and the selected release
-event/hashes survive restarts. Equal/older versions are never installed. A new
+event/hashes survive restarts. Equal/older executables are never installed.
+The local same-version service handover is a distinct action with no release or
+download. It retains the old worker service name for legacy startup hooks, and
+sets `CODR_SERVICE_NAME` for future updates of that same combined service. A new
 check replaces that chat's previous offer. A restart during the read-only check
 may require another `/update`; it never starts an installation by itself.
 
@@ -232,18 +244,27 @@ uses the existing installer. Missing, incomplete or conflicting records leave
 the running executable unchanged.
 
 Only the standard `~/.local/bin/herdr-white-noise-bridge` installation supervised
-by codr's existing per-user service is supported. The candidate must expose
-`update-info`, match the confirmed version and current connector pin/patch,
-protocol and state cohort, and read the existing configuration/state successfully.
-A different connector/storage cohort is refused; use local setup and its backup
-and migration approval gates instead. Neither the connector nor herdr's coding
-sessions are restarted, and no accepted work is cleared or automatically replayed.
+by a verified per-user service is supported. The candidate must expose
+`update-info --full`, match the confirmed version, protocol and state/storage cohort,
+and read the existing configuration/state successfully. External-connector mode
+still requires the exact connector pin/patch. Combined mode updates implementation
+revisions within the explicitly declared cohort and restarts the same verified
+service with the verified messaging home. Chat handovers retain
+`herdr-white-noise-bridge`; manual combined setup can use `codr`.
+It replaces bridge and messaging code
+together. The supported external-to-combined layout conversion has its own
+explicit chat confirmation and private cold backup. Other layout/cohort changes
+require local setup and its backup/migration approval gates. Herdr's coding sessions are not restarted and accepted work is
+not cleared or automatically replayed.
 
 The updater keeps the old executable and a stopped, private state backup under
 the routing state's `.updates` directory. It replaces the executable atomically,
-starts the bridge, and requires a version/job/PID-bound startup receipt. Failed
-startup restores the old executable and verifies its restart. **Rollback never
-restores an older routing state**, which could lose receipts or repeat work.
+starts the same service, and requires a version/job/PID-bound startup receipt.
+In combined mode, the existing local messaging account must also respond before
+that receipt is written. A slow first launch has a bounded 120-second window.
+Failed startup restores the old executable and verifies its restart. **Rollback never
+restores an older routing or MLS account state**, which could lose receipts,
+repeat work or discard newer messaging traffic.
 If rollback cannot confirm startup, local intervention is required.
 
 One installation may be pending globally. `/update cancel` cannot interrupt an
@@ -291,9 +312,9 @@ When OpenCode asks one single-choice question, **codr** sends a clean question c
 
 Decision cards and answers do not require editable progress.
 
-OpenCode V2 exports omit running questions. The bridge reads V2's live session forms through `opencode api` instead, using the CLI's existing service discovery and authentication. It still checks the exact visible question before submitting a choice. Completed forms disappear from this read and cannot be replayed as pending questions.
+OpenCode V2 exports omit running questions. The bridge reads live session forms through the configured reader. For a question with a native form ID, numbered and labelled choices use the authenticated form reply API, as custom answers do. The bridge sends the selected option value, not the number as custom text. No terminal screen match or keystrokes are needed. Completed forms disappear from this read and cannot be replayed as pending questions.
 
-The bridge checks the session, pending tool request, and visible question before sending the native number shortcut. If a question was not answered through **codr** and is replaced, the new card requires its short code, for example `qabc123 1`. Duplicate deliveries and uncertain submissions are not sent again automatically.
+The bridge checks the session and exact pending question before a reply. Legacy questions without a native form ID also need an exact visible-question check before a terminal number shortcut. If an unanswered question is replaced, the new card requires its short code, for example `qabc123 1`. Duplicate deliveries and uncertain submissions are not sent again automatically.
 
 For supported OpenCode V2 questions that allow custom input, type a complete text answer directly, such as `v6.6.6`, or use `/answer TEXT`. The bridge sends it to the freshly checked native form through the authenticated API, not as a prompt or arbitrary terminal keys. A combined reply such as `1 v6.6.6` remains literal custom text. If the question changed, prefix the text with its current question code. Custom replies are limited to 4000 UTF-8 bytes; an answer beginning with `/` must use `/answer TEXT` so commands keep their meaning. Prepared media is not automatically submitted as custom text. Submission intent is saved before the API call, and an uncertain outcome is never automatically retried.
 
@@ -501,7 +522,7 @@ State and the pending outbox use owner-only files. Keep them on persistent stora
 
 If histories appear empty and identically named invitations arrive, stop only the bridge worker and back up its current state before changing anything. Compare native session IDs, not chat names. Reattach the original OpenCode session in its Herdr pane; its retained group mapping reconnects without a new invitation. Keep replacement sessions and groups separate. Do not restore an older whole-state file, merge histories, reset an account, or migrate connector storage as a repair.
 
-An unexpected new identity on an established terminal now requires local approval. Inspect both sessions and the `session_change_from` entry in `status`. To deliberately accept the candidate, stop only the worker and run:
+New native identities no longer need an approval just because their terminal was reused. A saved `session_change_from` hold from an older worker still needs explicit approval. Inspect both sessions and the entry in `status`. To accept that legacy candidate, stop only the worker and run:
 
 ```sh
 ~/.local/bin/herdr-white-noise-bridge confirm-session-change 'CANDIDATE_SESSION_KEY_FROM_STATUS'
@@ -630,9 +651,26 @@ The bridge does not start, stop, replace, or write the server registration. Fail
 reads retry through the normal bridge poll loop, without a CLI fallback. Start or
 recover the service through its normal owner when necessary.
 
-The reader checks a bounded durable log watermark. Unchanged history is reused;
-changed history is rebuilt from an export. Pending forms and permissions are read
-separately on each snapshot because they need not share that durable log. Cursor
+The reader checks a bounded durable log watermark. Unchanged history is reused.
+On a change, a bounded log delta must contain consecutive, session-owned events
+with supported types and versions before any cached prefix can be reused. The
+reader fetches newest-first in 100-message API pages, back to an unchanged cached
+message before all affected or unfinished messages. It compares the boundary's
+projected contents, not just its ID, and refreshes the entire suffix. A watermark
+check rejects a race during that read without advancing the cache.
+
+Gapped or oversized logs, unknown event types or versions, history rewrites,
+missing or regressed watermarks, and a cold cache select the full ascending
+paginated read. A missing or changed boundary causes the descending read to
+continue through the whole timeline. Servers that expose only a watermark across
+a nonempty log range cannot safely use the incremental path.
+
+All conversational messages and input identities are retained, not just a recent window.
+Unused tool output and reasoning are discarded without changing task-part
+positions. Each HTTP page and the retained projection have a 128 MiB limit.
+Invalid or repeated cursors and duplicate message identities fail closed.
+Pending forms and permissions are read separately on each snapshot because
+they need not share that durable log. Cursor
 and snapshot updates are committed only after all reads succeed. Cache state is
 memory-only; restarting the bridge rebuilds it without changing delivery keys.
 `opencode_service_file` takes precedence over the optional legacy `opencode_db`.

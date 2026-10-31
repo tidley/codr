@@ -25,6 +25,7 @@ pub struct Bridge {
     pub herdr_available: bool,
     /// Set by the executable for managed worker updates; no installer path is inferred.
     pub update_config_path: Option<std::path::PathBuf>,
+    pub update_messaging_home: Option<std::path::PathBuf>,
     pub(crate) update_check: Option<crate::update::Check>,
     phone: String,
     media_job: Option<tokio::task::JoinHandle<Result<crate::media::Prepared>>>,
@@ -71,6 +72,7 @@ impl Bridge {
             agents: BTreeMap::new(),
             herdr_available: false,
             update_config_path: None,
+            update_messaging_home: None,
             update_check: None,
             phone,
             media_job: None,
@@ -692,35 +694,8 @@ impl Bridge {
                 agent.agent_status = "unknown".into();
             }
             let key = agent.key();
-            if !self.state.mappings.contains_key(&key)
-                && let Some(previous) = self.state.mappings.iter().find_map(|(key, mapping)| {
-                    (mapping.group_id_hex.is_some()
-                        && !agent.terminal_id.is_empty()
-                        && mapping
-                            .agent_record
-                            .as_ref()
-                            .is_some_and(|old| old.terminal_id == agent.terminal_id))
-                    .then(|| key.clone())
-                })
-            {
-                self.state.mappings.insert(
-                    key.clone(),
-                    Mapping {
-                        agent_record: Some(agent.clone()),
-                        session_change_from: Some(previous.clone()),
-                        last_agent_status: "session_changed".into(),
-                        ..Mapping::default()
-                    },
-                );
-                let group = self.state.mappings[&previous].group_id_hex.clone().unwrap();
-                self.state.enqueue_manual(
-                    &group,
-                    "Session changed unexpectedly. This connection is paused; no replacement chat was created. Restore the original native session, or inspect local status and use confirm-session-change to approve the exact new session. No prompt was sent.",
-                    &format!("session-change:{key}"),
-                );
-                // Persist the hold before any transcript, group creation, or input I/O.
-                self.save()?;
-            }
+            // New native identities get separate groups, even on reused terminals.
+            // Keep old saved holds explicit; never repurpose their previous groups.
             if self
                 .state
                 .mappings
@@ -2027,7 +2002,16 @@ impl Bridge {
                 .next()
                 .is_some_and(|command| command.eq_ignore_ascii_case("/update"))
         {
-            return crate::update::handle(self, &key, group, id, text, plain_command).await;
+            return crate::update::handle(
+                self,
+                &key,
+                group,
+                id,
+                text,
+                plain_command,
+                msg["recorded_at"].as_u64(),
+            )
+            .await;
         }
         if !prepared
             && !queued
@@ -3044,7 +3028,7 @@ impl Bridge {
             Err(_) if !custom_text => return Ok(false),
             Err(error) => return self.decision_notice(key, group, id, &error.to_string()),
         };
-        if let output::decision::Answer::Choice(_) = &answer {
+        if matches!(&answer, output::decision::Answer::Choice(_)) && decision.form_id.is_none() {
             let visible = self.herdr.herdr("agent.read", json!({"target":agent.pane_id,"source":"visible","format":"text","lines":300,"strip_ansi":true})).await?;
             let matches = visible["result"]["read"]["truncated"] != true
                 && visible["result"]["read"]["text"]
@@ -3071,25 +3055,29 @@ impl Bridge {
             self.state = before;
             return Err(error);
         }
-        let result = match &answer {
-            output::decision::Answer::Choice(choice) => {
-                herdr::choose(&self.herdr, agent, *choice).await
-            }
-            output::decision::Answer::Custom(text) => {
-                let path = format!(
-                    "/api/session/{}/form/{}/reply",
-                    session.value,
-                    decision.form_id.as_ref().unwrap()
-                );
-                crate::catalogue::api(
-                    &self.config,
-                    "post",
-                    &path,
-                    Some(&json!({"answer":{"q0":text}})),
-                )
-                .await
-                .map(|_| ())
-            }
+        let result = if let Some(form) = &decision.form_id {
+            // V2 form option values equal their labels, as checked by from_forms.
+            // Bind both choices and custom text to the verified request, not its UI.
+            let value = match &answer {
+                output::decision::Answer::Choice(choice) => {
+                    &decision.questions[0].options[choice - 1].label
+                }
+                output::decision::Answer::Custom(text) => text,
+            };
+            let path = format!("/api/session/{}/form/{form}/reply", session.value);
+            crate::catalogue::api(
+                &self.config,
+                "post",
+                &path,
+                Some(&json!({"answer":{"q0":value}})),
+            )
+            .await
+            .map(|_| ())
+        } else {
+            let output::decision::Answer::Choice(choice) = &answer else {
+                unreachable!("Custom answers require a native form");
+            };
+            herdr::choose(&self.herdr, agent, *choice).await
         };
         match result {
             Ok(()) => {
@@ -3392,7 +3380,9 @@ impl Bridge {
         } else {
             None
         };
-        crate::update::ready(self)?;
+        if self.update_messaging_home.is_none() {
+            crate::update::ready(self)?;
+        }
         self.reads.background = true;
         let reads_ready = self.reads.notify.clone();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Value>(256);
@@ -3449,6 +3439,11 @@ impl Bridge {
             }
             if recovery_due && self.herdr_available {
                 recovery_due = self.recover_inbound().await.is_err();
+            }
+            if self.update_messaging_home.is_some() && self.state.update_job.is_some() {
+                // Failed messaging startup leaves desktop reads available, but
+                // cannot acknowledge a healthy combined installation.
+                let _ = crate::update::ready_when_healthy(self).await;
             }
             if crate::update::poll(self).await.is_err() {
                 eprintln_throttled!(

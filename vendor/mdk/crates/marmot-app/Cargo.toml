@@ -1,0 +1,99 @@
+[package]
+name = "marmot-app"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+product-analytics-export = []
+# Test-only convergence timing/rewind overrides. Never enable in app artifacts.
+test-policy-overrides = [
+    "cgka-engine/test-policy-overrides",
+    "cgka-session/test-policy-overrides",
+]
+# Opt-in relay-telemetry OTLP exporter wire encoding and HTTP push. The
+# privacy-critical mapping and opt-in gate stay in the default build; this
+# feature only adds the OTLP protobuf dependencies and the push transport.
+otlp-export = ["dep:opentelemetry-proto", "dep:prost"]
+# Internal-only surface used by the repeatable media transport benchmark.
+media-benchmarks = []
+
+[dependencies]
+async-trait.workspace = true
+base64.workspace = true
+chrono.workspace = true
+cgka-engine.workspace = true
+cgka-session.workspace = true
+cgka-traits.workspace = true
+chacha20poly1305.workspace = true
+bytes.workspace = true
+fs-private.workspace = true
+fs4.workspace = true
+futures.workspace = true
+hex.workspace = true
+httpdate.workspace = true
+hkdf.workspace = true
+image.workspace = true
+jsonschema.workspace = true
+marmot-account.workspace = true
+marmot-forensics.workspace = true
+marmot-markdown.workspace = true
+nostr-directory.workspace = true
+nostr = { workspace = true, features = ["nip04"] }
+nostr-sdk.workspace = true
+openssl.workspace = true
+opentelemetry-proto = { workspace = true, optional = true }
+prost = { workspace = true, optional = true }
+psl.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+rusqlite.workspace = true
+secp256k1 = "0.30"
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+media-store.workspace = true
+storage-sqlite.workspace = true
+thiserror.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["fs", "net", "io-util"] }
+tokio-util.workspace = true
+tracing.workspace = true
+transport-nostr.workspace = true
+transport-nostr-adapter = { workspace = true, features = ["sdk"] }
+transport-nostr-peeler.workspace = true
+transport-quic-broker.workspace = true
+agent-stream-compose.workspace = true
+transport-quic-stream.workspace = true
+url.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+transport-nostr = { workspace = true, features = ["test-support"] }
+criterion.workspace = true
+media-store = { workspace = true, features = ["catalog-conformance", "test-support"] }
+nostr-directory = { workspace = true, features = ["test-support"] }
+storage-sqlite = { workspace = true, features = ["test-support"] }
+tokio-tungstenite.workspace = true
+keyring-core.workspace = true
+marmot-forensics.workspace = true
+nostr-relay-builder.workspace = true
+openmls.workspace = true
+openmls_basic_credential.workspace = true
+openmls_rust_crypto.workspace = true
+parking_lot = "0.12"
+tls_codec.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+
+[[bench]]
+name = "media_download_backlog"
+harness = false
+required-features = ["media-benchmarks"]
+
+[[bench]]
+name = "android_media_download"
+harness = false
+required-features = ["media-benchmarks"]

@@ -1,0 +1,191 @@
+//! Connector error type and its privacy-safe code/message projections.
+
+use agent_control::AgentControlError;
+use cgka_traits::error::EngineError;
+use marmot_account::AccountHomeError;
+use marmot_app::{AppError, DirectoryError};
+
+#[derive(Debug, thiserror::Error)]
+pub enum ConnectorError {
+    #[error(transparent)]
+    AccountHome(#[from] AccountHomeError),
+    #[error(transparent)]
+    App(#[from] AppError),
+    #[error(transparent)]
+    Control(#[from] AgentControlError),
+    #[error(transparent)]
+    Hex(#[from] hex::FromHexError),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error("control socket path exceeds platform byte limit; shorten --home or --socket")]
+    SocketPathTooLong,
+    #[error("debug controls are disabled")]
+    DebugControlsDisabled,
+    #[error("agent control request is unauthorized")]
+    Unauthorized,
+    #[error("unsafe agent control plane configuration: {0}")]
+    UnsafeControlPlaneConfig(&'static str),
+    #[error("agent stream error: {0}")]
+    Stream(String),
+    #[error("invalid group create request: {0}")]
+    InvalidGroupCreate(&'static str),
+    #[error("invalid profile name: {0}")]
+    InvalidProfileName(&'static str),
+    #[error("invalid profile {0}: {1}")]
+    InvalidProfileField(&'static str, &'static str),
+    #[error("invalid relay URL: {0}")]
+    InvalidRelayUrl(&'static str),
+    #[error("invalid relay list edit: {0}")]
+    InvalidRelayListEdit(&'static str),
+    #[error("the published relay list could not be confirmed: {0}")]
+    RelayListInconclusive(&'static str),
+    #[error("connector operation timed out: {0}")]
+    OperationTimedOut(&'static str),
+    #[error("matching send is still in progress")]
+    SendInProgress,
+    #[error("outbound media path denied: {0}")]
+    MediaPathDenied(&'static str),
+    #[error("outbound media exceeds connector limits: {0}")]
+    MediaLimitsExceeded(&'static str),
+    #[error("stream id is already reserved")]
+    StreamIdInUse,
+    #[error("stream capability denied")]
+    StreamCapabilityDenied,
+    #[error("stream begin request id is invalid")]
+    InvalidStreamBeginRequestId,
+    #[error("stream begin request id was reused with different inputs")]
+    StreamBeginRequestConflict,
+    #[error("stream preview idempotency key was reused with different inputs")]
+    StreamPreviewIdempotencyConflict,
+}
+
+/// Directory failures take the `AppError` codes they convert to.
+impl From<DirectoryError> for ConnectorError {
+    fn from(error: DirectoryError) -> Self {
+        Self::App(error.into())
+    }
+}
+
+impl ConnectorError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::AccountHome(_) => "account_home_error",
+            Self::App(AppError::ReactionNotFound) => "reaction_not_found",
+            Self::App(AppError::MediaUploadTimedOut) => "media_upload_timeout",
+            Self::App(AppError::AgentStreamPublisher(_)) => "stream_error",
+            Self::App(AppError::AgentStreamFinishMismatch) => "stream_finalize_mismatch",
+            Self::App(AppError::AgentStreamSendFailed(_)) => "stream_send_failed",
+            Self::App(AppError::InvalidGroupProfile(_)) => "invalid_group_profile",
+            Self::App(AppError::InvalidEditTarget) => "invalid_edit_target",
+            Self::App(error)
+                if matches!(
+                    error.as_engine_error(),
+                    Some(EngineError::NotGroupAdmin { .. })
+                ) =>
+            {
+                "not_group_admin"
+            }
+            Self::App(_) => "app_error",
+            Self::Control(_) => "control_error",
+            Self::Hex(_) => "invalid_hex",
+            Self::Json(_) => "json_error",
+            Self::Io(_) => "io_error",
+            Self::SocketPathTooLong => "socket_path_too_long",
+            Self::DebugControlsDisabled => "debug_controls_disabled",
+            Self::Unauthorized => "unauthorized",
+            Self::UnsafeControlPlaneConfig(_) => "unsafe_control_plane_config",
+            Self::Stream(_) => "stream_error",
+            Self::InvalidGroupCreate(_) => "invalid_group_create",
+            Self::InvalidProfileName(_) => "invalid_profile_name",
+            Self::InvalidProfileField(_, _) => "invalid_profile_field",
+            Self::InvalidRelayUrl(_) => "invalid_relay_url",
+            Self::InvalidRelayListEdit(_) => "invalid_relay_list_edit",
+            Self::RelayListInconclusive(_) => "relay_list_inconclusive",
+            Self::OperationTimedOut(_) => "operation_timed_out",
+            Self::SendInProgress => "send_in_progress",
+            Self::MediaPathDenied(_) => "media_path_denied",
+            Self::MediaLimitsExceeded(_) => "media_limits_exceeded",
+            Self::StreamIdInUse => "stream_id_in_use",
+            Self::StreamCapabilityDenied => "stream_capability_denied",
+            Self::InvalidStreamBeginRequestId => "invalid_stream_begin_request_id",
+            Self::StreamBeginRequestConflict => "stream_begin_request_conflict",
+            Self::StreamPreviewIdempotencyConflict => "stream_preview_idempotency_conflict",
+        }
+    }
+
+    pub fn client_message(&self) -> &'static str {
+        match self {
+            Self::DebugControlsDisabled => "debug controls are disabled",
+            Self::SocketPathTooLong => {
+                "control socket path exceeds platform byte limit; shorten --home or --socket"
+            }
+            Self::Unauthorized => "agent control request is unauthorized",
+            Self::UnsafeControlPlaneConfig(_) => "unsafe agent control plane configuration",
+            Self::Hex(_) => "invalid hex value",
+            Self::Json(_) | Self::Control(_) => "invalid control request",
+            Self::Stream(_) | Self::App(AppError::AgentStreamPublisher(_)) => {
+                "agent stream request failed"
+            }
+            Self::App(AppError::AgentStreamFinishMismatch) => {
+                "stream finalize does not match the sealed transcript"
+            }
+            Self::App(AppError::AgentStreamSendFailed(_)) => {
+                "stream durable send failed; retry the same finish request"
+            }
+            Self::App(AppError::InvalidGroupProfile(_)) => "invalid group profile",
+            Self::App(AppError::InvalidEditTarget) => {
+                "edit target must be an available chat message this account sent"
+            }
+            Self::App(error)
+                if matches!(
+                    error.as_engine_error(),
+                    Some(EngineError::NotGroupAdmin { .. })
+                ) =>
+            {
+                "only a group admin can make this change"
+            }
+            Self::InvalidGroupCreate(_) => "invalid group create request",
+            Self::InvalidProfileName(_) => "invalid profile name",
+            Self::InvalidProfileField(_, _) => "invalid profile field",
+            Self::InvalidRelayUrl(_) => "invalid relay URL",
+            Self::InvalidRelayListEdit(_) => "invalid relay list edit",
+            Self::RelayListInconclusive(_) => {
+                "the published relay list could not be confirmed; nothing was published"
+            }
+            Self::OperationTimedOut(_) => "connector operation timed out",
+            Self::SendInProgress => {
+                "matching send is still in progress; retry with the same idempotency key"
+            }
+            Self::MediaPathDenied(_) => "media path is not allowed",
+            Self::MediaLimitsExceeded(_) => "outbound media exceeds connector limits",
+            Self::StreamIdInUse => "stream id is already in use",
+            Self::StreamCapabilityDenied => "stream capability is not authorized",
+            Self::InvalidStreamBeginRequestId => "stream begin request id is invalid",
+            Self::StreamBeginRequestConflict => {
+                "stream begin request id was reused with different inputs"
+            }
+            Self::StreamPreviewIdempotencyConflict => {
+                "stream preview idempotency key was reused with different inputs"
+            }
+            Self::Io(_) => "connector I/O failed",
+            Self::App(AppError::ReactionNotFound) => "no matching reaction to remove",
+            Self::App(AppError::MediaUploadTimedOut) => "media upload timed out before publication",
+            Self::AccountHome(_) | Self::App(_) => "connector request failed",
+        }
+    }
+
+    pub fn retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::SendInProgress
+                | Self::RelayListInconclusive(_)
+                | Self::App(AppError::MediaUploadTimedOut | AppError::AgentStreamSendFailed(_))
+        )
+    }
+
+    pub fn privacy_safe_code(&self) -> &'static str {
+        self.code()
+    }
+}

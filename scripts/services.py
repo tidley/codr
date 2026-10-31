@@ -44,6 +44,16 @@ def detect_backend():
     return LAUNCHD if sys.platform == "darwin" else SYSTEMD
 
 
+def combined_service(binary, config, messaging_home):
+    """Describe one process; installation/start and account handover stay explicit."""
+    paths = [Path(value) for value in (binary, config, messaging_home)]
+    if not all(path.is_absolute() for path in paths):
+        raise ServiceError("Combined service paths must be absolute")
+    return Service("codr", "codr bridge and MDK messaging runtime",
+                   [paths[0], "--config", paths[1], "run", "--messaging-home", paths[2]],
+                   environment={"PATH": worker_path()})
+
+
 def for_host(runner, private_write, config_root, error=ServiceError):
     if detect_backend() == LAUNCHD:
         return LaunchdServices(runner, private_write, config_root, error)
@@ -158,8 +168,9 @@ class SystemdServices:
         self.runner(["systemctl", "--version"])
         self.runner(["systemctl", "--user", "show-environment"])
 
-    def install(self, service):
-        template = (ROOT / "systemd" / f"{service.name}.service").read_text()
+    def install(self, service, template=None):
+        if template is None:
+            template = (ROOT / "systemd" / f"{service.name}.service").read_text()
         try:
             # The unit templates already carry PATH; environment overrides are for launchd.
             text = _replace_directive(template, "ExecStart=",
@@ -255,8 +266,7 @@ class LaunchdServices:
         try:
             self.runner(["launchctl", "bootstrap", self.domain(), str(self.path(name))])
         except Exception:
-            # Right after a bootout launchd can refuse the job with
-            # "Bootstrap failed: 5: Input/output error"; a later attempt loads it.
+            # Preserve PR #16: launchd can refuse bootstrap just after bootout.
             time.sleep(2)
             if not self.loaded(name):
                 self.runner(["launchctl", "bootstrap", self.domain(), str(self.path(name))])
@@ -287,8 +297,7 @@ class LaunchdServices:
                     spawning = True
             if not pending:
                 return
-            # The first launch of a new executable can wait in xpcproxy for
-            # about half a minute while macOS registers the background item.
+            # A first launch can wait in xpcproxy while macOS registers the job.
             if time.monotonic() >= started + (90 if spawning else 15):
                 raise self.error(f"Service did not stay running: {', '.join(sorted(pending))}")
             time.sleep(0.25)

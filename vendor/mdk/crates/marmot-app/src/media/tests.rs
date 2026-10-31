@@ -1,0 +1,3401 @@
+use super::*;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpListener;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, mpsc};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use chacha20poly1305::aead::{Aead, AeadInPlace, KeyInit, Payload};
+use chacha20poly1305::{ChaCha20Poly1305, Nonce};
+use url::Url;
+
+use super::blossom::{
+    BlossomHttpTransport, DnsResolver, MAX_BLOSSOM_DESCRIPTOR_BYTES,
+    MAX_ENCRYPTED_MEDIA_BLOB_BYTES, fetch_blossom_blob_with_observer,
+    fetch_blossom_blob_with_transport, fetch_http_with_bounded_redirects,
+    read_limited_blossom_body,
+};
+use super::host_safety::validate_blossom_fetch_url;
+
+#[test]
+fn encrypted_media_blob_limit_supports_large_application_artifacts() {
+    assert_eq!(MAX_ENCRYPTED_MEDIA_BLOB_BYTES, 512 * 1024 * 1024);
+}
+
+#[test]
+fn media_plaintext_limit_accounts_for_the_aead_tag_without_allocating_the_boundary() {
+    let max_plaintext = MAX_ENCRYPTED_MEDIA_BLOB_BYTES - 16;
+    assert!(validate_media_plaintext_len(max_plaintext).is_ok());
+    assert!(validate_media_plaintext_len(max_plaintext + 1).is_err());
+}
+
+#[test]
+fn media_upload_batch_enforces_the_same_aggregate_bound_as_the_connector() {
+    let max_plaintext = MAX_ENCRYPTED_MEDIA_BLOB_BYTES - 16;
+    assert!(validate_media_upload_batch_lengths([max_plaintext]).is_ok());
+    assert!(validate_media_upload_batch_lengths([max_plaintext - 3, 3]).is_ok());
+    assert!(validate_media_upload_batch_lengths([max_plaintext, 1]).is_err());
+    assert!(validate_media_upload_batch_lengths([u64::MAX, 1]).is_err());
+}
+
+#[test]
+fn in_place_encryption_is_wire_identical_to_the_previous_allocating_api() {
+    let key = [0x11_u8; 32];
+    let nonce = [0x22_u8; 12];
+    let aad = b"encrypted-media compatibility";
+    let plaintext = b"same key nonce aad and plaintext";
+    let cipher = ChaCha20Poly1305::new_from_slice(&key).unwrap();
+    let expected = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
+        .unwrap();
+    let mut actual = plaintext.to_vec();
+    cipher
+        .encrypt_in_place(Nonce::from_slice(&nonce), aad, &mut actual)
+        .unwrap();
+    assert_eq!(actual, expected);
+}
+
+fn valid_imeta_tag() -> Vec<String> {
+    vec![
+        "imeta".to_owned(),
+        "v encrypted-media-v1".to_owned(),
+        format!(
+            "locator blossom-v1 https://media.example/{}.bin",
+            "11".repeat(32)
+        ),
+        format!("ciphertext_sha256 {}", "11".repeat(32)),
+        format!("plaintext_sha256 {}", "22".repeat(32)),
+        "nonce 333333333333333333333333".to_owned(),
+        "m image/png".to_owned(),
+        "filename diagram.png".to_owned(),
+    ]
+}
+
+fn valid_hash() -> String {
+    "11".repeat(32)
+}
+
+#[test]
+fn chat_list_attachment_projection_is_bounded_and_typed() {
+    let image = valid_imeta_tag();
+    let mut video = valid_imeta_tag();
+    video[6] = "m video/mp4".to_owned();
+    video[7] = "filename clip.mp4".to_owned();
+    let raw = serde_json::json!({ "imeta": [image, video] }).to_string();
+
+    assert_eq!(
+        classify_chat_list_attachments(Some(&raw)),
+        (Some(ChatListAttachmentKind::Mixed), 2)
+    );
+}
+
+#[test]
+fn chat_list_attachment_projection_counts_rejected_siblings_as_generic_files() {
+    // A rejected attachment is still an attachment: the timeline shows a
+    // placeholder for it, so the list preview must agree that the message
+    // carries one. Its declared media type is not trusted (the tag failed
+    // validation), so it classifies as the generic `File` glyph.
+    let valid = valid_imeta_tag();
+    let malformed = vec!["imeta".to_owned(), "m audio/mpeg".to_owned()];
+    let raw = serde_json::json!({ "imeta": [malformed.clone(), valid] }).to_string();
+
+    assert_eq!(
+        classify_chat_list_attachments(Some(&raw)),
+        (Some(ChatListAttachmentKind::Mixed), 2)
+    );
+    // The reported #1787 case: a message whose only attachment is the legacy
+    // shape must not look like a text-only row.
+    let legacy_only = serde_json::json!({ "imeta": [legacy_mip04_tag(false)] }).to_string();
+    assert_eq!(
+        classify_chat_list_attachments(Some(&legacy_only)),
+        (Some(ChatListAttachmentKind::File), 1)
+    );
+    // A media column that no longer parses is corruption of a message that
+    // did carry an attachment; it previews as one generic file, not as text.
+    assert_eq!(
+        classify_chat_list_attachments(Some("{not-json")),
+        (Some(ChatListAttachmentKind::File), 1)
+    );
+    assert_eq!(classify_chat_list_attachments(None), (None, 0));
+}
+
+#[test]
+fn encrypted_media_integrity_accepts_uppercase_hex() {
+    let encrypted = b"encrypted media bytes";
+    let uppercase_hash = hex::encode(Sha256::digest(encrypted)).to_ascii_uppercase();
+
+    assert!(encrypted_media_hash_matches(encrypted, &uppercase_hash));
+}
+
+fn valid_v2_imeta_tag() -> Vec<String> {
+    let mut tag = valid_imeta_tag();
+    tag[1] = "v encrypted-media-v2".to_owned();
+    tag
+}
+
+#[test]
+fn encrypted_media_v2_media_type_profile_is_exact() {
+    assert_eq!(
+        canonical_media_type_v2("\t\n\u{000c}\r IMAGE/JPG ; charset=utf-8 ")
+            .expect("the exact V2 trim set and alias are valid"),
+        "image/jpeg"
+    );
+    assert!(canonical_media_type_v2("\u{000b}image/png").is_err());
+    assert!(canonical_media_type_v2("\u{00a0}image/png").is_err());
+    assert!(canonical_media_type_v2("image/png/extra").is_err());
+    assert!(canonical_media_type_v2("image").is_err());
+    assert!(canonical_media_type_v2(&format!("{}/{}", "a".repeat(64), "b".repeat(64))).is_err());
+    assert_eq!(
+        canonical_media_type_v2("application/vnd.test+json").unwrap(),
+        "application/vnd.test+json"
+    );
+}
+
+#[test]
+fn encrypted_media_v2_reference_validation_is_version_specific() {
+    let mut v2 = valid_v2_imeta_tag();
+    v2[2] = "locator blossom-v1 http://10.0.0.1/blob".to_owned();
+    media_attachment_from_imeta_tag(&v2, Some(7), false)
+        .expect("V2 locator validity is independent of local destination policy");
+
+    let mut noncanonical_m = v2.clone();
+    noncanonical_m[6] = "m Image/JPG".to_owned();
+    assert!(media_attachment_from_imeta_tag(&noncanonical_m, Some(7), false).is_err());
+
+    let mut exact_filename = v2.clone();
+    exact_filename[7] = "filename  ".to_owned();
+    assert_eq!(
+        media_attachment_from_imeta_tag(&exact_filename, Some(7), false)
+            .expect("a nonempty V2 filename is preserved exactly")
+            .file_name,
+        " "
+    );
+
+    let mut too_long = v2.clone();
+    too_long[7] = format!("filename {}", "a".repeat(256));
+    assert!(media_attachment_from_imeta_tag(&too_long, Some(7), false).is_err());
+    let mut nul = v2;
+    nul[7] = "filename bad\0name".to_owned();
+    assert!(media_attachment_from_imeta_tag(&nul, Some(7), false).is_err());
+}
+
+#[test]
+fn outbound_media_never_crosses_group_version() {
+    let v1 = media_attachment_from_imeta_tag(&valid_imeta_tag(), Some(1), false).unwrap();
+    let v2 = media_attachment_from_imeta_tag(&valid_v2_imeta_tag(), Some(1), false).unwrap();
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+    assert!(
+        v1.validate_outbound(EncryptedMediaVersion::V2, &allowed, false)
+            .is_err()
+    );
+    assert!(
+        v2.validate_outbound(EncryptedMediaVersion::V1, &allowed, false)
+            .is_err()
+    );
+    assert!(
+        v1.build_imeta_tag(EncryptedMediaVersion::V2, &allowed, false)
+            .is_err()
+    );
+    assert!(
+        v2.build_imeta_tag(EncryptedMediaVersion::V1, &allowed, false)
+            .is_err()
+    );
+}
+
+#[test]
+fn checked_v1_builder_rejects_noncanonical_media_type_while_ingest_stays_tolerant() {
+    let mut noncanonical = valid_imeta_tag();
+    noncanonical[6] = "m Image/JPG; charset=utf-8".to_owned();
+    let reference = media_attachment_from_imeta_tag(&noncanonical, Some(1), false)
+        .expect("legacy V1 ingest still accepts a noncanonical m field");
+    assert_eq!(reference.media_type, "Image/JPG; charset=utf-8");
+
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+    let err = reference
+        .build_imeta_tag(EncryptedMediaVersion::V1, &allowed, false)
+        .expect_err("checked outbound V1 builder must reject noncanonical m");
+    assert!(
+        err.to_string()
+            .contains("media type is not canonical for encrypted-media-v1"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn retained_media_version_selects_its_historical_component_cache() {
+    assert_eq!(
+        EncryptedMediaVersion::V1.component_id(),
+        GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID
+    );
+    assert_eq!(
+        EncryptedMediaVersion::V2.component_id(),
+        GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID
+    );
+}
+
+#[test]
+fn checked_imeta_builder_preserves_version_and_present_empty_optional_fields() {
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+    let v1 = media_attachment_from_imeta_tag(&valid_imeta_tag(), Some(1), false).unwrap();
+    let v1_tag = v1
+        .build_imeta_tag(EncryptedMediaVersion::V1, &allowed, false)
+        .unwrap();
+    assert!(v1_tag.iter().any(|field| field == "v encrypted-media-v1"));
+
+    let mut v2 = media_attachment_from_imeta_tag(&valid_v2_imeta_tag(), Some(2), false).unwrap();
+    v2.dim = Some(String::new());
+    v2.thumbhash = Some(" ".to_owned());
+    let v2_tag = v2
+        .build_imeta_tag(EncryptedMediaVersion::V2, &allowed, false)
+        .unwrap();
+    assert!(v2_tag.iter().any(|field| field == "v encrypted-media-v2"));
+    assert!(v2_tag.iter().any(|field| field == "dim "));
+    assert!(v2_tag.iter().any(|field| field == "thumbhash  "));
+
+    let round_trip = media_attachment_from_imeta_tag(&v2_tag, Some(2), false).unwrap();
+    assert_eq!(round_trip.version, ENCRYPTED_MEDIA_FORMAT_V2);
+    assert_eq!(round_trip.dim.as_deref(), Some(""));
+    assert_eq!(round_trip.thumbhash.as_deref(), Some(" "));
+}
+
+#[test]
+fn encrypted_media_v2_kdf_and_aad_are_independent_from_v1() {
+    let secret = [7_u8; 32];
+    let hash = [0x22_u8; 32];
+    let v1_key = derive_media_file_key(
+        &secret,
+        EncryptedMediaVersion::V1,
+        &hash,
+        "image/jpeg",
+        " Photo.JPG ",
+    )
+    .unwrap();
+    let v2_key = derive_media_file_key(
+        &secret,
+        EncryptedMediaVersion::V2,
+        &hash,
+        "image/jpeg",
+        " Photo.JPG ",
+    )
+    .unwrap();
+    assert_ne!(v1_key, v2_key);
+    assert_eq!(
+        hex::encode(v2_key),
+        "5fcb5672b9cb2b3ac7915fd9c97697877837f7fb1312034486f400f601cd16b5"
+    );
+    assert_eq!(
+        hex::encode(media_aad(
+            EncryptedMediaVersion::V2,
+            &hash,
+            "image/jpeg",
+            " Photo.JPG "
+        )),
+        "656e637279707465642d6d656469612d763200222222222222222222222222222222222222222222222222222222222222222200696d6167652f6a706567002050686f746f2e4a504720"
+    );
+}
+
+#[test]
+fn invalid_media_attachment_is_local_to_that_attachment() {
+    let mut invalid = valid_v2_imeta_tag();
+    invalid.retain(|field| !field.starts_with("nonce "));
+    assert!(media_attachment_from_imeta_tag(&invalid, None, false).is_err());
+    assert!(media_imeta_tags_are_valid(
+        &[invalid, valid_v2_imeta_tag()],
+        false
+    ));
+}
+
+fn tag_with_locator(locator: String) -> Vec<String> {
+    let mut tag = valid_imeta_tag();
+    tag[2] = format!("locator blossom-v1 {locator}");
+    tag
+}
+
+#[test]
+fn imeta_parser_rejects_duplicate_single_occurrence_field() {
+    // Baseline valid tag parses.
+    assert!(media_attachment_from_imeta_tag(&valid_imeta_tag(), None, false).is_ok());
+    // A duplicate of a single-occurrence field MUST be rejected, especially the
+    // key/AAD-determining ones (m, filename, plaintext_sha256).
+    for dup in [
+        "m image/jpeg".to_owned(),
+        "filename evil.png".to_owned(),
+        format!("plaintext_sha256 {}", "44".repeat(32)),
+        format!("ciphertext_sha256 {}", "55".repeat(32)),
+        "nonce 444444444444444444444444".to_owned(),
+    ] {
+        let mut tag = valid_imeta_tag();
+        tag.push(dup.clone());
+        assert!(
+            media_attachment_from_imeta_tag(&tag, None, false).is_err(),
+            "duplicate field {dup:?} must be rejected"
+        );
+    }
+    // A repeated `locator` is allowed (locator is one-or-more).
+    let mut multi = valid_imeta_tag();
+    multi.push(format!(
+        "locator blossom-v1 https://media2.example/{}.bin",
+        "11".repeat(32)
+    ));
+    assert!(media_attachment_from_imeta_tag(&multi, None, false).is_ok());
+}
+
+pub(super) fn spawn_http_responses(responses: Vec<Vec<u8>>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+    let addr = listener.local_addr().expect("test server addr");
+    thread::spawn(move || {
+        for response in responses {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut request = [0_u8; 1024];
+                let _ = stream.read(&mut request);
+                let _ = stream.write_all(&response);
+            }
+        }
+    });
+    format!("http://{addr}")
+}
+
+pub(super) fn spawn_http_response(response: Vec<u8>) -> String {
+    spawn_http_responses(vec![response])
+}
+
+async fn spawn_keep_alive_http_server(
+    body: &'static [u8],
+    requests_expected: usize,
+) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let server_accepted = accepted.clone();
+    let server = tokio::spawn(async move {
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut requests = 0_usize;
+        while requests < requests_expected {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (mut stream, _) = accepted.unwrap();
+                    server_accepted.fetch_add(1, Ordering::SeqCst);
+                    let request_tx = request_tx.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            let mut request = Vec::new();
+                            let mut buffer = [0_u8; 1024];
+                            loop {
+                                let read = stream.read(&mut buffer).await.unwrap();
+                                if read == 0 {
+                                    break;
+                                }
+                                request.extend_from_slice(&buffer[..read]);
+                                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                            if request.is_empty() {
+                                break;
+                            }
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                                body.len()
+                            );
+                            stream.write_all(response.as_bytes()).await.unwrap();
+                            stream.write_all(body).await.unwrap();
+                            let _ = request_tx.send(());
+                        }
+                    });
+                }
+                request = request_rx.recv() => {
+                    if request.is_some() {
+                        requests += 1;
+                    }
+                }
+            }
+        }
+    });
+    (url, accepted, server)
+}
+
+async fn spawn_stalled_http_server() -> (String, tokio::task::JoinHandle<()>) {
+    use tokio::io::AsyncReadExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buffer = [0_u8; 1024];
+        let _ = stream.read(&mut buffer).await;
+        std::future::pending::<()>().await;
+    });
+    (url, server)
+}
+
+/// Stream a complete response in bounded intervals and count every accepted request.
+async fn spawn_progressing_http_server(
+    body: Arc<Vec<u8>>,
+    transfer_time: Duration,
+) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let requests = Arc::new(AtomicUsize::new(0));
+    let accepted = requests.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            accepted.fetch_add(1, Ordering::SeqCst);
+            let body = body.clone();
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                loop {
+                    let Ok(read) = stream.read(&mut buffer).await else {
+                        return;
+                    };
+                    if read == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                if stream.write_all(headers.as_bytes()).await.is_err() {
+                    return;
+                }
+                const CHUNKS: usize = 15;
+                let delay = transfer_time / CHUNKS as u32;
+                for chunk in body.chunks(body.len().div_ceil(CHUNKS)) {
+                    tokio::time::sleep(delay).await;
+                    if stream.write_all(chunk).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (url, requests, server)
+}
+
+/// Send a first byte promptly, then pause a live body without stalling headers.
+async fn spawn_http_server_with_body_gap(
+    body: Arc<Vec<u8>>,
+    gap: Duration,
+) -> (String, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            stream.set_nodelay(true).unwrap();
+            let body = body.clone();
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                loop {
+                    let Ok(read) = stream.read(&mut buffer).await else {
+                        return;
+                    };
+                    if read == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                if stream.write_all(headers.as_bytes()).await.is_err()
+                    || stream.write_all(&body[..1]).await.is_err()
+                {
+                    return;
+                }
+                tokio::time::sleep(gap).await;
+                let _ = stream.write_all(&body[1..]).await;
+            });
+        }
+    });
+    (url, server)
+}
+
+fn spawn_roundtrip_blob_server() -> (String, mpsc::Receiver<(u64, String)>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind upload test server");
+    let addr = listener.local_addr().expect("upload test server addr");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept upload");
+        let mut stream = BufReader::new(stream);
+        let mut content_length = None;
+        loop {
+            let mut line = String::new();
+            stream.read_line(&mut line).expect("read upload header");
+            if line == "\r\n" {
+                break;
+            }
+            if let Some(value) = line
+                .strip_prefix("content-length:")
+                .or_else(|| line.strip_prefix("Content-Length:"))
+            {
+                content_length = Some(value.trim().parse::<u64>().expect("content length"));
+            }
+        }
+        let content_length = content_length.expect("upload content length header");
+        let mut remaining = content_length;
+        let mut body = Vec::with_capacity(content_length as usize);
+        let mut buffer = [0_u8; 64 * 1024];
+        while remaining > 0 {
+            let take = remaining.min(buffer.len() as u64) as usize;
+            stream
+                .read_exact(&mut buffer[..take])
+                .expect("read complete upload body");
+            body.extend_from_slice(&buffer[..take]);
+            remaining -= take as u64;
+        }
+        let digest = hex::encode(Sha256::digest(&body));
+        stream
+            .get_mut()
+            .write_all(&http_json_response("{}"))
+            .expect("write upload descriptor");
+        drop(stream);
+        let (mut download, _) = listener.accept().expect("accept download");
+        let mut request = [0_u8; 4096];
+        let _ = download.read(&mut request).expect("read download request");
+        download
+            .write_all(&http_ok_response(&body))
+            .expect("write encrypted blob");
+        tx.send((content_length, digest))
+            .expect("report upload body");
+    });
+    (format!("http://{addr}"), rx)
+}
+
+fn spawn_hashing_upload_response(response: Vec<u8>) -> (String, mpsc::Receiver<(u64, String)>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind upload test server");
+    let addr = listener.local_addr().expect("upload test server addr");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept upload");
+        let mut stream = BufReader::new(stream);
+        let mut content_length = None;
+        loop {
+            let mut line = String::new();
+            stream.read_line(&mut line).expect("read upload header");
+            if line == "\r\n" {
+                break;
+            }
+            if let Some(value) = line
+                .strip_prefix("content-length:")
+                .or_else(|| line.strip_prefix("Content-Length:"))
+            {
+                content_length = Some(value.trim().parse::<u64>().expect("content length"));
+            }
+        }
+        let content_length = content_length.expect("upload content length header");
+        let mut remaining = content_length;
+        let mut hash = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        while remaining > 0 {
+            let take = remaining.min(buffer.len() as u64) as usize;
+            stream
+                .read_exact(&mut buffer[..take])
+                .expect("read complete upload body");
+            hash.update(&buffer[..take]);
+            remaining -= take as u64;
+        }
+        stream
+            .get_mut()
+            .write_all(&response)
+            .expect("write upload response");
+        tx.send((content_length, hex::encode(hash.finalize())))
+            .expect("report upload body");
+    });
+    (format!("http://{addr}"), rx)
+}
+
+#[derive(Clone, Copy)]
+enum SlowUploadIngest {
+    PauseAfterFirstChunk(Duration),
+    Continuous { delay_per_chunk: Duration },
+}
+
+fn spawn_slow_upload_response(ingest: SlowUploadIngest) -> (String, mpsc::Receiver<u64>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind slow upload test server");
+    let addr = listener.local_addr().expect("slow upload test server addr");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept slow upload");
+        let mut stream = BufReader::new(stream);
+        let mut content_length = None;
+        loop {
+            let mut line = String::new();
+            stream.read_line(&mut line).expect("read upload header");
+            if line == "\r\n" {
+                break;
+            }
+            if let Some(value) = line
+                .strip_prefix("content-length:")
+                .or_else(|| line.strip_prefix("Content-Length:"))
+            {
+                content_length = Some(value.trim().parse::<u64>().expect("content length"));
+            }
+        }
+        let content_length = content_length.expect("upload content length header");
+        let mut received = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+        while received < content_length {
+            let take = (content_length - received).min(buffer.len() as u64) as usize;
+            let Ok(count) = stream.read(&mut buffer[..take]) else {
+                return;
+            };
+            if count == 0 {
+                return;
+            }
+            received += count as u64;
+            match ingest {
+                SlowUploadIngest::PauseAfterFirstChunk(delay) if received == count as u64 => {
+                    thread::sleep(delay);
+                }
+                SlowUploadIngest::Continuous { delay_per_chunk } => {
+                    thread::sleep(delay_per_chunk);
+                }
+                SlowUploadIngest::PauseAfterFirstChunk(_) => {}
+            }
+        }
+        stream
+            .get_mut()
+            .write_all(&http_json_response("{}"))
+            .expect("write slow upload descriptor");
+        tx.send(received).expect("report slow upload body");
+    });
+    (format!("http://{addr}"), rx)
+}
+
+pub(super) fn http_redirect_response(location: &str) -> Vec<u8> {
+    format!(
+        "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    )
+    .into_bytes()
+}
+
+pub(super) fn http_ok_response(body: &[u8]) -> Vec<u8> {
+    let mut response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    response.extend_from_slice(body);
+    response
+}
+
+fn http_json_response(body: &str) -> Vec<u8> {
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    )
+    .into_bytes()
+}
+
+fn http_status_response(status: u16, reason: &str) -> Vec<u8> {
+    format!("HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        .into_bytes()
+}
+
+fn http_error_response(status: u16, reason: &str, headers: &[(&str, &str)], body: &str) -> Vec<u8> {
+    let headers = headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}\r\n"))
+        .collect::<String>();
+    format!(
+        "HTTP/1.1 {status} {reason}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
+}
+
+fn blossom_endpoint(base_url: String) -> crate::AppBlobEndpoint {
+    crate::AppBlobEndpoint {
+        locator_kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
+        base_url,
+    }
+}
+
+fn operation_policy<'a>(
+    version: EncryptedMediaVersion,
+    endpoints: &'a [crate::AppBlobEndpoint],
+    allowed_locator_kinds: &'a [String],
+    allow_loopback_http: bool,
+) -> MediaOperationPolicy<'a> {
+    MediaOperationPolicy {
+        version,
+        default_endpoints: endpoints,
+        allowed_locator_kinds,
+        allow_loopback_http,
+    }
+}
+
+fn media_upload_request(blossom_server: Option<String>) -> MediaUploadRequest {
+    MediaUploadRequest {
+        message_tags: Vec::new(),
+        attachments: vec![MediaUploadAttachmentRequest {
+            file_name: "diagram.png".to_owned(),
+            media_type: "image/png".to_owned(),
+            plaintext: b"hello encrypted media".to_vec(),
+            dim: None,
+            thumbhash: None,
+        }],
+        caption: None,
+        send: false,
+        blossom_server,
+    }
+}
+
+fn signing_keys() -> nostr::prelude::Keys {
+    nostr::prelude::Keys::generate()
+}
+
+fn media_secret() -> [u8; 32] {
+    [7_u8; 32]
+}
+
+fn http_not_found_response() -> Vec<u8> {
+    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upload_encrypted_media_falls_back_to_second_blossom_endpoint() {
+    let failing = spawn_http_response(http_status_response(500, "Internal Server Error"));
+    let succeeding = spawn_http_response(http_json_response("{}"));
+    let endpoints = [
+        blossom_endpoint(failing.clone()),
+        blossom_endpoint(succeeding.clone()),
+    ];
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+    let secret = media_secret();
+    let keys = signing_keys();
+
+    let result = upload_encrypted_media(
+        media_upload_request(None),
+        42,
+        &secret,
+        &keys,
+        operation_policy(EncryptedMediaVersion::V1, &endpoints, &allowed, true),
+        &BlossomHttpTransport::new(true),
+    )
+    .await
+    .expect("second Blossom endpoint should absorb first endpoint failure");
+
+    let locator = &result.attachments[0].reference.locators[0];
+    assert_eq!(locator.kind, BLOSSOM_LOCATOR_KIND_V1);
+    assert!(
+        locator.value.starts_with(&format!("{succeeding}/")),
+        "upload locator should come from fallback server, got {}",
+        locator.value
+    );
+    assert!(
+        !locator.value.starts_with(&failing),
+        "upload must not use the failed server locator"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blossom_fallback_reuses_the_identical_encrypted_body() {
+    let (failing, first_body) =
+        spawn_hashing_upload_response(http_status_response(500, "Internal Server Error"));
+    let (succeeding, second_body) = spawn_hashing_upload_response(http_json_response("{}"));
+    let endpoints = [blossom_endpoint(failing), blossom_endpoint(succeeding)];
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+    let secret = media_secret();
+    let keys = signing_keys();
+
+    upload_encrypted_media(
+        media_upload_request(None),
+        42,
+        &secret,
+        &keys,
+        operation_policy(EncryptedMediaVersion::V1, &endpoints, &allowed, true),
+        &BlossomHttpTransport::new(true),
+    )
+    .await
+    .expect("second Blossom endpoint should accept the retry body");
+
+    assert_eq!(first_body.recv().unwrap(), second_body.recv().unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blossom_upload_allows_response_gap_longer_than_read_timeout() {
+    let (server, received) = spawn_slow_upload_response(SlowUploadIngest::PauseAfterFirstChunk(
+        Duration::from_secs(16),
+    ));
+    let encrypted = bytes::Bytes::from(vec![0x5a; 40_405_416]);
+    let encrypted_hash = hex::encode(Sha256::digest(&encrypted));
+
+    upload_blossom_blob(
+        &server,
+        encrypted.clone(),
+        &encrypted_hash,
+        &signing_keys(),
+        &BlossomHttpTransport::new(true),
+    )
+    .await
+    .expect("a bounded upload may wait more than the response read timeout while sending");
+
+    assert_eq!(received.recv().unwrap(), encrypted.len() as u64);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blossom_upload_allows_continuous_slow_body_ingest() {
+    let (server, received) = spawn_slow_upload_response(SlowUploadIngest::Continuous {
+        delay_per_chunk: Duration::from_millis(30),
+    });
+    let encrypted = bytes::Bytes::from(vec![0x5a; 40_405_416]);
+    let encrypted_hash = hex::encode(Sha256::digest(&encrypted));
+
+    upload_blossom_blob(
+        &server,
+        encrypted.clone(),
+        &encrypted_hash,
+        &signing_keys(),
+        &BlossomHttpTransport::new(true),
+    )
+    .await
+    .expect("continuous request-body progress may exceed the response read timeout");
+
+    assert_eq!(received.recv().unwrap(), encrypted.len() as u64);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn encrypted_media_round_trip_crosses_the_previous_64_mib_limit() {
+    let (server, received) = spawn_roundtrip_blob_server();
+    let endpoints = [blossom_endpoint(server)];
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+    let secret = media_secret();
+    let keys = signing_keys();
+    let plaintext_len = 64 * 1024 * 1024 + 1;
+    let request = MediaUploadRequest {
+        message_tags: Vec::new(),
+        attachments: vec![MediaUploadAttachmentRequest {
+            file_name: "release.apk".to_owned(),
+            media_type: "application/vnd.android.package-archive".to_owned(),
+            plaintext: vec![0x5a; plaintext_len],
+            dim: None,
+            thumbhash: None,
+        }],
+        caption: None,
+        send: false,
+        blossom_server: None,
+    };
+
+    let result = upload_encrypted_media(
+        request,
+        42,
+        &secret,
+        &keys,
+        operation_policy(EncryptedMediaVersion::V2, &endpoints, &allowed, true),
+        &BlossomHttpTransport::new(true),
+    )
+    .await
+    .expect("payload above the previous limit should upload");
+
+    let attachment = &result.attachments[0];
+    let downloaded = download_encrypted_media(
+        attachment.reference.clone(),
+        &secret,
+        &endpoints,
+        &allowed,
+        true,
+    )
+    .await
+    .expect("payload above the previous limit should download and decrypt");
+    let (received_len, received_hash) = received.recv().expect("upload body report");
+    assert_eq!(received_len, plaintext_len as u64 + 16);
+    assert_eq!(attachment.encrypted_size_bytes, received_len);
+    assert_eq!(attachment.reference.ciphertext_sha256, received_hash);
+    assert_eq!(downloaded.plaintext, vec![0x5a; plaintext_len]);
+}
+
+/// A successful round trip records transport, integrity, and crypto phases
+/// without changing the downloaded result.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn encrypted_media_download_records_network_integrity_and_crypto_phases() {
+    let (server, _received) = spawn_roundtrip_blob_server();
+    let endpoints = [blossom_endpoint(server)];
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+    let secret = media_secret();
+    let upload = upload_encrypted_media(
+        media_upload_request(None),
+        42,
+        &secret,
+        &signing_keys(),
+        operation_policy(EncryptedMediaVersion::V2, &endpoints, &allowed, true),
+        &BlossomHttpTransport::new(true),
+    )
+    .await
+    .expect("fixture upload should succeed");
+    let telemetry = crate::app_telemetry::AppPerformanceTelemetry::default();
+    let transport =
+        BlossomHttpTransport::for_test(true, Duration::from_secs(60), Duration::from_secs(1));
+
+    download_encrypted_media_with_transport(
+        upload.attachments[0].reference.clone(),
+        &secret,
+        &endpoints,
+        &allowed,
+        &transport,
+        Some(&telemetry),
+    )
+    .await
+    .expect("fixture download should succeed");
+
+    let snapshot = telemetry.snapshot();
+    for phase in [
+        snapshot.media_download_host_setup,
+        snapshot.media_download_response_headers,
+        snapshot.media_download_first_byte,
+        snapshot.media_download_body_transfer,
+        snapshot.media_download_ciphertext_verify,
+        snapshot.media_download_decrypt,
+        snapshot.media_download_plaintext_verify,
+    ] {
+        assert_eq!(phase.attempts, 1);
+        assert_eq!(phase.successes, 1);
+        assert_eq!(phase.failures, 0);
+    }
+    assert_eq!(snapshot.media_download_locator_failover.attempts, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn encrypted_media_v2_upload_emits_v2_and_fresh_nonces() {
+    let server = spawn_http_responses(vec![http_json_response("{}"), http_json_response("{}")]);
+    let endpoints = [blossom_endpoint(server)];
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+    let secret = media_secret();
+    let keys = signing_keys();
+    let mut request = media_upload_request(None);
+    request.attachments[0].file_name = " Diagram.PNG ".to_owned();
+    request.attachments[0].media_type = " IMAGE/JPG ; charset=utf-8".to_owned();
+
+    let first = upload_encrypted_media(
+        request.clone(),
+        42,
+        &secret,
+        &keys,
+        operation_policy(EncryptedMediaVersion::V2, &endpoints, &allowed, true),
+        &BlossomHttpTransport::new(true),
+    )
+    .await
+    .unwrap();
+    let second = upload_encrypted_media(
+        request,
+        42,
+        &secret,
+        &keys,
+        operation_policy(EncryptedMediaVersion::V2, &endpoints, &allowed, true),
+        &BlossomHttpTransport::new(true),
+    )
+    .await
+    .unwrap();
+    let first = &first.attachments[0].reference;
+    let second = &second.attachments[0].reference;
+    assert_eq!(first.version, ENCRYPTED_MEDIA_FORMAT_V2);
+    assert_eq!(first.media_type, "image/jpeg");
+    assert_eq!(first.file_name, " Diagram.PNG ");
+    assert_ne!(first.nonce_hex, second.nonce_hex);
+    assert_ne!(first.ciphertext_sha256, second.ciphertext_sha256);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blossom_upload_rejects_oversized_descriptor_before_buffering() {
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        MAX_BLOSSOM_DESCRIPTOR_BYTES + 1
+    );
+    let server = spawn_http_response(response.into_bytes());
+    let encrypted = b"encrypted bytes";
+    let encrypted_hash = hex::encode(Sha256::digest(encrypted));
+
+    let error = upload_blossom_blob(
+        &server,
+        bytes::Bytes::from_static(encrypted),
+        &encrypted_hash,
+        &signing_keys(),
+        &BlossomHttpTransport::new(true),
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "blob store request failed: upload descriptor exceeds size limit"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn profile_image_upload_rejects_non_raster_and_oversized_inputs_before_network() {
+    let signer = signing_keys();
+    let svg = upload_profile_image(
+        b"<svg/>",
+        "image/svg+xml",
+        "https://blossom.example",
+        &signer,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        svg.to_string(),
+        "blob store request failed: profile image must be JPEG, PNG, WebP, or GIF"
+    );
+
+    let oversized = vec![0_u8; MAX_PROFILE_IMAGE_BYTES + 1];
+    let error = upload_profile_image(&oversized, "image/png", "https://blossom.example", &signer)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "blob store request failed: profile image exceeds 10 MiB limit"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn profile_image_upload_rejects_empty_inputs_before_network() {
+    let error = upload_profile_image(
+        &[],
+        "image/jpeg",
+        "https://blossom.example",
+        &signing_keys(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "blob store request failed: profile image cannot be empty"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn profile_image_upload_rejects_mismatched_raster_bytes_before_network() {
+    let error = upload_profile_image(
+        b"<svg/>",
+        "image/png",
+        "https://blossom.example",
+        &signing_keys(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "blob store request failed: profile image bytes do not match the declared media type"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn profile_image_upload_uses_media_extension_and_accepts_test_loopback_policy() {
+    let png_header = b"\x89PNG\r\n\x1a\n";
+    let server = spawn_http_response(http_json_response("{}"));
+    let url = upload_profile_image_with_policy(
+        png_header,
+        " IMAGE/PNG ; charset=binary",
+        &server,
+        &signing_keys(),
+        true,
+    )
+    .await
+    .expect("profile upload should accept the explicit test loopback policy");
+
+    assert!(url.ends_with(".png"), "unexpected profile image URL: {url}");
+    assert!(!url.ends_with(".bin"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn profile_image_upload_rejects_cross_site_descriptor_url() {
+    let png_header = b"\x89PNG\r\n\x1a\n";
+    let hash = hex::encode(Sha256::digest(png_header));
+    let descriptor = serde_json::json!({
+        "url": format!("https://attacker.example/{hash}.png"),
+        "sha256": hash,
+    });
+    let server = spawn_http_response(http_json_response(&descriptor.to_string()));
+    let error =
+        upload_profile_image_with_policy(png_header, "image/png", &server, &signing_keys(), true)
+            .await
+            .unwrap_err();
+
+    assert!(
+        error.to_string().contains("unsafe upload descriptor host"),
+        "unexpected error: {error}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upload_encrypted_media_reports_all_blossom_endpoint_failures() {
+    let first = spawn_http_response(http_status_response(500, "Internal Server Error"));
+    let second = spawn_http_response(http_status_response(502, "Bad Gateway"));
+    let endpoints = [
+        blossom_endpoint(first.clone()),
+        blossom_endpoint(second.clone()),
+    ];
+    let secret = media_secret();
+    let keys = signing_keys();
+
+    let err = upload_encrypted_media(
+        media_upload_request(None),
+        42,
+        &secret,
+        &keys,
+        operation_policy(EncryptedMediaVersion::V1, &endpoints, &[], true),
+        &BlossomHttpTransport::new(true),
+    )
+    .await
+    .expect_err("all failing endpoints should aggregate their failures");
+
+    let AppError::BlobStore(message) = err else {
+        panic!("expected aggregated BlobStore error");
+    };
+    assert!(
+        message.contains("upload failed for all Blossom servers"),
+        "unexpected error: {message}"
+    );
+    assert!(message.contains("server 1: upload returned HTTP 500"));
+    assert!(message.contains("server 2: upload returned HTTP 502"));
+    assert!(
+        !message.contains(&first) && !message.contains(&second),
+        "aggregated error must not embed Blossom server URLs: {message}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upload_encrypted_media_preserves_privacy_safe_blossom_rejection_reason() {
+    let rejecting = spawn_http_response(http_error_response(
+        415,
+        "Unsupported Media Type",
+        &[],
+        "upload rejected: unsupported media type application/octet-stream",
+    ));
+    let endpoints = [blossom_endpoint(rejecting)];
+    let secret = media_secret();
+    let keys = signing_keys();
+
+    let error = upload_encrypted_media(
+        media_upload_request(None),
+        42,
+        &secret,
+        &keys,
+        operation_policy(EncryptedMediaVersion::V1, &endpoints, &[], true),
+        &BlossomHttpTransport::new(true),
+    )
+    .await
+    .expect_err("the server rejection should fail the upload");
+
+    assert_eq!(
+        error.to_string(),
+        "blob store request failed: upload failed for all Blossom servers: server 1: upload returned HTTP 415: upload rejected: unsupported media type application/octet-stream"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upload_encrypted_media_drops_sensitive_blossom_rejection_reason() {
+    let secret_value = "11".repeat(32);
+    let rejecting = spawn_http_response(http_error_response(
+        403,
+        "Forbidden",
+        &[(
+            "X-Reason",
+            &format!("blob https://media.example/{secret_value} is forbidden"),
+        )],
+        "",
+    ));
+    let endpoints = [blossom_endpoint(rejecting)];
+    let secret = media_secret();
+    let keys = signing_keys();
+
+    let error = upload_encrypted_media(
+        media_upload_request(None),
+        42,
+        &secret,
+        &keys,
+        operation_policy(EncryptedMediaVersion::V1, &endpoints, &[], true),
+        &BlossomHttpTransport::new(true),
+    )
+    .await
+    .expect_err("the server rejection should fail the upload");
+    let message = error.to_string();
+
+    assert!(message.contains("upload returned HTTP 403"));
+    assert!(!message.contains("media.example"));
+    assert!(!message.contains(&secret_value));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upload_encrypted_media_drops_punctuated_hash_rejection_reason() {
+    let secret_value = "11".repeat(32);
+    let rejecting = spawn_http_response(http_error_response(
+        409,
+        "Conflict",
+        &[(
+            "X-Reason",
+            &format!("duplicate-blob-{secret_value}-already-exists"),
+        )],
+        "",
+    ));
+    let endpoints = [blossom_endpoint(rejecting)];
+    let secret = media_secret();
+    let keys = signing_keys();
+
+    let error = upload_encrypted_media(
+        media_upload_request(None),
+        42,
+        &secret,
+        &keys,
+        operation_policy(EncryptedMediaVersion::V1, &endpoints, &[], true),
+        &BlossomHttpTransport::new(true),
+    )
+    .await
+    .expect_err("the server rejection should fail the upload");
+    let message = error.to_string();
+
+    assert!(message.contains("upload returned HTTP 409"));
+    assert!(!message.contains(&secret_value));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upload_encrypted_media_drops_uuid_rejection_reason() {
+    let rejecting = spawn_http_response(http_error_response(
+        403,
+        "Forbidden",
+        &[(
+            "X-Reason",
+            "upload id 123e4567-e89b-12d3-a456-426614174000 already used",
+        )],
+        "",
+    ));
+    let endpoints = [blossom_endpoint(rejecting)];
+    let secret = media_secret();
+    let keys = signing_keys();
+
+    let error = upload_encrypted_media(
+        media_upload_request(None),
+        42,
+        &secret,
+        &keys,
+        operation_policy(EncryptedMediaVersion::V1, &endpoints, &[], true),
+        &BlossomHttpTransport::new(true),
+    )
+    .await
+    .expect_err("the server rejection should fail the upload");
+    let message = error.to_string();
+
+    assert!(message.contains("upload returned HTTP 403"));
+    assert!(!message.contains("123e4567"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upload_encrypted_media_drops_non_http_url_scheme_rejection_reason() {
+    let rejecting = spawn_http_response(http_error_response(
+        403,
+        "Forbidden",
+        &[("X-Reason", "denied, use relay wss://relay.example instead")],
+        "",
+    ));
+    let endpoints = [blossom_endpoint(rejecting)];
+    let secret = media_secret();
+    let keys = signing_keys();
+
+    let error = upload_encrypted_media(
+        media_upload_request(None),
+        42,
+        &secret,
+        &keys,
+        operation_policy(EncryptedMediaVersion::V1, &endpoints, &[], true),
+        &BlossomHttpTransport::new(true),
+    )
+    .await
+    .expect_err("the server rejection should fail the upload");
+    let message = error.to_string();
+
+    assert!(message.contains("upload returned HTTP 403"));
+    assert!(!message.contains("relay.example"));
+}
+
+#[test]
+fn white_noise_blossom_endpoints_are_ciphertext_compatible() {
+    let deployment = crate::MarmotDeployment::white_noise();
+    assert_eq!(
+        deployment.group_image_endpoint.as_deref(),
+        deployment
+            .new_group_media_endpoints
+            .first()
+            .map(String::as_str),
+        "the group-image server is the first new-group media server"
+    );
+    // primal's server is media-only: it refuses opaque ciphertext.
+    assert!(
+        !deployment
+            .new_group_media_endpoints
+            .iter()
+            .any(|endpoint| endpoint == "https://blossom.primal.net")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_blossom_server_override_skips_default_endpoint_failover() {
+    let override_server = spawn_http_response(http_status_response(500, "Internal Server Error"));
+    let default_server = spawn_http_response(http_json_response("{}"));
+    let endpoints = [blossom_endpoint(default_server.clone())];
+    let secret = media_secret();
+    let keys = signing_keys();
+
+    let err = upload_encrypted_media(
+        media_upload_request(Some(override_server.clone())),
+        42,
+        &secret,
+        &keys,
+        operation_policy(EncryptedMediaVersion::V1, &endpoints, &[], true),
+        &BlossomHttpTransport::new(true),
+    )
+    .await
+    .expect_err("explicit override must remain a single-server bypass");
+
+    let AppError::BlobStore(message) = err else {
+        panic!("expected single override BlobStore error");
+    };
+    assert!(message.contains("server 1: upload returned HTTP 500"));
+    assert!(
+        !message.contains("server 2") && !message.contains(&default_server),
+        "override failure should not include default endpoint fallback: {message}"
+    );
+}
+
+#[test]
+fn imeta_parser_rejects_legacy_version_even_when_later_current_version_present() {
+    let mut tag = valid_imeta_tag();
+    tag.insert(1, "v legacy-media-v0".to_owned());
+
+    assert!(media_attachment_from_imeta_tag(&tag, None, false).is_err());
+    assert!(!media_imeta_tags_are_valid(&[tag], false));
+}
+
+#[test]
+fn imeta_parser_rejects_duplicate_current_version_fields() {
+    let mut tag = valid_imeta_tag();
+    tag.insert(1, "v encrypted-media-v1".to_owned());
+
+    assert!(media_attachment_from_imeta_tag(&tag, None, false).is_err());
+    assert!(!media_imeta_tags_are_valid(&[tag], false));
+}
+
+#[test]
+fn out_of_policy_locator_kind_is_kept_not_dropped_on_ingest() {
+    // PR #328 review Finding 2 (the reviewer's "delayed old media message
+    // rejected after a policy update" regression): ingest is purely
+    // structural, so a structurally well-formed locator whose kind is NOT in
+    // the group's current `allowed_locator_kinds` MUST NOT invalidate the
+    // reference or drop the containing kind-9 message. Media is authenticated
+    // by its hashes + AEAD independent of the locator, so an out-of-policy
+    // locator cannot forge content; it only becomes unfetchable at download
+    // time. (The ingest parser no longer takes a policy at all.)
+    let mut tag = valid_imeta_tag();
+    // A non-blossom locator that is not in any default policy. It is
+    // structurally well-formed (parseable URL), so ingest keeps it.
+    tag.insert(2, "locator ipfs-v1 ipfs://bafybeigdyrexample".to_owned());
+
+    let reference = media_attachment_from_imeta_tag(&tag, None, false)
+        .expect("an out-of-policy but well-formed locator must not drop the message");
+    assert_eq!(reference.locators.len(), 2);
+    assert!(media_imeta_tags_are_valid(&[tag], false));
+}
+
+#[test]
+fn structurally_malformed_reference_is_rejected_on_ingest() {
+    // PR #328 review Finding 2: structural malformation (here a non-hex
+    // ciphertext hash) still invalidates the reference and drops the message,
+    // exactly as before. The "never drop" rule applies only to locator-kind
+    // policy, never to structural integrity.
+    let mut tag = valid_imeta_tag();
+    // Replace the valid `ciphertext_sha256` with a non-hex value.
+    let bad = tag
+        .iter_mut()
+        .find(|field| field.starts_with("ciphertext_sha256 "))
+        .expect("fixture has a ciphertext_sha256 field");
+    *bad = "ciphertext_sha256 not-a-valid-hash".to_owned();
+
+    assert!(media_attachment_from_imeta_tag(&tag, None, false).is_err());
+    assert!(!media_imeta_tags_are_valid(&[tag], false));
+}
+
+#[test]
+fn imeta_parser_rejects_non_https_media_locator() {
+    let tag = tag_with_locator(format!("http://media.example/{}.bin", valid_hash()));
+    let err = media_attachment_from_imeta_tag(&tag, None, false).unwrap_err();
+
+    assert!(err.to_string().contains("scheme must be https"));
+    assert!(!media_imeta_tags_are_valid(&[tag], false));
+}
+
+#[test]
+fn locator_with_unparseable_url_is_rejected_on_ingest() {
+    // A locator value that does not parse as a URL is structural malformation
+    // and MUST invalidate the reference even though the kind is `blossom-v1`.
+    let mut tag = valid_imeta_tag();
+    let locator = tag
+        .iter_mut()
+        .find(|field| field.starts_with("locator "))
+        .expect("fixture has a locator field");
+    *locator = "locator blossom-v1 not a url".to_owned();
+
+    assert!(media_attachment_from_imeta_tag(&tag, None, false).is_err());
+}
+
+fn blossom_reference() -> MediaAttachmentReference {
+    let mut reference = loopback_reference();
+    reference.locators = vec![MediaLocator {
+        kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
+        // The blossom locator URL must carry the ciphertext hash (= the
+        // reference's `ciphertext_sha256`, `11`*32) per the merged blossom
+        // content-hash binding.
+        value: format!("https://media.example/{}.bin", "11".repeat(32)),
+    }];
+    reference
+}
+
+#[test]
+fn media_fetch_candidates_deduplicate_non_adjacent_fallback_urls() {
+    let mut reference = blossom_reference();
+    let duplicate_url = reference.locators[0].value.clone();
+    reference.locators.push(MediaLocator {
+        kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
+        value: format!("https://other.example/{}.bin", reference.ciphertext_sha256),
+    });
+    let fallback = [crate::AppBlobEndpoint {
+        locator_kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
+        base_url: "https://media.example".to_owned(),
+    }];
+
+    let candidates = encrypted_media_fetch_candidates(&reference, &fallback);
+
+    assert_eq!(candidates.len(), 2);
+    assert_eq!(candidates[0], duplicate_url);
+}
+
+#[test]
+fn outbound_validation_rejects_blossom_reference_when_policy_disallows_blossom() {
+    // PR #328 review Finding 1: the sender MUST NOT emit a `blossom-v1`
+    // reference to a group whose policy does not allow `blossom-v1`, since
+    // receivers would treat the locator as unfetchable. A non-empty policy
+    // that omits `blossom-v1` must fail outbound validation.
+    let reference = blossom_reference();
+    let allowed = vec!["ipfs-v1".to_owned()];
+    assert!(
+        reference
+            .validate_outbound(EncryptedMediaVersion::V1, &allowed, false)
+            .is_err(),
+        "a blossom reference must be rejected when the policy omits blossom-v1"
+    );
+    // The same reference is valid against a policy that does allow blossom-v1.
+    let allowed = vec![BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+    reference
+        .validate_outbound(EncryptedMediaVersion::V1, &allowed, false)
+        .expect("a blossom reference is valid when the policy allows blossom-v1");
+}
+
+#[test]
+fn canonical_media_type_trims_ascii_whitespace_only() {
+    // ASCII whitespace on the edges is stripped per the V1 algorithm.
+    assert_eq!(
+        canonical_media_type_v1("  image/png \t").expect("ascii-trimmed type is valid"),
+        "image/png",
+    );
+
+    // A leading U+00A0 (non-breaking space) is Unicode whitespace but NOT
+    // ASCII whitespace, so it MUST be preserved: trimming it would derive a
+    // different file_key/AAD than a spec-conformant peer that keeps it.
+    let canonical =
+        canonical_media_type_v1("\u{00A0}image/png").expect("non-empty MIME type is valid");
+    assert_eq!(canonical, "\u{00A0}image/png");
+    assert!(canonical.starts_with('\u{00A0}'));
+}
+
+#[test]
+fn is_loopback_http_endpoint_classifies_only_cleartext_loopback() {
+    // Cleartext loopback hosts are loopback-HTTP endpoints.
+    assert!(is_loopback_http_endpoint("http://127.0.0.1:8080/up"));
+    assert!(is_loopback_http_endpoint("http://localhost:3000"));
+    assert!(is_loopback_http_endpoint("http://sub.localhost/blob"));
+    assert!(is_loopback_http_endpoint("http://[::1]:8080"));
+    // HTTPS (even to loopback) and routable HTTP hosts are not.
+    assert!(!is_loopback_http_endpoint("https://127.0.0.1:8080"));
+    assert!(!is_loopback_http_endpoint("http://media.example/blob"));
+    assert!(!is_loopback_http_endpoint("https://blossom.example"));
+    assert!(!is_loopback_http_endpoint("not a url"));
+}
+
+fn loopback_reference() -> MediaAttachmentReference {
+    MediaAttachmentReference {
+        locators: vec![MediaLocator {
+            kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
+            value: format!("http://127.0.0.1:8080/{}.bin", "11".repeat(32)),
+        }],
+        ciphertext_sha256: "11".repeat(32),
+        plaintext_sha256: "22".repeat(32),
+        nonce_hex: "33".repeat(12),
+        file_name: "diagram.png".to_owned(),
+        media_type: "image/png".to_owned(),
+        version: ENCRYPTED_MEDIA_VERSION.to_owned(),
+        source_epoch: 0,
+        dim: None,
+        thumbhash: None,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn download_prepare_stays_local() {
+    let dir = tempfile::tempdir().unwrap();
+    marmot_account::AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = std::sync::Arc::new(crate::tests::ScriptedPushRelayClient::default());
+    let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let mut client = app.client("alice").await.unwrap();
+    let group = client.create_group("media", &[]).await.unwrap();
+    let mut reference = loopback_reference();
+    reference.source_epoch = client.runtime.group_record(&group).unwrap().epoch.0;
+    client
+        .prepare_encrypted_media_download(&group, reference.clone())
+        .await
+        .unwrap();
+    client
+        .update_group_profile(&group, Some("advanced media"), None)
+        .await
+        .unwrap();
+    assert!(client.runtime.group_record(&group).unwrap().epoch.0 > reference.source_epoch);
+    let subscriptions = relay.subscription_count();
+    relay.fail_next_subscribe();
+    client
+        .prepare_encrypted_media_download(&group, reference.clone())
+        .await
+        .unwrap();
+    client
+        .prepare_encrypted_media_download(&group, reference.clone())
+        .await
+        .unwrap();
+    // Remove only the historical cache entries. The current exporter cannot
+    // recover this original reference after the group has advanced, but the
+    // source epoch's retained MLS anchor can, without leaving the device.
+    let path = app.account_storage_path("alice");
+    let keys = app.account_home().load_signing_keys("alice").unwrap();
+    let key = app
+        .sqlcipher_key("alice", &keys, &path, crate::SqlcipherDatabaseKind::Session)
+        .unwrap();
+    let connection = rusqlite::Connection::open(path).unwrap();
+    storage_sqlite::open_hardened_sqlcipher(
+        &connection,
+        &key,
+        storage_sqlite::SqlCipherHardening::cipher_only(),
+    )
+    .unwrap();
+    let forget_source_epoch = || {
+        assert!(
+            connection
+                .execute(
+                    "DELETE FROM encrypted_media_epoch_secrets WHERE group_id_hex = ?1 AND source_epoch = ?2",
+                    rusqlite::params![
+                        hex::encode(group.as_slice()),
+                        i64::try_from(reference.source_epoch).unwrap(),
+                    ],
+                )
+                .unwrap()
+                > 0
+        );
+    };
+    forget_source_epoch();
+    client
+        .prepare_encrypted_media_download(&group, reference.clone())
+        .await
+        .expect("the source epoch's retained anchor recovers the secret");
+    assert_eq!(relay.subscription_count(), subscriptions);
+
+    // Past the five-epoch anchor horizon nothing on the device holds it.
+    while client.runtime.group_record(&group).unwrap().epoch.0 < reference.source_epoch + 6 {
+        client
+            .update_group_profile(&group, Some("advanced media again"), None)
+            .await
+            .unwrap();
+    }
+    forget_source_epoch();
+    let subscriptions = relay.subscription_count();
+    let error = client
+        .prepare_encrypted_media_download(&group, reference)
+        .await
+        .err()
+        .expect("the historical secret is unavailable");
+    assert!(
+        matches!(error, crate::AppError::InvalidEncryptedMedia(detail)
+        if detail.contains("missing encrypted media secret"))
+    );
+    assert_eq!(relay.subscription_count(), subscriptions);
+}
+
+#[test]
+fn loopback_locator_validation_follows_runtime_flag_not_build_profile() {
+    // Issue #341 regression: the runtime `allow_loopback_http` flag (driven by
+    // `MarmotAppConfig::allow_loopback_blob_endpoints`) is now the SOLE
+    // authority for accepting a cleartext-`http` loopback `blossom-v1` locator,
+    // replacing the old compile-time `cfg!(debug_assertions)` gate. The
+    // reference carries a hash-bearing loopback URL so it clears the Blossom
+    // content-hash binding and the loopback host is the only thing under test.
+    // Outcome must depend on the flag in EVERY build profile (this test runs
+    // under `debug_assertions`, where the old gate would have force-allowed it).
+    let reference = loopback_reference();
+    assert!(
+        reference.validate(false).is_err(),
+        "a loopback-HTTP blossom locator must be rejected when the flag is off",
+    );
+    reference
+        .validate(true)
+        .expect("a loopback-HTTP blossom locator must be accepted when the flag is on");
+
+    // The same authority must hold on the ingest parser path
+    // (`media_attachment_from_imeta_tag` / `media_imeta_tags_are_valid`).
+    let tag = reference.imeta_tag();
+    let tags = std::slice::from_ref(&tag);
+    assert!(
+        media_attachment_from_imeta_tag(&tag, None, false).is_err(),
+        "ingest must reject a loopback-HTTP blossom locator when the flag is off",
+    );
+    assert!(!media_imeta_tags_are_valid(tags, false));
+    media_attachment_from_imeta_tag(&tag, None, true)
+        .expect("ingest must accept a loopback-HTTP blossom locator when the flag is on");
+    assert!(media_imeta_tags_are_valid(tags, true));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn production_config_does_not_fetch_loopback_endpoint() {
+    // With the dev/test gate off, a loopback-HTTP locator is dropped from the
+    // candidate set, so no GET is issued and the fetch fails as "no supported
+    // locators" rather than attempting to reach the local host.
+    let reference = loopback_reference();
+    let err = fetch_encrypted_media_blob(&reference, &[], &[], false)
+        .await
+        .expect_err("loopback-only reference must be unfetchable in production");
+    match err {
+        AppError::MediaUnfetchable(message) => {
+            assert!(
+                message.contains("no supported locators"),
+                "expected unfetchable error, got: {message}"
+            );
+        }
+        other => panic!("expected MediaUnfetchable, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn loopback_fallback_endpoint_is_skipped_in_production() {
+    // The same gate applies to remote-admin policy fallback endpoints. With
+    // no supported locator on the message, a loopback-HTTP fallback is the
+    // only candidate; in production it is filtered out, so the fetch fails as
+    // unfetchable instead of GETting the local host.
+    let mut reference = loopback_reference();
+    // Drop the message-carried locator so the loopback fallback is the only
+    // candidate under test, keeping one policy-allowed-but-unsupported
+    // locator so the reference stays structurally valid.
+    reference.locators.clear();
+    reference.locators.push(MediaLocator {
+        kind: "ipfs-v1".to_owned(),
+        value: "ipfs://bafyexample".to_owned(),
+    });
+    let fallback = [crate::AppBlobEndpoint {
+        locator_kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
+        base_url: "http://127.0.0.1:8080".to_owned(),
+    }];
+    let err = fetch_encrypted_media_blob(&reference, &fallback, &[], false)
+        .await
+        .expect_err("loopback fallback must be unfetchable in production");
+    match err {
+        AppError::MediaUnfetchable(message) => assert!(
+            message.contains("no supported locators"),
+            "expected unfetchable error, got: {message}"
+        ),
+        other => panic!("expected MediaUnfetchable, got {other:?}"),
+    }
+    // The loopback fallback would survive the candidate filter only when the
+    // dev/test gate is on; assert the classifier agrees so the gate stays the
+    // single decision point.
+    assert!(is_loopback_http_endpoint(&blossom_blob_url(
+        &fallback[0].base_url,
+        &reference.ciphertext_sha256,
+    )));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn out_of_policy_blossom_locator_is_unfetchable_not_a_hard_error() {
+    // PR #328 review Finding 2: when the group's CURRENT policy does not allow
+    // `blossom-v1`, a blossom locator is out of policy and this client cannot
+    // fetch it. The fetch MUST degrade to the unfetchable outcome ("no
+    // supported locators") rather than a hard error that looks like content
+    // corruption. The reference itself stays structurally valid and the
+    // message was already delivered at ingest.
+    let mut reference = loopback_reference();
+    // Use a routable https locator so loopback gating is not what skips it;
+    // the only reason it is unfetchable is the out-of-policy locator kind.
+    reference.locators = vec![MediaLocator {
+        kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
+        value: format!("https://media.example/{}.bin", "11".repeat(32)),
+    }];
+    // A non-empty policy that allows only a non-blossom kind: blossom is out
+    // of policy, so there is no fetchable locator for this client.
+    let allowed = vec!["ipfs-v1".to_owned()];
+    let err = fetch_encrypted_media_blob(&reference, &[], &allowed, true)
+        .await
+        .expect_err("an out-of-policy blossom locator must be unfetchable");
+    match err {
+        AppError::MediaUnfetchable(message) => assert!(
+            message.contains("no supported locators"),
+            "expected unfetchable error, got: {message}"
+        ),
+        other => panic!("expected MediaUnfetchable, got {other:?}"),
+    }
+    // The reference is still structurally valid: out-of-policy is a
+    // fetchability concern, not a structural one.
+    reference
+        .validate(false)
+        .expect("an out-of-policy reference is still structurally valid");
+}
+
+#[test]
+fn imeta_parser_rejects_private_ip_media_locator() {
+    let tag = tag_with_locator(format!("https://10.0.0.5/{}.bin", valid_hash()));
+    let err = media_attachment_from_imeta_tag(&tag, None, false).unwrap_err();
+
+    assert!(err.to_string().contains("public unicast"));
+    assert!(!media_imeta_tags_are_valid(&[tag], false));
+}
+
+#[test]
+fn imeta_parser_rejects_ipv6_transition_prefix_media_locators() {
+    for locator in [
+        // 6to4 wraps 10.0.0.5 in the two segments after 2002::/16.
+        format!("https://[2002:a00:5::]/{}.bin", valid_hash()),
+        // Teredo carries the obfuscated client IPv4 in the low 32 bits: !10.0.0.5.
+        format!(
+            "https://[2001:0:4136:e378:8000:63bf:f5ff:fffa]/{}.bin",
+            valid_hash()
+        ),
+    ] {
+        let tag = tag_with_locator(locator);
+        let err = media_attachment_from_imeta_tag(&tag, None, false).unwrap_err();
+
+        assert!(err.to_string().contains("public unicast"));
+        assert!(!media_imeta_tags_are_valid(&[tag], false));
+    }
+}
+
+#[test]
+fn imeta_parser_rejects_ipv6_documentation_3fff_media_locator() {
+    // 3fff::/20 (RFC 9637) is documentation space that sits inside global-unicast
+    // 2000::/3, so it must be rejected explicitly (canonical unsafe-host set).
+    let tag = tag_with_locator(format!("https://[3fff::1]/{}.bin", valid_hash()));
+    let err = media_attachment_from_imeta_tag(&tag, None, false).unwrap_err();
+
+    assert!(err.to_string().contains("public unicast"));
+    assert!(!media_imeta_tags_are_valid(&[tag], false));
+}
+
+#[test]
+fn imeta_parser_accepts_public_ipv6_media_locator() {
+    let tag = tag_with_locator(format!("https://[2606:4700::]/{}.bin", valid_hash()));
+
+    assert!(media_attachment_from_imeta_tag(&tag, None, false).is_ok());
+    assert!(media_imeta_tags_are_valid(&[tag], false));
+}
+
+#[test]
+fn imeta_parser_rejects_locator_without_content_hash() {
+    let tag = tag_with_locator("https://media.example/download.bin".to_owned());
+    let err = media_attachment_from_imeta_tag(&tag, None, false).unwrap_err();
+
+    assert!(
+        err.to_string()
+            .contains("must include the encrypted blob hash")
+    );
+    assert!(!media_imeta_tags_are_valid(&[tag], false));
+}
+
+#[test]
+fn imeta_parser_rejects_locator_hash_mismatch() {
+    let tag = tag_with_locator(format!("https://media.example/{}.bin", "33".repeat(32)));
+    let err = media_attachment_from_imeta_tag(&tag, None, false).unwrap_err();
+
+    assert!(err.to_string().contains("hash does not match"));
+    assert!(!media_imeta_tags_are_valid(&[tag], false));
+}
+
+#[test]
+fn media_fetch_url_policy_allows_loopback_http_only_when_explicitly_enabled() {
+    let url = Url::parse(&format!("http://127.0.0.1:3000/{}.bin", valid_hash())).unwrap();
+
+    assert!(validate_blossom_fetch_url(&url, true).is_ok());
+    assert!(validate_blossom_fetch_url(&url, false).is_err());
+}
+
+#[test]
+fn blossom_redirect_validation_allows_same_registrable_domain() {
+    let current = Url::parse(&format!("https://blossom.primal.net/{}.bin", valid_hash())).unwrap();
+    let next = Url::parse(&format!(
+        "https://r2a.primal.net/uploads/{}.bin",
+        valid_hash()
+    ))
+    .unwrap();
+
+    super::blossom::validate_blossom_redirect_target(&current, &next, false)
+        .expect("same registrable domain redirect must be allowed");
+}
+
+#[test]
+fn blossom_redirect_validation_rejects_cross_scheme_private_ip_and_cross_domain() {
+    let current = Url::parse(&format!("https://media.example/{}.bin", valid_hash())).unwrap();
+    for (next, expected) in [
+        (
+            format!("http://media.example/{}.bin", valid_hash()),
+            "scheme must be https",
+        ),
+        (
+            format!("https://10.0.0.5/{}.bin", valid_hash()),
+            "public unicast",
+        ),
+        (
+            format!("https://cdn.attacker.net/{}.bin", valid_hash()),
+            "same host or registrable domain",
+        ),
+    ] {
+        let next = Url::parse(&next).unwrap();
+        let err = super::blossom::validate_blossom_redirect_target(&current, &next, false)
+            .expect_err("unsafe redirect must be rejected");
+        assert!(
+            err.to_string().contains(expected),
+            "expected {expected:?}, got {err}"
+        );
+    }
+}
+
+fn blob_reference_for_servers(body: &[u8], servers: &[String]) -> MediaAttachmentReference {
+    let hash = hex::encode(Sha256::digest(body));
+    let mut reference = blossom_reference();
+    reference.ciphertext_sha256 = hash.clone();
+    reference.locators = servers
+        .iter()
+        .map(|server| MediaLocator {
+            kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
+            value: format!("{server}/{hash}.bin"),
+        })
+        .collect();
+    reference
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn renewed_lease_keeps_pool() {
+    let (server_url, accepted, server) = spawn_keep_alive_http_server(b"hello", 2).await;
+    let transport = BlossomHttpTransport::for_test(true, Duration::ZERO, Duration::from_secs(1));
+    let url = format!("{server_url}/{}.bin", valid_hash());
+    for _ in 0..2 {
+        assert_eq!(
+            fetch_blossom_blob_with_transport(&url, &transport)
+                .await
+                .unwrap(),
+            b"hello"
+        );
+    }
+    server.await.unwrap();
+    assert_eq!(accepted.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn uploads_reuse_renewed_pool() {
+    let (url, accepted, server) = spawn_keep_alive_http_server(b"{}", 2).await;
+    let transport = BlossomHttpTransport::for_test(true, Duration::ZERO, Duration::from_secs(1));
+    for _ in 0..2 {
+        upload_blossom_blob(
+            &url,
+            Bytes::new(),
+            &valid_hash(),
+            &signing_keys(),
+            &transport,
+        )
+        .await
+        .unwrap();
+    }
+    server.await.unwrap();
+    assert_eq!(accepted.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_same_origin_downloads_reuse_one_vetted_connection() {
+    let (server_url, accepted, server) = spawn_keep_alive_http_server(b"hello", 2).await;
+    let transport =
+        BlossomHttpTransport::for_test(true, Duration::from_secs(60), Duration::from_secs(1));
+    let url = format!("{server_url}/{}.bin", valid_hash());
+
+    assert_eq!(
+        fetch_blossom_blob_with_transport(&url, &transport)
+            .await
+            .unwrap(),
+        b"hello"
+    );
+    assert_eq!(
+        fetch_blossom_blob_with_transport(&url, &transport)
+            .await
+            .unwrap(),
+        b"hello"
+    );
+    server.await.unwrap();
+
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        1,
+        "compatible same-origin downloads should reuse the vetted connection"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_same_origin_client_setup_resolves_and_vets_once() {
+    let resolutions = Arc::new(AtomicUsize::new(0));
+    let resolver_resolutions = resolutions.clone();
+    let resolver: DnsResolver = Arc::new(move |_domain, port| {
+        resolver_resolutions.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            Ok(vec![format!("1.1.1.1:{port}").parse().unwrap()])
+        })
+    });
+    let transport = BlossomHttpTransport::for_test_with_resolver(
+        false,
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+        resolver,
+    );
+    let url = Url::parse(&format!("https://media.example/{}.bin", valid_hash())).unwrap();
+
+    let clients = futures::future::join_all((0..4).map(|_| transport.client_for_url(&url))).await;
+
+    assert!(clients.into_iter().all(|client| client.is_ok()));
+    assert_eq!(
+        resolutions.load(Ordering::SeqCst),
+        1,
+        "concurrent setup for one origin should share resolution and vetting"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn separate_download_transports_do_not_share_connections() {
+    let (server_url, accepted, server) = spawn_keep_alive_http_server(b"hello", 2).await;
+    let first =
+        BlossomHttpTransport::for_test(true, Duration::from_secs(60), Duration::from_secs(1));
+    let second =
+        BlossomHttpTransport::for_test(true, Duration::from_secs(60), Duration::from_secs(1));
+    let url = format!("{server_url}/{}.bin", valid_hash());
+
+    fetch_blossom_blob_with_transport(&url, &first)
+        .await
+        .unwrap();
+    fetch_blossom_blob_with_transport(&url, &second)
+        .await
+        .unwrap();
+    server.await.unwrap();
+
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        2,
+        "account-scoped transports must not share connection pools"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expired_origin_lease_is_resolved_and_vetted_again() {
+    let resolutions = Arc::new(AtomicUsize::new(0));
+    let resolver_resolutions = resolutions.clone();
+    let resolver: DnsResolver = Arc::new(move |_domain, port| {
+        let attempt = resolver_resolutions.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            let ip = if attempt == 0 { "1.1.1.1" } else { "127.0.0.1" };
+            Ok(vec![format!("{ip}:{port}").parse().unwrap()])
+        })
+    });
+    let transport = BlossomHttpTransport::for_test_with_resolver(
+        false,
+        Duration::ZERO,
+        Duration::from_secs(1),
+        resolver,
+    );
+    let url = Url::parse(&format!("https://media.example/{}.bin", valid_hash())).unwrap();
+
+    transport
+        .client_for_url(&url)
+        .await
+        .expect("first public address set should be accepted");
+    let error = transport
+        .client_for_url(&url)
+        .await
+        .expect_err("expired lease must reject the newly resolved loopback address");
+
+    assert_eq!(resolutions.load(Ordering::SeqCst), 2);
+    assert!(error.to_string().contains("public unicast"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stalled_first_locator_reaches_healthy_fallback_within_startup_bound() {
+    let body = b"healthy ciphertext";
+    let (stalled_url, stalled_server) = spawn_stalled_http_server().await;
+    let healthy_url = spawn_http_response(http_ok_response(body));
+    let reference = blob_reference_for_servers(body, &[stalled_url, healthy_url]);
+    let transport =
+        BlossomHttpTransport::for_test(true, Duration::from_secs(60), Duration::from_millis(500));
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+
+    let downloaded = tokio::time::timeout(
+        Duration::from_secs(2),
+        fetch_encrypted_media_blob_with_transport(&reference, &[], &allowed, &transport),
+    )
+    .await
+    .expect("healthy fallback must be reached promptly")
+    .expect("healthy fallback must succeed");
+    stalled_server.abort();
+
+    assert_eq!(downloaded, body);
+}
+
+/// Stalled locators reserve time for the remaining fallback candidates.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn locator_failover_shares_one_end_to_end_transfer_deadline() {
+    const TRANSFER_DEADLINE: Duration = Duration::from_millis(130);
+
+    let body = b"healthy ciphertext";
+    let (first_url, first_server) = spawn_stalled_http_server().await;
+    let (second_url, second_server) = spawn_stalled_http_server().await;
+    let healthy_url = spawn_http_response(http_ok_response(body));
+    let reference = blob_reference_for_servers(body, &[first_url, second_url, healthy_url]);
+    let transport = BlossomHttpTransport::for_test_with_transfer_timeout(
+        true,
+        Duration::from_secs(60),
+        Duration::from_millis(80),
+        TRANSFER_DEADLINE,
+    );
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+    let started = Instant::now();
+
+    let downloaded =
+        fetch_encrypted_media_blob_with_transport(&reference, &[], &allowed, &transport)
+            .await
+            .expect("stalled candidates must leave time for the healthy locator");
+    first_server.abort();
+    second_server.abort();
+
+    assert_eq!(downloaded, body);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "two stalled candidates must share the configured end-to-end deadline"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn slow_progressing_locator_is_not_cut_off_by_equal_fallback_share() {
+    const GLOBAL_DEADLINE: Duration = Duration::from_millis(600);
+    const FORMER_EQUAL_SHARE: Duration = Duration::from_millis(200);
+
+    let body = Arc::new(vec![0x5a; 192 * 1024]);
+    let (primary_url, primary_requests, primary) =
+        spawn_progressing_http_server(body.clone(), Duration::from_millis(300)).await;
+    let (fallback_a_url, fallback_a_requests, fallback_a) =
+        spawn_progressing_http_server(body.clone(), Duration::from_millis(20)).await;
+    let (fallback_b_url, fallback_b_requests, fallback_b) =
+        spawn_progressing_http_server(body.clone(), Duration::from_millis(20)).await;
+    let reference = blob_reference_for_servers(
+        body.as_slice(),
+        &[primary_url, fallback_a_url, fallback_b_url],
+    );
+    let transport = BlossomHttpTransport::for_test_with_transfer_timeout(
+        true,
+        Duration::from_secs(60),
+        Duration::from_millis(80),
+        GLOBAL_DEADLINE,
+    );
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+    let started = Instant::now();
+
+    let downloaded =
+        fetch_encrypted_media_blob_with_transport(&reference, &[], &allowed, &transport)
+            .await
+            .expect("continuous valid progress must outlive the former equal share");
+    let elapsed = started.elapsed();
+    primary.abort();
+    fallback_a.abort();
+    fallback_b.abort();
+
+    assert_eq!(downloaded.as_slice(), body.as_slice());
+    assert!(
+        elapsed > FORMER_EQUAL_SHARE,
+        "fixture must cross the old cutoff"
+    );
+    assert!(
+        elapsed < GLOBAL_DEADLINE,
+        "the acquisition stays globally bounded"
+    );
+    assert_eq!(primary_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(fallback_a_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(fallback_b_requests.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn media_download_client_does_not_short_circuit_the_body_idle_policy() {
+    use super::attachment_resume::BODY_IDLE_TIMEOUT;
+
+    assert_eq!(
+        BlossomHttpTransport::new(true).read_timeout,
+        BODY_IDLE_TIMEOUT
+    );
+    assert!(BODY_IDLE_TIMEOUT > super::blossom::MEDIA_HTTP_READ_TIMEOUT);
+
+    // A 40 MiB encrypted blob matches the reported received-APK size band.
+    let body = Arc::new(vec![0x5a; 40 * 1024 * 1024]);
+    let (url, server) =
+        spawn_http_server_with_body_gap(body.clone(), Duration::from_millis(800)).await;
+    let reference = blob_reference_for_servers(&body, &[url]);
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+
+    let short =
+        BlossomHttpTransport::for_test(true, Duration::from_secs(60), Duration::from_secs(1))
+            .with_read_timeout_for_test(Duration::from_millis(250));
+    let short_error = fetch_encrypted_media_blob_with_transport(&reference, &[], &allowed, &short)
+        .await
+        .expect_err("the shorter client timeout must interrupt the delayed body");
+    // The first yielded chunk may be coalesced with headers: either timeout
+    // branch is a download failure caused by the shorter HTTP read bound.
+    assert!(
+        matches!(&short_error, AppError::MediaDownloadFailed(detail) if detail == "request timed out" || detail == "body transfer failed"),
+        "expected a body-read failure, got {short_error:?}"
+    );
+
+    let viable =
+        BlossomHttpTransport::for_test(true, Duration::from_secs(60), Duration::from_secs(1))
+            .with_read_timeout_for_test(Duration::from_secs(2));
+    let downloaded = fetch_encrypted_media_blob_with_transport(&reference, &[], &allowed, &viable)
+        .await
+        .expect("a progressing body must survive a gap below the native idle bound");
+    server.abort();
+    assert_eq!(downloaded.as_slice(), body.as_slice());
+}
+
+/// Expiring the shared deadline while a later locator is active must leave a
+/// failed sample for the transport phase that consumed the remaining budget.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_deadline_timeout_records_the_active_later_locator_phase() {
+    let body = b"healthy ciphertext";
+    let (first_url, first_server) = spawn_stalled_http_server().await;
+    let (second_url, second_server) = spawn_stalled_http_server().await;
+    let reference = blob_reference_for_servers(body, &[first_url, second_url]);
+    let transport = BlossomHttpTransport::for_test_with_transfer_timeout(
+        true,
+        Duration::from_secs(60),
+        Duration::from_millis(80),
+        Duration::from_millis(130),
+    );
+    let telemetry = crate::app_telemetry::AppPerformanceTelemetry::default();
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+
+    let error = fetch_encrypted_media_blob_with_observer(
+        &reference,
+        &[],
+        &allowed,
+        &transport,
+        Some(&telemetry),
+    )
+    .await
+    .expect_err("the shared transfer deadline must still expire");
+    first_server.abort();
+    second_server.abort();
+
+    assert!(error.to_string().contains("timed out"));
+    let response_headers = telemetry.snapshot().media_download_response_headers;
+    assert_eq!(response_headers.attempts, 2);
+    assert_eq!(response_headers.successes, 0);
+    assert_eq!(response_headers.failures, 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transient_get_retries_once() {
+    for first_status in [502, 503] {
+        let server = spawn_http_responses(vec![
+            http_status_response(first_status, "Unavailable"),
+            http_ok_response(b"hello"),
+        ]);
+        let transport = BlossomHttpTransport::new(true);
+        let started = Instant::now();
+        let body = fetch_blossom_blob_with_transport(
+            &format!("{server}/{}.bin", valid_hash()),
+            &transport,
+        )
+        .await
+        .unwrap();
+        assert_eq!(body, b"hello");
+        assert!(started.elapsed() >= Duration::from_millis(500));
+    }
+    let server = spawn_http_responses(vec![
+        http_status_response(503, "Unavailable"),
+        http_status_response(503, "Unavailable"),
+    ]);
+    let error = fetch_blossom_blob_with_transport(
+        &format!("{server}/{}.bin", valid_hash()),
+        &BlossomHttpTransport::new(true),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("HTTP 503"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn trickle_yields_to_fallback() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = [0; 4096];
+        assert!(stream.read(&mut request).await.unwrap() > 0);
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\nx")
+            .await
+            .unwrap();
+        loop {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            if stream.write_all(b"x").await.is_err() {
+                return;
+            }
+        }
+    });
+    let body = b"healthy ciphertext";
+    let healthy = spawn_http_response(http_ok_response(body));
+    let reference = blob_reference_for_servers(body, &[url, healthy]);
+    let transport = BlossomHttpTransport::for_test_with_transfer_timeout(
+        true,
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+        Duration::from_millis(600),
+    );
+    let downloaded = fetch_encrypted_media_blob_with_transport(
+        &reference,
+        &[],
+        &[BLOSSOM_LOCATOR_KIND_V1.to_owned()],
+        &transport,
+    )
+    .await
+    .unwrap();
+    server.abort();
+    assert_eq!(downloaded, body);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn corrupt_first_locator_does_not_prevent_integrity_valid_fallback() {
+    let body = b"integrity-valid ciphertext";
+    let corrupt_url = spawn_http_response(http_ok_response(b"corrupt"));
+    let healthy_url = spawn_http_response(http_ok_response(body));
+    let reference = blob_reference_for_servers(body, &[corrupt_url, healthy_url]);
+    let transport =
+        BlossomHttpTransport::for_test(true, Duration::from_secs(60), Duration::from_secs(1));
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+
+    let downloaded =
+        fetch_encrypted_media_blob_with_transport(&reference, &[], &allowed, &transport)
+            .await
+            .expect("corrupt first candidate must fall through to the healthy locator");
+
+    assert_eq!(downloaded, body);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetch_blossom_blob_follows_hashless_redirect_targets() {
+    let final_server = spawn_http_response(http_ok_response(b"hello"));
+    let final_url = format!("{final_server}/signed/opaque-key?X-Amz-Signature=test");
+    let redirecting_server = spawn_http_response(http_redirect_response(&final_url));
+    let url = format!("{redirecting_server}/{}.bin", valid_hash());
+
+    let bytes = fetch_blossom_blob(&url, true)
+        .await
+        .expect("valid redirect should fetch final blob");
+
+    assert_eq!(bytes, b"hello");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetch_blossom_blob_rejects_redirect_chain_over_limit() {
+    let responses = (0..6)
+        .map(|idx| http_redirect_response(&format!("/hop-{idx}/{}.bin", valid_hash())))
+        .collect::<Vec<_>>();
+    let server = spawn_http_responses(responses);
+    let url = format!("{server}/{}.bin", valid_hash());
+    let err = fetch_blossom_blob(&url, true).await.unwrap_err();
+
+    assert!(err.to_string().contains("exceeded 5 hops"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetch_blossom_blob_rejects_redirect_without_location() {
+    let server = spawn_http_response(
+        b"HTTP/1.1 302 Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+    );
+    let url = format!("{server}/{}.bin", valid_hash());
+    let err = fetch_blossom_blob(&url, true).await.unwrap_err();
+
+    assert!(
+        err.to_string()
+            .contains("redirect response did not include Location")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetch_blossom_blob_reports_terminal_status_after_redirect() {
+    let server = spawn_http_responses(vec![
+        http_redirect_response("/missing-opaque-key"),
+        http_not_found_response(),
+    ]);
+    let url = format!("{server}/{}.bin", valid_hash());
+    let err = fetch_blossom_blob(&url, true).await.unwrap_err();
+
+    assert!(
+        err.to_string().contains("download returned HTTP 404"),
+        "expected terminal status, got: {err}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetch_blossom_blob_follows_redirect_target_with_different_path_hash() {
+    let final_server = spawn_http_response(http_ok_response(b"hello"));
+    let final_url = format!("{final_server}/{}.bin", "22".repeat(32));
+    let redirecting_server = spawn_http_response(http_redirect_response(&final_url));
+    let url = format!("{redirecting_server}/{}.bin", valid_hash());
+
+    let bytes = fetch_blossom_blob(&url, true)
+        .await
+        .expect("redirect target path hash is not authoritative for content integrity");
+
+    assert_eq!(bytes, b"hello");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fetch_blossom_blob_rejects_oversized_content_length() {
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        MAX_ENCRYPTED_MEDIA_BLOB_BYTES + 1
+    );
+    let server = spawn_http_response(response.into_bytes());
+    let url = format!("{server}/{}.bin", valid_hash());
+    let err = fetch_blossom_blob(&url, true).await.unwrap_err();
+
+    assert!(err.to_string().contains("download exceeds"));
+}
+
+/// Rejecting a declared oversized body happens before transfer and must not
+/// contribute an artificial zero-duration sample to the transfer histogram.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oversized_content_length_does_not_record_body_transfer_timing() {
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        MAX_ENCRYPTED_MEDIA_BLOB_BYTES + 1
+    );
+    let server = spawn_http_response(response.into_bytes());
+    let url = format!("{server}/{}.bin", valid_hash());
+    let transport = BlossomHttpTransport::new(true);
+    let telemetry = crate::app_telemetry::AppPerformanceTelemetry::default();
+
+    let err = fetch_blossom_blob_with_observer(&url, &transport, Some(&telemetry))
+        .await
+        .expect_err("oversized declared bodies must be rejected");
+
+    assert!(err.to_string().contains("download exceeds"));
+    let snapshot = telemetry.snapshot();
+    assert_eq!(snapshot.media_download_response_headers.attempts, 1);
+    assert_eq!(snapshot.media_download_body_transfer.attempts, 0);
+}
+
+/// EOF before any body bytes is a failed first-byte phase, not a successful
+/// zero-duration transfer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn empty_response_records_first_byte_failure_without_body_transfer_timing() {
+    let server = spawn_http_response(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+    );
+    let url = format!("{server}/{}.bin", valid_hash());
+    let transport = BlossomHttpTransport::new(true);
+    let telemetry = crate::app_telemetry::AppPerformanceTelemetry::default();
+
+    let body = fetch_blossom_blob_with_observer(&url, &transport, Some(&telemetry))
+        .await
+        .expect("an empty response remains available for integrity validation");
+
+    assert!(body.is_empty());
+    let snapshot = telemetry.snapshot();
+    assert_eq!(snapshot.media_download_response_headers.successes, 1);
+    assert_eq!(snapshot.media_download_first_byte.attempts, 1);
+    assert_eq!(snapshot.media_download_first_byte.successes, 0);
+    assert_eq!(snapshot.media_download_first_byte.failures, 1);
+    assert_eq!(snapshot.media_download_body_transfer.attempts, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::disallowed_methods)]
+async fn limited_body_reader_rejects_chunked_body_over_cap() {
+    let server = spawn_http_response(
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n6\r\nabcdef\r\n0\r\n\r\n"
+            .to_vec(),
+    );
+    let response = reqwest::Client::new()
+        .get(format!("{server}/{}.bin", valid_hash()))
+        .send()
+        .await
+        .expect("fetch chunked test body");
+    let err = read_limited_blossom_body(response, 5).await.unwrap_err();
+
+    assert!(err.to_string().contains("download exceeds 5 bytes"));
+}
+
+/// Load the shared golden imeta fixture file used by marmot-app, marmot-uniffi,
+/// and wn-cli agreement tests.
+fn shared_media_fixture_cases(file: &str) -> Vec<serde_json::Value> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/encrypted-media")
+        .join(file);
+    let doc: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("read media fixture {}: {err}", path.display())),
+    )
+    .expect("media fixture file is valid JSON");
+    doc["cases"].as_array().expect("fixture cases").clone()
+}
+
+fn fixture_tag(case: &serde_json::Value) -> Vec<String> {
+    case["tag"]
+        .as_array()
+        .expect("fixture tag")
+        .iter()
+        .map(|field| field.as_str().expect("fixture tag field").to_owned())
+        .collect()
+}
+
+/// `null`/absent means the optional wire field is absent; `""` (or any string)
+/// means it is present with exactly that value. The distinction is part of the
+/// fixture contract because build -> parse must not collapse it.
+fn fixture_optional(value: &serde_json::Value, key: &str) -> Option<String> {
+    match &value[key] {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(text) => Some(text.clone()),
+        other => panic!("fixture optional field {key} must be null or string, got {other}"),
+    }
+}
+
+fn assert_shared_media_fixture_file(file: &str) {
+    let cases = shared_media_fixture_cases(file);
+    assert!(!cases.is_empty(), "{file} must contain cases");
+    for case in cases {
+        let name = case["name"].as_str().expect("fixture case name");
+        let tag = fixture_tag(&case);
+        let source_epoch = case["source_epoch"].as_u64().expect("fixture source_epoch");
+        let result = media_attachment_from_imeta_tag(&tag, Some(source_epoch), false);
+        if case["valid"].as_bool().expect("fixture valid flag") {
+            let reference = result
+                .unwrap_or_else(|err| panic!("{file}/{name} must parse as a valid tag: {err}"));
+            let expected = &case["expected"];
+            assert_eq!(
+                reference.version,
+                expected["version"].as_str().unwrap(),
+                "{file}/{name} version"
+            );
+            let expected_locators: Vec<MediaLocator> = expected["locators"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|locator| MediaLocator {
+                    kind: locator["kind"].as_str().unwrap().to_owned(),
+                    value: locator["value"].as_str().unwrap().to_owned(),
+                })
+                .collect();
+            assert_eq!(
+                reference.locators, expected_locators,
+                "{file}/{name} locators"
+            );
+            assert_eq!(
+                reference.ciphertext_sha256,
+                expected["ciphertext_sha256"].as_str().unwrap(),
+                "{file}/{name} ciphertext_sha256"
+            );
+            assert_eq!(
+                reference.plaintext_sha256,
+                expected["plaintext_sha256"].as_str().unwrap(),
+                "{file}/{name} plaintext_sha256"
+            );
+            assert_eq!(
+                reference.nonce_hex,
+                expected["nonce_hex"].as_str().unwrap(),
+                "{file}/{name} nonce_hex"
+            );
+            assert_eq!(
+                reference.media_type,
+                expected["media_type"].as_str().unwrap(),
+                "{file}/{name} media_type"
+            );
+            assert_eq!(
+                reference.file_name,
+                expected["file_name"].as_str().unwrap(),
+                "{file}/{name} file_name"
+            );
+            assert_eq!(
+                reference.source_epoch, source_epoch,
+                "{file}/{name} source_epoch"
+            );
+            assert_eq!(
+                reference.dim,
+                fixture_optional(expected, "dim"),
+                "{file}/{name} dim absent-vs-present-empty"
+            );
+            assert_eq!(
+                reference.thumbhash,
+                fixture_optional(expected, "thumbhash"),
+                "{file}/{name} thumbhash absent-vs-present-empty"
+            );
+            // Exact wire round-trip through the checked outbound builder: the
+            // group-version gate and locator policy accept the reference, and
+            // the rebuilt tag is byte-identical to the golden fixture.
+            let version = EncryptedMediaVersion::parse(&reference.version).unwrap();
+            let allowed: Vec<String> = reference
+                .locators
+                .iter()
+                .map(|locator| locator.kind.clone())
+                .collect();
+            let rebuilt = reference
+                .build_imeta_tag(version, &allowed, false)
+                .unwrap_or_else(|err| panic!("{file}/{name} must rebuild: {err}"));
+            assert_eq!(rebuilt, tag, "{file}/{name} exact round-trip");
+        } else {
+            let err = result.expect_err(&format!("{file}/{name} must be rejected"));
+            let needle = case["error_contains"].as_str().expect("error_contains");
+            assert!(
+                err.to_string().contains(needle),
+                "{file}/{name} error must mention {needle:?}, got: {err}"
+            );
+            // The typed parser and the `AppError` wrapper must agree on the
+            // stable category and carry the same presentation text.
+            let rejection = parse_media_attachment(&tag, Some(source_epoch), false).expect_err(
+                &format!("{file}/{name} must be rejected by the typed parser"),
+            );
+            assert_eq!(
+                rejection.kind,
+                fixture_rejection_kind(&case),
+                "{file}/{name} stable rejection kind"
+            );
+            assert!(
+                rejection.detail.contains(needle),
+                "{file}/{name} rejection detail must mention {needle:?}, got: {}",
+                rejection.detail
+            );
+            assert!(
+                matches!(&err, AppError::MediaAttachmentRejected(wrapped) if *wrapped == rejection),
+                "{file}/{name} AppError must wrap the identical typed rejection, got: {err:?}"
+            );
+        }
+    }
+}
+
+/// Map a fixture's `rejection_kind` label onto the stable category enum.
+pub(super) fn fixture_rejection_kind(case: &serde_json::Value) -> MediaAttachmentRejectionKind {
+    match case["rejection_kind"]
+        .as_str()
+        .expect("rejection fixture names its rejection_kind")
+    {
+        "invalid_structure" => MediaAttachmentRejectionKind::InvalidStructure,
+        "unsupported_format" => MediaAttachmentRejectionKind::UnsupportedFormat,
+        "missing_field" => MediaAttachmentRejectionKind::MissingField,
+        "duplicate_field" => MediaAttachmentRejectionKind::DuplicateField,
+        "malformed_field" => MediaAttachmentRejectionKind::MalformedField,
+        other => panic!("unknown fixture rejection_kind {other:?}"),
+    }
+}
+
+#[test]
+fn shared_golden_v1_fixtures_parse_validate_and_round_trip_exactly() {
+    assert_shared_media_fixture_file("imeta-v1.json");
+}
+
+#[test]
+fn shared_golden_v2_fixtures_parse_validate_and_round_trip_exactly() {
+    assert_shared_media_fixture_file("imeta-v2.json");
+}
+
+fn legacy_mip04_tag(version_first: bool) -> Vec<String> {
+    // The MIP-era shape Amethyst's writer produced before the adopted format:
+    // `url` / `x` / `n` with a `blurhash` and a `v mip04-v2` marker. Neither
+    // field order may change the verdict a client is told about.
+    let mut fields = vec![
+        "url https://media.example/legacy-upload.bin".to_owned(),
+        "blurhash LEHV6nWB2yk8pyo0adR*.7kCMdnj".to_owned(),
+        "m image/jpeg".to_owned(),
+        "filename photo.jpg".to_owned(),
+        format!("x {}", "cd".repeat(32)),
+        "n efefefefefefefefefefefef".to_owned(),
+    ];
+    if version_first {
+        fields.insert(0, "v mip04-v2".to_owned());
+    } else {
+        fields.push("v mip04-v2".to_owned());
+    }
+    let mut tag = vec!["imeta".to_owned()];
+    tag.extend(fields);
+    tag
+}
+
+#[test]
+fn legacy_mip04_shape_is_unsupported_format_regardless_of_field_order() {
+    for tag in [legacy_mip04_tag(false), legacy_mip04_tag(true)] {
+        let rejection = parse_media_attachment(&tag, Some(3), false)
+            .expect_err("the legacy shape must be rejected");
+        assert_eq!(
+            rejection.kind,
+            MediaAttachmentRejectionKind::UnsupportedFormat,
+            "legacy shape {tag:?} must classify as an unsupported format, got {rejection:?}"
+        );
+        assert!(rejection.detail.contains("version"), "{}", rejection.detail);
+        assert!(
+            !rejection.detail.contains("media.example"),
+            "rejection detail must never echo tag content: {}",
+            rejection.detail
+        );
+    }
+}
+
+#[test]
+fn parser_rejections_carry_stable_kinds() {
+    use MediaAttachmentRejectionKind::*;
+
+    let mut missing_version = valid_imeta_tag();
+    missing_version.retain(|field| !field.starts_with("v "));
+    let mut unknown_version = valid_imeta_tag();
+    unknown_version[1] = "v encrypted-media-v9".to_owned();
+    let mut duplicate_media_type = valid_imeta_tag();
+    duplicate_media_type.push("m image/jpeg".to_owned());
+    let mut duplicate_version = valid_imeta_tag();
+    duplicate_version.push("v encrypted-media-v1".to_owned());
+    let mut missing_nonce = valid_imeta_tag();
+    missing_nonce.retain(|field| !field.starts_with("nonce "));
+    let mut missing_locator = valid_imeta_tag();
+    missing_locator.retain(|field| !field.starts_with("locator "));
+    let mut bad_hash = valid_imeta_tag();
+    bad_hash[3] = "ciphertext_sha256 not-hex".to_owned();
+    let mut blurhash = valid_imeta_tag();
+    blurhash.push("blurhash LEHV6nWB2yk8pyo0adR*.7kCMdnj".to_owned());
+    let mut bare_field = valid_imeta_tag();
+    bare_field.push("dim".to_owned());
+    let mut locator_without_value = valid_imeta_tag();
+    locator_without_value[2] = "locator blossom-v1".to_owned();
+    let mut not_imeta = valid_imeta_tag();
+    not_imeta[0] = "notimeta".to_owned();
+
+    for (label, tag, expected) in [
+        ("missing version", missing_version, UnsupportedFormat),
+        ("unknown version", unknown_version, UnsupportedFormat),
+        ("duplicate media type", duplicate_media_type, DuplicateField),
+        ("duplicate version", duplicate_version, DuplicateField),
+        ("missing nonce", missing_nonce, MissingField),
+        ("missing locator", missing_locator, MissingField),
+        ("non-hex hash", bad_hash, MalformedField),
+        ("blurhash present", blurhash, MalformedField),
+        ("field without value", bare_field, InvalidStructure),
+        (
+            "locator without value",
+            locator_without_value,
+            InvalidStructure,
+        ),
+        ("not an imeta tag", not_imeta, InvalidStructure),
+    ] {
+        let rejection = parse_media_attachment(&tag, None, false)
+            .err()
+            .unwrap_or_else(|| panic!("{label}: tag must be rejected"));
+        assert_eq!(rejection.kind, expected, "{label}: {rejection:?}");
+        assert!(
+            !rejection.detail.is_empty(),
+            "{label}: detail must be presentable"
+        );
+    }
+}
+
+#[test]
+fn typed_rejection_converts_to_app_error_without_losing_the_reason() {
+    let mut missing_nonce = valid_imeta_tag();
+    missing_nonce.retain(|field| !field.starts_with("nonce "));
+
+    let rejection = parse_media_attachment(&missing_nonce, None, false).unwrap_err();
+    let err: AppError = rejection.clone().into();
+
+    assert!(matches!(&err, AppError::MediaAttachmentRejected(wrapped) if *wrapped == rejection));
+    assert!(err.to_string().contains("nonce"), "{err}");
+    assert_eq!(
+        media_attachment_from_imeta_tag(&missing_nonce, None, false)
+            .unwrap_err()
+            .to_string(),
+        err.to_string(),
+        "the AppError entry point must report the identical rejection"
+    );
+}
+
+#[test]
+fn media_attachment_outcomes_preserve_position_and_skip_non_imeta_tags() {
+    let mut broken = valid_imeta_tag();
+    broken.retain(|field| !field.starts_with("nonce "));
+    let tags = vec![
+        vec!["p".to_owned(), "aa".repeat(32)],
+        valid_imeta_tag(),
+        broken,
+        valid_v2_imeta_tag(),
+        vec!["q".to_owned(), "bb".repeat(32)],
+    ];
+
+    let outcomes = media_attachment_outcomes_from_tags(&tags, Some(7), false);
+
+    assert_eq!(
+        outcomes.len(),
+        3,
+        "only imeta tags are attachments: {outcomes:?}"
+    );
+    match &outcomes[0] {
+        MediaAttachmentOutcome::Accepted {
+            attachment_index,
+            reference,
+        } => {
+            assert_eq!(*attachment_index, 0);
+            assert_eq!(reference.file_name, "diagram.png");
+            assert_eq!(reference.source_epoch, 7);
+        }
+        other => panic!("first attachment must be accepted, got {other:?}"),
+    }
+    match &outcomes[1] {
+        MediaAttachmentOutcome::Rejected {
+            attachment_index,
+            rejection,
+        } => {
+            assert_eq!(*attachment_index, 1);
+            assert_eq!(rejection.kind, MediaAttachmentRejectionKind::MissingField);
+            assert!(rejection.detail.contains("nonce"));
+        }
+        other => panic!("second attachment must be rejected, got {other:?}"),
+    }
+    match &outcomes[2] {
+        MediaAttachmentOutcome::Accepted {
+            attachment_index,
+            reference,
+        } => {
+            assert_eq!(*attachment_index, 2);
+            assert_eq!(reference.version, ENCRYPTED_MEDIA_FORMAT_V2);
+        }
+        other => panic!("third attachment must be accepted, got {other:?}"),
+    }
+    // A message with no imeta tags has no attachments and no rejections.
+    assert!(media_attachment_outcomes_from_tags(&tags[..1], Some(7), false).is_empty());
+}
+
+#[test]
+fn media_attachment_outcomes_from_media_json_report_undecodable_entries() {
+    let media = serde_json::json!({
+        "imeta": [
+            valid_imeta_tag(),
+            42,
+            ["notimeta", "m image/png"],
+            legacy_mip04_tag(false),
+        ]
+    });
+
+    let outcomes = media_attachment_outcomes_from_media_json(Some(&media), Some(5), false);
+
+    assert_eq!(outcomes.len(), 4);
+    assert!(matches!(
+        &outcomes[0],
+        MediaAttachmentOutcome::Accepted { attachment_index: 0, reference }
+            if reference.source_epoch == 5
+    ));
+    assert!(matches!(
+        &outcomes[1],
+        MediaAttachmentOutcome::Rejected { attachment_index: 1, rejection }
+            if rejection.kind == MediaAttachmentRejectionKind::InvalidStructure
+    ));
+    assert!(matches!(
+        &outcomes[2],
+        MediaAttachmentOutcome::Rejected { attachment_index: 2, rejection }
+            if rejection.kind == MediaAttachmentRejectionKind::InvalidStructure
+    ));
+    assert!(matches!(
+        &outcomes[3],
+        MediaAttachmentOutcome::Rejected { attachment_index: 3, rejection }
+            if rejection.kind == MediaAttachmentRejectionKind::UnsupportedFormat
+    ));
+
+    // No metadata, an object without an imeta list, or an empty imeta list
+    // means no attachments.
+    assert!(media_attachment_outcomes_from_media_json(None, Some(5), false).is_empty());
+    for empty in [serde_json::json!({}), serde_json::json!({ "imeta": [] })] {
+        assert!(
+            media_attachment_outcomes_from_media_json(Some(&empty), Some(5), false).is_empty(),
+            "{empty} must project as no attachments"
+        );
+    }
+    // A present container that cannot be indexed (an imeta value that is not a
+    // list, or a container that is not an object, which is how storage hands
+    // through a corrupt column) is reported once so the host still learns the
+    // row carried undisplayable media.
+    for corrupt in [
+        serde_json::json!({ "imeta": "nope" }),
+        serde_json::json!([42]),
+        serde_json::json!("broken"),
+        serde_json::Value::Null,
+        serde_json::Value::String("{not-json".to_owned()),
+    ] {
+        let outcomes = media_attachment_outcomes_from_media_json(Some(&corrupt), Some(5), false);
+        assert!(
+            matches!(
+                outcomes.as_slice(),
+                [MediaAttachmentOutcome::Rejected { attachment_index: 0, rejection }]
+                    if rejection.kind == MediaAttachmentRejectionKind::InvalidStructure
+            ),
+            "{corrupt} must project as one undecodable attachment, got {outcomes:?}"
+        );
+    }
+}
+
+#[test]
+fn media_attachment_outcomes_agree_between_tags_and_media_json() {
+    // The storage row's `media.imeta` is exactly the message's imeta tags in
+    // order, so both entry points must yield identical outcomes and indices.
+    let mut broken = valid_v2_imeta_tag();
+    broken.push("m image/jpeg".to_owned());
+    let tags = vec![
+        vec!["e".to_owned(), "cc".repeat(32)],
+        valid_imeta_tag(),
+        broken,
+        valid_v2_imeta_tag(),
+    ];
+    let imeta: Vec<&Vec<String>> = tags
+        .iter()
+        .filter(|tag| tag.first().map(String::as_str) == Some("imeta"))
+        .collect();
+    let media = serde_json::json!({ "imeta": imeta });
+
+    assert_eq!(
+        media_attachment_outcomes_from_tags(&tags, Some(9), false),
+        media_attachment_outcomes_from_media_json(Some(&media), Some(9), false),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ciphertext_mismatch_on_every_locator_is_a_download_failure_not_a_reference_error() {
+    // The reference is structurally valid and its locator is fetchable; only
+    // the bytes served do not verify. Per encrypted-media.md that is an
+    // attachment-availability failure, which must not be reported to hosts as
+    // an invalid reference.
+    let body = b"integrity-valid ciphertext";
+    let corrupt_url = spawn_http_response(http_ok_response(b"corrupt"));
+    let reference = blob_reference_for_servers(body, &[corrupt_url]);
+    let transport =
+        BlossomHttpTransport::for_test(true, Duration::from_secs(60), Duration::from_secs(1));
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+
+    let err = fetch_encrypted_media_blob_with_transport(&reference, &[], &allowed, &transport)
+        .await
+        .expect_err("a blob that does not verify must fail the download");
+
+    assert!(
+        matches!(&err, AppError::MediaDownloadFailed(message) if message.contains("hash does not match")),
+        "expected MediaDownloadFailed, got {err:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transport_rejection_is_a_download_failure() {
+    let body = b"never served";
+    let missing_url = spawn_http_response(http_not_found_response());
+    let reference = blob_reference_for_servers(body, &[missing_url]);
+    let transport =
+        BlossomHttpTransport::for_test(true, Duration::from_secs(60), Duration::from_secs(1));
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+
+    let err = fetch_encrypted_media_blob_with_transport(&reference, &[], &allowed, &transport)
+        .await
+        .expect_err("a 404 must fail the download");
+
+    assert!(
+        matches!(err, AppError::MediaDownloadFailed(_)),
+        "expected MediaDownloadFailed, got {err:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn decryption_failure_is_a_download_failure_not_a_reference_error() {
+    let (server, _received) = spawn_roundtrip_blob_server();
+    let endpoints = [blossom_endpoint(server)];
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+    let secret = media_secret();
+    let upload = upload_encrypted_media(
+        media_upload_request(None),
+        42,
+        &secret,
+        &signing_keys(),
+        operation_policy(EncryptedMediaVersion::V2, &endpoints, &allowed, true),
+        &BlossomHttpTransport::new(true),
+    )
+    .await
+    .expect("fixture upload should succeed");
+    let transport =
+        BlossomHttpTransport::for_test(true, Duration::from_secs(60), Duration::from_secs(1));
+    let wrong_secret = [0x77_u8; 32];
+
+    let err = download_encrypted_media_with_transport(
+        upload.attachments[0].reference.clone(),
+        &wrong_secret,
+        &endpoints,
+        &allowed,
+        &transport,
+        None,
+    )
+    .await
+    .expect_err("a wrong epoch secret cannot decrypt the blob");
+
+    assert!(
+        matches!(&err, AppError::MediaDownloadFailed(message) if message.contains("decryption")),
+        "expected MediaDownloadFailed, got {err:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_attempted_download_failure_outranks_an_unusable_locator_in_either_order() {
+    // A permitted server was contacted and answered 503; a sibling locator
+    // commits to a different blob and is never dialed. The attachment's class
+    // must be the retryable download failure whichever locator comes first,
+    // because `MediaUnfetchable` promises hosts that nothing was dialed.
+    let body = b"never served";
+    let hash = hex::encode(Sha256::digest(body));
+    let transport =
+        BlossomHttpTransport::for_test(true, Duration::from_secs(60), Duration::from_secs(1));
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+    for unusable_first in [false, true] {
+        let unavailable = spawn_http_response(http_status_response(503, "Service Unavailable"));
+        let dialed = MediaLocator {
+            kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
+            value: format!("{unavailable}/{hash}.bin"),
+        };
+        let unusable = MediaLocator {
+            kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
+            value: format!("https://media.example/{}.bin", "77".repeat(32)),
+        };
+        let mut reference = blossom_reference();
+        reference.ciphertext_sha256 = hash.clone();
+        reference.locators = if unusable_first {
+            vec![unusable, dialed]
+        } else {
+            vec![dialed, unusable]
+        };
+
+        let err = fetch_encrypted_media_blob_with_transport(&reference, &[], &allowed, &transport)
+            .await
+            .expect_err("a 503 with no other usable locator must fail the download");
+
+        assert!(
+            matches!(err, AppError::MediaDownloadFailed(_)),
+            "unusable_first={unusable_first}: expected MediaDownloadFailed, got {err:?}"
+        );
+    }
+}
+
+fn private_address_resolver() -> DnsResolver {
+    Arc::new(move |_domain, port| {
+        Box::pin(async move { Ok(vec![format!("10.0.0.5:{port}").parse().unwrap()]) })
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dns_destination_policy_rejection_is_unfetchable_not_a_download_failure() {
+    // The locator's hostname passes the literal-host prefilter, but DNS resolves
+    // it to a private address, so the dial policy refuses it before any request
+    // is sent. That is the same verdict as a private-IP literal: unfetchable.
+    let transport = BlossomHttpTransport::for_test_with_resolver(
+        false,
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+        private_address_resolver(),
+    );
+    let reference = blossom_reference();
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+
+    let err = fetch_encrypted_media_blob_with_transport(&reference, &[], &allowed, &transport)
+        .await
+        .expect_err("a hostname resolving to a private address must not be fetched");
+
+    assert!(
+        matches!(&err, AppError::MediaUnfetchable(message) if message.contains("public unicast")),
+        "expected MediaUnfetchable, got {err:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dns_lookup_failure_is_a_download_failure() {
+    let resolver: DnsResolver = Arc::new(move |_domain, _port| {
+        Box::pin(async move { Err(AppError::BlobStore("media host DNS lookup failed".into())) })
+    });
+    let transport = BlossomHttpTransport::for_test_with_resolver(
+        false,
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+        resolver,
+    );
+    let reference = blossom_reference();
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+
+    let err = fetch_encrypted_media_blob_with_transport(&reference, &[], &allowed, &transport)
+        .await
+        .expect_err("an unresolvable host cannot serve the blob");
+
+    assert!(
+        matches!(err, AppError::MediaDownloadFailed(_)),
+        "expected MediaDownloadFailed, got {err:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn policy_refused_and_attempted_candidates_classify_as_a_download_failure() {
+    // One locator is refused by destination policy (DNS -> private address),
+    // the other is a permitted loopback server answering 503. Because a server
+    // was contacted, the outcome is a download failure in either order.
+    let body = b"never served";
+    let hash = hex::encode(Sha256::digest(body));
+    let transport = BlossomHttpTransport::for_test_with_resolver(
+        true,
+        Duration::from_secs(60),
+        Duration::from_secs(1),
+        private_address_resolver(),
+    );
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+    for refused_first in [false, true] {
+        let unavailable = spawn_http_response(http_status_response(503, "Service Unavailable"));
+        let dialed = MediaLocator {
+            kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
+            value: format!("{unavailable}/{hash}.bin"),
+        };
+        let refused = MediaLocator {
+            kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
+            value: format!("https://media.example/{hash}.bin"),
+        };
+        let mut reference = blossom_reference();
+        reference.ciphertext_sha256 = hash.clone();
+        reference.locators = if refused_first {
+            vec![refused, dialed]
+        } else {
+            vec![dialed, refused]
+        };
+
+        let err = fetch_encrypted_media_blob_with_transport(&reference, &[], &allowed, &transport)
+            .await
+            .expect_err("neither candidate can serve the blob");
+
+        assert!(
+            matches!(err, AppError::MediaDownloadFailed(_)),
+            "refused_first={refused_first}: expected MediaDownloadFailed, got {err:?}"
+        );
+    }
+}
+
+/// Drive the bounded-redirect loop with a client factory that refuses the
+/// hop at `refused_hop` the way DNS destination-policy validation does.
+#[allow(clippy::disallowed_methods)]
+async fn redirect_loop_with_policy_refusal_at(refused_hop: usize) -> AppError {
+    let hash = valid_hash();
+    let redirecting = spawn_http_response(http_redirect_response(&format!(
+        "https://cdn.example/{hash}.bin"
+    )));
+    let start = Url::parse(&format!("{redirecting}/{hash}.bin")).unwrap();
+    let mut hop = 0_usize;
+    fetch_http_with_bounded_redirects(
+        start,
+        MAX_ENCRYPTED_MEDIA_BLOB_BYTES,
+        tokio::time::Instant::now() + Duration::from_secs(5),
+        Some(Duration::from_secs(5)),
+        None,
+        move |_url| {
+            let this_hop = hop;
+            hop += 1;
+            async move {
+                if this_hop == refused_hop {
+                    Err(AppError::UnsafeMediaFetch(
+                        "unsafe media host address: address is not public unicast".into(),
+                    ))
+                } else {
+                    // The loop owns redirect handling, exactly like the pinned
+                    // production clients, so the test client must not follow.
+                    Ok(reqwest::Client::builder()
+                        .redirect(reqwest::redirect::Policy::none())
+                        .no_proxy()
+                        .build()
+                        .unwrap())
+                }
+            }
+        },
+        |current, location| Ok(current.join(location).unwrap()),
+    )
+    .await
+    .expect_err("a refused hop must fail the fetch")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn policy_refusal_on_a_redirect_hop_is_a_download_failure_not_unfetchable() {
+    // The origin server was contacted and answered with a redirect whose target
+    // resolves to a forbidden address. Hosts must not be told nothing was
+    // dialed: the server may redirect elsewhere or serve the blob on retry.
+    let err = redirect_loop_with_policy_refusal_at(1).await;
+    assert!(
+        matches!(&err, AppError::BlobStore(message) if message.contains("after a permitted request")),
+        "expected a transfer failure, got {err:?}"
+    );
+    assert!(
+        matches!(
+            media_download_failure(err),
+            AppError::MediaDownloadFailed(_)
+        ),
+        "the encrypted-media path must classify it as a download failure"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn policy_refusal_on_the_first_hop_stays_unfetchable() {
+    let err = redirect_loop_with_policy_refusal_at(0).await;
+    assert!(
+        matches!(&err, AppError::UnsafeMediaFetch(_)),
+        "an initial refusal means nothing was dialed, got {err:?}"
+    );
+    assert!(matches!(
+        media_download_failure(err),
+        AppError::MediaUnfetchable(_)
+    ));
+}
+
+/// Shared runtime/media fixture: valid v2 ciphertext with a deterministic nonce.
+pub(crate) fn attachment_worker_fixture(plaintext: &[u8]) -> (MediaAttachmentReference, Vec<u8>) {
+    attachment_worker_fixture_with_secret(plaintext, &[7; 32])
+}
+
+/// `attachment_worker_fixture` encrypted under a caller-chosen epoch secret.
+pub(crate) fn attachment_worker_fixture_with_secret(
+    plaintext: &[u8],
+    media_secret: &[u8],
+) -> (MediaAttachmentReference, Vec<u8>) {
+    let hash: [u8; 32] = Sha256::digest(plaintext).into();
+    let mime = "application/octet-stream";
+    let name = "fixture.bin";
+    let nonce = [3; 12];
+    let key =
+        derive_media_file_key(media_secret, EncryptedMediaVersion::V2, &hash, mime, name).unwrap();
+    let aad = media_aad(EncryptedMediaVersion::V2, &hash, mime, name);
+    let mut encrypted = plaintext.to_vec();
+    ChaCha20Poly1305::new_from_slice(&key)
+        .unwrap()
+        .encrypt_in_place(Nonce::from_slice(&nonce), &aad, &mut encrypted)
+        .unwrap();
+    (
+        MediaAttachmentReference {
+            locators: vec![],
+            ciphertext_sha256: hex::encode(Sha256::digest(&encrypted)),
+            plaintext_sha256: hex::encode(hash),
+            nonce_hex: hex::encode(nonce),
+            file_name: name.into(),
+            media_type: mime.into(),
+            version: EncryptedMediaVersion::V2.as_str().into(),
+            source_epoch: 3,
+            dim: None,
+            thumbhash: None,
+        },
+        encrypted,
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn automatic_attachment_classifies_integrity_and_streaming_size_failures_without_changing_explicit_limit()
+ {
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.into()];
+    for (body, cap, expected_stop) in [
+        (b"bad ciphertext".to_vec(), 1024, true),
+        (vec![0; 64], 32, true),
+    ] {
+        let (mut reference, _) = attachment_worker_fixture(b"plaintext");
+        let server = spawn_http_response(http_ok_response(&body));
+        reference.locators = vec![MediaLocator {
+            kind: BLOSSOM_LOCATOR_KIND_V1.into(),
+            value: format!("{server}/{}", reference.ciphertext_sha256),
+        }];
+        let result = download_encrypted_media_classified(
+            reference,
+            &[7; 32],
+            &[],
+            &allowed,
+            &BlossomHttpTransport::new(true).with_download_limit(cap),
+            None,
+        )
+        .await;
+        assert_eq!(
+            matches!(result, Err(AttachmentDownloadFailure::Stop(_))),
+            expected_stop
+        );
+    }
+    // Chunked bodies enforce the same ceiling without Content-Length.
+    let (mut reference, _) = attachment_worker_fixture(b"plaintext");
+    let server = spawn_http_response(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n10\r\n0123456789abcdef\r\n0\r\n\r\n".to_vec());
+    reference.locators = vec![MediaLocator {
+        kind: BLOSSOM_LOCATOR_KIND_V1.into(),
+        value: format!("{server}/{}", reference.ciphertext_sha256),
+    }];
+    assert!(matches!(
+        download_encrypted_media_classified(
+            reference,
+            &[7; 32],
+            &[],
+            &allowed,
+            &BlossomHttpTransport::new(true).with_download_limit(8),
+            None
+        )
+        .await,
+        Err(AttachmentDownloadFailure::Stop(_))
+    ));
+
+    for wrong_secret in [false, true] {
+        let (mut reference, body) = attachment_worker_fixture(b"authenticated plaintext");
+        let server = spawn_http_response(http_ok_response(&body));
+        reference.locators = vec![MediaLocator {
+            kind: BLOSSOM_LOCATOR_KIND_V1.into(),
+            value: format!("{server}/{}", reference.ciphertext_sha256),
+        }];
+        let result = download_encrypted_media_classified(
+            reference,
+            &[if wrong_secret { 8 } else { 7 }; 32],
+            &[],
+            &allowed,
+            &BlossomHttpTransport::new(true),
+            None,
+        )
+        .await;
+        if wrong_secret {
+            assert!(matches!(result, Err(AttachmentDownloadFailure::Stop(_))));
+        } else {
+            assert_eq!(result.unwrap().plaintext, b"authenticated plaintext");
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn automatic_attachment_stops_only_when_every_locator_reports_the_blob_missing() {
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.into()];
+    let status = |line: &str| {
+        format!("HTTP/1.1 {line}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").into_bytes()
+    };
+    let missing = || vec![status("404 Not Found")];
+    let gone = || vec![status("410 Gone")];
+    let limited = || vec![status("429 Too Many Requests")];
+    // Server errors are retried once within the candidate.
+    let unavailable = || vec![status("503 Service Unavailable"); 2];
+    for (servers, expected_stop) in [
+        (vec![missing()], true),
+        (vec![gone()], true),
+        (vec![missing(), gone()], true),
+        (vec![limited()], false),
+        (vec![vec![status("403 Forbidden")]], false),
+        (vec![unavailable()], false),
+        (vec![missing(), limited()], false),
+        (vec![unavailable(), missing()], false),
+    ] {
+        let (mut reference, _) = attachment_worker_fixture(b"plaintext");
+        reference.locators = servers
+            .into_iter()
+            .map(|responses| MediaLocator {
+                kind: BLOSSOM_LOCATOR_KIND_V1.into(),
+                value: format!(
+                    "{}/{}",
+                    spawn_http_responses(responses),
+                    reference.ciphertext_sha256
+                ),
+            })
+            .collect();
+        let result = download_encrypted_media_classified(
+            reference,
+            &[7; 32],
+            &[],
+            &allowed,
+            &BlossomHttpTransport::new(true),
+            None,
+        )
+        .await;
+        match result {
+            Err(AttachmentDownloadFailure::Stop(_)) => assert!(expected_stop),
+            Err(AttachmentDownloadFailure::Retry(_)) => assert!(!expected_stop),
+            other => panic!("unexpected classification: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn large_file_upload_deadline_allows_progress_at_mobile_upload_rates() {
+    assert_eq!(
+        super::blossom::file_upload_timeout(1024),
+        Duration::from_secs(15 * 60)
+    );
+    assert_eq!(
+        super::blossom::file_upload_timeout(758_000_016),
+        Duration::from_secs(2892)
+    );
+    assert!(super::blossom::file_upload_timeout(900 * 1024 * 1024) >= Duration::from_secs(3600));
+}
+
+#[tokio::test(start_paused = true)]
+async fn file_upload_idle_watchdog_allows_setup_then_rejects_a_stalled_body() {
+    let (progress, observer) = tokio::sync::watch::channel(());
+    let watchdog = tokio::spawn(super::blossom::file_upload_idle_timeout(observer));
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(31)).await;
+    assert!(
+        !watchdog.is_finished(),
+        "setup must use the request deadline"
+    );
+    progress.send_replace(());
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(29)).await;
+    assert!(!watchdog.is_finished());
+    progress.send_replace(());
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(29)).await;
+    assert!(
+        !watchdog.is_finished(),
+        "body progress resets the idle clock"
+    );
+    tokio::time::advance(Duration::from_secs(2)).await;
+    assert!(matches!(
+        watchdog.await.unwrap(),
+        AppError::MediaUploadTimedOut
+    ));
+}

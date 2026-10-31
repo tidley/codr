@@ -1,0 +1,770 @@
+//! Final-message sends, agent activity/operation/group-system events, and debug send recording.
+
+use agent_control::{
+    AgentControlActor, AgentControlDebugFinalSend, AgentControlEvent, AgentControlMediaRef,
+    AgentControlMediaUpload, AgentControlMessage, AgentControlResponse,
+    AgentControlSendMaintenanceDisposition,
+};
+use cgka_traits::GroupId;
+use marmot_app::{
+    AgentOperationEventRequest, MediaAttachmentReference, MediaLocator,
+    MediaUploadAttachmentRequest, MediaUploadRequest,
+};
+
+use crate::error::ConnectorError;
+use crate::maintenance::agent_maintenance_disposition;
+use crate::media_roots::MediaAllowedRoots;
+use crate::stream_session::SendIdempotencyAcquisition;
+use crate::validation::normalize_hex;
+use crate::{
+    AgentConnector, MAX_MEDIA_UPLOAD_ATTACHMENT_BYTES, MAX_MEDIA_UPLOAD_ATTACHMENTS,
+    MAX_MEDIA_UPLOAD_BATCH_BYTES,
+};
+
+/// Map an account-scoped chat-list projection onto the optional `group_info`
+/// display subject. Missing rows, blank names, and projection errors yield
+/// `None` so display enrichment cannot fail a valid membership response.
+pub(crate) fn group_info_subject_from_projection<E>(
+    row: Result<Option<impl AsRef<str>>, E>,
+) -> Option<String> {
+    match row {
+        Ok(Some(name)) => {
+            let trimmed = name.as_ref().trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_owned())
+            }
+        }
+        Ok(None) | Err(_) => None,
+    }
+}
+
+/// Current schema version for persisted `send_final` request fingerprints.
+pub(crate) const SEND_FINAL_FINGERPRINT_VERSION: u8 = 1;
+/// Current schema version for persisted `send_media` request fingerprints.
+pub(crate) const SEND_MEDIA_FINGERPRINT_VERSION: u8 = 1;
+
+#[derive(Clone, Copy)]
+pub(crate) struct MediaUploadLimits {
+    pub(crate) max_attachments: usize,
+    pub(crate) max_attachment_bytes: u64,
+    pub(crate) max_batch_bytes: u64,
+}
+
+pub(crate) async fn read_media_upload_attachments_with_limits(
+    media_allowed_roots: &MediaAllowedRoots,
+    attachments: Vec<AgentControlMediaUpload>,
+    limits: MediaUploadLimits,
+) -> Result<Vec<MediaUploadAttachmentRequest>, ConnectorError> {
+    if attachments.len() > limits.max_attachments {
+        return Err(ConnectorError::MediaLimitsExceeded("attachment_count"));
+    }
+
+    let mut upload_attachments = Vec::with_capacity(attachments.len());
+    let mut total_bytes = 0_u64;
+    for attachment in attachments {
+        let remaining_batch_bytes = limits.max_batch_bytes.saturating_sub(total_bytes);
+        let max_read_bytes = limits.max_attachment_bytes.min(remaining_batch_bytes);
+        let limit_reason = if remaining_batch_bytes < limits.max_attachment_bytes {
+            "aggregate_bytes"
+        } else {
+            "attachment_bytes"
+        };
+        let plaintext = media_allowed_roots
+            .read_regular_file_limited(attachment.path.into(), max_read_bytes, limit_reason)
+            .await?;
+        if plaintext.is_empty() {
+            return Err(ConnectorError::MediaLimitsExceeded("empty_attachment"));
+        }
+        total_bytes += plaintext.len() as u64;
+        upload_attachments.push(MediaUploadAttachmentRequest {
+            file_name: attachment.file_name,
+            media_type: attachment.media_type,
+            plaintext,
+            dim: attachment.dim,
+            thumbhash: attachment.thumbhash,
+        });
+    }
+    Ok(upload_attachments)
+}
+
+/// Server-derived fingerprint of a `send_final` request: a versioned SHA-256 digest
+/// over the destination (account + group), message text, and optional reply target.
+/// The digest is stable across Rust/toolchain releases and is safe to persist on
+/// disk for connector-restart dedup.
+pub(crate) fn send_final_fingerprint(
+    account_id_hex: &str,
+    group_id_hex: &str,
+    text: &str,
+    reply_to_message_id_hex: Option<&str>,
+) -> String {
+    use sha2::{Digest, Sha256};
+
+    let preimage = serde_json::json!([
+        SEND_FINAL_FINGERPRINT_VERSION,
+        account_id_hex,
+        group_id_hex,
+        text,
+        reply_to_message_id_hex,
+    ]);
+    let bytes = serde_json::to_vec(&preimage).expect("send_final fingerprint preimage cannot fail");
+    hex::encode(Sha256::digest(bytes))
+}
+
+/// Server-derived fingerprint of a media send. Local paths are deliberately
+/// excluded; retries may stage the same bytes under a different private path.
+/// Attachment order, safe metadata, caption, destination, and plaintext bytes
+/// are all bound so one key cannot return ids for a different album.
+pub(crate) fn send_media_fingerprint(
+    account_id_hex: &str,
+    group_id_hex: &str,
+    caption: Option<&str>,
+    attachments: &[MediaUploadAttachmentRequest],
+) -> String {
+    use sha2::{Digest, Sha256};
+
+    let attachments = attachments
+        .iter()
+        .map(|attachment| {
+            serde_json::json!([
+                attachment.file_name,
+                attachment.media_type,
+                hex::encode(Sha256::digest(&attachment.plaintext)),
+                attachment.dim,
+                attachment.thumbhash,
+            ])
+        })
+        .collect::<Vec<_>>();
+    let preimage = serde_json::json!([
+        SEND_MEDIA_FINGERPRINT_VERSION,
+        account_id_hex,
+        group_id_hex,
+        caption,
+        attachments,
+    ]);
+    let bytes = serde_json::to_vec(&preimage).expect("send_media fingerprint preimage cannot fail");
+    hex::encode(Sha256::digest(bytes))
+}
+
+/// Per-blob temp subdir name for a downloaded media attachment: the SHA-256 of
+/// the decrypted bytes the connector actually holds. Computing it locally (as
+/// opposed to trusting the sender-supplied `ciphertext_sha256` field) makes the
+/// directory layout attacker-independent — two references can only share a
+/// subdir when their plaintext is byte-identical, in which case the overwrite
+/// is a no-op — while keeping repeat downloads of the same content stable. The
+/// runtime independently verifies `ciphertext_sha256` against the fetched blob;
+/// this just keeps that cross-crate invariant out of the filesystem layout.
+pub(crate) fn media_download_subdir(plaintext: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+
+    hex::encode(Sha256::digest(plaintext))
+}
+
+/// Map a control-plane media reference (the non-secret mirror) back into the
+/// app-runtime `MediaAttachmentReference`. Field-for-field; the content key is
+/// never part of either type, so this is a pure structural reshape.
+/// Reduce a sender-controlled media file name to a safe basename so a download
+/// cannot escape its per-blob temp dir (e.g. "../../x" -> "x"). Falls back to
+/// "media" for empty or parent-only names.
+pub(crate) fn safe_media_filename(name: &str) -> &str {
+    std::path::Path::new(name)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("media")
+}
+
+pub(crate) fn media_ref_to_reference(media: AgentControlMediaRef) -> MediaAttachmentReference {
+    MediaAttachmentReference {
+        locators: media
+            .locators
+            .into_iter()
+            .map(|locator| MediaLocator {
+                kind: locator.kind,
+                value: locator.value,
+            })
+            .collect(),
+        ciphertext_sha256: media.ciphertext_sha256,
+        plaintext_sha256: media.plaintext_sha256,
+        nonce_hex: media.nonce_hex,
+        file_name: media.file_name,
+        media_type: media.media_type,
+        version: media.version,
+        source_epoch: media.source_epoch,
+        dim: media.dim,
+        thumbhash: media.thumbhash,
+    }
+}
+
+impl AgentConnector {
+    pub(crate) async fn send_final_response(
+        &self,
+        account_id_hex: &str,
+        group_id_hex: &str,
+        text: String,
+        reply_to_message_id_hex: Option<String>,
+        idempotency_key: Option<String>,
+    ) -> Result<AgentControlResponse, ConnectorError> {
+        let group_id_hex = normalize_hex(group_id_hex)?;
+        if self.debug_controls {
+            return self.debug_record_final_send_response(
+                account_id_hex,
+                &group_id_hex,
+                text,
+                reply_to_message_id_hex,
+            );
+        }
+
+        // Reject unknown accounts and malformed group ids before a request can
+        // wait on or reserve an in-flight send gate.
+        let account = self.local_account_for_account_id(account_id_hex)?;
+        let group_id = GroupId::new(hex::decode(&group_id_hex)?);
+
+        // Server-derived request fingerprint: a reused idempotency key only short-
+        // circuits when the request it identifies is the same one. A reused key
+        // carrying a different request body is a cache miss, so dedup can never
+        // return ids belonging to an unrelated send.
+        let fingerprint = send_final_fingerprint(
+            account_id_hex,
+            &group_id_hex,
+            &text,
+            reply_to_message_id_hex.as_deref(),
+        );
+
+        // Reserve matching requests before the first await so concurrent
+        // same-key retries cannot both miss the cache and both durably send.
+        let idempotency = if let Some(key) = idempotency_key {
+            match self.idempotency.acquire(&key, &fingerprint).await? {
+                SendIdempotencyAcquisition::Completed((
+                    message_ids_hex,
+                    maintenance_disposition,
+                )) => {
+                    return Ok(AgentControlResponse::FinalSent {
+                        message_ids_hex,
+                        maintenance_disposition,
+                    });
+                }
+                SendIdempotencyAcquisition::Leader(reservation) => Some((key, reservation)),
+            }
+        } else {
+            None
+        };
+
+        let observation = self.runtime.begin_product_operation(
+            marmot_app::ProductFamily::Agent,
+            "final_message",
+            marmot_app::ProductUnit::Action,
+        );
+        let summary = if let Some(target_message_id) = reply_to_message_id_hex {
+            self.runtime
+                .reply_to_message(&account.label, &group_id, &target_message_id, &text)
+                .await
+        } else {
+            self.runtime
+                .send_message(&account.label, &group_id, text.into_bytes())
+                .await
+        };
+        if let Some(observation) = observation {
+            observation.finish(if summary.is_ok() {
+                "success"
+            } else {
+                "failure"
+            });
+        }
+        let summary = summary?;
+        // Record only after a successful send so a failed send remains retryable.
+        // A key already bound to a different fingerprint is left untouched (first
+        // write wins), so this send simply proceeds without caching.
+        if let Some((key, reservation)) = idempotency {
+            let message_ids = summary.message_ids.clone();
+            let maintenance_disposition =
+                agent_maintenance_disposition(summary.maintenance_disposition);
+            self.idempotency.record_with_disposition(
+                key,
+                fingerprint,
+                message_ids.clone(),
+                maintenance_disposition,
+            );
+            reservation.complete(message_ids, maintenance_disposition);
+        }
+        Ok(AgentControlResponse::FinalSent {
+            message_ids_hex: summary.message_ids,
+            maintenance_disposition: agent_maintenance_disposition(summary.maintenance_disposition),
+        })
+    }
+
+    /// Delete (retract) a previously-sent group message by id. Emits a kind-5
+    /// deletion event referencing the target; returns its durable message ids.
+    pub(crate) async fn delete_message_response(
+        &self,
+        account_id_hex: &str,
+        group_id_hex: &str,
+        target_message_id_hex: &str,
+    ) -> Result<AgentControlResponse, ConnectorError> {
+        let account = self.local_account_for_account_id(account_id_hex)?;
+        let group_id_hex = normalize_hex(group_id_hex)?;
+        let group_id = GroupId::new(hex::decode(&group_id_hex)?);
+        let target_message_id = normalize_hex(target_message_id_hex)?;
+        let summary = self
+            .runtime
+            .delete_message(&account.label, &group_id, &target_message_id)
+            .await?;
+        Ok(AgentControlResponse::FinalSent {
+            message_ids_hex: summary.message_ids,
+            maintenance_disposition: agent_maintenance_disposition(summary.maintenance_disposition),
+        })
+    }
+
+    /// Replace the text of a chat message this account sent. Emits a
+    /// kind-1009 edit referencing the target; the chat row keeps its identity
+    /// and returns the edit event's durable message ids.
+    pub(crate) async fn edit_message_response(
+        &self,
+        account_id_hex: &str,
+        group_id_hex: &str,
+        target_message_id_hex: &str,
+        text: &str,
+    ) -> Result<AgentControlResponse, ConnectorError> {
+        let account = self.local_account_for_account_id(account_id_hex)?;
+        let group_id_hex = normalize_hex(group_id_hex)?;
+        let group_id = GroupId::new(hex::decode(&group_id_hex)?);
+        let target_message_id = normalize_hex(target_message_id_hex)?;
+        let summary = self
+            .runtime
+            .edit_message(&account.label, &group_id, &target_message_id, text)
+            .await?;
+        Ok(AgentControlResponse::FinalSent {
+            message_ids_hex: summary.message_ids,
+            maintenance_disposition: agent_maintenance_disposition(summary.maintenance_disposition),
+        })
+    }
+
+    pub(crate) async fn send_reaction_response(
+        &self,
+        account_id_hex: &str,
+        group_id_hex: &str,
+        target_message_id_hex: &str,
+        emoji: &str,
+    ) -> Result<AgentControlResponse, ConnectorError> {
+        let account = self.local_account_for_account_id(account_id_hex)?;
+        let group_id_hex = normalize_hex(group_id_hex)?;
+        let group_id = GroupId::new(hex::decode(&group_id_hex)?);
+        let target_message_id = normalize_hex(target_message_id_hex)?;
+        let summary = self
+            .runtime
+            .react_to_message(&account.label, &group_id, &target_message_id, emoji)
+            .await?;
+        Ok(AgentControlResponse::AppEventSent {
+            message_ids_hex: summary.message_ids,
+            maintenance_disposition: agent_maintenance_disposition(summary.maintenance_disposition),
+        })
+    }
+
+    pub(crate) async fn remove_reaction_response(
+        &self,
+        account_id_hex: &str,
+        group_id_hex: &str,
+        target_message_id_hex: &str,
+        emoji: Option<&str>,
+    ) -> Result<AgentControlResponse, ConnectorError> {
+        let account = self.local_account_for_account_id(account_id_hex)?;
+        let group_id_hex = normalize_hex(group_id_hex)?;
+        let group_id = GroupId::new(hex::decode(&group_id_hex)?);
+        let target_message_id = normalize_hex(target_message_id_hex)?;
+        let summary = self
+            .runtime
+            .unreact_from_message_matching(&account.label, &group_id, &target_message_id, emoji)
+            .await?;
+        Ok(AgentControlResponse::AppEventSent {
+            message_ids_hex: summary.message_ids,
+            maintenance_disposition: agent_maintenance_disposition(summary.maintenance_disposition),
+        })
+    }
+
+    /// Report group membership for an account's group so a channel can decide
+    /// activation policy: `is_direct` (exactly two members, i.e. an effective DM
+    /// where the agent always replies) vs a multi-party group that gates on
+    /// being addressed.
+    pub(crate) async fn group_info_response(
+        &self,
+        account_id_hex: &str,
+        group_id_hex: &str,
+    ) -> Result<AgentControlResponse, ConnectorError> {
+        let account = self.local_account_for_account_id(account_id_hex)?;
+        let group_id_hex = normalize_hex(group_id_hex)?;
+        let group_id = GroupId::new(hex::decode(&group_id_hex)?);
+        let state = self
+            .runtime
+            .group_mls_state(&account.label, &group_id)
+            .await?;
+        let member_count = u32::try_from(state.member_count).unwrap_or(u32::MAX);
+        let subject = group_info_subject_from_projection(
+            self.runtime
+                .chat_list_row(&account.label, &group_id_hex)
+                .map(|row| row.map(|row| row.group_name)),
+        );
+        let agent_created = match self
+            .agent_created_groups
+            .contains(&account.account_id_hex, &group_id_hex)
+        {
+            Ok(agent_created) => agent_created,
+            Err(_) => {
+                tracing::warn!(
+                    target: "agent_connector",
+                    method = "group_info_response",
+                    error_code = "agent_created_groups_read_failed",
+                    "activation provenance unavailable for group info"
+                );
+                false
+            }
+        };
+        Ok(AgentControlResponse::GroupInfo {
+            account_id_hex: account.account_id_hex,
+            group_id_hex: hex::encode(group_id.as_slice()),
+            member_count,
+            is_direct: state.member_count == 2,
+            subject,
+            agent_created,
+        })
+    }
+
+    pub(crate) async fn update_group_profile_response(
+        &self,
+        account_id_hex: &str,
+        group_id_hex: &str,
+        name: Option<String>,
+        description: Option<String>,
+    ) -> Result<AgentControlResponse, ConnectorError> {
+        let account = self.local_account_for_account_id(account_id_hex)?;
+        let group_id_hex = normalize_hex(group_id_hex)?;
+        let group_id = GroupId::new(hex::decode(&group_id_hex)?);
+        let summary = self
+            .runtime
+            .update_group_profile(&account.label, &group_id, name, description)
+            .await?;
+        Ok(AgentControlResponse::GroupProfileUpdated {
+            group_id_hex,
+            message_ids_hex: summary.message_ids,
+        })
+    }
+
+    pub(crate) fn debug_inject_inbound_response(
+        &self,
+        account_id_hex: &str,
+        group_id_hex: &str,
+        message_id_hex: &str,
+        sender_account_id_hex: &str,
+        text: String,
+    ) -> Result<AgentControlResponse, ConnectorError> {
+        self.ensure_debug_controls()?;
+        let account_id_hex = normalize_hex(account_id_hex)?;
+        let sender_account_id_hex = normalize_hex(sender_account_id_hex)?;
+        let event = AgentControlEvent::InboundMessage {
+            account_id_hex: account_id_hex.clone(),
+            group_id_hex: normalize_hex(group_id_hex)?,
+            message: AgentControlMessage {
+                message_id_hex: normalize_hex(message_id_hex)?,
+                sender: AgentControlActor {
+                    is_self: sender_account_id_hex == account_id_hex,
+                    account_id_hex: sender_account_id_hex,
+                    display_name: None,
+                },
+                text,
+                recorded_at: 0,
+                media: Vec::new(),
+            },
+            mentions_self: false,
+            reply_to: None,
+        };
+        let _ = self.debug_events.send(event);
+        Ok(AgentControlResponse::Ack)
+    }
+
+    pub(crate) fn debug_recorded_finals_response(
+        &self,
+    ) -> Result<AgentControlResponse, ConnectorError> {
+        self.ensure_debug_controls()?;
+        Ok(AgentControlResponse::DebugRecordedFinals {
+            sends: self.debug_final_sends.list(),
+        })
+    }
+
+    fn debug_record_final_send_response(
+        &self,
+        account_id_hex: &str,
+        group_id_hex: &str,
+        text: String,
+        reply_to_message_id_hex: Option<String>,
+    ) -> Result<AgentControlResponse, ConnectorError> {
+        self.ensure_debug_controls()?;
+        let record = self.debug_final_sends.record(AgentControlDebugFinalSend {
+            account_id_hex: normalize_hex(account_id_hex)?,
+            group_id_hex: normalize_hex(group_id_hex)?,
+            text,
+            reply_to_message_id_hex: reply_to_message_id_hex
+                .map(|value| normalize_hex(&value))
+                .transpose()?,
+            message_ids_hex: Vec::new(),
+        });
+        Ok(AgentControlResponse::FinalSent {
+            message_ids_hex: record.message_ids_hex,
+            maintenance_disposition: AgentControlSendMaintenanceDisposition::Ready,
+        })
+    }
+
+    fn ensure_debug_controls(&self) -> Result<(), ConnectorError> {
+        if self.debug_controls {
+            Ok(())
+        } else {
+            Err(ConnectorError::DebugControlsDisabled)
+        }
+    }
+
+    pub(crate) async fn send_agent_activity_response(
+        &self,
+        account_id_hex: &str,
+        group_id_hex: &str,
+        status: String,
+        text: String,
+        reply_to_message_id_hex: Option<String>,
+        extra: Option<serde_json::Value>,
+    ) -> Result<AgentControlResponse, ConnectorError> {
+        let account = self.local_account_for_account_id(account_id_hex)?;
+        let group_id_hex = normalize_hex(group_id_hex)?;
+        let group_id = GroupId::new(hex::decode(&group_id_hex)?);
+        let reply_to_message_id_hex = reply_to_message_id_hex
+            .map(|value| normalize_hex(&value))
+            .transpose()?;
+        let summary = self
+            .runtime
+            .send_agent_activity(
+                &account.label,
+                &group_id,
+                status,
+                text,
+                reply_to_message_id_hex,
+                extra,
+            )
+            .await?;
+        Ok(AgentControlResponse::AppEventSent {
+            message_ids_hex: summary.message_ids,
+            maintenance_disposition: agent_maintenance_disposition(summary.maintenance_disposition),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn send_agent_operation_event_response(
+        &self,
+        account_id_hex: &str,
+        group_id_hex: &str,
+        event_type: String,
+        status: String,
+        operation_id: Option<String>,
+        run_id: Option<String>,
+        turn_id: Option<String>,
+        name: Option<String>,
+        text: String,
+        preview: Option<String>,
+        details: Option<serde_json::Value>,
+        sequence: Option<u64>,
+        ok: Option<bool>,
+        duration_ms: Option<u64>,
+        reply_to_message_id_hex: Option<String>,
+    ) -> Result<AgentControlResponse, ConnectorError> {
+        let account = self.local_account_for_account_id(account_id_hex)?;
+        let group_id_hex = normalize_hex(group_id_hex)?;
+        let group_id = GroupId::new(hex::decode(&group_id_hex)?);
+        let reply_to_message_id_hex = reply_to_message_id_hex
+            .map(|value| normalize_hex(&value))
+            .transpose()?;
+        let summary = self
+            .runtime
+            .send_agent_operation_event(
+                &account.label,
+                &group_id,
+                AgentOperationEventRequest {
+                    event_type,
+                    status,
+                    operation_id,
+                    run_id,
+                    turn_id,
+                    name,
+                    text,
+                    preview,
+                    details,
+                    sequence,
+                    ok,
+                    duration_ms,
+                    reply_to_message_id: reply_to_message_id_hex,
+                },
+            )
+            .await?;
+        Ok(AgentControlResponse::AppEventSent {
+            message_ids_hex: summary.message_ids,
+            maintenance_disposition: agent_maintenance_disposition(summary.maintenance_disposition),
+        })
+    }
+
+    pub(crate) async fn send_group_system_event_response(
+        &self,
+        account_id_hex: &str,
+        group_id_hex: &str,
+        system_type: String,
+        text: String,
+        data: Option<serde_json::Value>,
+    ) -> Result<AgentControlResponse, ConnectorError> {
+        let account = self.local_account_for_account_id(account_id_hex)?;
+        let group_id_hex = normalize_hex(group_id_hex)?;
+        let group_id = GroupId::new(hex::decode(&group_id_hex)?);
+        let summary = self
+            .runtime
+            .send_group_system_event(&account.label, &group_id, system_type, text, data)
+            .await?;
+        Ok(AgentControlResponse::AppEventSent {
+            message_ids_hex: summary.message_ids,
+            maintenance_disposition: agent_maintenance_disposition(summary.maintenance_disposition),
+        })
+    }
+
+    /// Encrypt + upload local files as encrypted media and send them as a kind-9
+    /// message. The plaintext bytes are read from the connector host by path and
+    /// never crossed the control plane; the content key stays in the runtime.
+    ///
+    /// Every path must identify a regular, non-symlink file beneath a directory
+    /// handle opened from `media_allowed_roots` at connector startup. Gateways
+    /// should still validate their source policy and stage a private copy beneath
+    /// one of those roots; the connector independently enforces the final read.
+    pub(crate) async fn send_media_response(
+        &self,
+        account_id_hex: &str,
+        group_id_hex: &str,
+        attachments: Vec<AgentControlMediaUpload>,
+        caption: Option<String>,
+        idempotency_key: Option<String>,
+    ) -> Result<AgentControlResponse, ConnectorError> {
+        let account = self.local_account_for_account_id(account_id_hex)?;
+        let group_id_hex = normalize_hex(group_id_hex)?;
+        let group_id = GroupId::new(hex::decode(&group_id_hex)?);
+        let upload_attachments = read_media_upload_attachments_with_limits(
+            &self.media_allowed_roots,
+            attachments,
+            MediaUploadLimits {
+                max_attachments: MAX_MEDIA_UPLOAD_ATTACHMENTS,
+                max_attachment_bytes: MAX_MEDIA_UPLOAD_ATTACHMENT_BYTES,
+                max_batch_bytes: MAX_MEDIA_UPLOAD_BATCH_BYTES,
+            },
+        )
+        .await?;
+        let idempotency = if let Some(key) = idempotency_key {
+            let fingerprint = send_media_fingerprint(
+                account_id_hex,
+                &group_id_hex,
+                caption.as_deref(),
+                &upload_attachments,
+            );
+            match self.idempotency.acquire(&key, &fingerprint).await? {
+                SendIdempotencyAcquisition::Completed((
+                    message_ids_hex,
+                    maintenance_disposition,
+                )) => {
+                    return Ok(AgentControlResponse::FinalSent {
+                        message_ids_hex,
+                        maintenance_disposition,
+                    });
+                }
+                SendIdempotencyAcquisition::Leader(reservation) => {
+                    Some((key, fingerprint, reservation))
+                }
+            }
+        } else {
+            None
+        };
+        let result = self
+            .runtime
+            .upload_media(
+                &account.label,
+                &group_id,
+                MediaUploadRequest {
+                    message_tags: Vec::new(),
+                    attachments: upload_attachments,
+                    caption,
+                    send: true,
+                    blossom_server: None,
+                },
+            )
+            .await?;
+        let Some(sent) = result.sent else {
+            return Ok(AgentControlResponse::FinalSent {
+                message_ids_hex: Vec::new(),
+                maintenance_disposition: AgentControlSendMaintenanceDisposition::default(),
+            });
+        };
+        let message_ids_hex = sent.message_ids;
+        let maintenance_disposition = agent_maintenance_disposition(sent.maintenance_disposition);
+        if let Some((key, fingerprint, reservation)) = idempotency {
+            self.idempotency.record_with_disposition(
+                key,
+                fingerprint,
+                message_ids_hex.clone(),
+                maintenance_disposition,
+            );
+            reservation.complete(message_ids_hex.clone(), maintenance_disposition);
+        }
+        Ok(AgentControlResponse::FinalSent {
+            message_ids_hex,
+            maintenance_disposition,
+        })
+    }
+
+    /// Fetch + decrypt an inbound media reference and write the plaintext to a
+    /// per-blob temp dir on the connector host (0600). The content key stays in
+    /// the runtime; only the local path + metadata are returned to the agent.
+    pub(crate) async fn download_media_response(
+        &self,
+        account_id_hex: &str,
+        group_id_hex: &str,
+        media: AgentControlMediaRef,
+    ) -> Result<AgentControlResponse, ConnectorError> {
+        let account = self.local_account_for_account_id(account_id_hex)?;
+        let group_id_hex = normalize_hex(group_id_hex)?;
+        let group_id = GroupId::new(hex::decode(&group_id_hex)?);
+        let reference = media_ref_to_reference(media);
+        let result = self
+            .runtime
+            .download_media(&account.label, &group_id, reference)
+            .await?;
+        // Derive a unique, stable-per-blob subdir from the connector-computed
+        // hash of the decrypted bytes (never the sender-supplied
+        // `ciphertext_sha256` field) so repeat downloads land in the same place
+        // and distinct blobs cannot be steered into colliding/overwriting each
+        // other. The hash is an opaque dir name, not an id we log.
+        let subdir = media_download_subdir(&result.plaintext);
+        let dir = crate::media_temp::create_media_download_dir(&subdir).await?;
+        // The file name comes from the (decrypted) sender-controlled media
+        // reference, so write under a sanitized basename: a crafted value like
+        // "../../x" must not let a download escape the per-blob temp dir.
+        let path = dir.join(safe_media_filename(&result.file_name));
+        // Create with 0600 atomically so the plaintext is never world-readable,
+        // even momentarily (no post-write chmod TOCTOU window).
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .await?;
+        use tokio::io::AsyncWriteExt as _;
+        file.write_all(&result.plaintext).await?;
+        // tokio's `write_all` hands the last chunk to a blocking task and
+        // returns early; flush so the file is complete before the agent,
+        // which checks its length against `size_bytes`, receives the path.
+        file.flush().await?;
+        Ok(AgentControlResponse::MediaDownloaded {
+            path: path.to_string_lossy().into_owned(),
+            media_type: result.media_type,
+            file_name: result.file_name,
+            size_bytes: result.size_bytes,
+        })
+    }
+}

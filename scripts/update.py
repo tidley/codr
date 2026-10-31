@@ -1,4 +1,4 @@
-"""Confirmed worker-only updates from pinned ngit records and Blossom assets."""
+"""Confirmed executable updates from pinned ngit records and Blossom assets."""
 from __future__ import annotations
 
 import fcntl
@@ -152,7 +152,7 @@ def download_blob(release, url, destination):
 
 
 def probe(binary):
-    return json.loads(run([binary, "update-info"], timeout=15))
+    return json.loads(run([binary, "update-info", "--full"], timeout=15))
 
 
 def check_state(binary, config):
@@ -186,15 +186,25 @@ class Controller:
     def __init__(self):
         root = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
         self.manager = services.for_host(run, None, root, UpdateError)
+        self.service = WORKER
+        self.combined = False
 
     def pid(self):
         if self.manager.backend == services.SYSTEMD:
-            return int(run(["systemctl", "--user", "show", WORKER + ".service", "--property=MainPID", "--value"]).strip())
-        output = run(["launchctl", "print", f"{self.manager.domain()}/{services.LABEL_PREFIX}.{WORKER}"])
+            return int(run(["systemctl", "--user", "show", self.service + ".service", "--property=MainPID", "--value"]).strip())
+        output = run(["launchctl", "print", f"{self.manager.domain()}/{services.LABEL_PREFIX}.{self.service}"])
         found = re.search(r"(?m)^\s*pid = (\d+)\s*$", output)
         return int(found[1]) if found else 0
 
     def validate(self, request):
+        home = request.get("messaging_home")
+        selected = request.get("service", WORKER)
+        if selected not in ((WORKER, "codr") if home is not None else (WORKER,)):
+            raise UpdateError("The update service layout does not match this runtime; use local setup")
+        if home is not None and (not isinstance(home, str) or not Path(home).is_absolute() or not Path(home).is_dir()):
+            raise UpdateError("The combined messaging home is unavailable; use local setup")
+        self.service = selected
+        self.combined = home is not None
         destination = Path.home() / ".local/bin" / WORKER
         if Path(request["installed_path"]) != destination or destination.is_symlink():
             raise UpdateError("Automatic updates require the standard managed worker installation")
@@ -209,7 +219,13 @@ class Controller:
             args = Path(f"/proc/{pid}/cmdline").read_bytes().decode().strip("\0").split("\0")
         else:
             import plistlib
-            args = plistlib.loads(self.manager.path(WORKER).read_bytes())["ProgramArguments"]
+            args = plistlib.loads(self.manager.path(self.service).read_bytes())["ProgramArguments"]
+        if args.count("--config") > 1 or args.count("run") != 1 or args.count("--messaging-home") != (1 if home is not None else 0):
+            raise UpdateError("The managed service arguments do not match this update")
+        if home is not None:
+            index = args.index("--messaging-home")
+            if index + 1 >= len(args) or Path(args[index + 1]).resolve() != Path(home).resolve():
+                raise UpdateError("The managed service messaging home does not match this update")
         config = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / WORKER / "config.toml"
         if "--config" in args:
             config = Path(args[args.index("--config") + 1])
@@ -218,20 +234,22 @@ class Controller:
 
     def stop(self):
         if self.manager.backend == services.SYSTEMD:
-            run(["systemctl", "--user", "stop", WORKER + ".service"], timeout=100)
+            run(["systemctl", "--user", "stop", self.service + ".service"], timeout=150)
         else:
-            run(["launchctl", "bootout", f"{self.manager.domain()}/{services.LABEL_PREFIX}.{WORKER}"])
+            run(["launchctl", "bootout", f"{self.manager.domain()}/{services.LABEL_PREFIX}.{self.service}"])
 
     def start(self):
-        self.manager.start(WORKER)
+        self.manager.start(self.service)
 
     def wait_ready(self, directory, version, job_id):
-        deadline = time.monotonic() + 30
+        # A combined first spawn includes launchd registration and MDK storage
+        # startup. Never accept a bridge-only or wrong-job receipt as ready.
+        deadline = time.monotonic() + (120 if self.combined or self.service == "codr" else 30)
         while time.monotonic() < deadline:
             try:
                 ready = json.loads((directory / "ready.json").read_text())
                 if ready == {"version": version, "job_id": job_id, "pid": self.pid()} and ready["pid"] > 0:
-                    self.manager.is_active(WORKER)
+                    self.manager.is_active(self.service)
                     return True
             except (OSError, ValueError, subprocess.SubprocessError, services.ServiceError, UpdateError):
                 pass
@@ -239,7 +257,31 @@ class Controller:
         return False
 
 
+def compatible_info(request, candidate):
+    """A combined executable may change implementation, never storage/protocol."""
+    expected = {**request["info"], "version": request["release"]["version"]}
+    if request.get("messaging_home") is not None:
+        current = request["info"]
+        cohort = current.get("storage_cohort")
+        if (not isinstance(cohort, str) or not cohort or candidate.get("storage_cohort") != cohort
+                or "embedded-mdk" not in candidate.get("runtimes", [])):
+            raise UpdateError("This release changes the messaging storage cohort; use local setup")
+        connector = candidate.get("connector", {})
+        previous = current.get("connector", {})
+        if (not isinstance(connector, dict) or not isinstance(previous, dict)
+                or numeric_version(connector.get("version"))[:2] != numeric_version(previous.get("version"))[:2]
+                or not re.fullmatch(r"[0-9a-f]{40}", connector.get("revision", ""))
+                or not re.fullmatch(r"[0-9a-f]{64}", connector.get("patch_sha256", ""))):
+            raise UpdateError("This release has incompatible messaging provenance; use local setup")
+        expected["connector"] = connector
+    if candidate != expected:
+        raise UpdateError("This release changes the runtime, connector or storage cohort; use local setup")
+
+
 def perform(directory, request, controller):
+    if request.get("action") == "handover":
+        import handover
+        return handover.perform(directory, request, controller)
     release = request["release"]
     version = release["version"]
     result = {"version": version, "job_id": request["job_id"], "status": "failed",
@@ -256,8 +298,7 @@ def perform(directory, request, controller):
                                checksum_url=release["checksum"]["url"], expected_sha256=release["asset"]["sha256"],
                                downloader=lambda url, path: download_blob(release, url, path))
         info = probe(candidate)
-        if info != {**request["info"], "version": version}:
-            raise UpdateError("This release changes the connector or storage cohort; use local setup")
+        compatible_info(request, info)
         check_state(candidate, request["config_path"])
         controller.validate(request)
         stopped = True
@@ -300,7 +341,10 @@ def launch(directory):
     try:
         request = load_request(directory)
         Controller().validate(request)
-        python = services.find_python((3, 10))
+        if request.get("action") == "handover":
+            import handover
+            handover.Plan(request, Controller())
+        python = services.find_python((3, 11))
         if not python:
             raise UpdateError("A supported Python interpreter is unavailable")
     except Exception as error:
@@ -320,6 +364,7 @@ def launch(directory):
 
 
 def main():
+    services.ensure_python((3, 11), __file__)
     os.umask(0o077)
     os.environ["PATH"] = services.worker_path()
     try:

@@ -29,13 +29,28 @@ class ReleasePreparationTests(unittest.TestCase):
         self.assertIn("needs: binaries", release)
         self.assertIn("--verify-tag", release)
 
-    def test_install_examples_select_this_release(self):
+    def test_fresh_install_examples_select_the_supported_setup_release(self):
         version = tomllib.loads((ROOT / "Cargo.toml").read_text())["package"]["version"]
+        # The combined MVP reuses existing accounts. Its CLI deliberately refuses
+        # legacy identity creation, so fresh accounts must bootstrap on 0.9.
+        combined = tuple(map(int, version.split("."))) >= (0, 10, 0)
+        setup_version = "0.9.0" if combined else version
         for name in ["README.md", "docs/INSTALL.md"]:
             with self.subTest(path=name):
-                refs = re.findall(r"herdr plugin install tidley/codr --ref v([0-9.]+)", (ROOT / name).read_text())
+                text = (ROOT / name).read_text()
+                refs = re.findall(r"herdr plugin install tidley/codr --ref v([0-9.]+)", text)
                 self.assertTrue(refs)
-                self.assertEqual(set(refs), {version})
+                self.assertEqual(set(refs), {setup_version})
+                if combined:
+                    self.assertIn("COMBINED.md", text)
+                    self.assertIn("handover", text)
+
+    def test_source_identity_setup_uses_the_same_supported_release(self):
+        version = tomllib.loads((ROOT / "Cargo.toml").read_text())["package"]["version"]
+        if tuple(map(int, version.split("."))) >= (0, 10, 0):
+            text = (ROOT / "docs/INSTALL.md").read_text().split("## Build from source", 1)[1]
+            self.assertIn("git checkout v0.9.0", text)
+            self.assertNotIn("git checkout master", text)
 
 
 if __name__ == "__main__":

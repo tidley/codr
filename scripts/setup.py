@@ -28,7 +28,7 @@ if __name__ == "__main__":
 import tomllib
 
 import services
-from install import InstallError, connector_path, install_connector, platform_name, version
+from install import InstallError, connector_path, install_connector, platform_name, version, sha256
 from phonon import configure_phonon
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -565,11 +565,127 @@ def _configure(owner, herdr_socket, runner, check, enable_audio, enable_portr):
             "phone_round_trip": "requires user confirmation"}
 
 
+def configure_combined(config_path, messaging_home, backup, previous_connector, approved=False, runner=run):
+    """Explicit existing-account handover. Never stop services or restore account state."""
+    if not approved:
+        raise SetupError("Combined handover requires explicit approval after stopping services and backing up account credentials locally")
+    paths = [Path(p) for p in (config_path, messaging_home, backup, previous_connector)]
+    if not all(p.is_absolute() for p in paths):
+        raise SetupError("Combined handover paths must be absolute")
+    config_path, home, backup, previous_connector = [p.resolve() for p in paths]
+    if not config_path.is_file() or not home.is_dir() or not backup.is_dir() or not previous_connector.is_file():
+        raise SetupError("Existing configuration, messaging home, private backup and previous connector are required")
+    if backup.is_relative_to(home) or home.is_relative_to(backup):
+        raise SetupError("The backup must be separate from the live messaging home")
+    metadata = backup.stat()
+    if metadata.st_uid != os.getuid() or metadata.st_mode & 0o077:
+        raise SetupError("The backup must be private and owned by this user")
+    with setup_lock(config_path.parent):
+        config = tomllib.loads(config_path.read_text())
+        if not Path(config["state_path"]).is_absolute() or not Path(config["wn_agent_socket"]).is_absolute():
+            raise SetupError("Existing state and messaging socket paths must be absolute for managed handover")
+        state_path = Path(config["state_path"]).resolve()
+        if json.loads(state_path.read_text()).get("update_job") is not None:
+            raise SetupError("Resolve the pending independent update before service handover; do not start a second installer")
+        identity = home / "codr-bootstrap.json"
+        if not identity.is_file() or json.loads(identity.read_text()).get("account_id_hex") != config["account_id_hex"]:
+            raise SetupError("The messaging home's recorded identity does not match the existing configuration")
+        root = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+        manager = services.for_host(runner, private_write, root, error=SetupError)
+        old_names = ("herdr-white-noise-bridge", "wn-agent-herdr")
+        if manager.backend == services.SYSTEMD:
+            for name in (*old_names, "codr"):
+                if int(runner(["systemctl", "--user", "show", name + ".service", "--property=MainPID", "--value"]).strip() or "0"):
+                    raise SetupError("Stop both old services and any combined service before handover")
+                active = runner(["systemctl", "--user", "show", name + ".service", "--property=ActiveState", "--value"]).strip()
+                if active not in ("inactive", "failed", ""):
+                    raise SetupError("Wait for services to stop before handover")
+            for name in old_names:
+                state = runner(["systemctl", "--user", "show", name + ".service", "--property=UnitFileState", "--value"]).strip()
+                if state not in ("disabled", "masked", ""):
+                    raise SetupError("Disable the old service startup before handover")
+            old_paths = [manager.unit_root / (name + ".service") for name in old_names]
+        else:
+            if any(manager.loaded(name) for name in (*old_names, "codr")):
+                raise SetupError("Boot out old and combined launchd jobs before handover")
+            disabled = runner(["launchctl", "print-disabled", manager.domain()])
+            if any(not re.search(r'"' + re.escape(services.LABEL_PREFIX + "." + name) + r'"\s*=>\s*true', disabled) for name in old_names):
+                raise SetupError("Disable old launchd job startup before handover")
+            old_paths = [manager.path(name) for name in old_names]
+        if runner([str(previous_connector), "--version"]).strip() != f"wn-agent {MDK_VERSION}":
+            raise SetupError("The old connector is outside the supported cohort; migration needs separate approval")
+        binary = Path.home() / ".local/bin/herdr-white-noise-bridge"
+        info = json.loads(runner([str(binary), "update-info", "--full"]))
+        if ("embedded-mdk" not in info.get("runtimes", []) or info.get("storage_cohort") != "mdk-" + ".".join(MDK_VERSION.split(".")[:2])
+                or info.get("connector", {}).get("version") != MDK_VERSION):
+            raise SetupError("The installed executable is not a compatible combined runtime")
+        pairs = [(config_path, backup / "config.toml"), (state_path, backup / "state.json")]
+        if any(path.is_symlink() for path in backup.rglob("*")):
+            raise SetupError("The private backup must not link to live files")
+        source_files = set()
+        for source in home.rglob("*"):
+            if source.is_symlink():
+                raise SetupError("Symlinked account storage needs manual backup inspection")
+            if source.is_file():
+                source_files.add(source.relative_to(home))
+                pairs.append((source, backup / "mdk-home" / source.relative_to(home)))
+        saved_files = {path.relative_to(backup / "mdk-home") for path in (backup / "mdk-home").rglob("*") if path.is_file()}
+        if source_files != saved_files:
+            raise SetupError("The account backup file set differs from the stopped home")
+        pairs.extend((path, backup / "services" / path.name) for path in old_paths if path.exists())
+        if not (backup / "previous").is_file() or (backup / "previous").is_symlink():
+            raise SetupError("Keep the previous executable in the private backup")
+        if any(not saved.is_file() or saved.is_symlink() or sha256(source) != sha256(saved) for source, saved in pairs):
+            raise SetupError("The stopped private backup does not match existing account, state, config or services")
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
+            control.settimeout(1)
+            try:
+                control.connect(str(config["wn_agent_socket"]))
+            except (FileNotFoundError, ConnectionRefusedError):
+                pass
+            except OSError as error:
+                raise SetupError("Messaging socket ownership needs local inspection before handover") from error
+            else:
+                raise SetupError("An unmanaged messaging socket owner is still running; nothing was installed")
+        # The embedded runtime repeats socket/home ownership checks. A failed
+        # start is not permission to recreate an identity or rewind MLS state.
+        runner([str(binary), "--config", str(config_path), "status"])
+        manager.install(services.combined_service(binary, config_path, home))
+        manager.reload()
+        if manager.backend == services.SYSTEMD:
+            runner(["systemctl", "--user", "enable", "codr.service"])
+        try:
+            if manager.backend == services.LAUNCHD:
+                runner(["launchctl", "enable", manager.domain() + "/" + services.LABEL_PREFIX + ".codr"])
+            manager.start("codr")
+            manager.is_active("codr")
+            accounts = local_accounts(Path(config["wn_agent_socket"]))
+            if not any(account.get("account_id_hex") == config["account_id_hex"] and account.get("local_signing") is True for account in accounts):
+                raise SetupError("The combined service did not confirm the existing messaging identity")
+        except Exception as error:
+            try:
+                if manager.backend == services.SYSTEMD:
+                    runner(["systemctl", "--user", "stop", "codr.service"])
+                    runner(["systemctl", "--user", "disable", "codr.service"])
+                else:
+                    runner(["launchctl", "bootout", manager.domain() + "/" + services.LABEL_PREFIX + ".codr"])
+                    runner(["launchctl", "disable", manager.domain() + "/" + services.LABEL_PREFIX + ".codr"])
+            except Exception:
+                raise SetupError("Combined startup and cleanup need local inspection; account data was not restored") from error
+            raise SetupError("Combined startup failed; inspect locally before restarting compatible services. Account data was not restored") from error
+        return {"service":"codr", "configuration":str(config_path), "messaging_home":str(home),
+                "existing_configuration_preserved":True, "phone_round_trip":"requires user confirmation"}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--npub", default=os.environ.get("CODR_OWNER_NPUB") or None)
     parser.add_argument("--herdr-socket", type=Path)
     parser.add_argument("--check", action="store_true", help="Validate an existing configuration without changing services")
+    parser.add_argument("--combined-home", type=Path, help="Hand over an existing MDK account home to the single codr service")
+    parser.add_argument("--backup", type=Path, help="Private stopped backup containing mdk-home, config.toml, state.json, services and previous executable")
+    parser.add_argument("--previous-connector", type=Path, help="Existing connector executable used to verify the storage cohort")
+    parser.add_argument("--approve-handover", action="store_true", help="Confirm old services are stopped/disabled and a complete private backup includes secret-store credentials")
     audio = parser.add_mutually_exclusive_group()
     audio.add_argument("--phonon", dest="enable_audio", action="store_true", default=None, help="Install or reuse the local Phonon-2 worker, including on an existing installation")
     audio.add_argument("--no-audio", dest="enable_audio", action="store_false", help="Skip audio setup on a fresh installation")
@@ -588,6 +704,13 @@ def main():
         except EOFError:
             args.enable_portr = False
     try:
+        if args.combined_home is not None:
+            if args.check or args.backup is None or args.previous_connector is None or args.enable_portr is not None or args.enable_audio is not None or args.npub or args.herdr_socket:
+                raise SetupError("Use --combined-home with --backup, --previous-connector and --approve-handover; do not combine it with other setup changes")
+            print(json.dumps(configure_combined(config, args.combined_home, args.backup, args.previous_connector, args.approve_handover), indent=2))
+            return 0
+        if not args.check and tuple(map(int, version().split("."))) >= (0, 10, 0):
+            raise SetupError("0.10 uses one combined service. For an existing account, use the approved --combined-home handover. Fresh identity setup remains available through 0.9 local setup before handover.")
         report = configure(args.npub, args.herdr_socket, check=args.check, enable_audio=args.enable_audio, enable_portr=args.enable_portr)
         print(json.dumps(report, indent=2))
         if report.get("default_profile_status") == "unconfirmed":

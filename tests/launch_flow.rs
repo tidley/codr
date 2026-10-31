@@ -604,7 +604,8 @@ async fn even_one_provider_starts_with_default_or_provider_and_then_lists_every_
         .inbound(&event("agent", &index.to_string()))
         .await
         .unwrap();
-    assert!(last(&bridge).contains("Use the backend default, or view models from a provider."));
+    assert!(!last(&bridge).contains("Use the backend default"));
+    assert!(last(&bridge).ends_with("**0. Cancel**"));
     assert!(last(&bridge).contains("1. Backend default\n2. View test models"));
     bridge.inbound(&event("provider", "2")).await.unwrap();
     assert!(last(&bridge).contains("1. Model 1"));
@@ -709,11 +710,16 @@ async fn account_model_groups_and_variants_are_separate_restart_safe_menus() {
     let (mut bridge, key) = bridge(&config, None);
     let (server, calls) = host(&config, None).await;
     bridge.inbound(&event("open", "/new")).await.unwrap();
-    assert!(last(&bridge).starts_with("[1/4] Choose a herdr workspace:"));
+    assert!(last(&bridge).starts_with("Choose workspace\n"));
+    assert!(last(&bridge).ends_with("**0. Cancel**"));
     bridge.inbound(&event("workspace", "3")).await.unwrap();
-    assert!(last(&bridge).starts_with("[2/4] Folder name:"));
+    assert_eq!(
+        last(&bridge),
+        "Folder name:\nReply with your chosen folder name.\n\n**0. Cancel**\n\n**`ls`** to list existing folders, or **`ls <part>`** to filter them."
+    );
     bridge.inbound(&event("folder", "my-idea")).await.unwrap();
-    assert!(last(&bridge).starts_with("[3/4] Choose an installed agent:"));
+    assert!(last(&bridge).starts_with("Choose agent:\n"));
+    assert!(last(&bridge).ends_with("**0. Cancel**"));
     let index = bridge.state.mappings[&key]
         .launch_draft
         .as_ref()
@@ -727,7 +733,8 @@ async fn account_model_groups_and_variants_are_separate_restart_safe_menus() {
         .inbound(&event("agent", &index.to_string()))
         .await
         .unwrap();
-    assert!(last(&bridge).starts_with("[4/4] Choose a model for OpenCode:"));
+    assert!(last(&bridge).starts_with("Choose a model for OpenCode:\n"));
+    assert!(last(&bridge).ends_with("**0. Cancel**"));
     for label in [
         "1. Backend default",
         "2. View OpenAI / Codex models",
@@ -740,12 +747,19 @@ async fn account_model_groups_and_variants_are_separate_restart_safe_menus() {
     assert!(!last(&bridge).contains("page"));
     bridge.inbound(&event("openai", "2")).await.unwrap();
     assert!(last(&bridge).contains("1. GPT Codex"));
+    assert!(last(&bridge).contains("Back: back"));
+    assert!(!last(&bridge).contains("Menus expire"));
+    assert!(!last(&bridge).contains("Reply with a listed number"));
     assert!(!last(&bridge).contains("Free model"));
     assert!(!last(&bridge).contains("#high"));
     drop(bridge);
     let mut bridge = Bridge::open(config.clone()).unwrap();
     bridge.inbound(&event("model", "1")).await.unwrap();
     assert!(last(&bridge).contains("Choose a variant"));
+    assert!(last(&bridge).contains("Back: back"));
+    assert!(!last(&bridge).contains("Menus expire"));
+    assert!(!last(&bridge).contains("[4/4]"));
+    assert!(!last(&bridge).contains("Reply with a listed number"));
     assert!(last(&bridge).contains("2. high"));
     bridge.inbound(&event("variant", "2")).await.unwrap();
     let chosen = bridge.state.mappings[&key]
@@ -1131,14 +1145,15 @@ async fn location_steps_are_tidy_and_new_workspace_is_the_last_numbered_choice()
     let (server, calls) = host(&config, None).await;
     bridge.inbound(&event("open", "/new")).await.unwrap();
     let text = last(&bridge);
-    assert!(text.starts_with("[1/4] Choose a herdr workspace:"));
+    assert!(text.starts_with("Choose workspace\n"));
+    assert!(text.ends_with("**0. Cancel**"));
     assert!(!text.contains("page 1 of 1"));
     assert!(
         text.contains("\n\n**0. Cancel**"),
         "Markdown must not renumber the cancellation option"
     );
     assert!(
-        text.contains("\n\n**3. Create new workspace**"),
+        text.contains("\n3. Create new workspace\n\n**0. Cancel**"),
         "The new-workspace number is independent of the current page"
     );
     assert!(text.find("1. Main").unwrap() < text.find("2. Other").unwrap());
@@ -1153,10 +1168,10 @@ async fn location_steps_are_tidy_and_new_workspace_is_the_last_numbered_choice()
             .target_workspace
             .is_none()
     );
-    assert!(last(&bridge).starts_with("[2/4] Folder name:"));
-    assert!(last(&bridge).contains(
-        "Reply with your chosen folder name, **`ls`** to list existing folders, or **`ls <part>`** to filter them.\n\n**0. Cancel**"
-    ));
+    assert_eq!(
+        last(&bridge),
+        "Folder name:\nReply with your chosen folder name.\n\n**0. Cancel**\n\n**`ls`** to list existing folders, or **`ls <part>`** to filter them."
+    );
     bridge
         .inbound(&event("folder", "side-project"))
         .await
@@ -1170,6 +1185,8 @@ async fn location_steps_are_tidy_and_new_workspace_is_the_last_numbered_choice()
         Step::Agent
     );
     assert!(last(&bridge).contains("0. Cancel"));
+    assert!(last(&bridge).starts_with("Choose agent:\n"));
+    assert!(last(&bridge).ends_with("**0. Cancel**"));
     assert!(!config.launch_root.join("side-project").exists());
     assert!(
         calls
@@ -1419,7 +1436,8 @@ async fn code_free_menu_choices_survive_restart_and_require_explicit_confirmatio
     bridge.inbound(&event("open", "/new")).await.unwrap();
     let code = draft_code(&bridge, &key);
     assert!(!last(&bridge).contains(&code));
-    assert!(last(&bridge).contains("Reply with"));
+    assert!(last(&bridge).starts_with("Choose workspace\n"));
+    assert!(last(&bridge).ends_with("**0. Cancel**"));
     bridge.inbound(&event("workspace", "new")).await.unwrap();
     assert_eq!(
         bridge.state.mappings[&key]
@@ -2230,7 +2248,8 @@ async fn workspace_pages_and_stale_choices_survive_restart() {
     bridge.inbound(&event("begin", "/new")).await.unwrap();
     let code = draft_code(&bridge, &key);
     assert!(last(&bridge).contains("page 1 of 2"));
-    assert!(last(&bridge).contains("**13. Create new workspace**\n\n**0. Cancel**"));
+    assert!(last(&bridge).contains("13. Create new workspace\n\n**0. Cancel**"));
+    assert!(last(&bridge).contains("Next page: next"));
     bridge
         .inbound(&event("page", &format!("/new workspace {code} next")))
         .await
@@ -2415,7 +2434,7 @@ async fn saved_folder_drafts_from_before_workspace_selection_keep_the_new_worksp
         .inbound(&event("folder", &format!("/new folder {code} existing")))
         .await
         .unwrap();
-    assert!(last(&bridge).contains("Choose an installed agent"));
+    assert!(last(&bridge).contains("Choose agent:"));
     assert!(
         bridge.state.mappings[&key]
             .launch_draft
@@ -2620,6 +2639,9 @@ async fn agent_selection_creates_a_separate_tab_without_changing_the_old_chat() 
     let (server, calls) = host(&config, Some(agent)).await;
     bridge.inbound(&event("open", "/agent")).await.unwrap();
     assert!(last(&bridge).contains("separate chat"));
+    assert!(last(&bridge).starts_with("Choose an installed agent:\n"));
+    assert!(last(&bridge).contains("Reply with a listed number."));
+    assert!(last(&bridge).ends_with("Menus expire after 10 minutes."));
     let draft = bridge.state.mappings[&key].launch_draft.as_ref().unwrap();
     let n = draft.agents.iter().position(|a| a == "opencode").unwrap() + 1;
     let code = draft.code.clone();
@@ -2627,6 +2649,9 @@ async fn agent_selection_creates_a_separate_tab_without_changing_the_old_chat() 
         .inbound(&event("agent", &format!("/agent {code} {n}")))
         .await
         .unwrap();
+    assert!(last(&bridge).contains("models from a provider."));
+    assert!(last(&bridge).contains("Reply with a listed number."));
+    assert!(last(&bridge).ends_with("Menus expire after 10 minutes."));
     let code = model_code(&mut bridge, &key).await;
     bridge
         .inbound(&event("choose", &format!("/model {code} 2")))
@@ -2679,6 +2704,10 @@ async fn existing_opencode_model_switch_is_confirmed_in_place_and_never_repeated
         let (mut bridge, key) = bridge(&config, Some(agent.clone()));
         let (server, calls) = host(&config, Some(agent)).await;
         bridge.inbound(&event("open", "/model")).await.unwrap();
+        assert!(last(&bridge).starts_with("Choose a model for OpenCode:\n"));
+        assert!(last(&bridge).contains("models from a provider."));
+        assert!(last(&bridge).contains("Reply with a listed number."));
+        assert!(last(&bridge).ends_with("Menus expire after 10 minutes."));
         let code = model_code(&mut bridge, &key).await;
         bridge
             .inbound(&event("choose", &format!("/model {code} 2")))

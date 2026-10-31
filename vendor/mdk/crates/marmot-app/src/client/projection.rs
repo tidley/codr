@@ -1,0 +1,1589 @@
+use cgka_traits::MARMOT_APP_EVENT_KIND_POLL;
+use cgka_traits::app_components::{
+    AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, GROUP_AVATAR_URL_COMPONENT_ID,
+    GROUP_BLOSSOM_IMAGE_COMPONENT_ID, GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
+    GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID, GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+    GROUP_PROFILE_COMPONENT_ID, NOSTR_ROUTING_COMPONENT_ID,
+};
+use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent as MarmotInnerEvent};
+use cgka_traits::group::ProtocolProfile;
+use cgka_traits::storage::{GroupStorage, MessageStorage, StorageProvider};
+use cgka_traits::{GroupId, TransportGroupSubscription};
+use storage_sqlite::StoredNostrRoute;
+
+use crate::groups::{EventGroupProjection, GroupConfirmationProjection, add_group, event_group_id};
+use crate::{
+    AppAgentTextStreamComponent, AppError, AppGroupAdminPolicyComponent,
+    AppGroupAvatarUrlComponent, AppGroupEncryptedMediaComponent, AppGroupImageInput,
+    AppGroupMessageRetentionComponent, AppGroupNostrRoutingComponent, AppGroupProfileComponent,
+    AppGroupRecord, AppMessageProjection, AppPriorNostrRoute, AppTransportRouting,
+    SecureDeleteExpiredResult, unix_now_seconds,
+};
+
+use super::AppClient;
+
+impl AppClient {
+    /// Project a fresh send intent optimistically, before the publish is tried.
+    ///
+    /// Inner app-event ids are NIP-01 hashes over
+    /// (pubkey, created_at, kind, tags, content) with second-granular
+    /// `created_at`, so a resend of identical text inside the same second as a
+    /// failed send mints that send's *exact* id and lands on the row
+    /// `retract_failed_local_projection` tombstoned as `local_publish_failed`.
+    /// `record_app_event`'s upsert keeps invalidation terminal by design — it
+    /// cannot tell a retry from a relay redelivery, a backfill replay, or a
+    /// re-synthesized system row — so reviving that row needs an explicit clear
+    /// carrying evidence the upsert lacks. A fresh send intent is that evidence,
+    /// and only this function sees one: replay seams re-record rows without ever
+    /// entering a send.
+    ///
+    /// **Record first, then clear**, because the two writes commit separately
+    /// and only this order is truthful at every prefix. The record alone
+    /// preserves the tombstone, so a failing record, a failing clear, and a
+    /// crash between the two commits all leave the row `Failed` — the state the
+    /// user last saw, still retryable. Clearing first would commit a revival the
+    /// send never earned: a live `pending` row with no publish attempt behind
+    /// it, which nothing short of a terminal-group sweep re-invalidates. See
+    /// `docs/marmot-architecture/overview/multi-step-state-changes.md`.
+    ///
+    /// The clear reprojects the same row against the post-record snapshot, so
+    /// its update supersedes the record's and exactly one flip is forwarded;
+    /// with no tombstone to clear, the record's update is the only one.
+    ///
+    /// Only the pre-publish projection clears. The post-publish one runs on a
+    /// row this call already revived, and anything that invalidated it *during*
+    /// the send — the terminal-group sweep, a convergence withdrawal — is a
+    /// verdict the send flow has no evidence to overturn. The one later
+    /// revival is publish finalization's, on a relay acceptance of the row's
+    /// own fanout (`revive_published_local_send`).
+    pub(crate) fn record_send_intent_projection(
+        &self,
+        group_id: &GroupId,
+        sender: &str,
+        event: &MarmotInnerEvent,
+    ) -> Result<crate::AppProjectionUpdate, AppError> {
+        let recorded =
+            self.record_local_app_event_projection(group_id, sender, event, None, None, false)?;
+        Ok(self
+            .app
+            .clear_timeline_local_publish_failure(
+                &self.state.label,
+                &hex::encode(group_id.as_slice()),
+                &event.id,
+            )?
+            .unwrap_or(recorded))
+    }
+
+    /// `advance_read_marker`: pre-publish projections must pass `false` so a
+    /// failed publish never leaves the group read marker advanced past inbound
+    /// unreads or pointing at an invalidated own message (#338); only the
+    /// post-publish success projection advances it.
+    pub(crate) fn record_local_app_event_projection(
+        &self,
+        group_id: &GroupId,
+        sender: &str,
+        event: &MarmotInnerEvent,
+        source_message_id_hex: Option<String>,
+        source_state: Option<(
+            u64,
+            crate::AppMessageRetentionDecision,
+            Option<cgka_traits::app_event::AppMessageAuthority>,
+        )>,
+        advance_read_marker: bool,
+    ) -> Result<crate::AppProjectionUpdate, AppError> {
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let (source_epoch, retention, authority) = source_state
+            .map(|(epoch, retention, authority)| (Some(epoch), Some(retention), authority))
+            .unwrap_or((None, None, None));
+        // Stamped on the sender's own store too, so a moderation delete of
+        // another member's message survives local reprojection instead of
+        // resurrecting the target.
+        let moderation_grant = authority.is_some_and(|a| a.moderation_grant);
+        let message_projection = AppMessageProjection {
+            authority,
+            message_id_hex: event.id.clone(),
+            source_message_id_hex,
+            direction: "sent".to_owned(),
+            group_id_hex: group_id_hex.clone(),
+            sender: sender.to_owned(),
+            plaintext: event.content.clone(),
+            kind: event.kind,
+            tags: event.tags.clone(),
+            source_epoch,
+            retention,
+            recorded_at: Some(event.created_at),
+            // Only synthesized kind-1210 system rows carry an origin commit;
+            // ordinary sent app events do not.
+            origin_commit_id: None,
+            moderation_grant,
+        };
+        // Publication carries the engine-stamped source authority.
+        let update = if advance_read_marker {
+            self.app
+                .record_account_app_event_refreshing_moderation_grant(
+                    &self.state.label,
+                    &message_projection,
+                )?
+        } else {
+            self.app
+                .record_account_app_event(&self.state.label, &message_projection)?
+        };
+        if advance_read_marker
+            && matches!(
+                event.kind,
+                MARMOT_APP_EVENT_KIND_CHAT | MARMOT_APP_EVENT_KIND_POLL
+            )
+        {
+            let read_marker =
+                self.app
+                    .mark_timeline_message_read(&self.state.label, &group_id_hex, &event.id);
+            if let Err(err) = read_marker {
+                let error_code = read_marker_error_code(&err);
+                tracing::warn!(
+                    target: "marmot_app::messages",
+                    method = "record_local_app_event_projection",
+                    error_code = %error_code,
+                    "local read marker update skipped after local send projection",
+                );
+            }
+        }
+        Ok(update)
+    }
+
+    /// Send-time preflight only. The engine stamps final authorization at
+    /// encryption, and receivers consume that authenticated source-state proof.
+    pub(crate) fn delete_moderation_grant(&self, group_id: &GroupId, sender_hex: &str) -> bool {
+        let Ok(group) = self.runtime.group_record(group_id) else {
+            return false;
+        };
+        let Ok(admins) = self.runtime.admin_pubkeys(group_id) else {
+            return false;
+        };
+        crate::groups::delete_moderation_grant(&group, &admins, sender_hex)
+    }
+
+    pub(crate) fn state_group_record(&self, group_id: &GroupId) -> Option<AppGroupRecord> {
+        let group_id_hex = hex::encode(group_id.as_slice());
+        self.state
+            .groups
+            .iter()
+            .find(|group| group.group_id_hex == group_id_hex)
+            .cloned()
+    }
+
+    pub(crate) fn has_local_group_deletion_frontier(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<bool, AppError> {
+        let group_id_hex = hex::encode(group_id.as_slice());
+        Ok(self
+            .app
+            .account_storage(&self.state.label)?
+            .app_storage()
+            .local_group_deletion_frontier(&group_id_hex)?
+            .is_some())
+    }
+    /// Suppress projection updates for an intentionally hidden live group while
+    /// keeping its durable transport routes active. `batch_start_frontier`
+    /// remains authoritative for the whole effects batch, even if an earlier
+    /// fresh event has already rebuilt the in-memory group. A terminal disband
+    /// removes both the routes and the now-redundant app-only deletion marker.
+    pub(crate) fn suppress_local_deleted_group_event(
+        &mut self,
+        event: &cgka_traits::engine::GroupEvent,
+        batch_start_frontier: Option<u64>,
+    ) -> Result<Option<bool>, AppError> {
+        let Some(group_id) = event_group_id(event) else {
+            return Ok(None);
+        };
+        if batch_start_frontier.is_none() && self.state_group_record(group_id).is_some() {
+            return Ok(None);
+        }
+        if batch_start_frontier.is_none() && !self.has_local_group_deletion_frontier(group_id)? {
+            return Ok(None);
+        }
+        let terminal = matches!(
+            event,
+            cgka_traits::engine::GroupEvent::GroupStateChanged {
+                change: cgka_traits::engine::GroupStateChange::GroupDisbanded,
+                ..
+            }
+        ) || super::group_is_terminal(&self.runtime, group_id);
+        if terminal {
+            return Ok(Some(self.routing.replace_group_routes(
+                group_id,
+                Vec::<TransportGroupSubscription>::new(),
+            )));
+        }
+        if self.state_group_record(group_id).is_some() {
+            // rebuilt the in-memory group. Historical events are still judged
+            // against the batch-start frontier and stay suppressed.
+            return Ok(Some(false));
+        }
+        Ok(Some(self.ensure_local_deleted_group_route(group_id)?))
+    }
+
+    /// Terminal events in one engine-effects batch all stay suppressed by the
+    /// marker. Remove it only after that batch drains so a trailing epoch/state
+    /// event cannot rebuild the projection or reinstall a terminal route.
+    pub(crate) fn clear_terminal_local_group_deletion_frontiers(
+        &self,
+        effects: &marmot_account::AccountDeviceEffects,
+    ) -> Result<(), AppError> {
+        let storage = self.app.account_storage(&self.state.label)?;
+        for event in &effects.events {
+            let cgka_traits::engine::GroupEvent::GroupStateChanged {
+                group_id,
+                change: cgka_traits::engine::GroupStateChange::GroupDisbanded,
+                ..
+            } = event
+            else {
+                continue;
+            };
+            if self.state_group_record(group_id).is_none() {
+                storage
+                    .app_storage()
+                    .clear_local_group_deletion_frontier(&hex::encode(group_id.as_slice()))?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn refresh_group(&mut self, group_id: &GroupId) {
+        if self.state_group_record(group_id).is_none() {
+            match self.has_local_group_deletion_frontier(group_id) {
+                Ok(true) => {
+                    let _ = self.ensure_local_deleted_group_route(group_id);
+                    return;
+                }
+                // Refresh is best-effort. Fail closed instead of letting a
+                // storage read failure resurrect a deliberately deleted group.
+                Err(_) => return,
+                Ok(false) => {}
+            }
+        }
+        let previous = self.state_group_record(group_id);
+        let group_metadata = self.runtime.group_record(group_id).ok();
+        let Ok(projection) = self.event_group_projection(group_id, group_metadata.as_ref()) else {
+            return;
+        };
+        add_group(
+            &mut self.state,
+            group_id,
+            &projection,
+            GroupConfirmationProjection::Preserve,
+        );
+        if previous != self.state_group_record(group_id) {
+            self.mark_group_projection_dirty(group_id);
+        }
+    }
+
+    pub(crate) fn add_group(&mut self, group_id: &GroupId) -> Result<(), AppError> {
+        let previous = self.state_group_record(group_id);
+        let group_metadata = self.runtime.group_record(group_id).ok();
+        let projection = self.event_group_projection(group_id, group_metadata.as_ref())?;
+        add_group(
+            &mut self.state,
+            group_id,
+            &projection,
+            GroupConfirmationProjection::Accepted,
+        );
+        if previous != self.state_group_record(group_id) {
+            self.mark_group_projection_dirty(group_id);
+        }
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let subscriptions = self
+            .state
+            .groups
+            .iter()
+            .find(|group| group.group_id_hex == group_id_hex)
+            .ok_or_else(|| AppError::UnknownGroup(group_id_hex))?
+            .transport_subscriptions(group_id)?;
+        self.routing.replace_group_routes(group_id, subscriptions);
+        Ok(())
+    }
+
+    /// Build the current and retained-prior subscriptions for an intentionally
+    /// hidden live group. The deletion frontier keeps each authenticated prior
+    /// route paired with the relay set that carried it.
+    ///
+    /// The current route comes first, as it does for every group, so it
+    /// resumes from the account cursor; the frontier's copy of it is not
+    /// history. Each retained route carries the floor of its recorded switch.
+    fn local_deleted_group_subscriptions(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Vec<TransportGroupSubscription>, AppError> {
+        if super::group_is_terminal(&self.runtime, group_id) {
+            return Ok(Vec::new());
+        }
+        let storage = self.app.account_storage(&self.state.label)?;
+        if self.skips_quarantined_group_reads(group_id) {
+            // No live routing component until it rehydrates (mdk#2318). Its
+            // delete stored the then-current route, which the engine can
+            // keep receiving on: it retains a quarantined group's inbound
+            // input as deferred peels and replays them on recovery.
+            let Some(current) = storage
+                .app_storage()
+                .local_group_deletion_prior_nostr_routes(&hex::encode(group_id.as_slice()))?
+                .into_iter()
+                .filter(|route| route.replaced_at.is_none())
+                .max_by_key(|route| route.last_epoch)
+            else {
+                return Ok(Vec::new());
+            };
+            let current = AppPriorNostrRoute {
+                nostr_group_id_hex: current.nostr_group_id_hex,
+                relays: current.relays,
+                last_epoch: current.last_epoch,
+                replaced_at: None,
+            }
+            .subscription(group_id)?;
+            return self.local_deleted_group_subscriptions_from(&storage, group_id, current);
+        }
+        let routing = self.nostr_routing_for_group(group_id)?;
+        let current = routing.subscription(group_id)?;
+        if storage
+            .app_storage()
+            .retain_local_group_deletion_nostr_routes(
+                &hex::encode(group_id.as_slice()),
+                &[StoredNostrRoute {
+                    nostr_group_id_hex: routing.nostr_group_id_hex,
+                    relays: routing.relays,
+                    last_epoch: self
+                        .runtime
+                        .group_record(group_id)
+                        .map(|group| group.epoch.0)
+                        .unwrap_or_default(),
+                    // Still current. A hidden group has no projection to see
+                    // its next switch, so the route that switch leaves keeps
+                    // no floor and is backfilled in full, until the first
+                    // account load after the group is restored stamps it.
+                    replaced_at: None,
+                }],
+            )
+            .is_err()
+        {
+            tracing::warn!(
+                target: "marmot_app::client::projection",
+                method = "local_deleted_group_subscriptions",
+                "could not retain the current route for a locally deleted group",
+            );
+        }
+        self.local_deleted_group_subscriptions_from(&storage, group_id, current)
+    }
+
+    /// The current route first, then each retained prior route still indexed
+    /// for the group, then any legacy route ids paired with the current relays.
+    fn local_deleted_group_subscriptions_from(
+        &self,
+        storage: &storage_sqlite::SqliteAccountStorage,
+        group_id: &GroupId,
+        current: TransportGroupSubscription,
+    ) -> Result<Vec<TransportGroupSubscription>, AppError> {
+        let indexed_routes = storage
+            .list_transport_group_routes()?
+            .into_iter()
+            .filter(|route| route.group_id == *group_id)
+            .collect::<Vec<_>>();
+        let mut subscriptions = vec![current.clone()];
+        for route in storage
+            .app_storage()
+            .local_group_deletion_prior_nostr_routes(&hex::encode(group_id.as_slice()))?
+        {
+            let route = AppPriorNostrRoute {
+                nostr_group_id_hex: route.nostr_group_id_hex,
+                relays: route.relays,
+                last_epoch: route.last_epoch,
+                replaced_at: route.replaced_at,
+            };
+            match route.subscription(group_id) {
+                Ok(subscription)
+                    if !same_transport_route(&subscription, &current)
+                        && indexed_routes.iter().any(|route| {
+                            route.transport_group_id == subscription.transport_group_id
+                        }) =>
+                {
+                    subscriptions.push(subscription);
+                }
+                Ok(_) => {}
+                Err(_) => tracing::warn!(
+                    target: "marmot_app::client::projection",
+                    method = "local_deleted_group_subscriptions",
+                    error_kind = "invalid_prior_nostr_route",
+                    "skipping invalid prior Nostr route",
+                ),
+            }
+        }
+
+        // Legacy deletion markers have no exact prior-route payload. Keep the
+        // old route-id coverage in that case by pairing only still-unrepresented
+        // ids with the authenticated current component's relay set.
+        for route in indexed_routes {
+            if !subscriptions
+                .iter()
+                .any(|subscription| subscription.transport_group_id == route.transport_group_id)
+            {
+                subscriptions.push(TransportGroupSubscription {
+                    group_id: group_id.clone(),
+                    transport_group_id: route.transport_group_id,
+                    endpoints: current.endpoints.clone(),
+                    retained_since: None,
+                });
+            }
+        }
+        Ok(subscriptions)
+    }
+
+    /// Keep every still-valid transport route active while the app projection
+    /// is intentionally deleted. This is the path by which a fresh chat message
+    /// can cross the deletion frontier and restore the conversation.
+    pub(crate) fn ensure_local_deleted_group_route(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<bool, AppError> {
+        let subscriptions = self.local_deleted_group_subscriptions(group_id)?;
+        Ok(self.routing.replace_group_routes(group_id, subscriptions))
+    }
+
+    /// Move exact route history out of the deletion marker and into the
+    /// recreated app group before the marker is cleared transactionally.
+    pub(crate) fn adopt_local_deleted_group_prior_routes(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<bool, AppError> {
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let routes = self
+            .app
+            .account_storage(&self.state.label)?
+            .app_storage()
+            .local_group_deletion_prior_nostr_routes(&group_id_hex)?
+            .into_iter()
+            .map(|route| AppPriorNostrRoute {
+                nostr_group_id_hex: route.nostr_group_id_hex,
+                relays: route.relays,
+                last_epoch: route.last_epoch,
+                replaced_at: route.replaced_at,
+            })
+            .collect::<Vec<_>>();
+        let Some(group) = self
+            .state
+            .groups
+            .iter_mut()
+            .find(|group| group.group_id_hex == group_id_hex)
+        else {
+            return Ok(false);
+        };
+        let previous_routes = group.prior_nostr_routes.clone();
+        group.adopt_prior_nostr_routes(routes);
+        let changed = group.prior_nostr_routes != previous_routes;
+        if changed {
+            self.mark_group_projection_dirty_hex(group_id_hex);
+        }
+        Ok(true)
+    }
+
+    /// Add intentionally hidden live-group routes to a freshly rebuilt routing
+    /// snapshot before it atomically replaces the active snapshot.
+    pub(crate) fn preserve_local_deleted_group_routes(
+        &self,
+        routing: &AppTransportRouting,
+    ) -> Result<(), AppError> {
+        // A quarantined hidden group is not live but keeps its stored route.
+        let quarantined = self
+            .runtime
+            .quarantined_groups()
+            .into_iter()
+            .map(|(group_id, _)| group_id);
+        for group_id in self
+            .runtime
+            .live_group_ids()?
+            .into_iter()
+            .chain(quarantined)
+        {
+            if self.state_group_record(&group_id).is_some()
+                || !self.has_local_group_deletion_frontier(&group_id)?
+            {
+                continue;
+            }
+            routing.replace_group_routes(
+                &group_id,
+                self.local_deleted_group_subscriptions(&group_id)?,
+            );
+        }
+        Ok(())
+    }
+
+    /// Repair an engine/projection tear left by a previously confirmed group
+    /// mutation whose trailing app-state write failed, and hydrate the durable
+    /// roster-count projection introduced for chat-list classification.
+    /// Quarantined groups are absent from `live_group_ids` and retain their
+    /// dedicated recovery path. So is a copy this device was removed from: its
+    /// add-missing leg no longer re-adds one, and its roster repair no longer
+    /// reaches one — a departed copy's projection is whatever the removal left,
+    /// until a re-add puts the group back in the listing.
+    pub(crate) fn reconcile_live_engine_groups(&mut self) -> Result<bool, AppError> {
+        let projected = self
+            .state
+            .groups
+            .iter()
+            .map(|group| group.group_id_hex.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let live_group_ids = self.runtime.live_group_ids()?;
+        let quarantined: std::collections::HashSet<_> = self
+            .runtime
+            .quarantined_groups()
+            .into_iter()
+            .map(|(id, _)| hex::encode(id.as_slice()))
+            .collect();
+        let mut cleared = Vec::new();
+        for group in &mut self.state.groups {
+            if quarantined.contains(&group.group_id_hex)
+                && group.presentation_member_ids_hex.is_some()
+            {
+                group.presentation_member_ids_hex = None;
+                cleared.push(group.group_id_hex.clone());
+            }
+        }
+        let mut changed = !cleared.is_empty();
+        for id in cleared {
+            self.mark_group_projection_dirty_hex(id);
+        }
+        for group_id in live_group_ids {
+            self.cleanup_stale_push_tokens_best_effort(&group_id);
+            // Reopen repairs a lost removal-withdrawal announcement from the
+            // canonical local leaf, including after the migration backfill ran.
+            changed |= self.reconcile_canonical_self_membership(&group_id)?;
+            let group_id_hex = hex::encode(group_id.as_slice());
+            if !projected.contains(group_id_hex.as_str()) {
+                if self
+                    .app
+                    .account_storage(&self.state.label)?
+                    .app_storage()
+                    .local_group_deletion_frontier(&group_id_hex)?
+                    .is_some()
+                {
+                    self.ensure_local_deleted_group_route(&group_id)?;
+                    continue;
+                }
+                self.add_group(&group_id)?;
+                changed = true;
+                continue;
+            }
+            let Some(projected_group) = self
+                .state
+                .groups
+                .iter_mut()
+                .find(|group| group.group_id_hex == group_id_hex)
+            else {
+                continue;
+            };
+            let mut dirty = false;
+            if let Ok(group) = self.runtime.group_record(&group_id) {
+                let live_count = u64::try_from(group.members.len()).ok();
+                if projected_group.member_count != live_count {
+                    projected_group.member_count = live_count;
+                    dirty = true;
+                }
+                let previous_direct_members = projected_group.direct_member_ids_hex.clone();
+                let previous_presentation_members =
+                    projected_group.presentation_member_ids_hex.clone();
+                projected_group.set_direct_member_ids_from_roster(&group.members);
+                dirty |= projected_group.direct_member_ids_hex != previous_direct_members
+                    || projected_group.presentation_member_ids_hex != previous_presentation_members;
+            }
+            if dirty {
+                self.mark_group_projection_dirty_hex(group_id_hex);
+                changed = true;
+            }
+        }
+        Ok(changed)
+    }
+
+    /// Finish the projection repairs that require fully hydrated group state.
+    /// Deferred runtime opens call this after their background hydration
+    /// pipeline; eager clients call it before returning from open.
+    pub(crate) fn reconcile_hydrated_account_state(&mut self) -> Result<(), AppError> {
+        if self.reconcile_live_engine_groups()? {
+            self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+        }
+        // Route seeding at open reads persisted group state, which carries no
+        // departure marker; the engine record does. This is the first point on
+        // either open path where that record is readable, and on an eager open
+        // it still precedes the first subscription, so a group this device has
+        // left is never re-subscribed. Only the routing table changes unless a
+        // prior route retired, which is the one case that persists.
+        //
+        // A quarantined group is the deliberate exception: `ensure_group_live`
+        // makes its record unreadable, so its route survives this seam and is
+        // reconciled on the next hydration that admits the group.
+        if self.refresh_group_routes()?.state_pruned {
+            self.save_state_with_pending_local_group_deletion_frontier_clears()?;
+        }
+        // A marker/queue transaction can outlive its in-memory announcement.
+        // Repair from durable terminal records even after the one-time backfill.
+        let groups = self
+            .state
+            .groups
+            .iter()
+            .map(|group| group.group_id_hex.clone())
+            .collect::<Vec<_>>();
+        for group_id_hex in groups {
+            let Ok(bytes) = hex::decode(&group_id_hex) else {
+                continue;
+            };
+            let group_id = GroupId::new(bytes);
+            let Ok(record) = self.runtime.group_record(&group_id) else {
+                continue;
+            };
+            if record.removed && record.disbanded.is_none() {
+                let event = cgka_traits::engine::GroupEvent::LocalGroupCopyTerminated {
+                    group_id,
+                    voluntary: false,
+                };
+                let mut summary = crate::SyncSummary::default();
+                if self
+                    .observe_event_projection_effects(&event, &mut summary)
+                    .is_err()
+                {
+                    // The durable terminal record repairs this again on reopen;
+                    // retain the event for the session worker's bounded retry too.
+                    self.retain_applied_effects(&marmot_account::AccountDeviceEffects {
+                        events: vec![event],
+                        ..Default::default()
+                    });
+                    tracing::warn!(target: "marmot_app::groups",
+                        method = "reconcile_hydrated_account_state",
+                        error_code = "terminal_projection_reconciliation_failed",
+                        "retained terminal projection for retry");
+                }
+                self.pending_projection_updates
+                    .extend(summary.projection_updates);
+            }
+        }
+        self.reconcile_disband_drafts();
+        // Live group state is readable from here on either open path, and the
+        // durable stall evidence was restored before this seam.
+        self.seed_epoch_stall_from_deferred_rows();
+        self.backfill_self_membership_once()?;
+        self.backfill_direct_conversation_members_once()
+    }
+
+    /// Finish the app-local half of durable disband acceptance after a crash
+    /// or a transient projection write failure. The engine request/tombstone is
+    /// the source of truth, so composer drafts must not reappear on reopen.
+    pub(crate) fn reconcile_disband_drafts(&self) {
+        for projected_group in &self.state.groups {
+            let Ok(group_id_bytes) = hex::decode(&projected_group.group_id_hex) else {
+                continue;
+            };
+            let group_id = GroupId::new(group_id_bytes);
+            let request_exists = self
+                .runtime
+                .disband_request(&group_id)
+                .ok()
+                .flatten()
+                .is_some();
+            let is_disbanded = self
+                .runtime
+                .group_record(&group_id)
+                .ok()
+                .is_some_and(|group| group.disbanded.is_some());
+            if (request_exists || is_disbanded)
+                && let Err(error) = self
+                    .app
+                    .delete_message_draft(&self.state.label, &projected_group.group_id_hex)
+            {
+                tracing::warn!(
+                    target: "marmot_app::client",
+                    method = "reconcile_disband_drafts",
+                    error_kind = error.privacy_safe_kind(),
+                    "composer draft cleanup remains pending"
+                );
+            }
+        }
+    }
+
+    /// Build the full [`EventGroupProjection`] for one group: one batched
+    /// engine read answers all 7 components (instead of 7 state loads), plus
+    /// the admin-policy lookup. Per-component fallbacks match the individual
+    /// `*_for_group` helpers. Errs when the batched component read itself
+    /// fails, or when the routing component is missing or unparseable — the
+    /// projection is unusable without a route.
+    pub(crate) fn event_group_projection<'a>(
+        &self,
+        group_id: &GroupId,
+        group_metadata: Option<&'a cgka_traits::group::Group>,
+    ) -> Result<EventGroupProjection<'a>, AppError> {
+        if group_metadata.is_some_and(|group| group.disbanded.is_some()) {
+            // Terminal settlement deletes live MLS state before emitting its
+            // effects. Preserve the last display components and project the
+            // authoritative tombstone instead of querying deleted MLS state.
+            let previous = match self.state_group_record(group_id) {
+                Some(previous) => previous,
+                None => self
+                    .app
+                    .group(&self.state.label, &hex::encode(group_id.as_slice()))?
+                    .ok_or_else(|| AppError::UnknownGroup(hex::encode(group_id.as_slice())))?,
+            };
+            return Ok(EventGroupProjection {
+                group_metadata,
+                nostr_routing: previous.nostr_routing,
+                profile: previous.profile,
+                admin_policy: previous.admin_policy,
+                message_retention: previous.message_retention,
+                agent_text_stream: previous.agent_text_stream,
+                avatar_url: previous.avatar_url,
+                encrypted_media: previous.encrypted_media,
+                image: AppGroupImageInput {
+                    image_hash_hex: previous.image.image_hash_hex,
+                    image_key_hex: previous.image.image_key_hex,
+                    image_nonce_hex: previous.image.image_nonce_hex,
+                    image_upload_key_hex: previous.image.image_upload_key_hex,
+                    media_type: previous.image.media_type,
+                },
+                observed_at_secs: unix_now_seconds(),
+            });
+        }
+        let protocol_profile = protocol_profile_of(group_metadata);
+        let media_component_id = Self::encrypted_media_component_id(protocol_profile);
+        let component_ids = [
+            NOSTR_ROUTING_COMPONENT_ID,
+            GROUP_PROFILE_COMPONENT_ID,
+            GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+            AGENT_TEXT_STREAM_QUIC_COMPONENT_ID,
+            GROUP_AVATAR_URL_COMPONENT_ID,
+            media_component_id,
+            GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
+        ];
+        let components = self.runtime.app_components(group_id, &component_ids)?;
+
+        // Keyed by id, not positional consumption order, so reordering the
+        // struct literal below cannot mis-assign a component.
+        let mut by_id: std::collections::HashMap<u16, Vec<u8>> = component_ids
+            .iter()
+            .copied()
+            .zip(components)
+            .filter_map(|(id, bytes)| bytes.map(|bytes| (id, bytes)))
+            .collect();
+        let mut take = |id: u16| by_id.remove(&id);
+        Ok(EventGroupProjection {
+            nostr_routing: parse_routing_component(take(NOSTR_ROUTING_COMPONENT_ID))?,
+            group_metadata,
+            profile: parse_profile_component(take(GROUP_PROFILE_COMPONENT_ID)),
+            admin_policy: self.admin_policy_for_group(group_id),
+            message_retention: parse_retention_component(take(
+                GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+            )),
+            agent_text_stream: parse_agent_stream_component(take(
+                AGENT_TEXT_STREAM_QUIC_COMPONENT_ID,
+            )),
+            avatar_url: parse_avatar_component(take(GROUP_AVATAR_URL_COMPONENT_ID)),
+            encrypted_media: parse_media_component(
+                media_component_id,
+                protocol_profile,
+                take(media_component_id),
+            ),
+            image: parse_image_component(take(GROUP_BLOSSOM_IMAGE_COMPONENT_ID)),
+            observed_at_secs: unix_now_seconds(),
+        })
+    }
+
+    pub(crate) fn admin_policy_for_group(
+        &self,
+        group_id: &GroupId,
+    ) -> AppGroupAdminPolicyComponent {
+        self.runtime
+            .admin_pubkeys(group_id)
+            .map(AppGroupAdminPolicyComponent::new)
+            .unwrap_or_else(|_| AppGroupAdminPolicyComponent::new(Vec::new()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn finalize_published_app_message_source_retention(
+        &mut self,
+        effects: &marmot_account::AccountDeviceEffects,
+    ) -> Result<Vec<crate::AppProjectionUpdate>, AppError> {
+        self.finalize_published_app_message_source_retention_with_status(effects)
+            .map(|(updates, _)| updates)
+    }
+
+    /// The status proves all source rows finalized; acknowledgement may still
+    /// be retried independently through the durable accepted fanout.
+    pub(super) fn finalize_published_app_message_source_retention_with_status(
+        &mut self,
+        effects: &marmot_account::AccountDeviceEffects,
+    ) -> Result<(Vec<crate::AppProjectionUpdate>, bool), AppError> {
+        if effects.published_app_messages.is_empty() {
+            return Ok((Vec::new(), true));
+        }
+        let mut updates = Vec::new();
+        for published in &effects.published_app_messages {
+            let group_id_hex = hex::encode(published.group_id.as_slice());
+            let source_message_id_hex = hex::encode(published.message_id.as_slice());
+            let finalized = self
+                .app
+                .account_storage(&self.state.label)
+                .and_then(|storage| {
+                    storage.with_transaction(|_| {
+                        let finalized = self.app.finalize_account_app_event_source_retention(
+                            &self.state.label,
+                            &group_id_hex,
+                            &published.app_event_id,
+                            Some(source_message_id_hex.as_str()),
+                            published.source_epoch.0,
+                            published.retention,
+                            published.authority,
+                        )?;
+                        // Revive after the source write, so the revival reprojects the
+                        // finalized row and its update supersedes the finalize update.
+                        let revived = self.revive_published_local_send(published, &group_id_hex)?;
+                        Ok::<_, AppError>(finalized.into_iter().chain(revived))
+                    })
+                });
+            match finalized {
+                Ok(row_updates) => updates.extend(row_updates),
+                Err(error) => {
+                    // Keep the accepted fanouts durable until projection can
+                    // be repaired. Replaying them does not publish again.
+                    for published in &effects.published_app_messages {
+                        self.pending_convergence_groups
+                            .insert(published.group_id.clone());
+                    }
+                    tracing::warn!(
+                        target: "marmot_app::client::projection",
+                        method = "finalize_published_app_message_source_retention",
+                        error_kind = error.privacy_safe_kind(),
+                        "published application-message projection deferred",
+                    );
+                    return Ok((updates, false));
+                }
+            }
+        }
+        let fail_acknowledgement = cfg!(feature = "test-policy-overrides")
+            && std::mem::take(&mut self.fail_next_published_app_message_acknowledgement);
+        let acknowledgement = if fail_acknowledgement {
+            Err(AppError::BlockingTask(
+                "injected published application-message acknowledgement failure".to_owned(),
+            ))
+        } else {
+            self.runtime
+                .acknowledge_published_app_messages(&effects.published_app_messages)
+                .map_err(AppError::from)
+        };
+        if let Err(error) = acknowledgement {
+            // Projection is already durable, and the accepted fanout remains
+            // durable when acknowledgement fails. Schedule its group so a
+            // cleanup-only replay runs without waiting for unrelated traffic;
+            // resume recognizes this terminal fanout and never republishes its
+            // network bytes.
+            for published in &effects.published_app_messages {
+                self.pending_convergence_groups
+                    .insert(published.group_id.clone());
+            }
+            tracing::warn!(
+                target: "marmot_app::client::projection",
+                method = "finalize_published_app_message_source_retention",
+                error_kind = error.privacy_safe_kind(),
+                "published application-message cleanup deferred",
+            );
+        }
+        Ok((updates, true))
+    }
+
+    /// Clear a `local_publish_failed` tombstone on an own send that a relay
+    /// has since accepted.
+    ///
+    /// The send path can retract a row whose intent survives it: an error after
+    /// the fanout was accepted, or a durably queued intent that a later drain
+    /// publishes. Without this, the group receives the message while the
+    /// sender's row stays `failed` forever, and typed rows such as polls lose
+    /// their projection. A relay acceptance is evidence the upsert never has,
+    /// like the fresh send intent in [`Self::record_send_intent_projection`].
+    ///
+    /// A terminal group keeps its sweep's verdict: the terminal-group sweep
+    /// writes the same reason, and nothing about a late acceptance reopens a
+    /// disbanded or removed copy. Convergence withdrawals carry other reasons
+    /// and the storage predicate never clears them.
+    ///
+    /// The group is read only when a tombstone is there to clear, and a read
+    /// error propagates: a seeded, quarantined or busy copy decides nothing,
+    /// and the caller's projection-error path keeps the accepted fanout for a
+    /// replay that revives the row without publishing again. Acknowledging it
+    /// instead would delete the only evidence the revival needs.
+    fn revive_published_local_send(
+        &self,
+        published: &marmot_account::PublishedApplicationMessage,
+        group_id_hex: &str,
+    ) -> Result<Option<crate::AppProjectionUpdate>, AppError> {
+        if !self
+            .app
+            .account_storage(&self.state.label)?
+            .app_storage()
+            .local_publish_failure_is_clearable(group_id_hex, &published.app_event_id)?
+        {
+            return Ok(None);
+        }
+        if self
+            .runtime
+            .group_record(&published.group_id)?
+            .is_terminal()
+        {
+            return Ok(None);
+        }
+        self.app.clear_timeline_local_publish_failure(
+            &self.state.label,
+            group_id_hex,
+            &published.app_event_id,
+        )
+    }
+
+    pub(crate) fn prune_plaintext_retention_for_group(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<(), AppError> {
+        self.secure_delete_expired_plaintext_for_group(group_id)
+            .map(|_| ())
+    }
+
+    pub fn secure_delete_expired_plaintext_for_group(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<SecureDeleteExpiredResult, AppError> {
+        self.secure_delete_expired_plaintext_for_group_at(group_id, unix_now_seconds())
+    }
+
+    pub(crate) fn secure_delete_expired_plaintext_for_group_at(
+        &self,
+        group_id: &GroupId,
+        now_seconds: u64,
+    ) -> Result<SecureDeleteExpiredResult, AppError> {
+        self.app.secure_prune_expired_account_app_events(
+            &self.state.label,
+            &hex::encode(group_id.as_slice()),
+            now_seconds,
+        )
+    }
+
+    pub(crate) fn encrypted_media_component_id(profile: ProtocolProfile) -> u16 {
+        match profile {
+            ProtocolProfile::Legacy => GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
+            ProtocolProfile::Current => GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+        }
+    }
+
+    pub(crate) fn encrypted_media_for_group(
+        &self,
+        group_id: &GroupId,
+    ) -> AppGroupEncryptedMediaComponent {
+        let profile = protocol_profile_of(self.runtime.group_record(group_id).ok().as_ref());
+        let component_id = Self::encrypted_media_component_id(profile);
+        parse_media_component(
+            component_id,
+            profile,
+            self.runtime
+                .app_component(group_id, component_id)
+                .ok()
+                .flatten(),
+        )
+    }
+
+    /// Authoritative encrypted-media component lookup for the epoch-secret warm
+    /// path. Unlike [`Self::encrypted_media_for_group`], lookup failures are NOT
+    /// collapsed into "disabled": a transient storage read failure must keep the
+    /// warm pass retryable instead of being latched as an authoritative
+    /// negative for the group's whole epoch.
+    pub(crate) fn try_encrypted_media_for_group(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<AppGroupEncryptedMediaComponent, AppError> {
+        let profile = self.runtime.group_record(group_id)?.protocol_profile;
+        let component_id = Self::encrypted_media_component_id(profile);
+        match self.runtime.app_component(group_id, component_id)? {
+            Some(bytes) => Ok(AppGroupEncryptedMediaComponent::from_bytes(
+                component_id,
+                &bytes,
+            )),
+            None => Ok(AppGroupEncryptedMediaComponent::disabled_for_profile(
+                profile.into(),
+            )),
+        }
+    }
+
+    pub(crate) fn image_for_group(&self, group_id: &GroupId) -> AppGroupImageInput {
+        parse_image_component(
+            self.runtime
+                .app_component(group_id, GROUP_BLOSSOM_IMAGE_COMPONENT_ID)
+                .ok()
+                .flatten(),
+        )
+    }
+
+    /// Persist and queue kind-1210 system rows for our own authenticated commits.
+    /// Call once publication has committed, before later local refreshes can
+    /// fail. The canonical activity remains valid even if that refresh fails.
+    pub(crate) fn queue_own_group_system_projection_updates(
+        &mut self,
+        effects: &marmot_account::AccountDeviceEffects,
+    ) {
+        // Gate on having published a commit: own send paths always carry a
+        // report. Reportless convergence effects are synthesized by the inbound
+        // projection path; skipping here avoids dispatching their updates twice.
+        if effects.reports.is_empty() {
+            return;
+        }
+        let events: Vec<_> = effects
+            .events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    cgka_traits::engine::GroupEvent::GroupStateChanged { .. }
+                        | cgka_traits::engine::GroupEvent::GroupStateInvalidated { .. }
+                        | cgka_traits::engine::GroupEvent::GroupStateRevalidated { .. }
+                )
+            })
+            .cloned()
+            .collect();
+        if events.is_empty() {
+            return;
+        }
+        let recorded_at = unix_now_seconds();
+        let mut updates = Vec::new();
+        let mut cursor = 0;
+        if self.has_pending_effect_projections()
+            || self
+                .try_project_group_system_rows(&events, recorded_at, &mut updates, &mut cursor)
+                .is_err()
+        {
+            self.retain_system_row_projection(&events, recorded_at, cursor);
+        }
+        self.pending_projection_updates.extend(updates);
+    }
+
+    pub(crate) fn take_pending_projection_updates(&mut self) -> Vec<crate::AppProjectionUpdate> {
+        std::mem::take(&mut self.pending_projection_updates)
+    }
+
+    /// Synthesize a durable kind-1210 group system row for each
+    /// `GroupStateChanged` event and persist it to the timeline. Used by both
+    /// the inbound delivery path (peer commits) and our own send path (local
+    /// commits). Failures are logged, not propagated: a missing system row must
+    /// never fail message delivery.
+    ///
+    /// A change whose `origin_commit_id` the same batch withdraws is skipped.
+    /// Every seam runs this once at its tail, *after* its projection loop has
+    /// already dispatched each `GroupStateInvalidated` through
+    /// [`MarmotApp::projection_update_for_invalidation_event`] — so by the time
+    /// the upsert below runs, the batch's withdrawals are all applied and it
+    /// would be the last writer. Without this filter the tail synthesizes a row
+    /// for a change that canonically never happened: when no row existed yet,
+    /// the withdrawal swept nothing and the upsert INSERTs a *live* row.
+    ///
+    /// When the row does already exist, storage is the second line of defence —
+    /// its upsert preserves the withdrawal rather than clearing it — so that
+    /// shape is pinned at both layers by design, not by this filter alone.
+    ///
+    /// One batch carries both because the engine buffers convergence passes:
+    /// `events_buf` has a single take site and
+    /// `advance_convergence_inputs_with_execution` runs up to
+    /// `MAX_CONVERGENCE_REPROCESSING_PASSES` passes without one, so an earlier
+    /// pass's accepted commit can be superseded by a later pass's reorg before
+    /// anything drains. Within a *single* pass the two are disjoint by
+    /// construction — the change's origin is the accepted commit and the
+    /// superseded emitter skips accepted commits — so the single-pass shape is
+    /// not what this guards.
+    ///
+    /// Ordering matters here in exactly one place. Whether a batch carries the
+    /// withdrawal before or after the `GroupStateChanged` it names is
+    /// irrelevant — neither ordering makes the change canonical, so membership
+    /// decides that pairing. But a withdrawal and a REVALIDATION of the *same*
+    /// commit are opposite verdicts on one question, and a multi-pass batch can
+    /// carry several: pass A re-adopts a parked commit (its `GroupStateChanged`
+    /// plus `GroupStateRevalidated`), pass B parks it again
+    /// (`GroupStateInvalidated`). Only the last one is the batch's answer.
+    ///
+    /// So the verdict is resolved per commit, in event order, and the row is
+    /// withheld iff that commit's final verdict is a withdrawal. Membership
+    /// alone would get this wrong in both directions: treating any revalidation
+    /// as exonerating synthesizes a live row for a commit the batch ends by
+    /// withdrawing (with no pre-existing row there is nothing for the dispatch
+    /// loop to tombstone, so the tail's INSERT is the last writer and the row
+    /// survives — issue #1593's exact shape), and treating any withdrawal as
+    /// damning withholds the row a re-adoption is entitled to, leaving nothing
+    /// for the revalidation to revive.
+    ///
+    /// This also keeps the tail consistent with the dispatch loop that ran just
+    /// before it, which applies the same events *in order* against storage. The
+    /// two must agree on which verdict is final or they fight over the row.
+    #[cfg(test)]
+    pub(crate) fn project_group_system_rows(
+        &self,
+        events: &[cgka_traits::engine::GroupEvent],
+        recorded_at: u64,
+    ) -> Vec<crate::AppProjectionUpdate> {
+        let mut updates = Vec::new();
+        if self
+            .project_group_system_rows_into(events, recorded_at, &mut updates, false, &mut 0)
+            .is_err()
+        {
+            tracing::warn!(target: "marmot_app::groups",
+                method = "project_group_system_rows",
+                error_code = "projection_apply_failed", "failed to project group system row");
+        }
+        updates
+    }
+
+    /// Project an entire committed batch, retaining storage failures for retry.
+    pub(crate) fn try_project_group_system_rows(
+        &self,
+        events: &[cgka_traits::engine::GroupEvent],
+        recorded_at: u64,
+        updates: &mut Vec<crate::AppProjectionUpdate>,
+        cursor: &mut usize,
+    ) -> Result<(), AppError> {
+        self.project_group_system_rows_into(events, recorded_at, updates, true, cursor)
+    }
+
+    fn project_group_system_rows_into(
+        &self,
+        events: &[cgka_traits::engine::GroupEvent],
+        recorded_at: u64,
+        updates: &mut Vec<crate::AppProjectionUpdate>,
+        retry_projection_writes: bool,
+        cursor: &mut usize,
+    ) -> Result<(), AppError> {
+        // Last verdict wins, per commit. `true` = withdrawn, `false` = revalidated.
+        let mut final_verdict: std::collections::HashMap<&[u8], bool> =
+            std::collections::HashMap::new();
+        for event in events {
+            match event {
+                cgka_traits::engine::GroupEvent::GroupStateInvalidated {
+                    invalidated_commit_id,
+                    ..
+                } => {
+                    final_verdict.insert(invalidated_commit_id.as_slice(), true);
+                }
+                cgka_traits::engine::GroupEvent::GroupStateRevalidated {
+                    revalidated_commit_id,
+                    ..
+                } => {
+                    final_verdict.insert(revalidated_commit_id.as_slice(), false);
+                }
+                _ => {}
+            }
+        }
+        let superseded_commits: std::collections::HashSet<&[u8]> = final_verdict
+            .into_iter()
+            .filter_map(|(commit_id, withdrawn)| withdrawn.then_some(commit_id))
+            .collect();
+        for (index, event) in events.iter().enumerate().skip(*cursor) {
+            if let cgka_traits::engine::GroupEvent::GroupStateChanged {
+                group_id,
+                epoch,
+                actor,
+                change,
+                origin_commit_id,
+            } = event
+            {
+                // An unattributed change carries no commit link, so nothing in
+                // this batch can name it and it is never withheld here.
+                if origin_commit_id
+                    .as_ref()
+                    .is_some_and(|id| superseded_commits.contains(id.as_slice()))
+                {
+                    *cursor = index + 1;
+                    continue;
+                }
+                let projection = match build_group_system_projection(
+                    group_id,
+                    epoch.0,
+                    actor.as_ref(),
+                    change,
+                    recorded_at,
+                    origin_commit_id
+                        .as_ref()
+                        .map(|id| hex::encode(id.as_slice())),
+                ) {
+                    Ok(projection) => projection,
+                    Err(_err) => {
+                        tracing::warn!(
+                            target: "marmot_app::groups",
+                            method = "project_group_system_rows",
+                            error_code = "projection_build_failed",
+                            "failed to build group system row",
+                        );
+                        *cursor = index + 1;
+                        continue;
+                    }
+                };
+                // Identical changes by sibling devices deliberately share a row id.
+                // Adopt a freshly selected origin and undo only a provisional fork
+                // withdrawal in the same transaction. A retained loser must never
+                // repoint that row when its projection is replayed later.
+                let result = self
+                    .app
+                    .account_storage(&self.state.label)
+                    .and_then(|storage| {
+                        storage.with_transaction(|storage| {
+                            let canonical = if let Some(origin) = origin_commit_id {
+                                match storage.get_message(origin) {
+                                    Ok(record) => {
+                                        if record.group_id != *group_id
+                                            || !matches!(
+                                                record.state,
+                                                cgka_traits::MessageState::Processed
+                                                    | cgka_traits::MessageState::Sent
+                                            )
+                                        {
+                                            return Ok(None);
+                                        }
+                                        true
+                                    }
+                                    // Older/pruned history can still be displayed, but
+                                    // has no durable proof authorizing a revival.
+                                    Err(cgka_traits::StorageError::NotFound) => false,
+                                    Err(error) => return Err(error.into()),
+                                }
+                            } else {
+                                false
+                            };
+                            let recorded = self.app.record_account_app_event_at(
+                                &self.state.label,
+                                &projection,
+                                recorded_at,
+                            )?;
+                            let revived = if canonical {
+                                self.app.revalidate_timeline_origin_commit(
+                                    &self.state.label,
+                                    projection
+                                        .origin_commit_id
+                                        .as_deref()
+                                        .expect("canonical origin"),
+                                )?
+                            } else {
+                                None
+                            };
+                            Ok(Some(revived.unwrap_or(recorded)))
+                        })
+                    });
+                match result {
+                    Ok(Some(update)) => updates.push(update),
+                    Ok(None) => {}
+                    Err(error) if retry_projection_writes => return Err(error),
+                    Err(_) => tracing::warn!(target: "marmot_app::groups",
+                        method = "project_group_system_rows_into",
+                        error_code = "projection_apply_failed", "failed to project group system row"),
+                }
+            }
+            *cursor = index + 1;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn nostr_routing_for_group(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<AppGroupNostrRoutingComponent, AppError> {
+        parse_routing_component(
+            self.runtime
+                .app_component(group_id, NOSTR_ROUTING_COMPONENT_ID)?,
+        )
+    }
+}
+
+/// A group with no readable record keeps the legacy-profile fallbacks the
+/// individual component helpers have always used.
+pub(crate) fn protocol_profile_of(
+    group_metadata: Option<&cgka_traits::group::Group>,
+) -> ProtocolProfile {
+    group_metadata
+        .map(|group| group.protocol_profile)
+        .unwrap_or(ProtocolProfile::Legacy)
+}
+
+/// The same route id over the same relay set, the identity the transport
+/// adapter keys a group REQ by.
+fn same_transport_route(
+    left: &TransportGroupSubscription,
+    right: &TransportGroupSubscription,
+) -> bool {
+    let relays = |route: &TransportGroupSubscription| {
+        let mut endpoints = route.endpoints.clone();
+        endpoints.sort();
+        endpoints.dedup();
+        endpoints
+    };
+    left.transport_group_id == right.transport_group_id && relays(left) == relays(right)
+}
+
+fn parse_routing_component(
+    bytes: Option<Vec<u8>>,
+) -> Result<AppGroupNostrRoutingComponent, AppError> {
+    let bytes = bytes.ok_or_else(|| {
+        AppError::InvalidNostrRouting("group is missing marmot.transport.nostr.routing.v1".into())
+    })?;
+    AppGroupNostrRoutingComponent::from_bytes(&bytes)
+}
+
+fn parse_profile_component(bytes: Option<Vec<u8>>) -> AppGroupProfileComponent {
+    bytes
+        .map(|bytes| AppGroupProfileComponent::from_bytes(&bytes))
+        .unwrap_or_else(AppGroupProfileComponent::absent)
+}
+
+fn parse_retention_component(bytes: Option<Vec<u8>>) -> AppGroupMessageRetentionComponent {
+    bytes
+        .map(|bytes| AppGroupMessageRetentionComponent::from_bytes(&bytes))
+        .unwrap_or_else(AppGroupMessageRetentionComponent::disabled)
+}
+
+fn parse_agent_stream_component(bytes: Option<Vec<u8>>) -> AppAgentTextStreamComponent {
+    bytes
+        .map(|bytes| AppAgentTextStreamComponent::from_bytes(&bytes))
+        .unwrap_or_else(AppAgentTextStreamComponent::disabled)
+}
+
+fn parse_avatar_component(bytes: Option<Vec<u8>>) -> AppGroupAvatarUrlComponent {
+    bytes
+        .map(|bytes| AppGroupAvatarUrlComponent::from_bytes(&bytes))
+        .unwrap_or_else(AppGroupAvatarUrlComponent::absent)
+}
+
+fn parse_media_component(
+    component_id: u16,
+    protocol_profile: ProtocolProfile,
+    bytes: Option<Vec<u8>>,
+) -> AppGroupEncryptedMediaComponent {
+    bytes
+        .map(|bytes| AppGroupEncryptedMediaComponent::from_bytes(component_id, &bytes))
+        .unwrap_or_else(|| {
+            AppGroupEncryptedMediaComponent::disabled_for_profile(protocol_profile.into())
+        })
+}
+
+fn parse_image_component(bytes: Option<Vec<u8>>) -> AppGroupImageInput {
+    bytes
+        .and_then(|bytes| AppGroupImageInput::from_component_bytes(&bytes))
+        .unwrap_or_default()
+}
+
+/// Build the durable kind-1210 group system row projection for one
+/// authenticated [`GroupStateChange`]. The row is synthesized locally
+/// (Approach A) — no kind-1210 message is sent on the wire. The message id is
+/// deterministic over (actor, epoch, system_type, content) so re-processing the
+/// same change upserts instead of duplicating. The row carries a null
+/// `source_message_id_hex` (one commit can synthesize several rows, which would
+/// collide on the partial unique source index); instead `origin_commit_id`
+/// links the row back to the commit that produced it, so losing-branch fork
+/// recovery can invalidate every row derived from a rolled-back commit (1:N).
+fn build_group_system_projection(
+    group_id: &cgka_traits::types::GroupId,
+    epoch: u64,
+    actor: Option<&cgka_traits::types::MemberId>,
+    change: &cgka_traits::engine::GroupStateChange,
+    recorded_at: u64,
+    origin_commit_id: Option<String>,
+) -> Result<AppMessageProjection, cgka_traits::app_event::MarmotAppEventError> {
+    use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_GROUP_SYSTEM, group_system_event_material};
+
+    let material = group_system_event_material(group_id, epoch, actor, change)?;
+
+    Ok(AppMessageProjection {
+        authority: None,
+        message_id_hex: material.message_id_hex,
+        // Synthesized rows carry no source: several rows can come from one
+        // commit, which would collide on the partial unique source index, and
+        // commit ids are never targeted by source-based invalidation anyway.
+        source_message_id_hex: None,
+        direction: "system".to_owned(),
+        group_id_hex: material.group_id_hex,
+        sender: material.sender,
+        plaintext: material.content,
+        kind: MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
+        tags: material.tags,
+        source_epoch: Some(epoch),
+        retention: None,
+        recorded_at: Some(recorded_at),
+        moderation_grant: false,
+        // Non-unique link to the origin commit so a losing-branch rollback can
+        // invalidate every row this commit synthesized (1:N).
+        origin_commit_id,
+    })
+}
+
+fn read_marker_error_code(error: &AppError) -> &'static str {
+    match error {
+        AppError::InvalidAppComponent(_) => "read_marker_failed:invalid_app_component",
+        AppError::ProductAnalytics(_) => "read_marker_failed:usage_diagnostics",
+        AppError::Account(_) => "read_marker_failed:account",
+        AppError::AccountHome(_) => "read_marker_failed:account_home",
+        AppError::Session(_) => "read_marker_failed:session",
+        AppError::Storage(_) => "read_marker_failed:storage",
+        AppError::Transport(_) => "read_marker_failed:transport",
+        AppError::Io(_) => "read_marker_failed:io",
+        AppError::Json(_) => "read_marker_failed:json",
+        AppError::Sqlite(_) => "read_marker_failed:sqlite",
+        AppError::Hex(_) => "read_marker_failed:hex",
+        AppError::MissingKeyPackage { .. } => "read_marker_failed:missing_key_package",
+        AppError::MissingMemberInboxRoute(_) => "read_marker_failed:missing_member_inbox_route",
+        AppError::DirectoryLookupIncomplete(_) => "read_marker_failed:directory_lookup_incomplete",
+        AppError::GroupCreateIncludesCreator => "read_marker_failed:group_create_includes_creator",
+        AppError::UnknownGroup(_) => "read_marker_failed:unknown_group",
+        AppError::GroupInviteNotPending => "read_marker_failed:group_invite_not_pending",
+        AppError::CreatedGroupProjectionUnavailable(_) => {
+            "read_marker_failed:created_group_projection_unavailable"
+        }
+        AppError::InvalidGroupMembershipPage(_) => {
+            "read_marker_failed:invalid_group_membership_page"
+        }
+        AppError::ChatPresentationNotReady => "read_marker_failed:chat_presentation_not_ready",
+        AppError::DirectConversationIndexNotReady => {
+            "read_marker_failed:direct_conversation_index_not_ready"
+        }
+        AppError::InvalidCachedIdentityPage(_) => "read_marker_failed:invalid_cached_identity_page",
+        AppError::InvalidPublicEventReferences(_) => {
+            "read_marker_failed:invalid_public_event_references"
+        }
+        AppError::InvalidChatPin(_) => "read_marker_failed:invalid_chat_pin",
+        AppError::GroupDisbanding(_) => "read_marker_failed:group_disbanding",
+        AppError::GroupRemoved(_) => "read_marker_failed:group_removed",
+        AppError::GroupCatchingUp(_) => "read_marker_failed:group_catching_up",
+        AppError::GroupCommitUndelivered(_) => "read_marker_failed:group_commit_undelivered",
+        AppError::MessageDraftRevisionConflict => {
+            "read_marker_failed:message_draft_revision_conflict"
+        }
+        AppError::InvalidMessageDraft(_) => "read_marker_failed:invalid_message_draft",
+        AppError::AgentStreamPublisher(_) => "read_marker_failed:agent_stream_publisher",
+        AppError::AgentStreamFinishMismatch => "read_marker_failed:agent_stream_finish_mismatch",
+        AppError::AgentStreamSendFailed(_) => "read_marker_failed:agent_stream_send_failed",
+        AppError::AgentStreamMissingStart => "read_marker_failed:agent_stream_missing_start",
+        AppError::AgentStreamStartNotConfirmed => {
+            "read_marker_failed:agent_stream_start_not_confirmed"
+        }
+        AppError::AgentStreamUnsupportedRoute => {
+            "read_marker_failed:agent_stream_unsupported_route"
+        }
+        AppError::AgentStreamMissingCandidate => {
+            "read_marker_failed:agent_stream_missing_candidate"
+        }
+        AppError::AgentStreamInvalidCandidate(_) => {
+            "read_marker_failed:agent_stream_invalid_candidate"
+        }
+        AppError::Publish(_) => "read_marker_failed:publish",
+        AppError::MissingDefaultRelays => "read_marker_failed:missing_default_relays",
+        AppError::MissingRelayLists(_) => "read_marker_failed:missing_relay_lists",
+        AppError::FollowListUnavailable => "read_marker_failed:follow_list_unavailable",
+        AppError::FollowListTooLarge => "read_marker_failed:follow_list_too_large",
+        AppError::RelayDirectory(_) => "read_marker_failed:relay_directory",
+        AppError::AccountCatchUp(_) => "read_marker_failed:account_catch_up",
+        AppError::InvalidPublicKey => "read_marker_failed:invalid_public_key",
+        AppError::UnexpectedPrivateKey => "read_marker_failed:unexpected_private_key",
+        AppError::IdentityKeyMismatch => "read_marker_failed:identity_key_mismatch",
+        AppError::ExternalSignerUnavailable(_) => "read_marker_failed:external_signer_unavailable",
+        AppError::ExternalSignerMismatch => "read_marker_failed:external_signer_mismatch",
+        AppError::ExternalSignerRejected => "read_marker_failed:external_signer_rejected",
+        AppError::InvalidKeyPackageEvent(_) => "read_marker_failed:invalid_key_package_event",
+        AppError::MissingDirectoryEntry(_) => "read_marker_failed:missing_directory_entry",
+        AppError::InvalidDirectorySearch(_) => "read_marker_failed:invalid_directory_search",
+        AppError::InvalidGroupProfile(_) => "read_marker_failed:invalid_group_profile",
+        AppError::InvalidNostrRouting(_) => "read_marker_failed:invalid_nostr_routing",
+        AppError::InvalidGroupAvatarUrl(_) => "read_marker_failed:invalid_group_avatar_url",
+        AppError::InvalidAgentTextStreamPolicy(_) => {
+            "read_marker_failed:invalid_agent_text_stream_policy"
+        }
+        AppError::InvalidEncryptedMedia(_) => "read_marker_failed:invalid_encrypted_media",
+        AppError::MediaReferenceStaleEpoch { .. } => {
+            "read_marker_failed:media_reference_stale_epoch"
+        }
+        AppError::MediaReferenceEpochUnsettled { .. } => {
+            "read_marker_failed:media_reference_epoch_unsettled"
+        }
+        AppError::MediaAttachmentRejected(_) => "read_marker_failed:media_attachment_rejected",
+        AppError::MediaUnfetchable(_) => "read_marker_failed:media_unfetchable",
+        AppError::MediaDownloadFailed(_) => "read_marker_failed:media_download_failed",
+        AppError::BlobStore(_) => "read_marker_failed:blob_store",
+        AppError::MediaUploadTimedOut => "read_marker_failed:media_upload_timed_out",
+        AppError::UnsafeMediaFetch(_) => "read_marker_failed:unsafe_media_fetch",
+        AppError::InvalidAppMessagePayload(_) => "read_marker_failed:invalid_app_message_payload",
+        AppError::InvalidPushToken(_) => "read_marker_failed:invalid_push_token",
+        AppError::InvalidPushServer(_) => "read_marker_failed:invalid_push_server",
+        AppError::InvalidPushGossip(_) => "read_marker_failed:invalid_push_gossip",
+        AppError::InvalidRelayTelemetrySettings(_) => {
+            "read_marker_failed:invalid_relay_telemetry_settings"
+        }
+        AppError::InvalidAuditLogFile(_) => "read_marker_failed:invalid_audit_log_file",
+        AppError::AuditLogUpload(_) => "read_marker_failed:audit_log_upload",
+        AppError::NotificationsDisabled => "read_marker_failed:notifications_disabled",
+        AppError::SqlcipherKeyDerivation(_) => "read_marker_failed:sqlcipher_key_derivation",
+        AppError::BlockingTask(_) => "read_marker_failed:blocking_task",
+        AppError::FullHistoryRepairIncomplete { .. } => {
+            "read_marker_failed:history_repair_incomplete"
+        }
+        AppError::RuntimeBusy => "read_marker_failed:runtime_busy",
+        AppError::AccountSessionBusy => "read_marker_failed:account_session_busy",
+        AppError::AccountWorkerBusy => "read_marker_failed:account_worker_busy",
+        AppError::AccountWorkerResponseTimedOut => {
+            "read_marker_failed:account_worker_response_timed_out"
+        }
+        AppError::AccountSetupRecoveryRequired => {
+            "read_marker_failed:account_setup_recovery_required"
+        }
+        AppError::OnboardingActionUnavailable => "read_marker_failed:onboarding_action_unavailable",
+        AppError::OnboardingRequired => "read_marker_failed:onboarding_required",
+        AppError::AccountSetupRetryRequired => "read_marker_failed:account_setup_retry_required",
+        AppError::AccountSetupResetNotApplicable => {
+            "read_marker_failed:account_setup_reset_not_applicable"
+        }
+        AppError::AccountSetupKeyPackageRecoveryAvailable => {
+            "read_marker_failed:account_setup_key_package_recovery_available"
+        }
+        AppError::AttachmentModeRequired => "read_marker_failed:attachment_mode_required",
+        AppError::AttachmentAccountSignedOut => "read_marker_failed:attachment_account_signed_out",
+        AppError::RuntimeStopping => "read_marker_failed:runtime_stopping",
+        AppError::ReactionNotFound => "read_marker_failed:reaction_not_found",
+        AppError::TransportClosed => "read_marker_failed:transport_closed",
+        AppError::UserBlocked => "read_marker_failed:user_blocked",
+        AppError::BlockListUnavailable => "read_marker_failed:block_list_unavailable",
+        AppError::BlockPublicationUncertain => "read_marker_failed:block_publication_uncertain",
+        AppError::ModerationReportingNotConfigured => {
+            "read_marker_failed:moderation_reporting_not_configured"
+        }
+        AppError::InvalidModerationReportConfig(_) => {
+            "read_marker_failed:invalid_moderation_report_config"
+        }
+        AppError::InvalidReportedPublicKey => "read_marker_failed:invalid_reported_public_key",
+        AppError::CannotReportSelf => "read_marker_failed:cannot_report_self",
+        AppError::ModerationReportRateLimited => {
+            "read_marker_failed:moderation_report_rate_limited"
+        }
+        AppError::InvalidEditTarget => "read_marker_failed:invalid_edit_target",
+    }
+}
+
+impl super::AppClient {
+    pub(crate) fn backfill_content_reports(&mut self) -> Result<(), crate::AppError> {
+        let started = std::time::Instant::now();
+        let storage = match self.app.account_storage(&self.state.label) {
+            Ok(storage) => storage,
+            Err(error) => {
+                self.record_v5_content_report_backfill(Err(&error), started.elapsed());
+                return Err(error);
+            }
+        };
+        // A failed chat-list conversion must roll back the backfill cursor and
+        // all projections. Queue the complete batch only after it commits.
+        let updates = cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
+            storage
+                .app_storage()
+                .backfill_content_reports(100)?
+                .into_iter()
+                .map(|update| self.app.app_projection_update(&self.state.label, update))
+                .collect::<Result<Vec<_>, crate::AppError>>()
+        });
+        self.record_v5_content_report_backfill(updates.as_ref(), started.elapsed());
+        let updates = updates?;
+        self.pending_projection_updates.extend(updates);
+        Ok(())
+    }
+}

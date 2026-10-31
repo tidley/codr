@@ -151,7 +151,9 @@ jobs:
             codesign --verify --strict "target/$TARGET/release/herdr-white-noise-bridge"
           fi
           asset="codr-v$version-$OS_NAME-$ARCH.tar.gz"
-          tar -czf "dist/$asset" -C "target/$TARGET/release" herdr-white-noise-bridge
+          tar -czf "dist/$asset" -C "target/$TARGET/release" herdr-white-noise-bridge \
+            -C "$GITHUB_WORKSPACE/vendor/mdk" LICENSE README.codr.md \
+            -C "$GITHUB_WORKSPACE/vendor/mdk/vendor/hpke-rs-libcrux" LICENSE-MPL-2.0
           if [ "$OS_NAME" = macos ]; then
             shasum -a 256 "dist/$asset" > "dist/$asset.sha256"
           else
@@ -214,16 +216,19 @@ jobs:
           mdk/target/release/wn-agent --version
           version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
           asset="codr-wn-agent-v$version-$OS_NAME-$ARCH.tar.gz"
-          tar -czf "dist/$asset" -C mdk/target/release wn-agent -C ../.. LICENSE CODR-CONNECTOR.json
+          # Keep connector compatibility/provenance checks, but ship only the
+          # combined application executable in the release's dist directory.
+          mkdir -p connector-checks
+          tar -czf "connector-checks/$asset" -C mdk/target/release wn-agent -C ../.. LICENSE CODR-CONNECTOR.json
           if [ "$OS_NAME" = macos ]; then
-            shasum -a 256 "dist/$asset" > "dist/$asset.sha256"
+            shasum -a 256 "connector-checks/$asset" > "connector-checks/$asset.sha256"
           else
-            sha256sum "dist/$asset" > "dist/$asset.sha256"
+            sha256sum "connector-checks/$asset" > "connector-checks/$asset.sha256"
           fi
           python3 - "$asset" "$version" <<'PY'
           import hashlib, json, sys, tarfile
           from pathlib import Path
-          with tarfile.open(Path("dist") / sys.argv[1]) as bundle:
+          with tarfile.open(Path("connector-checks") / sys.argv[1]) as bundle:
               assert sorted(bundle.getnames()) == ["CODR-CONNECTOR.json", "LICENSE", "wn-agent"]
               provenance = json.load(bundle.extractfile("CODR-CONNECTOR.json"))
           assert provenance["codr_version"] == sys.argv[2]
@@ -291,7 +296,9 @@ jobs:
           fi
           mkdir -p dist
           asset="codr-v$version-linux-$ARCH.tar.gz"
-          tar -czf "dist/$asset" -C "target/$TARGET/release" herdr-white-noise-bridge
+          tar -czf "dist/$asset" -C "target/$TARGET/release" herdr-white-noise-bridge \
+            -C "$GITHUB_WORKSPACE/vendor/mdk" LICENSE README.codr.md \
+            -C "$GITHUB_WORKSPACE/vendor/mdk/vendor/hpke-rs-libcrux" LICENSE-MPL-2.0
           (cd dist && sha256sum "$asset" > "$asset.sha256")
       - name: Read connector source pin
         id: connector
@@ -321,8 +328,9 @@ jobs:
           test "$(mdk/target/release/wn-agent --version)" = "wn-agent $(python3 -c 'import tomllib; print(tomllib.load(open("connector.toml", "rb"))["version"])')"
           version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
           asset="codr-wn-agent-v$version-linux-$ARCH.tar.gz"
-          tar -czf "dist/$asset" -C mdk/target/release wn-agent -C ../.. LICENSE CODR-CONNECTOR.json
-          (cd dist && sha256sum "$asset" > "$asset.sha256")
+          mkdir -p connector-checks
+          tar -czf "connector-checks/$asset" -C mdk/target/release wn-agent -C ../.. LICENSE CODR-CONNECTOR.json
+          (cd connector-checks && sha256sum "$asset" > "$asset.sha256")
       - uses: actions/upload-artifact@v4
         with:
           name: codr-preview-${{ matrix.arch }}
@@ -355,7 +363,7 @@ jobs:
           import tomllib
           from pathlib import Path
           version = tomllib.loads(Path('Cargo.toml').read_text())['package']['version']
-          archives = {f'{name}-v{version}-linux-{arch}.tar.gz' for name in ('codr', 'codr-wn-agent') for arch in ('x86_64', 'aarch64')}
+          archives = {f'codr-v{version}-linux-{arch}.tar.gz' for arch in ('x86_64', 'aarch64')}
           assert {path.name for path in Path('dist').iterdir()} == archives | {name + '.sha256' for name in archives}
           PY
           (cd dist && sha256sum -c *.sha256)

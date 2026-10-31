@@ -1,0 +1,3005 @@
+use std::collections::HashMap;
+
+use cgka_engine::canonicalization::CanonicalizationPolicy;
+use cgka_traits::agent_text_stream::{
+    AGENT_TEXT_STREAM_QUIC_COMPONENT, AGENT_TEXT_STREAM_ROLE_FANOUT,
+    AGENT_TEXT_STREAM_ROLE_RECEIVE, AGENT_TEXT_STREAM_ROLE_SEND, AgentTextStreamQuicPolicyV1,
+};
+use cgka_traits::app_components::{
+    AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, AppComponentData, BlobStoreEndpointV1,
+    BlobStoreEndpointV2, EncryptedMediaPolicyV1, EncryptedMediaPolicyV2,
+    GROUP_ADMIN_POLICY_COMPONENT, GROUP_ADMIN_POLICY_COMPONENT_ID, GROUP_AVATAR_URL_COMPONENT,
+    GROUP_AVATAR_URL_COMPONENT_ID, GROUP_BLOSSOM_IMAGE_COMPONENT, GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
+    GROUP_ENCRYPTED_MEDIA_V1_COMPONENT, GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
+    GROUP_ENCRYPTED_MEDIA_V2_COMPONENT, GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+    GROUP_MESSAGE_RETENTION_COMPONENT, GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+    GROUP_PROFILE_COMPONENT, GROUP_PROFILE_COMPONENT_ID, GroupAvatarUrlV1, GroupProfileV1,
+    NOSTR_ROUTING_COMPONENT, NOSTR_ROUTING_COMPONENT_ID, NostrRoutingV1,
+    decode_encrypted_media_policy_v1, decode_encrypted_media_policy_v2, decode_group_avatar_url_v1,
+    decode_group_profile_v1, decode_nostr_routing_v1, decode_quic_varint, encode_component_vectors,
+    encode_encrypted_media_policy_v1, encode_encrypted_media_policy_v2, encode_group_avatar_url_v1,
+    encode_nostr_routing_v1, encode_quic_varint,
+};
+use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent as MarmotInnerEvent};
+use cgka_traits::engine::{GroupEvent, GroupHydrationQuarantineReason};
+use cgka_traits::group::{Group, ProtocolProfile};
+use cgka_traits::{GroupId, MemberId, TransportEndpoint, TransportGroupSubscription};
+use serde::{Deserialize, Serialize};
+
+use crate::media::{EncryptedMediaVersion, media_imeta_tags_preserve_message};
+use crate::{AccountState, AppError, ReceivedMessage, SelfMembership, SendSummary, SyncSummary};
+
+/// Operational backstop for malformed or permanently unsettled routing
+/// histories. Normal stable pruning is much tighter because it follows the
+/// protocol's retained-epoch windows.
+const MAX_PRIOR_NOSTR_ROUTES: usize = 32;
+
+/// Maximum number of group rosters returned by one local membership read.
+///
+/// Host chat-list consumers should page larger accounts rather than issuing
+/// one worker command per group. Keeping the page bounded also prevents an
+/// untrusted host input from monopolizing the per-account worker.
+pub const MAX_GROUP_MEMBER_IDS_PAGE_SIZE: usize = 100;
+
+/// Initial group-image input for encrypted-Blossom-first creation.
+///
+/// The host owns discovery and download. MDK receives the decoded image bytes,
+/// prefers encrypting and uploading them to Blossom, and uses `source_url`
+/// only as a negotiated fallback when a founding member does not advertise the
+/// encrypted Blossom image component.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AppInitialGroupImage {
+    pub plaintext: Vec<u8>,
+    pub media_type: String,
+    pub source_url: Option<String>,
+    pub dim: Option<String>,
+    pub thumbhash: Option<String>,
+}
+
+/// Host-visible lifecycle for an opaque, SQLCipher-backed founding-image
+/// artifact. Upload retries reuse the same encrypted bytes and content hash.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AppPreparedGroupImageUploadState {
+    Staged,
+    /// An ephemeral worker state. A restart exposes the durable staged or
+    /// failed state again so the exact same upload can be retried.
+    Uploading,
+    Uploaded,
+    Failed,
+    Consumed,
+}
+
+/// Sanitized status for a prepared founding-image artifact. The component,
+/// ciphertext, image keys, upload key, and content hash never cross this API.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppPreparedGroupImageUpload {
+    pub upload_id: String,
+    pub state: AppPreparedGroupImageUploadState,
+    pub attempt_count: u32,
+    pub last_error_kind: Option<String>,
+    pub group_id_hex: Option<String>,
+}
+
+impl std::fmt::Debug for AppPreparedGroupImageUpload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppPreparedGroupImageUpload")
+            .field("upload_id", &self.upload_id)
+            .field("state", &self.state)
+            .field("attempt_count", &self.attempt_count)
+            .field("last_error_kind", &self.last_error_kind)
+            .field("has_group_id", &self.group_id_hex.is_some())
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for AppInitialGroupImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppInitialGroupImage")
+            .field("plaintext_len", &self.plaintext.len())
+            .field("media_type", &self.media_type)
+            .field("has_source_url", &self.source_url.is_some())
+            .field("dim", &self.dim)
+            .field("thumbhash", &self.thumbhash)
+            .finish()
+    }
+}
+
+/// Forward-compatible options for creating a group.
+///
+/// A zero retention value preserves the historical disabled-retention
+/// behavior and does not make message retention a founding capability
+/// requirement.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AppCreateGroupOptions {
+    /// Initial group routing relays. Omitted uses the app configuration.
+    pub relays: Option<Vec<String>>,
+    pub description: String,
+    /// Invited account references granted admin in the founding group state.
+    pub initial_admins: Vec<String>,
+    pub initial_image: Option<AppInitialGroupImage>,
+    pub disappearing_message_secs: u64,
+}
+
+/// A group invite still pending the local device's confirmation decision
+/// (`pending_confirmation && !archived` in the account projection). Carries
+/// only what an invite policy needs to accept or decline; returned by
+/// [`crate::MarmotApp::pending_group_invites`] (mdk#1380).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingGroupInvite {
+    pub group_id: GroupId,
+    /// Account id of the welcomer who authenticated the invite, when known.
+    pub welcomer: Option<MemberId>,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppGroupRecord {
+    pub group_id_hex: String,
+    /// Compatibility profile for all profile-gated behavior in this group.
+    #[serde(default)]
+    pub protocol_profile: AppProtocolProfile,
+    pub endpoint: String,
+    pub nostr_routing: AppGroupNostrRoutingComponent,
+    /// Highest epoch observed while the current routing address was active.
+    /// Kept separately so a rollback can retain the losing branch address for
+    /// its real epoch range instead of inferring from the new canonical tip.
+    #[serde(default)]
+    pub nostr_routing_last_epoch: u64,
+    /// Older authenticated routing addresses that still overlap at least one
+    /// retained-history window. These are local delivery history, not part of
+    /// the current signed component.
+    #[serde(default)]
+    pub prior_nostr_routes: Vec<AppPriorNostrRoute>,
+    pub profile: AppGroupProfileComponent,
+    pub image: AppGroupImageComponent,
+    /// URL-based group avatar, used when no valid encrypted `image` is available.
+    /// When both sources are present, encrypted group image material wins.
+    #[serde(default)]
+    pub avatar_url: AppGroupAvatarUrlComponent,
+    pub admin_policy: AppGroupAdminPolicyComponent,
+    #[serde(default)]
+    pub message_retention: AppGroupMessageRetentionComponent,
+    #[serde(default)]
+    pub agent_text_stream: AppAgentTextStreamComponent,
+    #[serde(default)]
+    pub encrypted_media: AppGroupEncryptedMediaComponent,
+    /// Optional GroupContext components this client does not project into typed
+    /// fields. Preserved byte-for-byte across unrelated group updates.
+    #[serde(default)]
+    pub unknown_components: Vec<AppGroupOpaqueComponent>,
+    #[serde(default)]
+    pub archived: bool,
+    #[serde(default)]
+    pub pending_confirmation: bool,
+    /// Current locally observed MLS roster size. `None` only for legacy
+    /// projections that have not yet been hydrated by an upgraded runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_count: Option<u64>,
+    /// Hex member ids when this group is currently a Direct conversation
+    /// (empty name, roster size 2). Persisted as the peer-keyed reuse index.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_member_ids_hex: Option<Vec<String>>,
+    /// Current authoritative two-member roster, including explicitly named groups.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presentation_member_ids_hex: Option<Vec<String>>,
+    /// Whether the local account is still a member of this group, and if not,
+    /// whether it left voluntarily (`Left`) or was removed (`Removed`).
+    #[serde(default)]
+    pub self_membership: SelfMembership,
+    /// When the local account asked to leave this group, if a durable leave
+    /// request is still outstanding.
+    ///
+    /// Derived from the engine-owned `cgka_leave_requests` table when the record
+    /// is read; not part of the stored `account_groups` projection. MLS
+    /// SelfRemove proposals are epoch-bound while the product intent is not, so
+    /// the engine keeps re-proposing until a commit removes the local member.
+    ///
+    /// Orthogonal to [`Self::self_membership`]: that field records the locally
+    /// classified departure (`Left` is written as soon as the proposal
+    /// publishes, before anyone commits it), while this one tracks whether the
+    /// request has resolved. Both can be set at once, and this is the only
+    /// durable evidence of the intent when a publish failed — so it is also the
+    /// only way a cold launch can rediscover it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leave_requested_at_ms: Option<u64>,
+    /// Whether ordinary outbound work is gated by a local request or an
+    /// authenticated inbound disband candidate awaiting convergence.
+    #[serde(default)]
+    pub disbanding: bool,
+    /// Local disband request outcome, when this account initiated the action.
+    /// `disbanding` can be true with no request when another admin authored the
+    /// candidate being settled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disband_request: Option<AppDisbandRequest>,
+    /// Durable terminal projection used by group-state subscribers after the
+    /// request row has been cleared.
+    #[serde(default)]
+    pub disbanded: bool,
+    /// The engine has frozen this local group copy because it cannot safely
+    /// select canonical state from retained material. Sending and applying
+    /// group traffic remain blocked until a verified repair replaces it.
+    #[serde(default)]
+    pub unrecoverable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub welcomer_account_id_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via_welcome_message_id_hex: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AppProtocolProfile {
+    #[default]
+    Legacy,
+    Current,
+}
+
+impl From<ProtocolProfile> for AppProtocolProfile {
+    fn from(value: ProtocolProfile) -> Self {
+        match value {
+            ProtocolProfile::Legacy => Self::Legacy,
+            ProtocolProfile::Current => Self::Current,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppGroupMemberRecord {
+    pub member_id_hex: String,
+    pub account: Option<String>,
+    pub local: bool,
+}
+
+/// Lightweight local roster projection for one group.
+///
+/// This deliberately contains identifiers only: profile/display-name
+/// enrichment remains on the group-detail path. Admin identifiers come from
+/// the durable admin-policy component so recipient-selection screens can
+/// decide add-to-group eligibility without a per-group roster read.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppGroupMemberIds {
+    pub group_id_hex: String,
+    pub member_ids_hex: Vec<String>,
+    pub admin_ids_hex: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppGroupMlsState {
+    pub group_id_hex: String,
+    pub protocol_profile: AppProtocolProfile,
+    pub lifecycle_state: AppGroupLifecycleState,
+    pub epoch: u64,
+    pub member_count: usize,
+    #[serde(default)]
+    pub unrecoverable: bool,
+    pub required_app_components: Vec<u16>,
+    pub disbanding_enabled: bool,
+    /// True while all ordinary outbound group work, including application
+    /// messages, is blocked pending terminal convergence.
+    #[serde(default)]
+    pub disbanding: bool,
+    #[serde(default)]
+    pub disbanding_blockers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disband_request: Option<AppDisbandRequest>,
+}
+
+/// Session-consistent group record, members, and MLS state captured in one live read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AppGroupRosterSession {
+    pub group_record: AppGroupRecord,
+    pub members: Vec<AppGroupMemberRecord>,
+    pub mls_state: AppGroupMlsState,
+}
+
+/// One conversation-loading view captured from a single account-worker read.
+///
+/// `group`, `members`, and `mls_state` come from the same live-session or
+/// startup-snapshot frontier. The worker does not yield or re-enter its queue
+/// while capturing those three projections. `display_names` is optional
+/// directory-cache enrichment loaded in one synchronous batch after that
+/// authoritative snapshot; it does not participate in group-management
+/// decisions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppGroupConversationSnapshot {
+    pub my_account_id_hex: String,
+    pub group: AppGroupRecord,
+    pub members: Vec<AppGroupMemberRecord>,
+    pub mls_state: AppGroupMlsState,
+    pub display_names: HashMap<String, String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppGroupRosterMember {
+    pub member_id_hex: String,
+    pub account: Option<String>,
+    pub local: bool,
+    pub is_admin: bool,
+    pub is_self: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+}
+
+/// Lightweight membership projection for roster screens and change detection.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppGroupRoster {
+    pub group_id_hex: String,
+    pub members: Vec<AppGroupRosterMember>,
+    pub epoch: u64,
+    /// Monotonic change token for MLS roster state plus caller membership.
+    /// Non-roster MLS commits may bump this revision; directory-only
+    /// display-name changes do not.
+    pub roster_revision: u64,
+    pub self_membership: SelfMembership,
+    pub member_count: usize,
+    pub lifecycle_state: AppGroupLifecycleState,
+}
+
+pub(crate) fn app_group_roster_from_session(
+    session: AppGroupRosterSession,
+    my_account_id_hex: &str,
+    display_names: std::collections::HashMap<String, String>,
+) -> AppGroupRoster {
+    use std::collections::HashSet;
+
+    let AppGroupRosterSession {
+        group_record,
+        members,
+        mls_state,
+    } = session;
+    let admin_ids: HashSet<String> = group_record.admin_policy.admins.iter().cloned().collect();
+    let members = members
+        .into_iter()
+        .map(|member| {
+            let member_id_hex = member.member_id_hex.clone();
+            AppGroupRosterMember {
+                member_id_hex,
+                account: member.account,
+                local: member.local,
+                is_admin: admin_ids.contains(&member.member_id_hex),
+                is_self: member.member_id_hex == my_account_id_hex,
+                display_name: display_names.get(&member.member_id_hex).cloned(),
+            }
+        })
+        .collect();
+    let epoch = mls_state.epoch;
+    let membership_revision = match group_record.self_membership {
+        SelfMembership::Member => 0,
+        SelfMembership::Left => 1,
+        SelfMembership::Removed => 2,
+    };
+    AppGroupRoster {
+        group_id_hex: group_record.group_id_hex,
+        members,
+        epoch,
+        roster_revision: epoch.saturating_mul(3).saturating_add(membership_revision),
+        self_membership: group_record.self_membership,
+        member_count: mls_state.member_count,
+        lifecycle_state: mls_state.lifecycle_state,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AppGroupLifecycleState {
+    #[default]
+    Stable,
+    PendingPublish,
+    Merging,
+    Recovering,
+    Unrecoverable,
+    Disbanded,
+}
+
+impl From<cgka_traits::GroupLifecycleState> for AppGroupLifecycleState {
+    fn from(value: cgka_traits::GroupLifecycleState) -> Self {
+        match value {
+            cgka_traits::GroupLifecycleState::Stable => Self::Stable,
+            cgka_traits::GroupLifecycleState::PendingPublish => Self::PendingPublish,
+            cgka_traits::GroupLifecycleState::Merging => Self::Merging,
+            cgka_traits::GroupLifecycleState::Recovering => Self::Recovering,
+            cgka_traits::GroupLifecycleState::Unrecoverable => Self::Unrecoverable,
+            cgka_traits::GroupLifecycleState::Disbanded => Self::Disbanded,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AppDisbandFailureReason {
+    NoLongerAdmin,
+    NoLongerMember,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AppDisbandRequest {
+    Pending {
+        requested_at_ms: u64,
+    },
+    Failed {
+        requested_at_ms: u64,
+        reason: AppDisbandFailureReason,
+    },
+}
+
+impl From<cgka_traits::DisbandRequest> for AppDisbandRequest {
+    fn from(value: cgka_traits::DisbandRequest) -> Self {
+        match value.status {
+            cgka_traits::DisbandRequestStatus::Pending => Self::Pending {
+                requested_at_ms: value.requested_at_ms,
+            },
+            cgka_traits::DisbandRequestStatus::Failed(reason) => Self::Failed {
+                requested_at_ms: value.requested_at_ms,
+                reason: match reason {
+                    cgka_traits::DisbandFailureReason::NoLongerAdmin => {
+                        AppDisbandFailureReason::NoLongerAdmin
+                    }
+                    cgka_traits::DisbandFailureReason::NoLongerMember => {
+                        AppDisbandFailureReason::NoLongerMember
+                    }
+                },
+            },
+        }
+    }
+}
+
+pub use storage_sqlite::{
+    GroupSystemEventProjection as AppGroupSystemEvent, GroupSystemEventProvenance,
+    group_system_event_from_message,
+};
+
+/// Coarse, app-facing classification of why a stored group failed session-open
+/// hydration and was quarantined (mdk#151 / #417). Mirrors
+/// [`cgka_traits::engine::GroupHydrationQuarantineReason`] one-to-one so app
+/// clients can render per-reason recovery guidance without depending on the
+/// engine crate. The categories are deliberately coarse and privacy-safe — they
+/// carry no group/member ids, payloads, or key material.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AppGroupHydrationQuarantineReason {
+    /// OpenMLS returned an error while loading the stored group state or while
+    /// persisting mandatory runtime-configuration normalization after the
+    /// loaded group passed validation.
+    OpenMlsLoadFailed,
+    /// Marmot metadata referenced a group whose OpenMLS state was missing.
+    OpenMlsGroupMissing,
+    /// Member credentials, account-identity proofs, or ratchet-tree export
+    /// validation failed for the loaded MLS group.
+    MemberValidationFailed,
+    /// The Marmot group record could not be loaded or refreshed.
+    GroupRecordLoadFailed,
+    /// Hydrate found a stranded pending commit, but recovery itself failed.
+    PendingCommitRecoveryFailed,
+}
+
+impl From<GroupHydrationQuarantineReason> for AppGroupHydrationQuarantineReason {
+    fn from(reason: GroupHydrationQuarantineReason) -> Self {
+        match reason {
+            GroupHydrationQuarantineReason::OpenMlsLoadFailed => Self::OpenMlsLoadFailed,
+            GroupHydrationQuarantineReason::OpenMlsGroupMissing => Self::OpenMlsGroupMissing,
+            GroupHydrationQuarantineReason::MemberValidationFailed => Self::MemberValidationFailed,
+            GroupHydrationQuarantineReason::GroupRecordLoadFailed => Self::GroupRecordLoadFailed,
+            GroupHydrationQuarantineReason::PendingCommitRecoveryFailed => {
+                Self::PendingCommitRecoveryFailed
+            }
+        }
+    }
+}
+
+/// A stored group that failed session-open hydration and was skipped so the
+/// rest of the account could open (mdk#151 / #417). Surfaced to the app
+/// so it can present a per-group recovery flow (mdk#426) distinct from
+/// healthy and archived groups, and offer a non-destructive re-hydration retry.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppQuarantinedGroup {
+    pub group_id_hex: String,
+    pub reason: AppGroupHydrationQuarantineReason,
+}
+
+fn profile_present_by_default() -> bool {
+    true
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppGroupOpaqueComponent {
+    pub component_id: u16,
+    pub component: String,
+    pub data_hex: String,
+}
+
+impl std::fmt::Debug for AppGroupOpaqueComponent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppGroupOpaqueComponent")
+            .field("component_id", &self.component_id)
+            .field("component", &self.component)
+            .field("data_hex", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppGroupProfileComponent {
+    pub component_id: u16,
+    pub component: String,
+    #[serde(default = "profile_present_by_default")]
+    pub present: bool,
+    pub name: String,
+    pub description: String,
+    pub data_hex: String,
+}
+
+/// `image_key_hex`/`image_upload_key_hex` are key material that travels
+/// in-band inside the MLS-protected component (`data_hex` carries the same
+/// bytes). Serialization is the component's design; the hand-written `Debug`
+/// impl below redacts the key fields so a `{:?}` never prints key material.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppGroupImageComponent {
+    pub component_id: u16,
+    pub component: String,
+    pub present: bool,
+    pub image_hash_hex: String,
+    pub image_key_hex: String,
+    pub image_nonce_hex: String,
+    pub image_upload_key_hex: String,
+    pub media_type: Option<String>,
+    pub data_hex: String,
+}
+
+impl std::fmt::Debug for AppGroupImageComponent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppGroupImageComponent")
+            .field("component_id", &self.component_id)
+            .field("component", &self.component)
+            .field("present", &self.present)
+            .field("image_hash_hex", &self.image_hash_hex)
+            .field("image_key_hex", &"<redacted>")
+            .field("image_nonce_hex", &self.image_nonce_hex)
+            .field("image_upload_key_hex", &"<redacted>")
+            .field("media_type", &self.media_type)
+            .field("data_hex", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppGroupAvatarUrlComponent {
+    pub component_id: u16,
+    pub component: String,
+    pub present: bool,
+    pub url: String,
+    pub dim: Option<String>,
+    pub thumbhash: Option<String>,
+    pub data_hex: String,
+}
+
+impl Default for AppGroupAvatarUrlComponent {
+    fn default() -> Self {
+        Self::absent()
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppGroupAdminPolicyComponent {
+    pub component_id: u16,
+    pub component: String,
+    pub admins: Vec<String>,
+    pub data_hex: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppGroupMessageRetentionComponent {
+    pub component_id: u16,
+    pub component: String,
+    pub disappearing_message_secs: u64,
+    pub data_hex: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppGroupNostrRoutingComponent {
+    pub component_id: u16,
+    pub component: String,
+    pub nostr_group_id_hex: String,
+    pub relays: Vec<String>,
+    pub data_hex: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppPriorNostrRoute {
+    pub nostr_group_id_hex: String,
+    pub relays: Vec<String>,
+    /// Last epoch known to have used this route.
+    pub last_epoch: u64,
+    /// Unix seconds when this device saw the route replaced as the group's
+    /// current route. The retained route's relay history floor is this less
+    /// the clock-skew allowance. A route recorded before this was kept is
+    /// stamped by the first account load that finds it. `None` until then,
+    /// and on a locally deleted group's route that was replaced while the
+    /// group was hidden, until the first load after the group is restored;
+    /// such a route is backfilled in full.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaced_at: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppAgentTextStreamComponent {
+    pub component_id: u16,
+    pub component: String,
+    pub required: bool,
+    pub required_member_roles: Vec<String>,
+    pub allowed_member_roles: Vec<String>,
+    pub max_plaintext_frame_len: u32,
+    pub replay_ttl_secs: u32,
+    pub padding_bucket_bytes: u16,
+    pub data_hex: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppBlobEndpoint {
+    pub locator_kind: String,
+    pub base_url: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppGroupEncryptedMediaComponent {
+    pub component_id: u16,
+    pub component: String,
+    pub required: bool,
+    pub media_format: String,
+    pub allowed_locator_kinds: Vec<String>,
+    pub default_blob_endpoints: Vec<AppBlobEndpoint>,
+    pub data_hex: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AppEncryptedMediaPolicy {
+    pub(crate) component_id: u16,
+    pub(crate) version: EncryptedMediaVersion,
+    pub(crate) allowed_locator_kinds: Vec<String>,
+    pub(crate) default_blob_endpoints: Vec<AppBlobEndpoint>,
+}
+
+impl Default for AppAgentTextStreamComponent {
+    fn default() -> Self {
+        Self::disabled()
+    }
+}
+
+impl Default for AppGroupEncryptedMediaComponent {
+    fn default() -> Self {
+        Self::disabled()
+    }
+}
+
+impl Default for AppGroupMessageRetentionComponent {
+    fn default() -> Self {
+        Self::disabled()
+    }
+}
+
+impl std::fmt::Debug for AppGroupRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppGroupRecord")
+            .field("member_count", &self.member_count)
+            .field("archived", &self.archived)
+            .field("pending_confirmation", &self.pending_confirmation)
+            .field("self_membership", &self.self_membership)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AppGroupRecord {
+    pub(crate) fn new(
+        group_id_hex: String,
+        nostr_routing: AppGroupNostrRoutingComponent,
+        profile_name: String,
+        profile_description: String,
+        image: AppGroupImageInput,
+        admin_policy: AppGroupAdminPolicyComponent,
+        message_retention: AppGroupMessageRetentionComponent,
+    ) -> Self {
+        let endpoint = nostr_routing.relays.first().cloned().unwrap_or_default();
+        Self {
+            group_id_hex,
+            protocol_profile: AppProtocolProfile::Legacy,
+            endpoint,
+            nostr_routing,
+            nostr_routing_last_epoch: 0,
+            prior_nostr_routes: Vec::new(),
+            profile: AppGroupProfileComponent::new(profile_name, profile_description),
+            image: AppGroupImageComponent::new(image),
+            avatar_url: AppGroupAvatarUrlComponent::absent(),
+            admin_policy,
+            message_retention,
+            agent_text_stream: AppAgentTextStreamComponent::disabled(),
+            encrypted_media: AppGroupEncryptedMediaComponent::disabled(),
+            unknown_components: Vec::new(),
+            archived: false,
+            pending_confirmation: false,
+            member_count: None,
+            direct_member_ids_hex: None,
+            presentation_member_ids_hex: None,
+            self_membership: SelfMembership::Member,
+            leave_requested_at_ms: None,
+            disbanding: false,
+            disband_request: None,
+            disbanded: false,
+            unrecoverable: false,
+            welcomer_account_id_hex: None,
+            via_welcome_message_id_hex: None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_group(
+        group_id: &GroupId,
+        nostr_routing: AppGroupNostrRoutingComponent,
+        group: Option<&Group>,
+        admin_policy: AppGroupAdminPolicyComponent,
+        message_retention: AppGroupMessageRetentionComponent,
+        agent_text_stream: AppAgentTextStreamComponent,
+        avatar_url: AppGroupAvatarUrlComponent,
+        encrypted_media: AppGroupEncryptedMediaComponent,
+        image: AppGroupImageInput,
+    ) -> Self {
+        let (profile_name, profile_description) = group
+            .map(|group| (group.name.clone(), group.description.clone()))
+            .unwrap_or_default();
+        let mut record = Self::new(
+            hex::encode(group_id.as_slice()),
+            nostr_routing,
+            profile_name,
+            profile_description,
+            image,
+            admin_policy,
+            message_retention,
+        );
+        record.agent_text_stream = agent_text_stream;
+        record.avatar_url = avatar_url;
+        record.encrypted_media = encrypted_media;
+        if let Some(group) = group {
+            record.protocol_profile = group.protocol_profile.into();
+            record.nostr_routing_last_epoch = group.epoch.0;
+            record.member_count = u64::try_from(group.members.len()).ok();
+            record.unrecoverable = group.unrecoverable;
+            record.disbanded = group.disbanded.is_some();
+            record.set_direct_member_ids_from_roster(&group.members);
+        }
+        record
+    }
+
+    pub(crate) fn refresh_from_group(&mut self, projection: &EventGroupProjection<'_>) {
+        let nostr_routing = projection.nostr_routing.clone();
+        let route_changed = !same_nostr_route(&self.nostr_routing, &nostr_routing);
+        if route_changed {
+            let last_epoch = projection
+                .group_metadata
+                .map(|group| group.epoch.0.saturating_sub(1))
+                .unwrap_or_default()
+                .max(self.nostr_routing_last_epoch);
+            self.remember_prior_nostr_route(last_epoch, projection.observed_at_secs);
+        }
+        self.endpoint = nostr_routing.relays.first().cloned().unwrap_or_default();
+        self.nostr_routing = nostr_routing;
+        self.nostr_routing_last_epoch = match (route_changed, projection.group_metadata) {
+            (true, Some(group)) => group.epoch.0,
+            (true, None) => 0,
+            (false, Some(group)) => self.nostr_routing_last_epoch.max(group.epoch.0),
+            (false, None) => self.nostr_routing_last_epoch,
+        };
+        let current = &self.nostr_routing;
+        self.prior_nostr_routes.retain(|route| {
+            route.nostr_group_id_hex != current.nostr_group_id_hex
+                || normalized_relays(&route.relays) != normalized_relays(&current.relays)
+        });
+        self.admin_policy = projection.admin_policy.clone();
+        self.message_retention = projection.message_retention.clone();
+        self.agent_text_stream = projection.agent_text_stream.clone();
+        self.avatar_url = projection.avatar_url.clone();
+        self.encrypted_media = projection.encrypted_media.clone();
+        self.image = AppGroupImageComponent::new(projection.image.clone());
+        self.profile = projection.profile.clone();
+        if let Some(group) = projection.group_metadata {
+            self.protocol_profile = group.protocol_profile.into();
+            self.member_count = u64::try_from(group.members.len()).ok();
+            self.unrecoverable = group.unrecoverable;
+            self.disbanded = group.disbanded.is_some();
+            self.set_direct_member_ids_from_roster(&group.members);
+        }
+    }
+
+    pub(crate) fn set_direct_member_ids_from_roster(
+        &mut self,
+        members: &[cgka_traits::group::Member],
+    ) {
+        self.presentation_member_ids_hex = (members.len() == 2
+            && members
+                .iter()
+                .all(|member| member.id.as_slice().len() == 32)
+            && members[0].id != members[1].id)
+            .then(|| {
+                let mut ids: Vec<_> = members
+                    .iter()
+                    .map(|member| hex::encode(member.id.as_slice()))
+                    .collect();
+                ids.sort_unstable();
+                ids
+            });
+        self.direct_member_ids_hex = if self.profile.name.trim().is_empty() {
+            self.presentation_member_ids_hex.clone()
+        } else {
+            None
+        };
+    }
+
+    /// Retain the current route as history, replaced at `replaced_at`: the
+    /// moment this device saw the switch, which anchors the retained route's
+    /// history floor.
+    fn remember_prior_nostr_route(&mut self, last_epoch: u64, replaced_at: u64) {
+        self.merge_prior_nostr_routes(vec![AppPriorNostrRoute {
+            nostr_group_id_hex: self.nostr_routing.nostr_group_id_hex.clone(),
+            relays: normalized_relays(&self.nostr_routing.relays),
+            last_epoch,
+            replaced_at: Some(replaced_at),
+        }]);
+    }
+
+    /// Merge exact route history recovered from a local-deletion marker into a
+    /// newly recreated app projection. The current route is not prior history;
+    /// duplicate historical pairs retain the greatest authenticated epoch.
+    pub(crate) fn adopt_prior_nostr_routes(&mut self, mut routes: Vec<AppPriorNostrRoute>) {
+        let current_relays = normalized_relays(&self.nostr_routing.relays);
+        routes.retain(|route| {
+            route.nostr_group_id_hex != self.nostr_routing.nostr_group_id_hex
+                || normalized_relays(&route.relays) != current_relays
+        });
+        self.merge_prior_nostr_routes(routes);
+    }
+
+    fn merge_prior_nostr_routes(&mut self, routes: Vec<AppPriorNostrRoute>) {
+        for mut route in routes {
+            route.relays = normalized_relays(&route.relays);
+            if let Some(existing) = self.prior_nostr_routes.iter_mut().find(|existing| {
+                existing.nostr_group_id_hex == route.nostr_group_id_hex
+                    && normalized_relays(&existing.relays) == route.relays
+            }) {
+                existing.last_epoch = existing.last_epoch.max(route.last_epoch);
+                // Keep the earliest known switch: it reaches furthest back.
+                existing.replaced_at = match (existing.replaced_at, route.replaced_at) {
+                    (Some(kept), Some(new)) => Some(kept.min(new)),
+                    (kept, new) => kept.or(new),
+                };
+            } else {
+                self.prior_nostr_routes.push(route);
+            }
+        }
+        self.prior_nostr_routes.sort_by(|left, right| {
+            left.last_epoch
+                .cmp(&right.last_epoch)
+                .then_with(|| left.nostr_group_id_hex.cmp(&right.nostr_group_id_hex))
+                .then_with(|| left.relays.cmp(&right.relays))
+        });
+        let overflow = self
+            .prior_nostr_routes
+            .len()
+            .saturating_sub(MAX_PRIOR_NOSTR_ROUTES);
+        if overflow > 0 {
+            self.prior_nostr_routes.drain(..overflow);
+        }
+    }
+
+    /// Retire prior routes only after every protocol retention window has
+    /// advanced beyond the route's last epoch. Returns whether anything was
+    /// retired.
+    pub(crate) fn prune_prior_nostr_routes(&mut self, current_epoch: u64) -> bool {
+        // MDK currently runs the protocol-pinned convergence and application
+        // history depths. The only runtime override is settlement timing, so
+        // deriving these two depths from the canonical default is intentional.
+        let policy = CanonicalizationPolicy::default();
+        let retained_depth = policy
+            .convergence
+            .max_rewind_commits
+            .max(policy.app_message_past_epoch_limit);
+        let oldest_live_epoch = current_epoch.saturating_sub(retained_depth);
+        let before = self.prior_nostr_routes.len();
+        self.prior_nostr_routes
+            .retain(|route| route.last_epoch >= oldest_live_epoch);
+        self.prior_nostr_routes.len() != before
+    }
+
+    pub(crate) fn transport_subscriptions(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Vec<TransportGroupSubscription>, AppError> {
+        let mut subscriptions = vec![self.nostr_routing.subscription(group_id)?];
+        for route in &self.prior_nostr_routes {
+            match route.subscription(group_id) {
+                Ok(subscription) => subscriptions.push(subscription),
+                Err(_) => tracing::warn!(
+                    target: "marmot_app::groups",
+                    method = "transport_subscriptions",
+                    error_kind = "invalid_prior_nostr_route",
+                    "skipping invalid prior Nostr route",
+                ),
+            }
+        }
+        Ok(subscriptions)
+    }
+
+    pub(crate) fn apply_confirmation_state(&mut self, state: GroupConfirmationProjection) {
+        match state {
+            GroupConfirmationProjection::Preserve => {}
+            GroupConfirmationProjection::Accepted => {
+                self.pending_confirmation = false;
+                // Acceptance preserves explicit archive intent. Restore is a separate command.
+            }
+            GroupConfirmationProjection::Welcome {
+                explicitly_confirmed,
+                via_welcome_message_id_hex,
+                welcomer_account_id_hex,
+            } => {
+                // Short-circuit only on a true replay: an already-resolved
+                // group (accepted or declined, so `pending_confirmation` is
+                // false) whose recorded welcome id matches the incoming one.
+                // A genuine re-invite carries a *different* `via_welcome` id and
+                // must re-surface as pending even though MLS auto-joined, so the
+                // pending-invite projection stays visible until accepted
+                // (see mdk#184).
+                if !self.pending_confirmation
+                    && self.via_welcome_message_id_hex.as_deref()
+                        == Some(via_welcome_message_id_hex.as_str())
+                {
+                    return;
+                }
+                self.pending_confirmation = !explicitly_confirmed;
+                // Only the engine's successful consented rejoin clears archive.
+                // Offers and ordinary invitation acceptance preserve explicit archive intent;
+                // the replay guard above prevents an old join from undoing a later archive.
+                if explicitly_confirmed {
+                    self.archived = false;
+                }
+                self.via_welcome_message_id_hex = Some(via_welcome_message_id_hex);
+                self.welcomer_account_id_hex = welcomer_account_id_hex;
+            }
+        }
+    }
+}
+
+impl AppPriorNostrRoute {
+    /// The retained route's subscription, floored at its switch less the
+    /// clock-skew allowance. Members that have not applied the switch still
+    /// send here; history before it arrived while the route was current.
+    pub(crate) fn subscription(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<TransportGroupSubscription, AppError> {
+        let transport_group_id = hex::decode(&self.nostr_group_id_hex)?;
+        if transport_group_id.len() != 32 {
+            return Err(AppError::InvalidNostrRouting(
+                "prior Nostr group id must be 32 bytes".into(),
+            ));
+        }
+        if self.relays.is_empty() {
+            return Err(AppError::InvalidNostrRouting(
+                "prior Nostr routing relays must not be empty".into(),
+            ));
+        }
+        Ok(TransportGroupSubscription {
+            group_id: group_id.clone(),
+            transport_group_id,
+            endpoints: self.relays.iter().cloned().map(TransportEndpoint).collect(),
+            retained_since: self.replaced_at.map(crate::history_floor),
+        })
+    }
+}
+
+fn same_nostr_route(
+    left: &AppGroupNostrRoutingComponent,
+    right: &AppGroupNostrRoutingComponent,
+) -> bool {
+    left.nostr_group_id_hex == right.nostr_group_id_hex
+        && normalized_relays(&left.relays) == normalized_relays(&right.relays)
+}
+
+fn normalized_relays(relays: &[String]) -> Vec<String> {
+    let mut relays = relays.to_vec();
+    relays.sort();
+    relays.dedup();
+    relays
+}
+
+/// Advisory recovery state, separate from user invite acceptance and MLS membership.
+/// Subscribe to GroupStateUpdated, then re-read this durable snapshot.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupRecoveryStatus {
+    pub group_id_hex: String,
+    /// Repeated relay-confirmed full-history replays recovered nothing.
+    /// Hosts may show "Unable to restore group synchronization"; this is not removal evidence.
+    pub automatic_recovery_failed: bool,
+    /// Lost invitations awaiting fresh material on this inviter device.
+    pub pending_reinvites: u32,
+    /// Exhausted recovery attempts requiring a new user-initiated invitation.
+    pub failed_reinvites: u32,
+    pub rejoin_invitations: Vec<GroupRejoinInvitation>,
+    /// Automatic recovery parked on this group's own history, so hosts may
+    /// show "history may be incomplete". Account-wide occurrences, such as
+    /// delivery loss, are listed only by `history_notices`.
+    #[serde(default)]
+    pub history_may_be_incomplete: bool,
+    /// Notice ids of those group-scoped occurrences, oldest first; pass one to
+    /// `dismiss_history_notice`. Empty exactly when the flag is false.
+    #[serde(default)]
+    pub history_notice_ids: Vec<String>,
+}
+
+/// A fully validated Welcome awaiting a recipient's explicit decision to
+/// replace their existing active group copy. The sender must be shown to the user.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupRejoinInvitation {
+    pub welcome_id_hex: String,
+    pub welcomer_account_id_hex: String,
+    pub epoch: u64,
+    pub local_state_token: String,
+}
+
+#[cfg(test)]
+mod prior_nostr_route_tests {
+    use super::*;
+    use cgka_traits::capabilities::GroupCapabilities;
+    use cgka_traits::types::EpochId;
+
+    fn routing(id: u8, relay: &str) -> AppGroupNostrRoutingComponent {
+        AppGroupNostrRoutingComponent::new(NostrRoutingV1 {
+            nostr_group_id: [id; 32],
+            relays: vec![relay.to_owned()],
+        })
+        .unwrap()
+    }
+
+    fn group(epoch: u64) -> Group {
+        Group {
+            id: GroupId::new(vec![1; 16]),
+            name: "group".to_owned(),
+            description: String::new(),
+            epoch: EpochId(epoch),
+            members: Vec::new(),
+            required_capabilities: GroupCapabilities::default(),
+            protocol_profile: ProtocolProfile::Current,
+            removed: false,
+            unrecoverable: false,
+            disbanded: None,
+            join_epoch: EpochId(0),
+            local_copy_install_epoch: EpochId(0),
+            local_copy_welcome_created_at: None,
+        }
+    }
+
+    /// When every projection below is read.
+    const OBSERVED_AT: u64 = 1_800_000_000;
+
+    fn projection<'a>(
+        nostr_routing: AppGroupNostrRoutingComponent,
+        group: &'a Group,
+    ) -> EventGroupProjection<'a> {
+        EventGroupProjection {
+            nostr_routing,
+            group_metadata: Some(group),
+            profile: AppGroupProfileComponent::new(group.name.clone(), group.description.clone()),
+            admin_policy: AppGroupAdminPolicyComponent::new(Vec::new()),
+            message_retention: AppGroupMessageRetentionComponent::disabled(),
+            agent_text_stream: AppAgentTextStreamComponent::disabled(),
+            avatar_url: AppGroupAvatarUrlComponent::absent(),
+            encrypted_media: AppGroupEncryptedMediaComponent::disabled(),
+            image: AppGroupImageInput::default(),
+            observed_at_secs: OBSERVED_AT,
+        }
+    }
+
+    #[test]
+    fn rotation_retains_prior_route_until_both_epoch_windows_expire() {
+        let mut record = AppGroupRecord::new(
+            hex::encode([1u8; 16]),
+            routing(1, "wss://old.example"),
+            "group".to_owned(),
+            String::new(),
+            AppGroupImageInput::default(),
+            AppGroupAdminPolicyComponent::new(Vec::new()),
+            AppGroupMessageRetentionComponent::disabled(),
+        );
+        let at_epoch_six = group(6);
+
+        record.refresh_from_group(&projection(
+            routing(2, "wss://current.example"),
+            &at_epoch_six,
+        ));
+
+        assert_eq!(
+            record.prior_nostr_routes,
+            vec![AppPriorNostrRoute {
+                nostr_group_id_hex: hex::encode([1u8; 32]),
+                relays: vec!["wss://old.example".to_owned()],
+                last_epoch: 5,
+                replaced_at: Some(OBSERVED_AT),
+            }]
+        );
+        let subscriptions = record
+            .transport_subscriptions(&GroupId::new(vec![1; 16]))
+            .unwrap();
+        assert_eq!(
+            subscriptions
+                .iter()
+                .map(|subscription| (
+                    subscription.transport_group_id[0],
+                    subscription.retained_since
+                ))
+                .collect::<Vec<_>>(),
+            vec![(2, None), (1, Some(crate::history_floor(OBSERVED_AT)))],
+            "the current route resumes from the account cursor; the retained route \
+             from its switch less the clock-skew allowance"
+        );
+
+        assert!(!record.prune_prior_nostr_routes(10));
+        assert!(record.prune_prior_nostr_routes(11));
+        assert!(record.prior_nostr_routes.is_empty());
+    }
+
+    #[test]
+    fn rotating_back_to_a_prior_address_deduplicates_history() {
+        let mut record = AppGroupRecord::new(
+            hex::encode([1u8; 16]),
+            routing(1, "wss://one.example"),
+            "group".to_owned(),
+            String::new(),
+            AppGroupImageInput::default(),
+            AppGroupAdminPolicyComponent::new(Vec::new()),
+            AppGroupMessageRetentionComponent::disabled(),
+        );
+        let epoch_two = group(2);
+        record.refresh_from_group(&projection(routing(2, "wss://two.example"), &epoch_two));
+        let epoch_three = group(3);
+        record.refresh_from_group(&projection(routing(1, "wss://one.example"), &epoch_three));
+
+        assert_eq!(record.prior_nostr_routes.len(), 1);
+        assert_eq!(
+            record.prior_nostr_routes[0].nostr_group_id_hex,
+            hex::encode([2u8; 32])
+        );
+    }
+
+    #[test]
+    fn refresh_projects_and_clears_unrecoverable_repair_requirement() {
+        let mut record = AppGroupRecord::new(
+            hex::encode([1u8; 16]),
+            routing(1, "wss://relay.example"),
+            "group".to_owned(),
+            String::new(),
+            AppGroupImageInput::default(),
+            AppGroupAdminPolicyComponent::new(Vec::new()),
+            AppGroupMessageRetentionComponent::disabled(),
+        );
+        let mut halted = group(6);
+        halted.unrecoverable = true;
+        record.refresh_from_group(&projection(routing(1, "wss://relay.example"), &halted));
+        assert!(record.unrecoverable);
+
+        let repaired = group(7);
+        record.refresh_from_group(&projection(routing(1, "wss://relay.example"), &repaired));
+        assert!(!record.unrecoverable);
+    }
+
+    #[test]
+    fn relay_only_rotation_retains_the_prior_relay_set_for_the_same_id() {
+        let mut record = AppGroupRecord::new(
+            hex::encode([1u8; 16]),
+            routing(1, "wss://old.example"),
+            "group".to_owned(),
+            String::new(),
+            AppGroupImageInput::default(),
+            AppGroupAdminPolicyComponent::new(Vec::new()),
+            AppGroupMessageRetentionComponent::disabled(),
+        );
+        record.nostr_routing_last_epoch = 5;
+        let epoch_six = group(6);
+
+        record.refresh_from_group(&projection(routing(1, "wss://current.example"), &epoch_six));
+
+        assert_eq!(
+            record.prior_nostr_routes,
+            vec![AppPriorNostrRoute {
+                nostr_group_id_hex: hex::encode([1u8; 32]),
+                relays: vec!["wss://old.example".to_owned()],
+                last_epoch: 5,
+                replaced_at: Some(OBSERVED_AT),
+            }]
+        );
+        assert_eq!(
+            record
+                .transport_subscriptions(&GroupId::new(vec![1; 16]))
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn rollback_retains_losing_route_through_its_last_observed_epoch() {
+        let mut record = AppGroupRecord::new(
+            hex::encode([1u8; 16]),
+            routing(2, "wss://losing.example"),
+            "group".to_owned(),
+            String::new(),
+            AppGroupImageInput::default(),
+            AppGroupAdminPolicyComponent::new(Vec::new()),
+            AppGroupMessageRetentionComponent::disabled(),
+        );
+        record.nostr_routing_last_epoch = 10;
+        let rolled_back = group(6);
+
+        record.refresh_from_group(&projection(
+            routing(1, "wss://selected.example"),
+            &rolled_back,
+        ));
+
+        assert_eq!(
+            record.prior_nostr_routes,
+            vec![AppPriorNostrRoute {
+                nostr_group_id_hex: hex::encode([2u8; 32]),
+                relays: vec!["wss://losing.example".to_owned()],
+                last_epoch: 10,
+                replaced_at: Some(OBSERVED_AT),
+            }]
+        );
+        assert_eq!(record.nostr_routing_last_epoch, 6);
+    }
+
+    #[test]
+    fn malformed_prior_route_does_not_discard_current_or_valid_history() {
+        let mut record = AppGroupRecord::new(
+            hex::encode([1u8; 16]),
+            routing(1, "wss://current.example"),
+            "group".to_owned(),
+            String::new(),
+            AppGroupImageInput::default(),
+            AppGroupAdminPolicyComponent::new(Vec::new()),
+            AppGroupMessageRetentionComponent::disabled(),
+        );
+        record.prior_nostr_routes = vec![
+            AppPriorNostrRoute {
+                nostr_group_id_hex: "not-hex".to_owned(),
+                relays: vec!["wss://invalid.example".to_owned()],
+                last_epoch: 1,
+                replaced_at: None,
+            },
+            AppPriorNostrRoute {
+                nostr_group_id_hex: hex::encode([2u8; 32]),
+                relays: vec!["wss://prior.example".to_owned()],
+                last_epoch: 1,
+                replaced_at: None,
+            },
+        ];
+
+        let subscriptions = record
+            .transport_subscriptions(&GroupId::new(vec![1; 16]))
+            .expect("the valid current route remains usable");
+
+        assert_eq!(subscriptions.len(), 2);
+        assert_eq!(subscriptions[0].transport_group_id, vec![1u8; 32]);
+        assert_eq!(subscriptions[1].transport_group_id, vec![2u8; 32]);
+    }
+
+    #[test]
+    fn retained_route_floor_follows_its_earliest_known_switch() {
+        let mut record = AppGroupRecord::new(
+            hex::encode([1u8; 16]),
+            routing(1, "wss://current.example"),
+            "group".to_owned(),
+            String::new(),
+            AppGroupImageInput::default(),
+            AppGroupAdminPolicyComponent::new(Vec::new()),
+            AppGroupMessageRetentionComponent::disabled(),
+        );
+        let retained = |id: u8, replaced_at| AppPriorNostrRoute {
+            nostr_group_id_hex: hex::encode([id; 32]),
+            relays: vec![format!("wss://retained-{id}.example")],
+            last_epoch: 1,
+            replaced_at,
+        };
+        record.adopt_prior_nostr_routes(vec![
+            retained(2, Some(OBSERVED_AT)),
+            retained(2, Some(OBSERVED_AT - 60)),
+            retained(3, Some(OBSERVED_AT)),
+            retained(3, None),
+            retained(4, None),
+        ]);
+
+        let floors = record
+            .transport_subscriptions(&GroupId::new(vec![1; 16]))
+            .unwrap()
+            .into_iter()
+            .map(|subscription| {
+                (
+                    subscription.transport_group_id[0],
+                    subscription.retained_since,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            floors,
+            vec![
+                (1, None),
+                (2, Some(crate::history_floor(OBSERVED_AT - 60))),
+                (3, Some(crate::history_floor(OBSERVED_AT))),
+                (4, None),
+            ],
+            "duplicates keep the earliest known switch; a route with no recorded \
+             switch has no floor and is backfilled in full"
+        );
+    }
+
+    #[test]
+    fn unsettled_prior_route_history_has_a_fixed_operational_bound() {
+        let mut record = AppGroupRecord::new(
+            hex::encode([1u8; 16]),
+            routing(1, "wss://one.example"),
+            "group".to_owned(),
+            String::new(),
+            AppGroupImageInput::default(),
+            AppGroupAdminPolicyComponent::new(Vec::new()),
+            AppGroupMessageRetentionComponent::disabled(),
+        );
+
+        for epoch in 2..=34 {
+            let next_group = group(epoch);
+            record.refresh_from_group(&projection(
+                routing(epoch as u8, "wss://next.example"),
+                &next_group,
+            ));
+        }
+
+        assert_eq!(record.prior_nostr_routes.len(), MAX_PRIOR_NOSTR_ROUTES);
+        assert_eq!(
+            record
+                .prior_nostr_routes
+                .first()
+                .expect("bounded history remains non-empty")
+                .last_epoch,
+            2,
+            "the oldest route is evicted first"
+        );
+    }
+}
+
+impl AppGroupProfileComponent {
+    fn new(name: String, description: String) -> Self {
+        let data = encode_component_vectors(&[name.as_bytes(), description.as_bytes()]);
+        Self {
+            component_id: GROUP_PROFILE_COMPONENT_ID,
+            component: GROUP_PROFILE_COMPONENT.to_owned(),
+            present: true,
+            name,
+            description,
+            data_hex: hex::encode(data),
+        }
+    }
+
+    pub(crate) fn absent() -> Self {
+        Self {
+            component_id: GROUP_PROFILE_COMPONENT_ID,
+            component: GROUP_PROFILE_COMPONENT.to_owned(),
+            present: false,
+            name: String::new(),
+            description: String::new(),
+            data_hex: String::new(),
+        }
+    }
+
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Self {
+        match decode_group_profile_v1(bytes) {
+            Ok(GroupProfileV1 { name, description }) => {
+                let mut profile = Self::new(name, description);
+                profile.data_hex = hex::encode(bytes);
+                profile
+            }
+            Err(_) => Self {
+                component_id: GROUP_PROFILE_COMPONENT_ID,
+                component: GROUP_PROFILE_COMPONENT.to_owned(),
+                present: true,
+                name: String::new(),
+                description: String::new(),
+                data_hex: hex::encode(bytes),
+            },
+        }
+    }
+}
+
+impl AppGroupImageComponent {
+    pub(crate) fn new(input: AppGroupImageInput) -> Self {
+        let present = !input.image_hash_hex.is_empty()
+            || !input.image_key_hex.is_empty()
+            || !input.image_nonce_hex.is_empty()
+            || !input.image_upload_key_hex.is_empty()
+            || input.media_type.is_some();
+        let image_hash = hex::decode(&input.image_hash_hex).unwrap_or_default();
+        let image_key = hex::decode(&input.image_key_hex).unwrap_or_default();
+        let image_nonce = hex::decode(&input.image_nonce_hex).unwrap_or_default();
+        let image_upload_key = hex::decode(&input.image_upload_key_hex).unwrap_or_default();
+        let media_type_bytes = input.media_type.as_deref().unwrap_or("").as_bytes();
+        let data = encode_component_vectors(&[
+            image_hash.as_slice(),
+            image_key.as_slice(),
+            image_nonce.as_slice(),
+            image_upload_key.as_slice(),
+            media_type_bytes,
+        ]);
+        Self {
+            component_id: GROUP_BLOSSOM_IMAGE_COMPONENT_ID,
+            component: GROUP_BLOSSOM_IMAGE_COMPONENT.to_owned(),
+            present,
+            image_hash_hex: input.image_hash_hex,
+            image_key_hex: input.image_key_hex,
+            image_nonce_hex: input.image_nonce_hex,
+            image_upload_key_hex: input.image_upload_key_hex,
+            media_type: input.media_type,
+            data_hex: hex::encode(data),
+        }
+    }
+}
+
+impl AppGroupAvatarUrlComponent {
+    /// Build a present avatar from validated parts (used on the send path).
+    pub(crate) fn new(
+        url: String,
+        dim: Option<String>,
+        thumbhash: Option<String>,
+    ) -> Result<Self, AppError> {
+        let avatar = GroupAvatarUrlV1 {
+            url,
+            dim: dim.unwrap_or_default().into_bytes(),
+            thumbhash: thumbhash.unwrap_or_default().into_bytes(),
+        };
+        let data = encode_group_avatar_url_v1(&avatar).map_err(AppError::InvalidGroupAvatarUrl)?;
+        // Decode the encoded bytes back so the struct fields carry the normalized
+        // URL, matching `from_bytes(to_app_component_data(..))` for any input.
+        let normalized =
+            decode_group_avatar_url_v1(&data).map_err(AppError::InvalidGroupAvatarUrl)?;
+        Ok(Self::from_decoded(normalized, data))
+    }
+
+    pub(crate) fn absent() -> Self {
+        // Encode the canonical empty state (three zero-length fields) so a
+        // "clear avatar" update is engine-valid, not raw-empty bytes.
+        let data = encode_group_avatar_url_v1(&GroupAvatarUrlV1::default()).unwrap_or_default();
+        Self {
+            component_id: GROUP_AVATAR_URL_COMPONENT_ID,
+            component: GROUP_AVATAR_URL_COMPONENT.to_owned(),
+            present: false,
+            url: String::new(),
+            dim: None,
+            thumbhash: None,
+            data_hex: hex::encode(data),
+        }
+    }
+
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Self {
+        match decode_group_avatar_url_v1(bytes) {
+            Ok(avatar) if !avatar.url.is_empty() => Self::from_decoded(avatar, bytes.to_vec()),
+            _ => Self::absent(),
+        }
+    }
+
+    fn from_decoded(avatar: GroupAvatarUrlV1, data: Vec<u8>) -> Self {
+        let GroupAvatarUrlV1 {
+            url,
+            dim,
+            thumbhash,
+        } = avatar;
+        Self {
+            component_id: GROUP_AVATAR_URL_COMPONENT_ID,
+            component: GROUP_AVATAR_URL_COMPONENT.to_owned(),
+            present: !url.is_empty(),
+            url,
+            // Rendering interpretation is local: non-UTF-8 opaque hints are
+            // treated as absent here without invalidating wire state.
+            dim: String::from_utf8(dim).ok().filter(|hint| !hint.is_empty()),
+            thumbhash: String::from_utf8(thumbhash)
+                .ok()
+                .filter(|hint| !hint.is_empty()),
+            data_hex: hex::encode(data),
+        }
+    }
+
+    pub(crate) fn to_app_component_data(&self) -> Result<AppComponentData, AppError> {
+        Ok(AppComponentData {
+            component_id: GROUP_AVATAR_URL_COMPONENT_ID,
+            data: hex::decode(&self.data_hex)?,
+        })
+    }
+}
+
+impl AppGroupAdminPolicyComponent {
+    pub(crate) fn new(mut admins: Vec<[u8; 32]>) -> Self {
+        admins.sort();
+        admins.dedup();
+        let mut admin_bytes = Vec::with_capacity(admins.len() * 32);
+        for admin in &admins {
+            admin_bytes.extend_from_slice(admin);
+        }
+        let mut data = Vec::new();
+        encode_quic_varint(admin_bytes.len() as u64, &mut data);
+        data.extend_from_slice(&admin_bytes);
+        Self {
+            component_id: GROUP_ADMIN_POLICY_COMPONENT_ID,
+            component: GROUP_ADMIN_POLICY_COMPONENT.to_owned(),
+            admins: admins.iter().map(hex::encode).collect(),
+            data_hex: hex::encode(data),
+        }
+    }
+
+    pub(crate) fn to_app_component_data(&self) -> Result<AppComponentData, AppError> {
+        Ok(AppComponentData {
+            component_id: GROUP_ADMIN_POLICY_COMPONENT_ID,
+            data: hex::decode(&self.data_hex)?,
+        })
+    }
+}
+
+impl AppGroupMessageRetentionComponent {
+    pub(crate) fn new(disappearing_message_secs: u64) -> Self {
+        Self {
+            component_id: GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+            component: GROUP_MESSAGE_RETENTION_COMPONENT.to_owned(),
+            disappearing_message_secs,
+            data_hex: hex::encode(disappearing_message_secs.to_be_bytes()),
+        }
+    }
+
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Self {
+        if bytes.len() != 8 {
+            return Self {
+                component_id: GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+                component: GROUP_MESSAGE_RETENTION_COMPONENT.to_owned(),
+                disappearing_message_secs: 0,
+                data_hex: hex::encode(bytes),
+            };
+        }
+        let mut value = [0_u8; 8];
+        value.copy_from_slice(bytes);
+        Self::new(u64::from_be_bytes(value))
+    }
+
+    pub(crate) fn disabled() -> Self {
+        Self::new(0)
+    }
+
+    pub(crate) fn to_app_component_data(&self) -> Result<AppComponentData, AppError> {
+        Ok(AppComponentData {
+            component_id: GROUP_MESSAGE_RETENTION_COMPONENT_ID,
+            data: hex::decode(&self.data_hex)?,
+        })
+    }
+}
+
+impl AppGroupNostrRoutingComponent {
+    pub(crate) fn new(routing: NostrRoutingV1) -> Result<Self, AppError> {
+        let data = encode_nostr_routing_v1(&routing).map_err(AppError::InvalidNostrRouting)?;
+        Ok(Self {
+            component_id: NOSTR_ROUTING_COMPONENT_ID,
+            component: NOSTR_ROUTING_COMPONENT.to_owned(),
+            nostr_group_id_hex: hex::encode(routing.nostr_group_id),
+            relays: routing.relays,
+            data_hex: hex::encode(data),
+        })
+    }
+
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self, AppError> {
+        let routing = decode_nostr_routing_v1(bytes).map_err(AppError::InvalidNostrRouting)?;
+        Self::new(routing)
+    }
+
+    pub(crate) fn subscription(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<TransportGroupSubscription, AppError> {
+        let transport_group_id = hex::decode(&self.nostr_group_id_hex)?;
+        if transport_group_id.len() != 32 {
+            return Err(AppError::InvalidNostrRouting(
+                "Nostr group id must be 32 bytes".into(),
+            ));
+        }
+        if self.relays.is_empty() {
+            return Err(AppError::InvalidNostrRouting(
+                "Nostr routing relays must not be empty".into(),
+            ));
+        }
+        Ok(TransportGroupSubscription {
+            group_id: group_id.clone(),
+            transport_group_id,
+            endpoints: self.relays.iter().cloned().map(TransportEndpoint).collect(),
+            retained_since: None,
+        })
+    }
+}
+
+impl AppAgentTextStreamComponent {
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Self {
+        match AgentTextStreamQuicPolicyV1::decode_component_state(bytes) {
+            Ok(policy) => Self::from_policy(policy, bytes.to_vec()),
+            Err(_) => Self {
+                component_id: AGENT_TEXT_STREAM_QUIC_COMPONENT_ID,
+                component: AGENT_TEXT_STREAM_QUIC_COMPONENT.to_owned(),
+                required: true,
+                required_member_roles: Vec::new(),
+                allowed_member_roles: Vec::new(),
+                max_plaintext_frame_len: 0,
+                replay_ttl_secs: 0,
+                padding_bucket_bytes: 0,
+                data_hex: hex::encode(bytes),
+            },
+        }
+    }
+
+    fn from_policy(policy: AgentTextStreamQuicPolicyV1, data: Vec<u8>) -> Self {
+        Self {
+            component_id: AGENT_TEXT_STREAM_QUIC_COMPONENT_ID,
+            component: AGENT_TEXT_STREAM_QUIC_COMPONENT.to_owned(),
+            required: true,
+            required_member_roles: role_names(policy.required_member_roles),
+            allowed_member_roles: role_names(policy.allowed_member_roles),
+            max_plaintext_frame_len: policy.max_plaintext_frame_len,
+            replay_ttl_secs: policy.replay_ttl_secs,
+            padding_bucket_bytes: policy.padding_bucket_bytes,
+            data_hex: hex::encode(data),
+        }
+    }
+
+    pub(crate) fn disabled() -> Self {
+        Self {
+            component_id: AGENT_TEXT_STREAM_QUIC_COMPONENT_ID,
+            component: AGENT_TEXT_STREAM_QUIC_COMPONENT.to_owned(),
+            required: false,
+            required_member_roles: Vec::new(),
+            allowed_member_roles: Vec::new(),
+            max_plaintext_frame_len: 0,
+            replay_ttl_secs: 0,
+            padding_bucket_bytes: 0,
+            data_hex: String::new(),
+        }
+    }
+}
+
+impl AppGroupEncryptedMediaComponent {
+    pub(crate) fn new_v1(policy: EncryptedMediaPolicyV1) -> Result<Self, AppError> {
+        let data =
+            encode_encrypted_media_policy_v1(&policy).map_err(AppError::InvalidEncryptedMedia)?;
+        let decoded =
+            decode_encrypted_media_policy_v1(&data).map_err(AppError::InvalidEncryptedMedia)?;
+        Ok(Self::from_policy_v1(decoded, data))
+    }
+
+    pub(crate) fn new_v2(policy: EncryptedMediaPolicyV2) -> Result<Self, AppError> {
+        let data =
+            encode_encrypted_media_policy_v2(&policy).map_err(AppError::InvalidEncryptedMedia)?;
+        let decoded =
+            decode_encrypted_media_policy_v2(&data).map_err(AppError::InvalidEncryptedMedia)?;
+        Ok(Self::from_policy_v2(decoded, data))
+    }
+
+    pub(crate) fn from_bytes(component_id: u16, bytes: &[u8]) -> Self {
+        match component_id {
+            GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID => {
+                match decode_encrypted_media_policy_v1(bytes) {
+                    Ok(policy) => Self::from_policy_v1(policy, bytes.to_vec()),
+                    Err(_) => Self::invalid(component_id, bytes),
+                }
+            }
+            GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID => {
+                match decode_encrypted_media_policy_v2(bytes) {
+                    Ok(policy) => Self::from_policy_v2(policy, bytes.to_vec()),
+                    Err(_) => Self::invalid(component_id, bytes),
+                }
+            }
+            _ => Self::invalid(component_id, bytes),
+        }
+    }
+
+    fn invalid(component_id: u16, bytes: &[u8]) -> Self {
+        let component = match component_id {
+            GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID => GROUP_ENCRYPTED_MEDIA_V2_COMPONENT,
+            _ => GROUP_ENCRYPTED_MEDIA_V1_COMPONENT,
+        };
+        Self {
+            component_id,
+            component: component.to_owned(),
+            required: true,
+            media_format: String::new(),
+            allowed_locator_kinds: Vec::new(),
+            default_blob_endpoints: Vec::new(),
+            data_hex: hex::encode(bytes),
+        }
+    }
+
+    fn from_policy_v1(policy: EncryptedMediaPolicyV1, data: Vec<u8>) -> Self {
+        Self {
+            component_id: GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
+            component: GROUP_ENCRYPTED_MEDIA_V1_COMPONENT.to_owned(),
+            required: true,
+            media_format: policy.media_format,
+            allowed_locator_kinds: policy.allowed_locator_kinds,
+            default_blob_endpoints: policy
+                .default_blob_endpoints
+                .into_iter()
+                .map(|endpoint| AppBlobEndpoint {
+                    locator_kind: endpoint.locator_kind,
+                    base_url: endpoint.base_url,
+                })
+                .collect(),
+            data_hex: hex::encode(data),
+        }
+    }
+
+    fn from_policy_v2(policy: EncryptedMediaPolicyV2, data: Vec<u8>) -> Self {
+        Self {
+            component_id: GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+            component: GROUP_ENCRYPTED_MEDIA_V2_COMPONENT.to_owned(),
+            required: true,
+            media_format: policy.media_format,
+            allowed_locator_kinds: policy.allowed_locator_kinds,
+            default_blob_endpoints: policy
+                .default_blob_endpoints
+                .into_iter()
+                .map(|endpoint| AppBlobEndpoint {
+                    locator_kind: endpoint.locator_kind,
+                    base_url: endpoint.base_url,
+                })
+                .collect(),
+            data_hex: hex::encode(data),
+        }
+    }
+
+    pub(crate) fn disabled_for_profile(profile: AppProtocolProfile) -> Self {
+        let (component_id, component) = match profile {
+            AppProtocolProfile::Legacy => (
+                GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
+                GROUP_ENCRYPTED_MEDIA_V1_COMPONENT,
+            ),
+            AppProtocolProfile::Current => (
+                GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+                GROUP_ENCRYPTED_MEDIA_V2_COMPONENT,
+            ),
+        };
+        Self {
+            component_id,
+            component: component.to_owned(),
+            required: false,
+            media_format: String::new(),
+            allowed_locator_kinds: Vec::new(),
+            default_blob_endpoints: Vec::new(),
+            data_hex: String::new(),
+        }
+    }
+
+    pub(crate) fn disabled() -> Self {
+        Self::disabled_for_profile(AppProtocolProfile::Legacy)
+    }
+
+    pub(crate) fn to_app_component_data(&self) -> Result<AppComponentData, AppError> {
+        Ok(AppComponentData {
+            component_id: self.component_id,
+            data: hex::decode(&self.data_hex)?,
+        })
+    }
+
+    pub(crate) fn endpoint_policy(&self) -> Result<AppEncryptedMediaPolicy, AppError> {
+        if !self.required {
+            // A group created with no media servers is text-only for life:
+            // nothing can add the component later.
+            return Err(AppError::InvalidEncryptedMedia(
+                "group has no encrypted-media servers, so it carries no media".into(),
+            ));
+        }
+        match self.component_id {
+            GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID => {
+                let policy = EncryptedMediaPolicyV1::new(
+                    self.media_format.clone(),
+                    self.allowed_locator_kinds.clone(),
+                    self.default_blob_endpoints
+                        .iter()
+                        .map(|endpoint| BlobStoreEndpointV1 {
+                            locator_kind: endpoint.locator_kind.clone(),
+                            base_url: endpoint.base_url.clone(),
+                        }),
+                    true,
+                )
+                .map_err(AppError::InvalidEncryptedMedia)?;
+                Ok(AppEncryptedMediaPolicy {
+                    component_id: GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID,
+                    version: EncryptedMediaVersion::V1,
+                    allowed_locator_kinds: policy.allowed_locator_kinds,
+                    default_blob_endpoints: policy
+                        .default_blob_endpoints
+                        .into_iter()
+                        .map(|endpoint| AppBlobEndpoint {
+                            locator_kind: endpoint.locator_kind,
+                            base_url: endpoint.base_url,
+                        })
+                        .collect(),
+                })
+            }
+            GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID => {
+                let policy = EncryptedMediaPolicyV2::new(
+                    self.media_format.clone(),
+                    self.allowed_locator_kinds.clone(),
+                    self.default_blob_endpoints
+                        .iter()
+                        .map(|endpoint| BlobStoreEndpointV2 {
+                            locator_kind: endpoint.locator_kind.clone(),
+                            base_url: endpoint.base_url.clone(),
+                        }),
+                )
+                .map_err(AppError::InvalidEncryptedMedia)?;
+                Ok(AppEncryptedMediaPolicy {
+                    component_id: GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+                    version: EncryptedMediaVersion::V2,
+                    allowed_locator_kinds: policy.allowed_locator_kinds,
+                    default_blob_endpoints: policy
+                        .default_blob_endpoints
+                        .into_iter()
+                        .map(|endpoint| AppBlobEndpoint {
+                            locator_kind: endpoint.locator_kind,
+                            base_url: endpoint.base_url,
+                        })
+                        .collect(),
+                })
+            }
+            _ => Err(AppError::InvalidEncryptedMedia(
+                "group has an unsupported encrypted media component".into(),
+            )),
+        }
+    }
+}
+
+/// `image_key_hex`/`image_upload_key_hex` are key material; the hand-written
+/// `Debug` impl below redacts them.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub(crate) struct AppGroupImageInput {
+    pub(crate) image_hash_hex: String,
+    pub(crate) image_key_hex: String,
+    pub(crate) image_nonce_hex: String,
+    pub(crate) image_upload_key_hex: String,
+    pub(crate) media_type: Option<String>,
+}
+
+impl std::fmt::Debug for AppGroupImageInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppGroupImageInput")
+            .field("image_hash_hex", &self.image_hash_hex)
+            .field("image_key_hex", &"<redacted>")
+            .field("image_nonce_hex", &self.image_nonce_hex)
+            .field("image_upload_key_hex", &"<redacted>")
+            .field("media_type", &self.media_type)
+            .finish()
+    }
+}
+
+impl AppGroupImageInput {
+    /// Whether a usable image is present (matches the engine's all-or-nothing
+    /// validation: hash, key, nonce, and media type must all be set).
+    pub(crate) fn is_present(&self) -> bool {
+        !self.image_hash_hex.is_empty()
+            && !self.image_key_hex.is_empty()
+            && !self.image_nonce_hex.is_empty()
+            && self.media_type.is_some()
+    }
+
+    /// Decode the `marmot.group.blossom.image.v1` component wire format
+    /// (`encode_component_vectors([hash, key, nonce, upload_key, media_type])`).
+    /// Returns the default (absent) input when the component is empty.
+    pub(crate) fn from_component_bytes(bytes: &[u8]) -> Option<Self> {
+        let mut cursor = bytes;
+        let mut fields: Vec<Vec<u8>> = Vec::with_capacity(5);
+        for _ in 0..5 {
+            fields.push(read_component_vector(&mut cursor)?);
+        }
+        if !cursor.is_empty() {
+            return None;
+        }
+        let media_type = fields.pop().unwrap_or_default();
+        let media_type = if media_type.is_empty() {
+            None
+        } else {
+            Some(String::from_utf8(media_type).ok()?)
+        };
+        Some(Self {
+            image_hash_hex: hex::encode(&fields[0]),
+            image_key_hex: hex::encode(&fields[1]),
+            image_nonce_hex: hex::encode(&fields[2]),
+            image_upload_key_hex: hex::encode(&fields[3]),
+            media_type,
+        })
+    }
+}
+
+/// Read a single QUIC-varint-length-prefixed byte vector, advancing the cursor.
+fn read_component_vector(cursor: &mut &[u8]) -> Option<Vec<u8>> {
+    let (len, width) = decode_quic_varint(cursor).ok()?;
+    let len = len as usize;
+    let rest = cursor.get(width..)?;
+    if rest.len() < len {
+        return None;
+    }
+    let (head, tail) = rest.split_at(len);
+    *cursor = tail;
+    Some(head.to_vec())
+}
+
+pub(crate) struct EventGroupProjection<'a> {
+    pub(crate) nostr_routing: AppGroupNostrRoutingComponent,
+    pub(crate) group_metadata: Option<&'a Group>,
+    pub(crate) profile: AppGroupProfileComponent,
+    pub(crate) admin_policy: AppGroupAdminPolicyComponent,
+    pub(crate) message_retention: AppGroupMessageRetentionComponent,
+    pub(crate) agent_text_stream: AppAgentTextStreamComponent,
+    pub(crate) avatar_url: AppGroupAvatarUrlComponent,
+    pub(crate) encrypted_media: AppGroupEncryptedMediaComponent,
+    pub(crate) image: AppGroupImageInput,
+    /// Unix seconds when this projection was read. A route change it reveals
+    /// is recorded as replaced then.
+    pub(crate) observed_at_secs: u64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum GroupConfirmationProjection {
+    Preserve,
+    Accepted,
+    Welcome {
+        explicitly_confirmed: bool,
+        via_welcome_message_id_hex: String,
+        welcomer_account_id_hex: Option<String>,
+    },
+}
+
+/// Send-time preflight for admin actions. The engine stamps final authority
+/// from the authenticated source state when the event is encrypted.
+pub(crate) fn delete_moderation_grant(
+    group: &Group,
+    admins: &[[u8; 32]],
+    sender_hex: &str,
+) -> bool {
+    group
+        .members
+        .iter()
+        .any(|member| hex::encode(member.id.as_slice()) == sender_hex)
+        && admins.iter().any(|admin| hex::encode(admin) == sender_hex)
+}
+
+#[cfg(test)]
+mod delete_moderation_grant_tests {
+    use super::*;
+    use cgka_traits::group::Member;
+    use cgka_traits::types::{EpochId, MemberId};
+
+    fn group_with(name: &str, member_count: usize) -> Group {
+        Group {
+            id: GroupId::new(vec![1u8; 16]),
+            name: name.to_owned(),
+            description: String::new(),
+            epoch: EpochId(3),
+            members: (0..member_count)
+                .map(|index| Member {
+                    id: MemberId::new(vec![index as u8; 32]),
+                    credential: Vec::new(),
+                })
+                .collect(),
+            required_capabilities: Default::default(),
+            protocol_profile: cgka_traits::group::ProtocolProfile::Legacy,
+            removed: false,
+            unrecoverable: false,
+            disbanded: None,
+            join_epoch: EpochId(0),
+            local_copy_install_epoch: EpochId(0),
+            local_copy_welcome_created_at: None,
+        }
+    }
+
+    const ADMIN: [u8; 32] = [0u8; 32];
+
+    #[test]
+    fn admin_in_named_group_gets_grant() {
+        let group = group_with("ops", 3);
+        assert!(delete_moderation_grant(
+            &group,
+            &[ADMIN],
+            &hex::encode(ADMIN)
+        ));
+    }
+
+    #[test]
+    fn non_admin_sender_gets_no_grant() {
+        let group = group_with("ops", 3);
+        assert!(!delete_moderation_grant(
+            &group,
+            &[ADMIN],
+            &hex::encode([1u8; 32])
+        ));
+    }
+
+    #[test]
+    fn unnamed_pair_allows_admin_removal() {
+        let group = group_with("", 2);
+        assert!(delete_moderation_grant(
+            &group,
+            &[ADMIN],
+            &hex::encode(ADMIN)
+        ));
+        // Display names do not affect protocol authorization.
+        let group = group_with("  ", 2);
+        assert!(delete_moderation_grant(
+            &group,
+            &[ADMIN],
+            &hex::encode(ADMIN)
+        ));
+    }
+
+    #[test]
+    fn named_pair_allows_admin_removal() {
+        let group = group_with("pair", 2);
+        assert!(delete_moderation_grant(
+            &group,
+            &[ADMIN],
+            &hex::encode(ADMIN)
+        ));
+    }
+
+    #[test]
+    fn unnamed_larger_group_allows_admin_removal() {
+        let group = group_with("", 3);
+        assert!(delete_moderation_grant(
+            &group,
+            &[ADMIN],
+            &hex::encode(ADMIN)
+        ));
+    }
+
+    #[test]
+    fn admin_without_a_current_member_leaf_gets_no_grant() {
+        let group = group_with("ops", 3);
+        let departed_admin = [7u8; 32];
+        assert!(!delete_moderation_grant(
+            &group,
+            &[departed_admin],
+            &hex::encode(departed_admin)
+        ));
+    }
+
+    #[test]
+    fn multiple_devices_and_display_name_do_not_change_admin_authority() {
+        let mut group = group_with("\u{00a0}\u{2007}\u{3000}", 2);
+        group.members.push(group.members[0].clone());
+        assert!(delete_moderation_grant(
+            &group,
+            &[ADMIN],
+            &hex::encode(ADMIN)
+        ));
+        group.name = "pair".into();
+        assert!(delete_moderation_grant(
+            &group,
+            &[ADMIN],
+            &hex::encode(ADMIN)
+        ));
+    }
+
+    #[test]
+    fn empty_admin_set_grants_nothing() {
+        let group = group_with("ops", 3);
+        assert!(!delete_moderation_grant(&group, &[], &hex::encode(ADMIN)));
+    }
+}
+
+/// Strictly decode the inner Marmot app event from MLS plaintext and bind it to
+/// the MLS-authenticated sender. Returns `None` (rejecting the message) when the
+/// canonical id does not match or the inner `pubkey` is not the authenticated
+/// sender — both are integrity failures that must not reach the timeline.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_received_event(
+    payload: &[u8],
+    sender_hex: &str,
+    sender_display_name: Option<String>,
+    group_id: &GroupId,
+    source_epoch: u64,
+    retention: Option<crate::AppMessageRetentionDecision>,
+    source_message_id_hex: &str,
+    source_received_at: u64,
+    outer_transport_at: Option<u64>,
+    allow_loopback_http: bool,
+) -> Option<ReceivedMessage> {
+    let event = match MarmotInnerEvent::decode(payload) {
+        Ok(event) => event,
+        Err(_) => {
+            tracing::warn!(
+                target: "marmot_app::ingest",
+                method = "decode_received_event",
+                "rejecting MLS application message: inner app event failed strict decode",
+            );
+            return None;
+        }
+    };
+    if event.validate_sender(sender_hex).is_err() {
+        tracing::warn!(
+            target: "marmot_app::ingest",
+            method = "decode_received_event",
+            "rejecting MLS application message: inner author is not the authenticated sender",
+        );
+        return None;
+    }
+    if outer_transport_at.is_some_and(|outer| {
+        outer.abs_diff(event.created_at) > crate::TRANSPORT_CURSOR_MAX_FUTURE_SKEW.as_secs()
+    }) {
+        tracing::warn!(
+            target: "marmot_app::ingest",
+            method = "decode_received_event",
+            "outer transport timestamp differs materially from authenticated app timestamp",
+        );
+    }
+    // Inner tags are opaque application content except for the frozen
+    // encrypted-media validity rule. V1 made a malformed V1 reference fatal to
+    // its carrying message; V2 changed rejection to attachment-local. Preserve
+    // that version boundary instead of applying V2 behavior to legacy traffic.
+    if event.kind == MARMOT_APP_EVENT_KIND_CHAT
+        && !media_imeta_tags_preserve_message(&event.tags, allow_loopback_http)
+    {
+        tracing::warn!(
+            target: "marmot_app::ingest",
+            method = "decode_received_event",
+            "rejecting MLS application message: structurally invalid encrypted media V1 reference",
+        );
+        return None;
+    }
+    Some(ReceivedMessage {
+        authority: None,
+        message_id_hex: event.id,
+        source_message_id_hex: source_message_id_hex.to_owned(),
+        sender: sender_hex.to_owned(),
+        sender_display_name,
+        group_id: group_id.clone(),
+        source_epoch,
+        retention,
+        plaintext: event.content,
+        kind: event.kind,
+        tags: event.tags,
+        recorded_at: event.created_at,
+        received_at: source_received_at,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn observe_event(
+    state: &mut AccountState,
+    display_names: &HashMap<String, String>,
+    summary: &mut SyncSummary,
+    event: &GroupEvent,
+    group_projection: Option<&EventGroupProjection<'_>>,
+    source_message_id_hex: &str,
+    source_received_at: u64,
+    outer_transport_at: Option<u64>,
+    allow_loopback_http: bool,
+) -> Option<ReceivedMessage> {
+    match event {
+        GroupEvent::GroupJoined { group_id, .. } | GroupEvent::GroupCreated { group_id } => {
+            if let Some(projection) = group_projection {
+                add_group(
+                    state,
+                    group_id,
+                    projection,
+                    match event {
+                        GroupEvent::GroupCreated { .. } => GroupConfirmationProjection::Accepted,
+                        GroupEvent::GroupJoined {
+                            via_welcome,
+                            welcomer,
+                            explicitly_confirmed,
+                            ..
+                        } => GroupConfirmationProjection::Welcome {
+                            explicitly_confirmed: *explicitly_confirmed,
+                            via_welcome_message_id_hex: hex::encode(via_welcome.as_slice()),
+                            welcomer_account_id_hex: welcomer
+                                .as_ref()
+                                .map(|member_id| hex::encode(member_id.as_slice())),
+                        },
+                        _ => GroupConfirmationProjection::Preserve,
+                    },
+                );
+            }
+            summary.joined_groups.push(group_id.clone());
+            summary.events.push(event.clone());
+            None
+        }
+        GroupEvent::MessageReceived {
+            group_id,
+            sender,
+            epoch,
+            payload,
+            retention,
+            authority,
+            ..
+        } => {
+            if let Some(projection) = group_projection {
+                add_group(
+                    state,
+                    group_id,
+                    projection,
+                    GroupConfirmationProjection::Preserve,
+                );
+            }
+            let sender_hex = hex::encode(sender.as_slice());
+            let sender_display_name = display_names.get(&sender_hex).cloned();
+            // The MLS layer authenticated `sender`; the inner Nostr-shaped event
+            // must (1) carry a valid canonical id and (2) name `sender` as its
+            // author. Reject anything that fails either check rather than
+            // rendering an unauthenticated or tampered payload. Media reference
+            // structure is checked inside `decode_received_event` only to retain
+            // frozen V1's message-fatal rule. V2 rejection is attachment-local,
+            // and locator-kind policy gates fetchability at download time rather
+            // than delivery.
+            let Some(mut message) = decode_received_event(
+                payload,
+                &sender_hex,
+                sender_display_name,
+                group_id,
+                epoch.0,
+                *retention,
+                source_message_id_hex,
+                source_received_at,
+                outer_transport_at,
+                allow_loopback_http,
+            ) else {
+                summary.events.push(event.clone());
+                return None;
+            };
+            message.authority = *authority;
+            // Gossip remains available to native ingestion, but must never enter
+            // the host message summary, including a partially applied batch.
+            if !crate::notifications::is_push_gossip_kind(message.kind) {
+                summary.messages.push(message.clone());
+            }
+            summary.events.push(event.clone());
+            Some(message)
+        }
+        _ => {
+            if let (Some(group_id), Some(projection)) = (event_group_id(event), group_projection) {
+                add_group(
+                    state,
+                    group_id,
+                    projection,
+                    GroupConfirmationProjection::Preserve,
+                );
+            }
+            summary.events.push(event.clone());
+            None
+        }
+    }
+}
+
+pub(crate) fn event_group_id(event: &GroupEvent) -> Option<&GroupId> {
+    match event {
+        GroupEvent::LocalGroupCopyTerminated { group_id, .. }
+        | GroupEvent::LocalGroupCopyRestored { group_id }
+        | GroupEvent::GroupMemberLeavesRemoved { group_id, .. }
+        | GroupEvent::GroupCreated { group_id }
+        | GroupEvent::GroupJoined { group_id, .. }
+        | GroupEvent::TransportObjectResourceRefused { group_id, .. }
+        | GroupEvent::MessageReceived { group_id, .. }
+        | GroupEvent::AppMessageInvalidated { group_id, .. }
+        | GroupEvent::GroupStateChanged { group_id, .. }
+        | GroupEvent::EpochChanged { group_id, .. }
+        | GroupEvent::CommitRolledBack { group_id, .. }
+        | GroupEvent::GroupStateInvalidated { group_id, .. }
+        | GroupEvent::GroupStateRevalidated { group_id, .. }
+        | GroupEvent::GroupUnrecoverable { group_id, .. }
+        | GroupEvent::PendingCommitRecovered { group_id, .. }
+        | GroupEvent::GroupHydrationQuarantined { group_id, .. }
+        | GroupEvent::GroupHydrationRecovered { group_id, .. } => Some(group_id),
+    }
+}
+
+pub(crate) fn add_group(
+    state: &mut AccountState,
+    group_id: &GroupId,
+    projection: &EventGroupProjection<'_>,
+    confirmation: GroupConfirmationProjection,
+) {
+    let group_id_hex = hex::encode(group_id.as_slice());
+    if let Some(existing) = state
+        .groups
+        .iter_mut()
+        .find(|group| group.group_id_hex == group_id_hex)
+    {
+        existing.refresh_from_group(projection);
+        existing.apply_confirmation_state(confirmation);
+        return;
+    }
+    let mut group = AppGroupRecord::from_group(
+        group_id,
+        projection.nostr_routing.clone(),
+        projection.group_metadata,
+        projection.admin_policy.clone(),
+        projection.message_retention.clone(),
+        projection.agent_text_stream.clone(),
+        projection.avatar_url.clone(),
+        projection.encrypted_media.clone(),
+        projection.image.clone(),
+    );
+    group.profile = projection.profile.clone();
+    if let Some(metadata) = projection.group_metadata {
+        group.set_direct_member_ids_from_roster(&metadata.members);
+    }
+    group.apply_confirmation_state(confirmation);
+    state.groups.push(group);
+}
+
+/// Decide whether per-endpoint publish failures should abort an app-layer
+/// operation, gated on how the underlying MLS pending state resolved.
+///
+/// A `PublishFailure` lands in `effects.failures` whenever an outbound message
+/// fails to reach the required acknowledgement count. On its own that is *not*
+/// enough to know whether the operation succeeded: the runtime confirms a
+/// create/commit once it is durably live (e.g. a create whose commit is at
+/// epoch 1 with at least one welcome exposed), even if some welcomes or relays
+/// were unreached. Dropping the local app projection in that case strands the
+/// creator with a confirmed MLS group its own UI never recorded, while invitees
+/// who did receive a welcome see a real group (mdk#428).
+///
+/// Resolution semantics:
+/// - no failures: success.
+/// - any pending `RolledBack`: the commit/create was reverted at the MLS layer,
+///   so the publish failure is a genuine hard error the caller must see.
+/// - any pending `Confirmed` (and none rolled back): confirmed-but-partial. The
+///   operation is live at its new epoch; unreached endpoints are recoverable
+///   "ghost member" conditions. Keep the local projection (caller still runs
+///   `add_group` / `save_state`) and surface a soft warning only.
+/// - a canonical founding create has an immediate `GroupCreated` event and no
+///   pending resolution. If every flat publish failure is paired with a
+///   structured Welcome failure, the group itself succeeded and only its
+///   independently retryable Welcome deliveries remain outstanding.
+/// - failures with no pending resolution at all (e.g. a plain application
+///   message or proposal publish that never landed): hard error, as before.
+///
+/// Call this from
+/// `AppClient::observe_recovery_evidence_then_fail_if_publish_failed` rather
+/// than directly. Gating an effects batch without first observing its
+/// epoch-gap recovery evidence drops any one-shot
+/// `TransportObjectResourceRefused` the batch carries, and any `EpochChanged`
+/// passage that would have ended a stall run; the seams that already observe
+/// explicitly are the only exception.
+pub(crate) fn fail_if_publish_failed(
+    effects: &marmot_account::AccountDeviceEffects,
+) -> Result<(), AppError> {
+    if effects.failures.is_empty() {
+        return Ok(());
+    }
+
+    let mut any_confirmed = false;
+    let mut any_rolled_back = false;
+    for resolution in &effects.pending {
+        match resolution {
+            marmot_account::PendingResolution::Confirmed { .. } => any_confirmed = true,
+            marmot_account::PendingResolution::RolledBack { .. } => any_rolled_back = true,
+        }
+    }
+
+    if any_rolled_back {
+        return Err(publish_failure_error(&effects.failures));
+    }
+
+    if any_confirmed {
+        tracing::warn!(
+            target: "marmot_app",
+            method = "fail_if_publish_failed",
+            failures = effects.failures.len(),
+            "publish reached insufficient endpoints but pending state confirmed; \
+             treating unreached endpoints as recoverable and keeping local projection"
+        );
+        return Ok(());
+    }
+
+    let canonical_create_with_only_welcome_failures = effects
+        .events
+        .iter()
+        .any(|event| matches!(event, GroupEvent::GroupCreated { .. }))
+        && !effects.welcome_failures.is_empty()
+        && effects.failures.iter().all(|failure| {
+            effects
+                .welcome_failures
+                .iter()
+                .any(|welcome| welcome.message_id == failure.message_id)
+        });
+    if canonical_create_with_only_welcome_failures {
+        tracing::warn!(
+            target: "marmot_app",
+            method = "fail_if_publish_failed",
+            failures = effects.failures.len(),
+            "founding group is canonical but one or more Welcome deliveries remain pending"
+        );
+        return Ok(());
+    }
+
+    Err(publish_failure_error(&effects.failures))
+}
+
+pub(crate) fn publish_failure_error(failures: &[marmot_account::PublishFailure]) -> AppError {
+    AppError::Publish(
+        failures
+            .iter()
+            .map(|failure| failure.reason.as_str())
+            .collect::<Vec<_>>()
+            .join("; "),
+    )
+}
+
+pub(crate) fn send_summary_from_effects(
+    effects: &marmot_account::AccountDeviceEffects,
+) -> SendSummary {
+    SendSummary {
+        published: effects
+            .reports
+            .iter()
+            .filter(|report| report.accepted_count() > 0)
+            .count(),
+        message_ids: effects
+            .reports
+            .iter()
+            .filter(|report| report.accepted_count() > 0)
+            .map(|report| hex::encode(report.message_id.as_slice()))
+            .collect(),
+        accept_disposition: accept_disposition_from_effects(effects),
+        maintenance_disposition: effects.maintenance_disposition,
+    }
+}
+
+/// Whether a group-state send pass was published or retained (mdk#1177).
+///
+/// Any retained intent makes the pass accepted-pending. These callers send
+/// group-state intents, which the engine only queues as a whole — it never
+/// splits one into a published and a retained half — so a non-empty queue is
+/// this send's own outcome.
+///
+/// The application-message path deliberately does not use this: it has a
+/// per-message answer in `effects.published_app_messages` and reports that,
+/// because one pass can publish unrelated work alongside a retained message.
+pub(crate) fn accept_disposition_from_effects(
+    effects: &marmot_account::AccountDeviceEffects,
+) -> cgka_traits::SendAcceptDisposition {
+    if effects
+        .reports
+        .iter()
+        .any(|report| report.accepted_count() > 0)
+    {
+        cgka_traits::SendAcceptDisposition::Published
+    } else if !effects.unresolved_publishes.is_empty() {
+        cgka_traits::SendAcceptDisposition::CompletionUnknown
+    } else if effects.queued.is_empty() {
+        cgka_traits::SendAcceptDisposition::Published
+    } else {
+        cgka_traits::SendAcceptDisposition::AcceptedPending
+    }
+}
+
+pub(crate) fn validate_group_profile(name: &str, description: &str) -> Result<(), AppError> {
+    if name.len() > 256 {
+        return Err(AppError::InvalidGroupProfile(
+            "name must be at most 256 UTF-8 bytes".into(),
+        ));
+    }
+    if description.len() > 4096 {
+        return Err(AppError::InvalidGroupProfile(
+            "description must be at most 4096 UTF-8 bytes".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn role_names(mask: u8) -> Vec<String> {
+    let mut roles = Vec::new();
+    if mask & AGENT_TEXT_STREAM_ROLE_RECEIVE != 0 {
+        roles.push("receive".to_owned());
+    }
+    if mask & AGENT_TEXT_STREAM_ROLE_SEND != 0 {
+        roles.push("send".to_owned());
+    }
+    if mask & AGENT_TEXT_STREAM_ROLE_FANOUT != 0 {
+        roles.push("fanout".to_owned());
+    }
+    roles
+}
+
+#[cfg(test)]
+mod avatar_url_tests {
+    use super::*;
+
+    #[test]
+    fn avatar_url_component_round_trips_through_bytes() {
+        let component = AppGroupAvatarUrlComponent::new(
+            "https://cdn.example.com/a.png".to_owned(),
+            Some("512x512".to_owned()),
+            Some("thumbhash-bytes".to_owned()),
+        )
+        .unwrap();
+        assert!(component.present);
+
+        let data = component.to_app_component_data().unwrap();
+        let decoded = AppGroupAvatarUrlComponent::from_bytes(&data.data);
+        assert_eq!(decoded, component);
+        assert_eq!(decoded.url, "https://cdn.example.com/a.png");
+        assert_eq!(decoded.dim.as_deref(), Some("512x512"));
+        assert_eq!(decoded.thumbhash.as_deref(), Some("thumbhash-bytes"));
+    }
+
+    #[test]
+    fn absent_avatar_round_trips_and_is_engine_valid_bytes() {
+        let absent = AppGroupAvatarUrlComponent::absent();
+        assert!(!absent.present);
+        // Clearing the avatar must produce non-empty, decodable bytes.
+        let data = absent.to_app_component_data().unwrap();
+        assert!(!data.data.is_empty());
+        assert!(!AppGroupAvatarUrlComponent::from_bytes(&data.data).present);
+    }
+
+    #[test]
+    fn non_https_avatar_url_is_rejected() {
+        let err =
+            AppGroupAvatarUrlComponent::new("http://cdn.example.com/a.png".to_owned(), None, None)
+                .unwrap_err();
+        assert!(matches!(err, AppError::InvalidGroupAvatarUrl(_)));
+    }
+}
+
+#[cfg(test)]
+mod confirmation_state_tests {
+    use super::*;
+
+    fn test_record() -> AppGroupRecord {
+        let routing = AppGroupNostrRoutingComponent::new(NostrRoutingV1 {
+            nostr_group_id: [0u8; 32],
+            relays: vec!["wss://relay.example.com".to_owned()],
+        })
+        .expect("routing component");
+        AppGroupRecord::new(
+            hex::encode([1u8; 32]),
+            routing,
+            "group".to_owned(),
+            "desc".to_owned(),
+            AppGroupImageInput::default(),
+            AppGroupAdminPolicyComponent::new(Vec::new()),
+            AppGroupMessageRetentionComponent::disabled(),
+        )
+    }
+
+    fn pending(via_welcome: &str, welcomer: Option<&str>) -> GroupConfirmationProjection {
+        GroupConfirmationProjection::Welcome {
+            explicitly_confirmed: false,
+            via_welcome_message_id_hex: via_welcome.to_owned(),
+            welcomer_account_id_hex: welcomer.map(str::to_owned),
+        }
+    }
+
+    // A genuine re-invite (a new GroupJoined carrying a *different* welcome id)
+    // after the user accepted must re-surface the group as pending and record
+    // the new welcome/welcomer. Regression test for mdk#184.
+    #[test]
+    fn reinvite_after_accept_resurfaces_as_pending() {
+        let mut record = test_record();
+
+        record.apply_confirmation_state(pending("welcome-1", Some("welcomer-1")));
+        assert!(record.pending_confirmation);
+
+        // User accepts: pending cleared, welcome id retained.
+        record.apply_confirmation_state(GroupConfirmationProjection::Accepted);
+        assert!(!record.pending_confirmation);
+        assert_eq!(
+            record.via_welcome_message_id_hex.as_deref(),
+            Some("welcome-1")
+        );
+
+        // Genuine re-invite: a different welcome id must re-mark pending and
+        // update the recorded welcome/welcomer fields.
+        record.apply_confirmation_state(pending("welcome-2", Some("welcomer-2")));
+        assert!(record.pending_confirmation);
+        assert!(!record.archived);
+        assert_eq!(
+            record.via_welcome_message_id_hex.as_deref(),
+            Some("welcome-2")
+        );
+        assert_eq!(
+            record.welcomer_account_id_hex.as_deref(),
+            Some("welcomer-2")
+        );
+    }
+
+    // A new invitation is pending but does not restore explicit archive intent.
+    #[test]
+    fn reinvite_after_decline_preserves_archive_until_supported_rejoin() {
+        let mut record = test_record();
+        record.apply_confirmation_state(pending("welcome-1", None));
+
+        // Simulate decline: leave + archive, pending cleared, welcome retained.
+        record.pending_confirmation = false;
+        record.archived = true;
+
+        record.apply_confirmation_state(pending("welcome-2", Some("welcomer-2")));
+        assert!(record.pending_confirmation);
+        assert!(record.archived);
+        assert_eq!(
+            record.via_welcome_message_id_hex.as_deref(),
+            Some("welcome-2")
+        );
+        assert_eq!(
+            record.welcomer_account_id_hex.as_deref(),
+            Some("welcomer-2")
+        );
+    }
+
+    #[test]
+    fn acceptance_preserves_archive_and_consented_rejoin_restores_once() {
+        let mut record = test_record();
+        record.apply_confirmation_state(pending("old", None));
+        record.archived = true;
+        record.apply_confirmation_state(GroupConfirmationProjection::Accepted);
+        assert!(record.archived);
+        assert!(!record.pending_confirmation);
+        let rejoin = GroupConfirmationProjection::Welcome {
+            explicitly_confirmed: true,
+            via_welcome_message_id_hex: "new".into(),
+            welcomer_account_id_hex: None,
+        };
+        record.apply_confirmation_state(rejoin.clone());
+        assert!(!record.archived);
+        assert!(!record.pending_confirmation);
+        record.archived = true;
+        record.apply_confirmation_state(rejoin);
+        assert!(record.archived, "replayed join cannot undo a later archive");
+    }
+
+    // A true replay (same welcome id on an already-resolved group) must NOT
+    // re-mark pending — otherwise an accepted/declined group would bounce back
+    // to the invite list on every redelivered GroupJoined.
+    #[test]
+    fn replay_same_welcome_id_does_not_resurface() {
+        let mut record = test_record();
+        record.apply_confirmation_state(pending("welcome-1", Some("welcomer-1")));
+        record.apply_confirmation_state(GroupConfirmationProjection::Accepted);
+        assert!(!record.pending_confirmation);
+
+        // Redelivery of the same welcome id is a replay: stay resolved.
+        record.apply_confirmation_state(pending("welcome-1", Some("welcomer-1")));
+        assert!(!record.pending_confirmation);
+        assert_eq!(
+            record.via_welcome_message_id_hex.as_deref(),
+            Some("welcome-1")
+        );
+    }
+
+    // While a group is still pending, a redelivered welcome (same or different
+    // id) keeps it pending and refreshes the welcome metadata.
+    #[test]
+    fn pending_record_keeps_pending_on_redelivery() {
+        let mut record = test_record();
+        record.apply_confirmation_state(pending("welcome-1", Some("welcomer-1")));
+        assert!(record.pending_confirmation);
+
+        record.apply_confirmation_state(pending("welcome-2", Some("welcomer-2")));
+        assert!(record.pending_confirmation);
+        assert_eq!(
+            record.via_welcome_message_id_hex.as_deref(),
+            Some("welcome-2")
+        );
+    }
+}
+
+#[cfg(test)]
+mod inner_tag_tests {
+    use super::*;
+
+    fn decode_with_tags(tags: Vec<Vec<String>>) -> Option<ReceivedMessage> {
+        let pubkey = "aa".repeat(32);
+        let event =
+            MarmotInnerEvent::new(pubkey.clone(), 1, MARMOT_APP_EVENT_KIND_CHAT, tags, "hi");
+        let payload = event.encode().unwrap();
+        decode_received_event(
+            &payload,
+            &pubkey,
+            None,
+            &GroupId::new(vec![0x01; 32]),
+            1,
+            None,
+            &"00".repeat(32),
+            0,
+            None,
+            false,
+        )
+    }
+
+    // `h`/`p`/`relays`/`expiration` were the old "transport routing tag" denylist;
+    // on the inner event they are application content and must pass through.
+    #[test]
+    fn inner_tags_are_not_policed() {
+        for name in ["h", "p", "relays", "expiration", "e", "k"] {
+            assert!(
+                decode_with_tags(vec![vec![name.to_string(), "ab".repeat(32)]]).is_some(),
+                "inner tag {name} must pass through as application content"
+            );
+        }
+    }
+
+    // Accepted tags reach the app projection intact (e.g. a NIP-25 reaction's `e`
+    // target and `p` author), not just survive decode.
+    #[test]
+    fn decoded_event_preserves_tags() {
+        let message = decode_with_tags(vec![
+            vec!["p".to_string(), "ab".repeat(32)],
+            vec!["e".to_string(), "cd".repeat(32)],
+        ])
+        .expect("event with inner tags is accepted");
+        assert_eq!(
+            message.tags,
+            vec![
+                vec!["p".to_string(), "ab".repeat(32)],
+                vec!["e".to_string(), "cd".repeat(32)],
+            ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod fail_if_publish_failed_tests {
+    use super::*;
+    use cgka_traits::engine_state::PendingStateRef;
+    use cgka_traits::{
+        GroupId, MemberId, MessageId, TransportEndpoint, TransportEndpointReceipt,
+        TransportPublishReport,
+    };
+    use marmot_account::{
+        AccountDeviceEffects, PendingResolution, PublishFailure, UnresolvedPublish,
+        UnresolvedPublishReason, WelcomeDeliveryFailure,
+    };
+
+    fn failure(reason: &str) -> PublishFailure {
+        PublishFailure {
+            message_id: MessageId::new(vec![0xab; 32]),
+            reason: reason.to_owned(),
+        }
+    }
+
+    fn pending_ref() -> PendingStateRef {
+        PendingStateRef::new(7)
+    }
+
+    #[test]
+    fn no_failures_is_ok() {
+        let effects = AccountDeviceEffects::default();
+        assert!(fail_if_publish_failed(&effects).is_ok());
+    }
+
+    #[test]
+    fn unresolved_publish_is_non_failure_with_typed_completion_unknown_disposition() {
+        let mut effects = AccountDeviceEffects::default();
+        effects.unresolved_publishes.push(UnresolvedPublish {
+            message_id: MessageId::new(vec![0xac; 32]),
+            reason: UnresolvedPublishReason::AcknowledgementUnknown,
+        });
+
+        assert!(fail_if_publish_failed(&effects).is_ok());
+        assert_eq!(
+            accept_disposition_from_effects(&effects),
+            cgka_traits::SendAcceptDisposition::CompletionUnknown
+        );
+    }
+
+    #[test]
+    fn accepted_report_is_published_even_when_sibling_fanout_remains_unresolved() {
+        let mut effects = AccountDeviceEffects::default();
+        let message_id = MessageId::new(vec![0xad; 32]);
+        effects.reports.push(TransportPublishReport {
+            message_id: message_id.clone(),
+            accepted: vec![TransportEndpointReceipt {
+                endpoint: TransportEndpoint("wss://accepted.example".into()),
+                accepted_at: None,
+                ack_kind: None,
+            }],
+            failed: Vec::new(),
+            required_acks: 1,
+        });
+        effects.unresolved_publishes.push(UnresolvedPublish {
+            message_id,
+            reason: UnresolvedPublishReason::AcknowledgementUnknown,
+        });
+
+        assert_eq!(
+            accept_disposition_from_effects(&effects),
+            cgka_traits::SendAcceptDisposition::Published
+        );
+    }
+
+    // mdk#428: a confirmed-but-partial create/commit (pending Confirmed,
+    // welcomes/relays unreached) must NOT abort the app-layer projection. The
+    // group is live at its new epoch; unreached endpoints are recoverable.
+    #[test]
+    fn confirmed_partial_publish_is_soft_pass() {
+        let mut effects = AccountDeviceEffects::default();
+        effects
+            .failures
+            .push(failure("insufficient publish acknowledgements"));
+        effects.pending.push(PendingResolution::Confirmed {
+            pending: pending_ref(),
+        });
+        assert!(
+            fail_if_publish_failed(&effects).is_ok(),
+            "confirmed-but-partial create must keep the local projection (mdk#428)"
+        );
+    }
+
+    // A rolled-back pending means the commit/create was reverted at the MLS
+    // layer, so the publish failure is a genuine hard error.
+    #[test]
+    fn rolled_back_publish_is_hard_error() {
+        let mut effects = AccountDeviceEffects::default();
+        effects
+            .failures
+            .push(failure("insufficient publish acknowledgements"));
+        effects.pending.push(PendingResolution::RolledBack {
+            pending: pending_ref(),
+        });
+        let err = fail_if_publish_failed(&effects).unwrap_err();
+        assert!(matches!(err, AppError::Publish(_)));
+    }
+
+    // A plain application-message/proposal publish carries no pending
+    // resolution; a failure there means the message never landed, so it stays a
+    // hard error (preserves pre-#428 behavior).
+    #[test]
+    fn failure_without_pending_is_hard_error() {
+        let mut effects = AccountDeviceEffects::default();
+        effects.failures.push(failure("relay rejected"));
+        let err = fail_if_publish_failed(&effects).unwrap_err();
+        assert!(matches!(err, AppError::Publish(_)));
+    }
+
+    #[test]
+    fn canonical_founding_create_with_only_welcome_failures_is_soft_pass() {
+        let mut effects = AccountDeviceEffects::default();
+        let publish_failure = failure("welcome inbox unavailable");
+        effects.failures.push(publish_failure.clone());
+        effects.events.push(GroupEvent::GroupCreated {
+            group_id: GroupId::new(vec![0xcd; 16]),
+        });
+        effects.welcome_failures.push(WelcomeDeliveryFailure {
+            message_id: publish_failure.message_id,
+            recipient: MemberId::new(vec![0xef; 32]),
+            group_id: Some(GroupId::new(vec![0xcd; 16])),
+            reason: publish_failure.reason,
+        });
+
+        assert!(
+            fail_if_publish_failed(&effects).is_ok(),
+            "canonical group creation must not be reported as failed solely because a Welcome is pending"
+        );
+    }
+
+    #[test]
+    fn group_created_event_does_not_soften_an_unrelated_publish_failure() {
+        let mut effects = AccountDeviceEffects::default();
+        effects.failures.push(failure("unrelated publish failed"));
+        effects.events.push(GroupEvent::GroupCreated {
+            group_id: GroupId::new(vec![0xcd; 16]),
+        });
+        effects.welcome_failures.push(WelcomeDeliveryFailure {
+            message_id: MessageId::new(vec![0x11; 32]),
+            recipient: MemberId::new(vec![0xef; 32]),
+            group_id: Some(GroupId::new(vec![0xcd; 16])),
+            reason: "different Welcome".into(),
+        });
+
+        assert!(matches!(
+            fail_if_publish_failed(&effects),
+            Err(AppError::Publish(_))
+        ));
+    }
+
+    // A mixed resolution where any pending rolled back must hard-fail even if
+    // another pending confirmed: a reverted commit is not recoverable.
+    #[test]
+    fn rolled_back_dominates_confirmed() {
+        let mut effects = AccountDeviceEffects::default();
+        effects.failures.push(failure("insufficient acks"));
+        effects.pending.push(PendingResolution::Confirmed {
+            pending: PendingStateRef::new(1),
+        });
+        effects.pending.push(PendingResolution::RolledBack {
+            pending: PendingStateRef::new(2),
+        });
+        let err = fail_if_publish_failed(&effects).unwrap_err();
+        assert!(matches!(err, AppError::Publish(_)));
+    }
+
+    // The hard-error message joins all failure reasons, unchanged from the
+    // original contract.
+    #[test]
+    fn hard_error_joins_all_failure_reasons() {
+        let mut effects = AccountDeviceEffects::default();
+        effects.failures.push(failure("reason-a"));
+        effects.failures.push(failure("reason-b"));
+        match fail_if_publish_failed(&effects).unwrap_err() {
+            AppError::Publish(msg) => assert_eq!(msg, "reason-a; reason-b"),
+            other => panic!("expected AppError::Publish, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod group_roster_api_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    use cgka_traits::NostrRoutingV1;
+
+    fn test_record() -> AppGroupRecord {
+        let routing = AppGroupNostrRoutingComponent::new(NostrRoutingV1 {
+            nostr_group_id: [0u8; 32],
+            relays: vec!["wss://relay.example.com".to_owned()],
+        })
+        .expect("routing component");
+        AppGroupRecord::new(
+            hex::encode([1u8; 16]),
+            routing,
+            "group".to_owned(),
+            String::new(),
+            AppGroupImageInput::default(),
+            AppGroupAdminPolicyComponent::new(Vec::new()),
+            AppGroupMessageRetentionComponent::disabled(),
+        )
+    }
+
+    #[test]
+    fn app_group_roster_carries_self_membership_and_epoch_revision() {
+        let mut record = test_record();
+        record.self_membership = SelfMembership::Removed;
+        let self_id = "aa4fc8665f5696e33db7e1a572e3b0f5b3d615837b0f362dcb1c8068b098c7b4";
+        let self_id_bytes = hex::decode(self_id)
+            .expect("self id hex")
+            .try_into()
+            .expect("32-byte self id");
+        record.admin_policy = AppGroupAdminPolicyComponent::new(vec![self_id_bytes]);
+        let members = vec![AppGroupMemberRecord {
+            member_id_hex: self_id.to_owned(),
+            account: Some("alice".to_owned()),
+            local: true,
+        }];
+        let mls_state = AppGroupMlsState {
+            group_id_hex: record.group_id_hex.clone(),
+            protocol_profile: AppProtocolProfile::Current,
+            lifecycle_state: AppGroupLifecycleState::Stable,
+            epoch: 7,
+            member_count: 1,
+            unrecoverable: false,
+            required_app_components: Vec::new(),
+            disbanding_enabled: false,
+            disbanding: false,
+            disbanding_blockers: Vec::new(),
+            disband_request: None,
+        };
+        let roster = app_group_roster_from_session(
+            AppGroupRosterSession {
+                group_record: record,
+                members,
+                mls_state,
+            },
+            self_id,
+            HashMap::from([(self_id.to_owned(), "Alice".to_owned())]),
+        );
+        assert_eq!(roster.epoch, 7);
+        assert_eq!(roster.roster_revision, 23);
+        assert_eq!(roster.self_membership, SelfMembership::Removed);
+        assert_eq!(roster.member_count, 1);
+        assert_eq!(roster.lifecycle_state, AppGroupLifecycleState::Stable);
+        assert_eq!(roster.members.len(), 1);
+        assert!(roster.members[0].is_admin);
+        assert!(roster.members[0].is_self);
+        assert_eq!(roster.members[0].display_name.as_deref(), Some("Alice"));
+    }
+}

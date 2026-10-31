@@ -1,4 +1,4 @@
-//! Owner-confirmed, worker-only updates through pinned ngit release records.
+//! Owner-confirmed executable updates through pinned ngit release records.
 use crate::{
     bridge::{Bridge, now},
     state,
@@ -23,7 +23,9 @@ pub struct Release {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Offer {
-    pub release: Release,
+    pub release: Option<Release>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub handover: bool,
     pub code: String,
     pub expires_at: u64,
 }
@@ -46,6 +48,8 @@ pub fn info() -> Result<Value> {
     let connector: toml::Value = toml::from_str(include_str!("../connector.toml"))?;
     Ok(json!({
         "version":env!("CARGO_PKG_VERSION"), "state_version":1,
+        "runtimes":["external-connector", "embedded-mdk"],
+        "storage_cohort":connector["storage_cohort"].as_str().ok_or_else(|| anyhow::anyhow!("Missing messaging storage cohort"))?,
         "protocol":crate::wire::PROTOCOL,
         "connector":{"version":connector["version"].as_str(), "revision":connector["revision"].as_str(),
             "patch_sha256":hex::encode(Sha256::digest(include_bytes!("../patches/mdk-codr.patch")))}
@@ -57,6 +61,8 @@ fn tools(directory: &Path) -> Result<()> {
         ("update.py", include_str!("../scripts/update.py")),
         ("install.py", include_str!("../scripts/install.py")),
         ("services.py", include_str!("../scripts/services.py")),
+        ("handover.py", include_str!("../scripts/handover.py")),
+        ("codr.service", include_str!("../systemd/codr.service")),
     ] {
         use std::{io::Write, os::unix::fs::OpenOptionsExt};
         let mut file = std::fs::OpenOptions::new()
@@ -128,17 +134,49 @@ pub fn store_offer(
     );
     let before = bridge.state.clone();
     let code = uuid::Uuid::new_v4().simple().to_string()[..10].to_string();
+    let scope = if bridge.update_messaging_home.is_some() {
+        "The complete combined bridge and messaging executable will update together. Accounts, chats and accepted work stay in place; coding agents are not restarted."
+    } else {
+        "Only the bridge worker will update. Accounts, chats and accepted work stay in place; coding agents and the external connector are not restarted."
+    };
     let message = format!(
-        "codr {} → {}\nSource: the maintainer's ngit release, downloaded from Blossom.\nOnly the bridge worker will update. Accounts, chats and accepted work stay in place; coding agents and the connector are not restarted.\n\nConfirm within 10 minutes:\n/update confirm {code}\n\nOr /update cancel. A connector or storage-cohort change requires local setup.",
+        "codr {} → {}\nSource: the maintainer's ngit release, downloaded from Blossom.\n{scope}\n\nConfirm within 10 minutes:\n/update confirm\n\nOr /update cancel. A storage-cohort or service-layout change requires local setup.",
         env!("CARGO_PKG_VERSION"),
         release.version
     );
     bridge.state.mappings.get_mut(key).unwrap().update_offer = Some(Offer {
-        release,
+        release: Some(release),
+        handover: false,
         code,
         expires_at: now().saturating_add(600),
     });
     if let Err(error) = reply(bridge, key, group, id, "offer", &message) {
+        bridge.state = before;
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn store_handover_offer(bridge: &mut Bridge, key: &str, group: &str, id: &str) -> Result<()> {
+    ensure!(
+        bridge.state.mappings[key].group_id_hex.as_deref() == Some(group),
+        "Update chat changed"
+    );
+    let before = bridge.state.clone();
+    bridge.state.mappings.get_mut(key).unwrap().update_offer = Some(Offer {
+        release: None,
+        handover: true,
+        code: uuid::Uuid::new_v4().simple().to_string()[..10].to_string(),
+        expires_at: now().saturating_add(600),
+    });
+    if let Err(error) = reply(
+        bridge,
+        key,
+        group,
+        id,
+        "offer",
+        "Finish the combined codr upgrade using the already installed executable. No release download is needed.\n\nThis will stop the old bridge and messaging services, verify a private cold backup of account credentials, chat state and service files, then start one combined service. Coding agents are not restarted. Unsupported layouts or storage changes are refused before stopping anything.\n\nConfirm within 10 minutes:\n/update confirm\n\nOr /update cancel.",
+    ) {
         bridge.state = before;
         return Err(error);
     }
@@ -198,10 +236,23 @@ pub fn prepare(
         ensure!(parts.len() == 3, "Invalid update version");
         Ok(parts)
     };
-    ensure!(
-        numeric(&offer.release.version)? > numeric(env!("CARGO_PKG_VERSION"))?,
-        "This release is no longer newer than the running bridge. Send /update again"
-    );
+    let version = if offer.handover {
+        ensure!(
+            offer.release.is_none() && bridge.update_messaging_home.is_none(),
+            "This handover is no longer applicable"
+        );
+        env!("CARGO_PKG_VERSION").to_string()
+    } else {
+        let release = offer
+            .release
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Missing update release"))?;
+        ensure!(
+            numeric(&release.version)? > numeric(env!("CARGO_PKG_VERSION"))?,
+            "This release is no longer newer than the running bridge. Send /update again"
+        );
+        release.version.clone()
+    };
     let config = bridge
         .update_config_path
         .as_ref()
@@ -217,7 +268,7 @@ pub fn prepare(
             .unwrap()
             .to_string_lossy()
             .into_owned(),
-        version: offer.release.version.clone(),
+        version,
         group: group.into(),
     };
     let binary = std::env::current_exe()?;
@@ -225,8 +276,13 @@ pub fn prepare(
         &temporary.path().join("request.json"),
         &json!({
         "job_id":job.id, "release":offer.release, "info":info()?, "pid":std::process::id(),
+            "action":if offer.handover {"handover"} else {"install"},
             "installed_path":binary, "base_sha256":hex::encode(Sha256::digest(std::fs::read(&binary)?)),
             "config_path":config, "state_path":bridge.config.state_path,
+            "service":if bridge.update_messaging_home.is_some() {
+                std::env::var("CODR_SERVICE_NAME").unwrap_or_else(|_| "codr".into())
+            } else {"herdr-white-noise-bridge".into()},
+            "messaging_home":bridge.update_messaging_home,
         }),
     )?;
     let before = bridge.state.clone();
@@ -238,7 +294,11 @@ pub fn prepare(
         group,
         id,
         "confirmed",
-        "Update confirmed. Verifying the ngit release and Blossom downloads before replacing the bridge. No automatic installation retry will run.",
+        if offer.handover {
+            "Combined handover confirmed. Checking the existing services and account before a private cold backup and service handover. No automatic retry will run."
+        } else {
+            "Update confirmed. Verifying the ngit release and Blossom downloads before replacing the bridge. No automatic installation retry will run."
+        },
     ) {
         bridge.state = before;
         return Err(error);
@@ -253,6 +313,7 @@ pub async fn handle(
     id: &str,
     text: &str,
     plain: bool,
+    recorded_at: Option<u64>,
 ) -> Result<()> {
     if !plain {
         return reply(
@@ -301,8 +362,40 @@ pub async fn handle(
         }
         return Ok(());
     }
-    if arguments.len() == 3 && arguments[1].eq_ignore_ascii_case("confirm") {
-        let path = match prepare(bridge, key, group, id, arguments[2]) {
+    if matches!(arguments.len(), 2 | 3) && arguments[1].eq_ignore_ascii_case("confirm") {
+        if arguments.len() == 2 {
+            let fresh = bridge.update_check.is_none()
+                && bridge.state.mappings[key]
+                    .update_offer
+                    .as_ref()
+                    .is_some_and(|offer| {
+                        recorded_at.is_some_and(|at| {
+                            at > offer.expires_at.saturating_sub(600)
+                                && at <= now().saturating_add(5)
+                        })
+                    });
+            if !fresh {
+                return reply(
+                    bridge,
+                    key,
+                    group,
+                    id,
+                    "invalid",
+                    "No fresh, verifiable update confirmation for this chat. Send /update, wait for the offer, then send /update confirm as a new message.",
+                );
+            }
+        }
+        let confirmation = arguments
+            .get(2)
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| {
+                bridge.state.mappings[key]
+                    .update_offer
+                    .as_ref()
+                    .map(|offer| offer.code.clone())
+                    .unwrap_or_default()
+            });
+        let path = match prepare(bridge, key, group, id, &confirmation) {
             Ok(path) => path,
             Err(error) => return reply(bridge, key, group, id, "invalid", &error.to_string()),
         };
@@ -343,7 +436,7 @@ pub async fn handle(
             group,
             id,
             "usage",
-            "Use /update, /update confirm CODE, or /update cancel.",
+            "Use /update, /update confirm, or /update cancel.",
         );
     }
     if bridge.update_check.is_some() {
@@ -356,14 +449,22 @@ pub async fn handle(
             "A read-only ngit release check is already running. Nothing has been installed.",
         );
     }
-    reply(
+    if bridge.update_messaging_home.is_none() {
+        return store_handover_offer(bridge, key, group, id);
+    }
+    let before = bridge.state.clone();
+    bridge.state.mappings.get_mut(key).unwrap().update_offer = None;
+    if let Err(error) = reply(
         bridge,
         key,
         group,
         id,
         "checking",
         "Checking the maintainer's stable ngit releases. Nothing will be installed without your confirmation.",
-    )?;
+    ) {
+        bridge.state = before;
+        return Err(error);
+    }
     let parent = bridge.config.state_path.parent().unwrap().to_path_buf();
     bridge.update_check = Some(Check {
         key: key.into(),
@@ -392,6 +493,33 @@ pub fn ready(bridge: &Bridge) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+/// A combined replacement is ready only when its configured local account works.
+/// This is not a relay/phone receipt check; offline relays must not force rollback.
+pub async fn ready_when_healthy(bridge: &Bridge) -> Result<()> {
+    if bridge.state.update_job.is_none() {
+        return Ok(());
+    }
+    if bridge.update_messaging_home.is_some() {
+        let accounts = tokio::time::timeout(
+            Duration::from_secs(1),
+            bridge.marmot.marmot(json!({"type":"account_list"})),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("Messaging startup is not ready"))??;
+        ensure!(
+            accounts["type"] == "account_list"
+                && accounts["accounts"]
+                    .as_array()
+                    .is_some_and(|accounts| accounts.iter().any(
+                        |account| account["account_id_hex"] == bridge.config.account_id_hex
+                            && account["local_signing"] == true
+                    )),
+            "The configured messaging account is not ready"
+        );
+    }
+    ready(bridge)
 }
 
 pub async fn poll(bridge: &mut Bridge) -> Result<()> {
@@ -448,14 +576,18 @@ pub async fn poll(bridge: &mut Bridge) -> Result<()> {
         ),
         "Invalid update result"
     );
-    let message = result["message"]
+    let mut message = result["message"]
         .as_str()
         .filter(|text| text.len() <= 2048)
-        .ok_or_else(|| anyhow::anyhow!("Missing update result message"))?;
+        .ok_or_else(|| anyhow::anyhow!("Missing update result message"))?
+        .to_string();
+    if result["status"] == "installed" && bridge.update_messaging_home.is_none() {
+        message.push_str("\nMessaging still uses the external connector. Send /update, then /update confirm to finish the combined upgrade with a private cold backup. No terminal commands are needed for a supported managed installation.");
+    }
     let before = bridge.state.clone();
     bridge
         .state
-        .enqueue_manual(&job.group, message, &format!("update-result:{}", job.id));
+        .enqueue_manual(&job.group, &message, &format!("update-result:{}", job.id));
     bridge.state.update_job = None;
     if let Err(error) = bridge.save() {
         bridge.state = before;

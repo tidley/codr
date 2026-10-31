@@ -1,6 +1,6 @@
 [package]
 name = "herdr-white-noise-bridge"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2024"
 
 [dependencies]
@@ -17,9 +17,21 @@ tempfile = "3"
 fs2 = "0.4"
 uuid = { version = "1", features = ["v4", "serde"] }
 unicode-width = "0.2"
-rusqlite = { version = "0.37", features = ["bundled", "limits"] }
+rusqlite = { version = "=0.40.1", default-features = false, features = ["bundled-sqlcipher-vendored-openssl", "limits"] }
 sha2 = "0.10"
 pulldown-cmark = { version = "0.13", default-features = false }
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
 rustix = { version = "1", features = ["fs"] }
+agent-connector = { path = "vendor/mdk/crates/agent-connector" }
+# MDK pins SQLCipher 4.17 through this sys crate; do not select registry 0.38.2.
+libsqlite3-sys = "=0.38.1"
+
+[patch.crates-io]
+# Keep the same security/storage backports as the pinned MDK workspace.
+hpke-rs-libcrux = { path = "vendor/mdk/vendor/hpke-rs-libcrux" }
+hax-lib-macros = { git = "https://github.com/cryspen/hax.git", rev = "8f9cb576e58f6cc7e9ed249a7d4439b0f7ed0da7" }
+libsqlite3-sys = { git = "https://github.com/rusqlite/rusqlite.git", rev = "5ae7fdf83085c595fd54f977b3a56ccacabaf16b" }
+
+[profile.dev.package."*"]
+debug = false

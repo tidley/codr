@@ -3,6 +3,7 @@ from pathlib import Path
 import plistlib
 import sys
 import tempfile
+import subprocess
 import unittest
 from unittest.mock import patch
 
@@ -47,6 +48,7 @@ class LaunchdTests(unittest.TestCase):
             with self.assertRaises(services.ServiceError):
                 manager.install(services.Service("codr-phonon", "speech", ["/bin/echo", "changed"]))
 
+    # Preserve Juraj Bednar's already merged PR #16 regression coverage.
     def test_a_refused_bootstrap_after_bootout_is_retried_once(self):
         calls = []
         def runner(argv):
@@ -111,6 +113,33 @@ class LaunchdTests(unittest.TestCase):
 
 
 class SystemdTests(unittest.TestCase):
+    def test_plugin_start_prefers_an_explicitly_installed_combined_service(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            units = root / "config/systemd/user"
+            units.mkdir(parents=True)
+            (units / "codr.service").write_text("combined fixture")
+            binary = root / "systemctl"
+            binary.write_text('#!/bin/sh\nprintf "%s\\n" "$*"\n')
+            binary.chmod(0o755)
+            environment = dict(os.environ, CODR_SERVICE_MANAGER="systemd", XDG_CONFIG_HOME=str(root / "config"), PATH=str(root) + os.pathsep + os.environ["PATH"])
+            result = subprocess.run(["sh", str(SCRIPTS.parent / "plugin-start.sh")], env=environment, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0)
+            self.assertIn("start codr.service", result.stdout)
+            self.assertNotIn("start herdr-white-noise-bridge.service", result.stdout)
+
+    def test_combined_definition_has_one_process_and_no_connector_dependency(self):
+        service = services.combined_service("/binary", "/config.toml", "/existing/mdk")
+        self.assertEqual(service.name, "codr")
+        self.assertEqual(service.argv, ["/binary", "--config", "/config.toml", "run", "--messaging-home", "/existing/mdk"])
+        template = (SCRIPTS.parent / "systemd/codr.service").read_text()
+        self.assertNotIn("Requires=", template)
+        self.assertNotIn("wn-agent", template)
+        self.assertIn("KillMode=process", template)
+        payload = LaunchdTests().manager().payload(service)
+        self.assertEqual(payload["ProgramArguments"], service.argv)
+        self.assertEqual(payload["Label"], "io.github.tidley.codr.codr")
+
     def test_bounded_python_selection_skips_313_for_the_intel_mac_runtime(self):
         versions = {"/python3.13": (3, 13), "/python3.10": (3, 10)}
         with patch.dict(os.environ, {"CODR_PYTHON": ""}), patch.object(services.shutil, "which", side_effect=lambda name: {"python3.13": "/python3.13", "python3.10": "/python3.10"}.get(name)), patch.object(services, "python_version", side_effect=lambda path: versions.get(path)):

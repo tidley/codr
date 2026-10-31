@@ -22,6 +22,14 @@ spec.loader.exec_module(setup)
 
 
 class InstallerTests(unittest.TestCase):
+    def test_combined_release_installs_one_executable_without_a_connector_download(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.dict(os.environ, {"HOME":temporary}), patch.object(installer,"version",return_value="0.10.0"), patch.object(installer,"platform_name",return_value="linux-x86_64"), patch.object(installer,"install_bundle") as install:
+                self.assertEqual(installer.main(),0)
+            self.assertEqual(install.call_count,1)
+            self.assertIn("codr-v0.10.0-linux-x86_64.tar.gz",install.call_args.args[0])
+            self.assertEqual(install.call_args.args[1],"herdr-white-noise-bridge")
+
     def test_release_installs_its_dedicated_connector_before_the_bridge(self):
         with tempfile.TemporaryDirectory() as temporary:
             with patch.dict(os.environ, {"HOME": temporary}), patch.object(installer, "version", return_value="0.6.0"), patch.object(installer, "platform_name", return_value="linux-x86_64"), patch.object(installer, "install_bundle") as install:
@@ -270,13 +278,13 @@ class SetupTests(unittest.TestCase):
 
     def test_setup_cli_portr_selection_is_explicit_and_defaults_to_unspecified(self):
         for arguments, expected in [([], None), (["--portr"], True), (["--no-portr"], False)]:
-            with self.subTest(arguments=arguments), patch.object(setup.sys, "argv", ["setup.py", "--npub", "npub1fixture", *arguments]), patch.object(setup.sys.stdin, "isatty", return_value=False), patch.object(setup, "configure", return_value={}) as configure, patch.object(setup.sys, "stdout", io.StringIO()):
+            with self.subTest(arguments=arguments), patch.object(setup, "version", return_value="0.9.0"), patch.object(setup.sys, "argv", ["setup.py", "--npub", "npub1fixture", *arguments]), patch.object(setup.sys.stdin, "isatty", return_value=False), patch.object(setup, "configure", return_value={}) as configure, patch.object(setup.sys, "stdout", io.StringIO()):
                 self.assertEqual(setup.main(), 0)
                 self.assertIs(configure.call_args.kwargs["enable_portr"], expected)
 
     def test_interactive_fresh_setup_offers_portr_with_no_as_the_default(self):
         for answer, expected in [("", False), ("n", False), ("yes", True)]:
-            with self.subTest(answer=answer), patch.object(setup.sys, "argv", ["setup.py", "--npub", "npub1fixture"]), patch.object(setup.sys.stdin, "isatty", return_value=True), patch("builtins.input", return_value=answer) as prompt, patch.object(setup, "configure", return_value={}) as configure, patch.object(setup.sys, "stdout", io.StringIO()):
+            with self.subTest(answer=answer), patch.object(setup, "version", return_value="0.9.0"), patch.object(setup.sys, "argv", ["setup.py", "--npub", "npub1fixture"]), patch.object(setup.sys.stdin, "isatty", return_value=True), patch("builtins.input", return_value=answer) as prompt, patch.object(setup, "configure", return_value={}) as configure, patch.object(setup.sys, "stdout", io.StringIO()):
                 self.assertEqual(setup.main(), 0)
                 prompt.assert_called_once()
                 self.assertIn("[y/N]", prompt.call_args.args[0])
@@ -285,10 +293,16 @@ class SetupTests(unittest.TestCase):
     def test_existing_interactive_setup_does_not_prompt_for_portr_again(self):
         self.config.parent.mkdir(parents=True)
         self.config.write_text("# existing setup\n")
-        with patch.object(setup.sys, "argv", ["setup.py"]), patch.object(setup.sys.stdin, "isatty", return_value=True), patch("builtins.input") as prompt, patch.object(setup, "configure", return_value={}) as configure, patch.object(setup.sys, "stdout", io.StringIO()):
+        with patch.object(setup, "version", return_value="0.9.0"), patch.object(setup.sys, "argv", ["setup.py"]), patch.object(setup.sys.stdin, "isatty", return_value=True), patch("builtins.input") as prompt, patch.object(setup, "configure", return_value={}) as configure, patch.object(setup.sys, "stdout", io.StringIO()):
             self.assertEqual(setup.main(), 0)
             prompt.assert_not_called()
             self.assertIsNone(configure.call_args.kwargs["enable_portr"])
+
+    def test_combined_version_refuses_legacy_two_service_setup(self):
+        with patch.object(setup, "version", return_value="0.10.0"), patch.object(setup.sys, "argv", ["setup.py", "--npub", "npub1fixture"]), patch.object(setup.sys.stdin, "isatty", return_value=False), patch.object(setup, "configure") as configure, patch.object(setup.sys, "stderr", io.StringIO()) as errors:
+            self.assertEqual(setup.main(), 1)
+            configure.assert_not_called()
+            self.assertIn("--combined-home", errors.getvalue())
 
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()

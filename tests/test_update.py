@@ -257,6 +257,128 @@ class InstallationTests(unittest.TestCase):
         self.assertEqual(result["status"], "failed")
         self.assertIn("local attention", result["message"])
 
+    def combined_request(self):
+        self.home = self.root / "mdk"
+        self.home.mkdir(mode=0o700)
+        (self.home / "account.db").write_bytes(b"existing encrypted account and MLS state")
+        self.info = {"version":"0.7.0", "state_version":1, "protocol":"v2",
+                     "runtimes":["external-connector", "embedded-mdk"], "storage_cohort":"mdk-0.14",
+                     "connector":{"version":"0.14.0", "revision":"11"*20, "patch_sha256":"22"*32}}
+        self.request.update(info=self.info, messaging_home=str(self.home), service="codr")
+
+    def test_combined_update_replaces_both_components_within_the_storage_cohort(self):
+        self.combined_request()
+        newer = {**self.info, "version":"0.7.1", "connector":{"version":"0.14.1", "revision":"33"*20, "patch_sha256":"44"*32}}
+        controller = FakeController()
+        result = self.perform(controller, newer)
+        self.assertEqual(result["status"], "installed")
+        self.assertEqual(self.binary.read_bytes(), self.payload)
+        self.assertEqual((self.home/"account.db").read_bytes(), b"existing encrypted account and MLS state")
+
+    def test_combined_update_refuses_storage_protocol_or_runtime_changes(self):
+        self.combined_request()
+        for mutate in [lambda x:x.update(storage_cohort="mdk-0.15"),
+                       lambda x:x.update(protocol="v3"), lambda x:x.update(state_version=2),
+                       lambda x:x.update(runtimes=["external-connector"]),
+                       lambda x:x.update(connector={}),
+                       lambda x:x["connector"].update(version="0.15.0")]:
+            candidate = copy.deepcopy({**self.info,"version":"0.7.1"}); mutate(candidate)
+            controller=FakeController(); result=self.perform(controller,candidate)
+            self.assertEqual(result["status"], "failed")
+            self.assertNotIn("stop",controller.calls)
+
+    def test_combined_rollback_preserves_new_messaging_state(self):
+        self.combined_request()
+        controller=FakeController(healthy=False)
+        original_wait=controller.wait_ready
+        def health(directory,version,job_id):
+            if version=="0.7.1":(self.home/"account.db").write_bytes(b"new MLS traffic")
+            return original_wait(directory,version,job_id)
+        controller.wait_ready=health
+        self.assertEqual(self.perform(controller)["status"],"rolled_back")
+        self.assertEqual((self.home/"account.db").read_bytes(),b"new MLS traffic")
+        self.assertEqual(self.binary.read_bytes(),b"old executable")
+
+    def test_launchd_combined_service_validates_and_restarts_the_same_home(self):
+        destination=self.root/".local/bin"/updater.WORKER; destination.parent.mkdir(parents=True)
+        destination.write_bytes(b"combined binary")
+        home=self.root/"mdk";home.mkdir()
+        config=self.root/"config.toml"; config.write_text("configuration")
+        plist=self.job/"combined.plist"
+        args=[str(destination),"--config",str(config),"run","--messaging-home",str(home)]
+        plist.write_bytes(plistlib.dumps({"ProgramArguments":args}))
+        request={**self.request,"installed_path":str(destination),"base_sha256":updater.install.sha256(destination),
+                 "pid":1234,"config_path":str(config),"messaging_home":str(home),"service":"codr"}
+        selected=[]
+        manager=SimpleNamespace(backend=updater.services.LAUNCHD,path=lambda name:(selected.append(name) or plist),
+                                domain=lambda:"gui/123",start=lambda name:selected.append(name))
+        with patch.object(Path,"home",return_value=self.root),patch.object(updater.services,"for_host",return_value=manager):
+            controller=updater.Controller()
+            with patch.object(controller,"pid",return_value=1234),patch.object(updater,"run",return_value="") as run:
+                controller.validate(request);controller.stop();controller.start()
+                self.assertEqual(run.call_args.args[0],["launchctl","bootout","gui/123/"+updater.services.LABEL_PREFIX+".codr"])
+                self.assertEqual(selected,["codr","codr"])
+                request["messaging_home"]=str(self.root/"another-home")
+                with self.assertRaises(updater.UpdateError):controller.validate(request)
+
+    def test_systemd_combined_service_targets_only_codr(self):
+        manager=SimpleNamespace(backend=updater.services.SYSTEMD)
+        with patch.object(updater.services,"for_host",return_value=manager),patch.object(updater,"run",return_value="1234") as run:
+            controller=updater.Controller()
+            controller.service="codr"
+            self.assertEqual(controller.pid(),1234)
+            self.assertIn("codr.service",run.call_args.args[0])
+            controller.stop()
+            self.assertEqual(run.call_args.args[0],["systemctl","--user","stop","codr.service"])
+
+    def test_combined_runtime_can_keep_the_legacy_service_label_for_old_plugin_hooks(self):
+        destination=self.root/".local/bin"/updater.WORKER;destination.parent.mkdir(parents=True)
+        destination.write_bytes(b"combined executable")
+        home=self.root/"mdk";home.mkdir()
+        config=self.root/"config.toml";config.write_text("fixture")
+        plist=self.root/"worker.plist"
+        plist.write_bytes(plistlib.dumps({"ProgramArguments":[str(destination),"--config",str(config),"run","--messaging-home",str(home)]}))
+        request={**self.request,"installed_path":str(destination),"base_sha256":updater.install.sha256(destination),
+                 "pid":1234,"config_path":str(config),"messaging_home":str(home),"service":updater.WORKER}
+        manager=SimpleNamespace(backend=updater.services.LAUNCHD,path=lambda name:plist,domain=lambda:"gui/123")
+        with patch.object(Path,"home",return_value=self.root),patch.object(updater.services,"for_host",return_value=manager):
+            controller=updater.Controller()
+            with patch.object(controller,"pid",return_value=1234),patch.object(updater,"run",return_value="") as run:
+                controller.validate(request)
+                self.assertEqual(controller.service,updater.WORKER)
+                self.assertTrue(controller.combined)
+                controller.stop()
+                self.assertTrue(run.call_args.args[0][-1].endswith("."+updater.WORKER))
+
+    def test_combined_readiness_allows_slow_first_spawn_without_accepting_wrong_job(self):
+        clock=[0.0]
+        manager=SimpleNamespace(backend=updater.services.LAUNCHD,is_active=lambda name:None)
+        (self.job/"ready.json").write_text(json.dumps({"version":"0.7.1","job_id":"job","pid":1234}))
+        with patch.object(updater.services,"for_host",return_value=manager),patch.object(updater.time,"monotonic",side_effect=lambda:clock[0]),patch.object(updater.time,"sleep",side_effect=lambda seconds:clock.__setitem__(0,clock[0]+seconds)):
+            controller=updater.Controller();controller.service="codr"
+            with patch.object(controller,"pid",side_effect=lambda:1234 if clock[0]>=40 else 0):
+                self.assertTrue(controller.wait_ready(self.job,"0.7.1","job"))
+            self.assertGreaterEqual(clock[0],40)
+
+    def test_combined_readiness_checks_only_the_selected_service(self):
+        for backend in (updater.services.SYSTEMD, updater.services.LAUNCHD):
+            with self.subTest(backend=backend):
+                clock = [0.0]
+                checked = []
+                def active(name):
+                    checked.append(name)
+                    if name != "codr":
+                        raise updater.UpdateError("Legacy service is disabled")
+                manager = SimpleNamespace(backend=backend, is_active=active)
+                (self.job/"ready.json").write_text(json.dumps({"version":"0.7.1","job_id":"job","pid":1234}))
+                with patch.object(updater.services,"for_host",return_value=manager), patch.object(updater.time,"monotonic",side_effect=lambda:clock[0]), patch.object(updater.time,"sleep",side_effect=lambda seconds:clock.__setitem__(0,clock[0]+seconds)):
+                    controller = updater.Controller()
+                    controller.service = "codr"
+                    with patch.object(controller,"pid",return_value=1234):
+                        self.assertFalse(controller.wait_ready(self.job,"0.7.1","different-job"))
+                        self.assertTrue(controller.wait_ready(self.job,"0.7.1","job"))
+                self.assertEqual(checked,["codr"])
+
     def test_updater_runs_outside_the_bridge_service_on_linux_and_macos(self):
         (self.job / "request.json").write_text(json.dumps(self.request))
         for backend, command in [(updater.services.SYSTEMD, "systemd-run"), (updater.services.LAUNCHD, "launchctl")]:

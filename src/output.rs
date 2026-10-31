@@ -486,7 +486,7 @@ struct ExportV2 {
     messages: Vec<MessageV2>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, PartialEq)]
 struct MessageV2 {
     #[serde(rename = "type")]
     kind: String,
@@ -504,7 +504,7 @@ struct MessageV2 {
     error: Option<Value>,
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Clone, Default, Deserialize, PartialEq)]
 struct MessageTimeV2 {
     created: Option<u64>,
     updated: Option<u64>,
@@ -513,7 +513,7 @@ struct MessageTimeV2 {
     completed: Option<u64>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, PartialEq)]
 struct PartV2 {
     #[serde(rename = "type")]
     kind: String,

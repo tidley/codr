@@ -1,0 +1,2388 @@
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use chacha20poly1305::{
+    ChaCha20Poly1305, KeyInit, Nonce,
+    aead::{Aead, Payload},
+};
+use hkdf::Hkdf;
+use nostr::nips::nip59::GiftWrapBuilder;
+#[cfg(test)]
+use nostr::prelude::FinalizeEvent;
+use nostr::prelude::{
+    Event, EventBuilder, FinalizeEventAsync, FinalizeUnsignedEvent, Keys, Kind, PublicKey,
+    Signature, Tag, Timestamp, UnsignedEvent,
+};
+use rand::{RngCore, rngs::OsRng};
+use secp256k1::{
+    Parity, PublicKey as SecpPublicKey, Secp256k1, SecretKey, XOnlyPublicKey, ecdh,
+    schnorr::Signature as SchnorrSignature,
+};
+use serde::{
+    Deserialize, Deserializer, Serialize,
+    de::{DeserializeOwned, Error as _, IgnoredAny, SeqAccess, Visitor},
+};
+use sha2::{Digest, Sha256};
+use transport_nostr_peeler::{MarmotNostrSigner, NostrTransportEvent};
+
+use cgka_traits::MARMOT_APP_EVENT_KIND_POLL;
+use cgka_traits::app_event::{
+    EVENT_REF_TAG, GROUP_SYSTEM_TYPE_ADMIN_ADDED, GROUP_SYSTEM_TYPE_ADMIN_REMOVED,
+    GROUP_SYSTEM_TYPE_MEMBER_REMOVED, MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY,
+    MARMOT_APP_EVENT_KIND_AGENT_OPERATION, MARMOT_APP_EVENT_KIND_CHAT,
+    MARMOT_APP_EVENT_KIND_GROUP_SYSTEM, MARMOT_APP_EVENT_KIND_REACTION,
+    group_system_event_material,
+};
+use cgka_traits::engine::{GroupEvent, GroupStateChange};
+use cgka_traits::group::ProtocolProfile;
+use cgka_traits::{GroupId, MemberId};
+
+use crate::messages::{PUBKEY_REF_TAG, inline_mention_pubkey_hexes, mention_pubkey_hex};
+use crate::{
+    AppError, AppGroupRecord, AppMessageQuery, AppMessageRecord, MarmotApp, MarmotAppEvent,
+    ReceivedMessage, RuntimeGroupEvent, RuntimeMessageReceived, group_system_event_from_message,
+    tag_value,
+};
+use storage_sqlite::TimelineMessageTarget;
+
+pub const MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE: u64 = 447;
+pub const MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST: u64 = 448;
+pub const MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL: u64 = 449;
+pub const KIND_MARMOT_NOTIFICATION_RUMOR: u64 = 446;
+pub const KIND_MARMOT_NOTIFICATION_SERVER_RELAYS: u64 = 10050;
+pub const PUSH_VERSION: &str = "marmot-push-v1";
+pub const PUSH_ENCRYPTED_TOKEN_LEN: usize = 1084;
+const PUSH_MAX_GOSSIP_ENTRIES: usize = 32;
+const PUSH_MAX_NOTIFICATION_TRIGGER_TOKENS: usize = 32;
+// NIP-59's nested encryption fits 19 tokens below a 64 KiB event ceiling;
+// 20 tokens cross it. The protocol's 32-token rumor bound remains separate.
+const PUSH_GIFT_WRAP_TOKEN_LIMIT: usize = 19;
+const PUSH_OWNER_TS_MAX_FUTURE_MS: i64 = 3_600_000;
+const PUSH_TOKEN_PLAINTEXT_LEN: usize = 1024;
+const PUSH_MAX_PROVIDER_TOKEN_LEN: usize = PUSH_TOKEN_PLAINTEXT_LEN - 3;
+const PUSH_CIPHERTEXT_LEN: usize = PUSH_TOKEN_PLAINTEXT_LEN + 16;
+const PUSH_HKDF_SALT: &[u8] = b"marmot-push-token-v1";
+const PUSH_HKDF_INFO: &[u8] = b"marmot-push-token-encryption";
+/// Owner-signature domain tags from the push-notifications spec's "Owner
+/// authentication" section. Token entries (447/448) and removals (449) sign
+/// distinct unpublished Nostr events so a signature cannot be cross-applied
+/// between them and external signers can produce the proof without raw digest
+/// access.
+const PUSH_OWNER_PROOF_EVENT_KIND: u16 = 451;
+const LEGACY_PUSH_OWNER_PROOF_EVENT_KIND: u16 = 450;
+const PUSH_RECORD_DOMAIN: &str = "marmot-push-token-record-v1";
+const PUSH_REMOVAL_DOMAIN: &str = "marmot-push-token-removal-v1";
+const NOTIFICATION_VERSION_TAG: &str = "v";
+/// Bounded recent-history window used to rebuild missed notifications after
+/// broadcast lag. Large enough to cover a slow consumer, small enough that
+/// recovery stays a snapshot rather than a full-history hydrate.
+const NOTIFICATION_LAG_RECOVERY_LIMIT: usize = 64;
+
+#[cfg(test)]
+std::thread_local! {
+    static OWNER_SIGNATURE_VERIFICATION_COUNT: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[cfg(test)]
+fn reset_owner_signature_verification_count() {
+    OWNER_SIGNATURE_VERIFICATION_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn owner_signature_verification_count() -> usize {
+    OWNER_SIGNATURE_VERIFICATION_COUNT.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn note_owner_signature_verification() {
+    OWNER_SIGNATURE_VERIFICATION_COUNT.with(|count| count.set(count.get() + 1));
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PushPlatform {
+    Apns,
+    Fcm,
+}
+
+impl PushPlatform {
+    pub fn platform_byte(self) -> u8 {
+        match self {
+            Self::Apns => 0x01,
+            Self::Fcm => 0x02,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Apns => "apns",
+            Self::Fcm => "fcm",
+        }
+    }
+
+    pub fn from_platform_byte(value: u8) -> Result<Self, AppError> {
+        match value {
+            0x01 => Ok(Self::Apns),
+            0x02 => Ok(Self::Fcm),
+            _ => Err(AppError::InvalidPushToken(
+                "unsupported push platform".into(),
+            )),
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(value: &str) -> Result<Self, AppError> {
+        // Lowercase-only per spec/features/push-notifications.md ("platform is the
+        // string apns or fcm") and the no-case-fold canonical-decoding rule. Do NOT
+        // accept "Apns"/"APNS"/"Fcm"/"FCM": a case-folding decoder would store and
+        // match push-token state differently from a strict peer.
+        match value {
+            "apns" => Ok(Self::Apns),
+            "fcm" => Ok(Self::Fcm),
+            _ => Err(AppError::InvalidPushToken(
+                "unsupported push platform".into(),
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NotificationWakeSource {
+    ApnsNse,
+    FcmDataMessage,
+    AndroidForegroundService,
+    ManualCatchUp,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NotificationCollectionStatus {
+    NewData,
+    NoData,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NotificationTrigger {
+    NewMessage,
+    GroupInvite,
+    RemovedFromGroup,
+    MadeAdmin,
+    RemovedAsAdmin,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationSettings {
+    pub account_ref: String,
+    pub account_id_hex: String,
+    pub local_notifications_enabled: bool,
+    pub native_push_enabled: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatNotificationSettings {
+    pub account_ref: String,
+    pub account_id_hex: String,
+    pub group_id_hex: String,
+    pub muted: bool,
+    pub muted_until_ms: Option<i64>,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PushRegistration {
+    pub account_ref: String,
+    pub account_id_hex: String,
+    pub platform: PushPlatform,
+    pub token_fingerprint: String,
+    pub server_pubkey_hex: String,
+    pub relay_hint: Option<String>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub last_shared_at_ms: Option<i64>,
+}
+
+/// Whether all durable push-registration update/removal work is complete.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PushRegistrationShareStatus {
+    /// No per-group update or removal work remains.
+    Complete,
+    /// One or more joined groups still need an update or removal.
+    Pending,
+}
+
+/// Per-attempt result for the durable push-registration gossip outbox.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PushRegistrationShareOutcome {
+    /// Aggregate completion status after the attempt.
+    pub status: PushRegistrationShareStatus,
+    /// Groups selected for this attempt.
+    pub attempted_groups: u32,
+    /// Selected groups whose publish completed and durable work was cleared.
+    pub succeeded_groups: u32,
+    /// Selected groups whose preparation, publish, or conditional completion failed.
+    pub failed_groups: u32,
+    /// Groups still durably queued after the attempt.
+    pub pending_groups: u32,
+}
+
+impl PushRegistrationShareOutcome {
+    pub(crate) fn from_counts(
+        attempted_groups: usize,
+        succeeded_groups: usize,
+        failed_groups: usize,
+        pending_groups: usize,
+    ) -> Self {
+        Self {
+            status: if pending_groups == 0 {
+                PushRegistrationShareStatus::Complete
+            } else {
+                PushRegistrationShareStatus::Pending
+            },
+            attempted_groups: attempted_groups.try_into().unwrap_or(u32::MAX),
+            succeeded_groups: succeeded_groups.try_into().unwrap_or(u32::MAX),
+            failed_groups: failed_groups.try_into().unwrap_or(u32::MAX),
+            pending_groups: pending_groups.try_into().unwrap_or(u32::MAX),
+        }
+    }
+}
+
+/// Stored registration together with the immediate lifecycle gossip outcome.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PushRegistrationSyncResult {
+    /// The registration revision persisted for the account.
+    pub registration: PushRegistration,
+    /// Result of attempting the new revision and any superseded-registration removals.
+    pub share: PushRegistrationShareOutcome,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StoredPushRegistration {
+    pub registration: PushRegistration,
+    pub token_bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupPushTokenRecord {
+    pub group_id_hex: String,
+    pub member_id_hex: String,
+    pub leaf_index: u32,
+    pub platform: PushPlatform,
+    pub token_fingerprint: String,
+    pub server_pubkey_hex: String,
+    pub relay_hint: Option<String>,
+    pub encrypted_token: Vec<u8>,
+    /// Owner-signed millisecond stamp; the high half of the `(owner_ts, digest)`
+    /// ordering primitive. Distinct from `updated_at_ms` (local receive time).
+    pub owner_ts: i64,
+    /// 64-byte BIP-340 Schnorr signature (128 lowercase hex) by `member_id_hex`.
+    /// Current producers sign the exact local-only kind-451 owner-proof event
+    /// id; legacy groups may retain kind-450 or raw-record-digest proofs.
+    pub owner_sig: String,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationUser {
+    pub account_id_hex: String,
+    pub display_name: Option<String>,
+    pub picture_url: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NotificationTrafficClass {
+    Standard,
+    AgentActivity,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationUpdate {
+    pub notification_key: String,
+    pub conversation_key: String,
+    pub trigger: NotificationTrigger,
+    pub traffic_class: NotificationTrafficClass,
+    pub account_ref: String,
+    pub account_id_hex: String,
+    pub group_id_hex: String,
+    pub group_name: Option<String>,
+    pub is_dm: bool,
+    /// True when this notification's receiving account is mentioned by a NIP-27
+    /// pubkey-reference (`p`) tag or an inline nostr pubkey entity (a bare
+    /// `@npub1…` handle or an explicit `nostr:` URI) on the inbound app event.
+    /// This is computed from event semantics, not the rendered preview text.
+    /// A durable chat mute still emits direct mentions with this flag set;
+    /// blocked senders remain suppressed before an update is emitted.
+    pub is_mention: bool,
+    pub message_id_hex: Option<String>,
+    pub sender: NotificationUser,
+    pub receiver: NotificationUser,
+    pub preview_text: Option<String>,
+    /// Reaction emoji (Nostr kind 7 content); `None` for non-reactions. Additive
+    /// at the DTO level (no `trigger`/`preview_text` change), but it changes the
+    /// generated UniFFI record: consumers must regenerate bindings and ship the
+    /// matching native library to receive it.
+    pub reaction_emoji: Option<String>,
+    /// Preview of the reacted-to message (resolved via the `e` tag against the
+    /// timeline). `None` for non-reactions, an unresolvable target, or a
+    /// deleted/invalidated one — removed text must never reach the preview.
+    /// Group-system targets expose only supported parsed `text`; malformed,
+    /// oversized, unsupported-version and blank payloads produce `None`.
+    /// Synthesized system text is an English fallback, not a localization key:
+    /// this notification DTO does not carry the target's structured system event.
+    pub reacted_to_preview: Option<String>,
+    pub timestamp_ms: i64,
+    pub is_from_self: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundNotificationCollection {
+    pub status: NotificationCollectionStatus,
+    pub notifications: Vec<NotificationUpdate>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalPushRegistrationDebug {
+    pub registered: bool,
+    pub shareable: bool,
+    pub local_notifications_enabled: bool,
+    pub native_push_enabled: bool,
+    pub local_leaf_index: Option<u32>,
+    pub local_token_cached: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupPushTokenDebugEntry {
+    pub member_id_hex: String,
+    pub leaf_index: u32,
+    pub platform: PushPlatform,
+    pub token_fingerprint: String,
+    pub server_pubkey_hex: String,
+    pub has_relay_hint: bool,
+    pub active_leaf: bool,
+    pub member_matches_active_leaf: bool,
+    pub is_local_member: bool,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupPushDebugInfo {
+    pub total_token_count: u32,
+    pub active_token_count: u32,
+    pub stale_token_count: u32,
+    pub missing_relay_hint_count: u32,
+    pub last_token_list_updated_at_ms: Option<i64>,
+    pub local_registration: LocalPushRegistrationDebug,
+    pub tokens: Vec<GroupPushTokenDebugEntry>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct PushTokenGossipPayload {
+    pub v: String,
+    #[serde(default)]
+    pub tokens: Vec<PushTokenGossipEntry>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub(crate) struct PushTokenGossipEntry {
+    pub member_id_hex: String,
+    pub leaf_index: u32,
+    pub platform: String,
+    pub token_fingerprint: String,
+    pub server_pubkey_hex: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_hint: Option<String>,
+    pub encrypted_token: String,
+    pub owner_ts: i64,
+    pub owner_sig: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct PushTokenRemovalPayload {
+    pub v: String,
+    #[serde(default)]
+    pub removals: Vec<PushTokenRemovalEntry>,
+}
+
+/// First-pass array decoder that counts entries without allocating a `Vec` or
+/// decoding entry fields. Returning as soon as entry 33 is observed keeps
+/// oversized advisory arrays from reaching record parsing or signature work.
+#[derive(Default)]
+struct BoundedPushGossipEntries;
+
+impl<'de> Deserialize<'de> for BoundedPushGossipEntries {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct BoundedEntriesVisitor;
+
+        impl<'de> Visitor<'de> for BoundedEntriesVisitor {
+            type Value = BoundedPushGossipEntries;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(
+                    formatter,
+                    "an array of at most {PUSH_MAX_GOSSIP_ENTRIES} push gossip entries"
+                )
+            }
+
+            fn visit_seq<A>(self, mut entries: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut count = 0_usize;
+                while entries.next_element::<IgnoredAny>()?.is_some() {
+                    count += 1;
+                    if count > PUSH_MAX_GOSSIP_ENTRIES {
+                        return Err(A::Error::custom(format!(
+                            "push gossip array exceeds {PUSH_MAX_GOSSIP_ENTRIES} entries"
+                        )));
+                    }
+                }
+                Ok(BoundedPushGossipEntries)
+            }
+        }
+
+        deserializer.deserialize_seq(BoundedEntriesVisitor)
+    }
+}
+
+#[derive(Deserialize)]
+struct PushTokenGossipShape {
+    #[serde(default, rename = "tokens")]
+    _tokens: BoundedPushGossipEntries,
+}
+
+#[derive(Deserialize)]
+struct PushTokenRemovalShape {
+    #[serde(default, rename = "removals")]
+    _removals: BoundedPushGossipEntries,
+}
+
+#[derive(Deserialize)]
+struct InboundPushTokenGossipPayload {
+    v: String,
+    #[serde(default)]
+    tokens: Vec<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct InboundPushTokenRemovalPayload {
+    v: String,
+    #[serde(default)]
+    removals: Vec<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub(crate) struct PushTokenRemovalEntry {
+    pub member_id_hex: String,
+    pub leaf_index: u32,
+    pub platform: String,
+    pub token_fingerprint: String,
+    pub server_pubkey_hex: String,
+    pub owner_ts: i64,
+    pub owner_sig: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PushGossipAction {
+    Upsert(Vec<GroupPushTokenRecord>),
+    Remove(Vec<PushTokenRemovalRecord>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PushTokenRemovalRecord {
+    pub member_id_hex: String,
+    pub leaf_index: u32,
+    pub platform: PushPlatform,
+    pub token_fingerprint: String,
+    pub server_pubkey_hex: String,
+    pub owner_ts: i64,
+    pub owner_sig: String,
+}
+
+pub fn parse_provider_token(platform: PushPlatform, raw_token: &str) -> Result<Vec<u8>, AppError> {
+    let token = match platform {
+        PushPlatform::Apns => parse_apns_hex_token(raw_token)?,
+        PushPlatform::Fcm => raw_token.as_bytes().to_vec(),
+    };
+    validate_provider_token_len(&token)?;
+    Ok(token)
+}
+
+fn parse_apns_hex_token(raw_token: &str) -> Result<Vec<u8>, AppError> {
+    if raw_token.is_empty()
+        || !raw_token.len().is_multiple_of(2)
+        || !raw_token
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(AppError::InvalidPushToken(
+            "APNS token must be lowercase hex".into(),
+        ));
+    }
+    hex::decode(raw_token)
+        .map_err(|_| AppError::InvalidPushToken("APNS token must be lowercase hex".into()))
+}
+
+fn validate_provider_token_len(token: &[u8]) -> Result<(), AppError> {
+    if token.is_empty() {
+        return Err(AppError::InvalidPushToken(
+            "push token must not be empty".into(),
+        ));
+    }
+    if token.len() > PUSH_MAX_PROVIDER_TOKEN_LEN {
+        return Err(AppError::InvalidPushToken(
+            "push token is too long for marmot-push-v1".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn push_token_fingerprint(platform: PushPlatform, token_bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update([platform.platform_byte()]);
+    hasher.update(token_bytes);
+    let digest = hex::encode(hasher.finalize());
+    format!("sha256:{}", &digest[..24])
+}
+
+pub fn encrypted_push_token(
+    platform: PushPlatform,
+    token_bytes: &[u8],
+    server_pubkey_hex: &str,
+) -> Result<Vec<u8>, AppError> {
+    validate_provider_token_len(token_bytes)?;
+    let server_pubkey_bytes = hex::decode(server_pubkey_hex)
+        .map_err(|_| AppError::InvalidPushServer("server pubkey must be 32-byte hex".into()))?;
+    if server_pubkey_bytes.len() != 32 {
+        return Err(AppError::InvalidPushServer(
+            "server pubkey must be 32-byte hex".into(),
+        ));
+    }
+    let server_xonly = XOnlyPublicKey::from_slice(&server_pubkey_bytes).map_err(|_| {
+        AppError::InvalidPushServer("server pubkey is not valid x-only secp256k1".into())
+    })?;
+    let server_pubkey = SecpPublicKey::from_x_only_public_key(server_xonly, Parity::Even);
+
+    let ephemeral_secret = random_secret_key();
+    let ephemeral_pubkey = SecpPublicKey::from_secret_key(&Secp256k1::new(), &ephemeral_secret);
+    let (ephemeral_xonly, _) = ephemeral_pubkey.x_only_public_key();
+    let shared_x = secp256k1_ecdh_x(&server_pubkey, &ephemeral_secret);
+    let key = push_encryption_key(&shared_x)?;
+
+    let mut plaintext = [0_u8; PUSH_TOKEN_PLAINTEXT_LEN];
+    plaintext[0] = platform.platform_byte();
+    let token_len = u16::try_from(token_bytes.len()).map_err(|_| {
+        AppError::InvalidPushToken("push token is too long for marmot-push-v1".into())
+    })?;
+    plaintext[1..3].copy_from_slice(&token_len.to_be_bytes());
+    plaintext[3..3 + token_bytes.len()].copy_from_slice(token_bytes);
+    OsRng.fill_bytes(&mut plaintext[3 + token_bytes.len()..]);
+
+    let mut nonce = [0_u8; 12];
+    OsRng.fill_bytes(&mut nonce);
+    let cipher = ChaCha20Poly1305::new_from_slice(&key)
+        .map_err(|_| AppError::InvalidPushToken("marmot-push-v1 key setup failed".into()))?;
+    let ciphertext = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: &plaintext,
+                aad: &[],
+            },
+        )
+        .map_err(|_| AppError::InvalidPushToken("marmot-push-v1 token encryption failed".into()))?;
+    if ciphertext.len() != PUSH_CIPHERTEXT_LEN {
+        return Err(AppError::InvalidPushToken(
+            "marmot-push-v1 token encryption produced invalid length".into(),
+        ));
+    }
+
+    let mut out = Vec::with_capacity(PUSH_ENCRYPTED_TOKEN_LEN);
+    out.extend_from_slice(&ephemeral_xonly.serialize());
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&ciphertext);
+    debug_assert_eq!(out.len(), PUSH_ENCRYPTED_TOKEN_LEN);
+    Ok(out)
+}
+
+fn random_secret_key() -> SecretKey {
+    loop {
+        let mut bytes = [0_u8; 32];
+        OsRng.fill_bytes(&mut bytes);
+        if let Ok(secret) = SecretKey::from_slice(&bytes) {
+            return secret;
+        }
+    }
+}
+
+fn secp256k1_ecdh_x(point: &SecpPublicKey, scalar: &SecretKey) -> [u8; 32] {
+    let shared_point = ecdh::shared_secret_point(point, scalar);
+    shared_point[..32]
+        .try_into()
+        .expect("shared point X coordinate is 32 bytes")
+}
+
+fn push_encryption_key(shared_x: &[u8; 32]) -> Result<[u8; 32], AppError> {
+    let hkdf = Hkdf::<Sha256>::new(Some(PUSH_HKDF_SALT), shared_x);
+    let mut key = [0_u8; 32];
+    hkdf.expand(PUSH_HKDF_INFO, &mut key).map_err(|_| {
+        AppError::InvalidPushToken("marmot-push-v1 token key derivation failed".into())
+    })?;
+    Ok(key)
+}
+
+fn validate_owner_sig_hex(owner_sig: &str) -> Result<(), AppError> {
+    let decoded = hex::decode(owner_sig).map_err(|_| {
+        AppError::InvalidPushGossip("owner_sig must be 64-byte lowercase hex".into())
+    })?;
+    if decoded.len() != 64 || owner_sig.chars().any(|c| c.is_ascii_uppercase()) {
+        return Err(AppError::InvalidPushGossip(
+            "owner_sig must be 64-byte lowercase hex".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The 12 raw bytes that a `sha256:`-prefixed token fingerprint encodes.
+fn fingerprint_bytes(token_fingerprint: &str) -> Result<[u8; 12], AppError> {
+    let hex_part = token_fingerprint.strip_prefix("sha256:").ok_or_else(|| {
+        AppError::InvalidPushGossip("token fingerprint must start with sha256:".into())
+    })?;
+    let decoded = hex::decode(hex_part)
+        .map_err(|_| AppError::InvalidPushGossip("token fingerprint must be hex".into()))?;
+    decoded
+        .try_into()
+        .map_err(|_| AppError::InvalidPushGossip("token fingerprint must be 12 bytes".into()))
+}
+
+fn decode_hex_32(value: &str, name: &str) -> Result<[u8; 32], AppError> {
+    let decoded = hex::decode(value)
+        .map_err(|_| AppError::InvalidPushGossip(format!("{name} must be 32-byte hex")))?;
+    decoded
+        .try_into()
+        .map_err(|_| AppError::InvalidPushGossip(format!("{name} must be 32-byte hex")))
+}
+
+fn normalized_relay_hint(relay_hint: Option<&str>) -> Option<&str> {
+    relay_hint.map(str::trim).filter(|hint| !hint.is_empty())
+}
+
+/// Canonical `SignedRecord` bytes from the spec's "Owner authentication" section.
+/// `encrypted_token` is `Some` for token entries (kinds 447/448, `PUSH_RECORD_DOMAIN`)
+/// and `None` for removals (kind 449, `PUSH_REMOVAL_DOMAIN`), which omit the field.
+#[allow(clippy::too_many_arguments)]
+fn push_signed_record_bytes(
+    domain: &[u8],
+    group_id_hex: &str,
+    member_id_hex: &str,
+    leaf_index: u32,
+    platform_byte: u8,
+    server_pubkey_hex: &str,
+    token_fingerprint: &str,
+    owner_ts: i64,
+    relay_hint: Option<&str>,
+    encrypted_token: Option<&[u8]>,
+) -> Result<Vec<u8>, AppError> {
+    // `group_id` is the MLS group id and is variable-length (16 bytes for the
+    // current Nostr binding, but the protocol does not fix it), so it is
+    // length-prefixed. `member_id` and `server_pubkey` are Nostr x-only keys and
+    // are always 32 bytes.
+    let group_id = hex::decode(group_id_hex)
+        .map_err(|_| AppError::InvalidPushGossip("group id must be hex".into()))?;
+    let member_id = decode_hex_32(member_id_hex, "member id")?;
+    let server_pubkey = decode_hex_32(server_pubkey_hex, "server pubkey")?;
+    let fingerprint = fingerprint_bytes(token_fingerprint)?;
+    let group_id_len = u16::try_from(group_id.len())
+        .map_err(|_| AppError::InvalidPushGossip("group id too long".into()))?;
+    // Blank/whitespace-only hints sign as absent so signer and verifier agree.
+    let relay = normalized_relay_hint(relay_hint).unwrap_or("");
+    let relay_bytes = relay.as_bytes();
+    let relay_len = u16::try_from(relay_bytes.len())
+        .map_err(|_| AppError::InvalidPushGossip("relay hint too long".into()))?;
+
+    let mut buf = Vec::with_capacity(
+        domain.len() + 91 + group_id.len() + relay_bytes.len() + PUSH_ENCRYPTED_TOKEN_LEN,
+    );
+    buf.extend_from_slice(domain);
+    buf.extend_from_slice(&group_id_len.to_be_bytes());
+    buf.extend_from_slice(&group_id);
+    buf.extend_from_slice(&member_id);
+    buf.extend_from_slice(&leaf_index.to_be_bytes());
+    buf.push(platform_byte);
+    buf.extend_from_slice(&server_pubkey);
+    buf.extend_from_slice(&fingerprint);
+    // owner_ts is i64 throughout (codebase timestamp convention + SQLite INTEGER).
+    // For a non-negative millisecond timestamp its two's-complement big-endian
+    // bytes are identical to the spec's `u64` encoding, so no cast is needed.
+    buf.extend_from_slice(&owner_ts.to_be_bytes());
+    buf.extend_from_slice(&relay_len.to_be_bytes());
+    buf.extend_from_slice(relay_bytes);
+    if let Some(token) = encrypted_token {
+        buf.extend_from_slice(token);
+    }
+    Ok(buf)
+}
+
+fn push_digest(bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher.finalize().into()
+}
+
+struct PushOwnerProofEvent<'a> {
+    domain: &'a str,
+    group_id_hex: &'a str,
+    member_id_hex: &'a str,
+    leaf_index: u32,
+    platform: PushPlatform,
+    server_pubkey_hex: &'a str,
+    token_fingerprint: &'a str,
+    owner_ts: i64,
+    relay_hint: Option<&'a str>,
+    encrypted_token: Option<&'a [u8]>,
+}
+
+fn push_owner_proof_event(
+    input: PushOwnerProofEvent<'_>,
+    kind: u16,
+) -> Result<UnsignedEvent, AppError> {
+    let member_pubkey = PublicKey::parse(input.member_id_hex)
+        .map_err(|_| AppError::InvalidPushGossip("member id must be a Nostr pubkey".into()))?;
+    let relay = normalized_relay_hint(input.relay_hint).unwrap_or("");
+    let mut tags = vec![
+        Tag::custom("d", [input.domain.to_owned()]),
+        Tag::custom("group_id", [input.group_id_hex.to_owned()]),
+        Tag::custom("member_id", [input.member_id_hex.to_owned()]),
+        Tag::custom("leaf_index", [input.leaf_index.to_string()]),
+        Tag::custom("platform", [input.platform.as_str().to_owned()]),
+        Tag::custom("server_pubkey", [input.server_pubkey_hex.to_owned()]),
+        Tag::custom("token_fingerprint", [input.token_fingerprint.to_owned()]),
+        Tag::custom("owner_ts", [input.owner_ts.to_string()]),
+        Tag::custom("relay_hint", [relay.to_owned()]),
+    ];
+    if input.encrypted_token.is_some() {
+        tags.push(Tag::custom(
+            "encrypted_token_encoding",
+            ["base64".to_owned()],
+        ));
+    }
+    let content = input
+        .encrypted_token
+        .map(|token| BASE64_STANDARD.encode(token))
+        .unwrap_or_default();
+    let mut event = EventBuilder::new(Kind::Custom(kind), content)
+        .tags(tags)
+        .custom_created_at(Timestamp::zero())
+        .finalize_unsigned(member_pubkey);
+    event.ensure_id();
+    Ok(event)
+}
+
+fn push_owner_sig_from_signed_event(
+    expected: &UnsignedEvent,
+    signed: Event,
+) -> Result<String, AppError> {
+    let expected_id = expected
+        .id
+        .ok_or_else(|| AppError::Publish("push owner proof event id was not set".into()))?;
+    // The id plus `verify` cryptographically binds these fields. Compare them
+    // explicitly as defense in depth at the external-signer trust boundary.
+    if signed.id != expected_id
+        || signed.pubkey != expected.pubkey
+        || signed.created_at != expected.created_at
+        || signed.kind != expected.kind
+        || signed.tags != expected.tags
+        || signed.content != expected.content
+    {
+        return Err(AppError::Publish(
+            "push owner proof signature does not match record".into(),
+        ));
+    }
+    signed
+        .verify()
+        .map_err(|err| AppError::Publish(format!("invalid push owner proof signature: {err}")))?;
+    Ok(hex::encode(signed.sig.to_bytes()))
+}
+
+/// Verify a Nostr event signature by `member_id_hex` over the canonical,
+/// unpublished owner-proof event. Returns false on malformed input rather than
+/// erroring, so a bad entry is dropped.
+fn verify_push_owner_sig(proof_event: UnsignedEvent, owner_sig_hex: &str) -> bool {
+    let Ok(sig_bytes) = hex::decode(owner_sig_hex) else {
+        return false;
+    };
+    let Ok(sig) = Signature::from_slice(&sig_bytes) else {
+        return false;
+    };
+    #[cfg(test)]
+    note_owner_signature_verification();
+    proof_event.add_signature(sig).is_ok()
+}
+
+/// Verify the legacy owner signature — a BIP-340 Schnorr signature by
+/// `member_id_hex` over `SHA-256(SignedRecord)` (`digest`), rather than over the
+/// owner-proof event id. Older clients, and `group_push_tokens` rows already
+/// persisted before the event-shaped proof landed, signed this digest, so
+/// accepting it keeps the unchanged `owner_sig` wire and storage contract
+/// backward compatible. Returns false on malformed input.
+fn verify_push_owner_sig_legacy(
+    digest: [u8; 32],
+    member_id_hex: &str,
+    owner_sig_hex: &str,
+) -> bool {
+    let Ok(member_bytes) = hex::decode(member_id_hex) else {
+        return false;
+    };
+    let Ok(member_pubkey) = XOnlyPublicKey::from_slice(&member_bytes) else {
+        return false;
+    };
+    let Ok(sig_bytes) = hex::decode(owner_sig_hex) else {
+        return false;
+    };
+    let Ok(sig) = SchnorrSignature::from_slice(&sig_bytes) else {
+        return false;
+    };
+    #[cfg(test)]
+    note_owner_signature_verification();
+    Secp256k1::new()
+        .verify_schnorr(&sig, &digest, &member_pubkey)
+        .is_ok()
+}
+
+impl GroupPushTokenRecord {
+    fn signing_digest(&self) -> Result<[u8; 32], AppError> {
+        let bytes = push_signed_record_bytes(
+            PUSH_RECORD_DOMAIN.as_bytes(),
+            &self.group_id_hex,
+            &self.member_id_hex,
+            self.leaf_index,
+            self.platform.platform_byte(),
+            &self.server_pubkey_hex,
+            &self.token_fingerprint,
+            self.owner_ts,
+            self.relay_hint.as_deref(),
+            Some(&self.encrypted_token),
+        )?;
+        Ok(push_digest(&bytes))
+    }
+
+    /// `SHA-256(SignedRecord)` as lowercase hex: the ordering-primitive tie-breaker.
+    pub(crate) fn record_digest(&self) -> Result<String, AppError> {
+        Ok(hex::encode(self.signing_digest()?))
+    }
+
+    fn owner_proof_event(&self) -> Result<UnsignedEvent, AppError> {
+        self.owner_proof_event_with_kind(PUSH_OWNER_PROOF_EVENT_KIND)
+    }
+
+    fn owner_proof_event_with_kind(&self, kind: u16) -> Result<UnsignedEvent, AppError> {
+        push_owner_proof_event(
+            PushOwnerProofEvent {
+                domain: PUSH_RECORD_DOMAIN,
+                group_id_hex: &self.group_id_hex,
+                member_id_hex: &self.member_id_hex,
+                leaf_index: self.leaf_index,
+                platform: self.platform,
+                server_pubkey_hex: &self.server_pubkey_hex,
+                token_fingerprint: &self.token_fingerprint,
+                owner_ts: self.owner_ts,
+                relay_hint: self.relay_hint.as_deref(),
+                encrypted_token: Some(&self.encrypted_token),
+            },
+            kind,
+        )
+    }
+
+    /// Sign this record with the owner account `keys`, populating `owner_sig`.
+    #[cfg(test)]
+    pub(crate) fn sign_owner(&mut self, keys: &Keys) -> Result<(), AppError> {
+        let proof_event = self.owner_proof_event()?;
+        let signed = proof_event
+            .finalize(keys)
+            .map_err(|err| AppError::Publish(format!("push owner proof: {err}")))?;
+        self.owner_sig = push_owner_sig_from_signed_event(&self.owner_proof_event()?, signed)?;
+        Ok(())
+    }
+
+    pub(crate) async fn sign_owner_with_signer(
+        &mut self,
+        signer: &dyn MarmotNostrSigner,
+    ) -> Result<(), AppError> {
+        let proof_event = self.owner_proof_event()?;
+        let signed = signer
+            .sign_event(proof_event.clone())
+            .await
+            .map_err(|err| crate::external_signer_error(err, "push owner proof"))?;
+        self.owner_sig = push_owner_sig_from_signed_event(&proof_event, signed)?;
+        Ok(())
+    }
+
+    /// True when `owner_sig` is a valid Nostr signature by `member_id_hex`.
+    pub(crate) fn verify_owner_sig(&self, profile: ProtocolProfile) -> bool {
+        if let Ok(proof_event) = self.owner_proof_event()
+            && verify_push_owner_sig(proof_event, &self.owner_sig)
+        {
+            return true;
+        }
+        if profile == ProtocolProfile::Current {
+            return false;
+        }
+        if let Ok(proof_event) =
+            self.owner_proof_event_with_kind(LEGACY_PUSH_OWNER_PROOF_EVENT_KIND)
+            && verify_push_owner_sig(proof_event, &self.owner_sig)
+        {
+            return true;
+        }
+        // Verification-only raw legacy fallback for already-deployed groups.
+        match self.signing_digest() {
+            Ok(digest) => {
+                verify_push_owner_sig_legacy(digest, &self.member_id_hex, &self.owner_sig)
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+impl PushTokenRemovalRecord {
+    fn signing_digest(&self, group_id_hex: &str) -> Result<[u8; 32], AppError> {
+        let bytes = push_signed_record_bytes(
+            PUSH_REMOVAL_DOMAIN.as_bytes(),
+            group_id_hex,
+            &self.member_id_hex,
+            self.leaf_index,
+            self.platform.platform_byte(),
+            &self.server_pubkey_hex,
+            &self.token_fingerprint,
+            self.owner_ts,
+            None,
+            None,
+        )?;
+        Ok(push_digest(&bytes))
+    }
+
+    pub(crate) fn record_digest(&self, group_id_hex: &str) -> Result<String, AppError> {
+        Ok(hex::encode(self.signing_digest(group_id_hex)?))
+    }
+
+    fn owner_proof_event(&self, group_id_hex: &str) -> Result<UnsignedEvent, AppError> {
+        self.owner_proof_event_with_kind(group_id_hex, PUSH_OWNER_PROOF_EVENT_KIND)
+    }
+
+    fn owner_proof_event_with_kind(
+        &self,
+        group_id_hex: &str,
+        kind: u16,
+    ) -> Result<UnsignedEvent, AppError> {
+        push_owner_proof_event(
+            PushOwnerProofEvent {
+                domain: PUSH_REMOVAL_DOMAIN,
+                group_id_hex,
+                member_id_hex: &self.member_id_hex,
+                leaf_index: self.leaf_index,
+                platform: self.platform,
+                server_pubkey_hex: &self.server_pubkey_hex,
+                token_fingerprint: &self.token_fingerprint,
+                owner_ts: self.owner_ts,
+                relay_hint: None,
+                encrypted_token: None,
+            },
+            kind,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sign_owner(&mut self, group_id_hex: &str, keys: &Keys) -> Result<(), AppError> {
+        let proof_event = self.owner_proof_event(group_id_hex)?;
+        let signed = proof_event
+            .clone()
+            .finalize(keys)
+            .map_err(|err| AppError::Publish(format!("push removal owner proof: {err}")))?;
+        self.owner_sig = push_owner_sig_from_signed_event(&proof_event, signed)?;
+        Ok(())
+    }
+
+    pub(crate) async fn sign_owner_with_signer(
+        &mut self,
+        group_id_hex: &str,
+        signer: &dyn MarmotNostrSigner,
+    ) -> Result<(), AppError> {
+        let proof_event = self.owner_proof_event(group_id_hex)?;
+        let signed = signer
+            .sign_event(proof_event.clone())
+            .await
+            .map_err(|err| crate::external_signer_error(err, "push removal owner proof"))?;
+        self.owner_sig = push_owner_sig_from_signed_event(&proof_event, signed)?;
+        Ok(())
+    }
+
+    pub(crate) fn verify_owner_sig(&self, group_id_hex: &str, profile: ProtocolProfile) -> bool {
+        if let Ok(proof_event) = self.owner_proof_event(group_id_hex)
+            && verify_push_owner_sig(proof_event, &self.owner_sig)
+        {
+            return true;
+        }
+        if profile == ProtocolProfile::Current {
+            return false;
+        }
+        if let Ok(proof_event) =
+            self.owner_proof_event_with_kind(group_id_hex, LEGACY_PUSH_OWNER_PROOF_EVENT_KIND)
+            && verify_push_owner_sig(proof_event, &self.owner_sig)
+        {
+            return true;
+        }
+        // Verification-only raw legacy fallback for already-deployed groups.
+        match self.signing_digest(group_id_hex) {
+            Ok(digest) => {
+                verify_push_owner_sig_legacy(digest, &self.member_id_hex, &self.owner_sig)
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+pub fn build_notification_rumor_content(tokens: &[Vec<u8>]) -> Result<String, AppError> {
+    if tokens.is_empty()
+        || tokens.len() > PUSH_MAX_NOTIFICATION_TRIGGER_TOKENS
+        || tokens
+            .iter()
+            .any(|token| token.len() != PUSH_ENCRYPTED_TOKEN_LEN)
+    {
+        return Err(AppError::InvalidPushToken(
+            "notification rumor requires marmot-push-v1 encrypted tokens".into(),
+        ));
+    }
+    let mut joined = Vec::with_capacity(tokens.len() * PUSH_ENCRYPTED_TOKEN_LEN);
+    for token in tokens {
+        joined.extend_from_slice(token);
+    }
+    Ok(BASE64_STANDARD.encode(joined))
+}
+
+pub(crate) fn notification_trigger_chunks(tokens: &[Vec<u8>]) -> std::slice::Chunks<'_, Vec<u8>> {
+    tokens.chunks(PUSH_GIFT_WRAP_TOKEN_LIMIT)
+}
+
+pub async fn build_notification_gift_wrap(
+    server_pubkey_hex: &str,
+    tokens: &[Vec<u8>],
+) -> Result<NostrTransportEvent, AppError> {
+    let server_pubkey = PublicKey::parse(server_pubkey_hex).map_err(|_| {
+        AppError::InvalidPushServer("server pubkey must be a valid Nostr public key".into())
+    })?;
+    let content = build_notification_rumor_content(tokens)?;
+    let seal_keys = Keys::generate();
+    let rumor: UnsignedEvent =
+        EventBuilder::new(Kind::Custom(KIND_MARMOT_NOTIFICATION_RUMOR as u16), content)
+            .tags([Tag::custom(NOTIFICATION_VERSION_TAG, [PUSH_VERSION])])
+            .finalize_unsigned(seal_keys.public_key());
+    let gift_wrap = GiftWrapBuilder::new(server_pubkey, rumor)
+        .finalize_async(&seal_keys)
+        .await
+        .map_err(|err| AppError::Publish(format!("notification gift wrap: {err}")))?;
+    NostrTransportEvent::from_nostr_event(&gift_wrap)
+        .map_err(|err| AppError::Publish(format!("notification event: {err}")))
+}
+
+pub(crate) async fn local_token_gossip_payload(
+    group_id_hex: String,
+    member_id_hex: String,
+    leaf_index: u32,
+    registration: &StoredPushRegistration,
+    signer: &dyn MarmotNostrSigner,
+) -> Result<(PushTokenGossipPayload, GroupPushTokenRecord), AppError> {
+    let encrypted_token = encrypted_push_token(
+        registration.registration.platform,
+        &registration.token_bytes,
+        &registration.registration.server_pubkey_hex,
+    )?;
+    let now = unix_now_ms();
+    let mut record = GroupPushTokenRecord {
+        group_id_hex,
+        member_id_hex,
+        leaf_index,
+        platform: registration.registration.platform,
+        token_fingerprint: registration.registration.token_fingerprint.clone(),
+        server_pubkey_hex: registration.registration.server_pubkey_hex.clone(),
+        relay_hint: normalized_relay_hint(registration.registration.relay_hint.as_deref())
+            .map(str::to_owned),
+        encrypted_token,
+        owner_ts: now,
+        owner_sig: String::new(),
+        updated_at_ms: now,
+    };
+    record.sign_owner_with_signer(signer).await?;
+    let payload = PushTokenGossipPayload {
+        v: PUSH_VERSION.to_owned(),
+        tokens: vec![PushTokenGossipEntry::from_record(&record)],
+    };
+    Ok((payload, record))
+}
+
+pub(crate) async fn local_token_removal_payload(
+    group_id_hex: &str,
+    member_id_hex: String,
+    leaf_index: u32,
+    registration: &PushRegistration,
+    signer: &dyn MarmotNostrSigner,
+) -> Result<(PushTokenRemovalPayload, PushTokenRemovalRecord), AppError> {
+    let mut record = PushTokenRemovalRecord {
+        member_id_hex,
+        leaf_index,
+        platform: registration.platform,
+        token_fingerprint: registration.token_fingerprint.clone(),
+        server_pubkey_hex: registration.server_pubkey_hex.clone(),
+        owner_ts: unix_now_ms(),
+        owner_sig: String::new(),
+    };
+    record.sign_owner_with_signer(group_id_hex, signer).await?;
+    let payload = PushTokenRemovalPayload {
+        v: PUSH_VERSION.to_owned(),
+        removals: vec![PushTokenRemovalEntry {
+            member_id_hex: record.member_id_hex.clone(),
+            leaf_index: record.leaf_index,
+            platform: record.platform.as_str().to_owned(),
+            token_fingerprint: record.token_fingerprint.clone(),
+            server_pubkey_hex: record.server_pubkey_hex.clone(),
+            owner_ts: record.owner_ts,
+            owner_sig: record.owner_sig.clone(),
+        }],
+    };
+    Ok((payload, record))
+}
+
+pub(crate) fn parse_push_gossip(
+    kind: u64,
+    group_id_hex: &str,
+    content: &str,
+) -> Result<PushGossipAction, AppError> {
+    match kind {
+        MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE | MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST => {
+            preflight_push_gossip_array::<PushTokenGossipShape>(
+                content,
+                "malformed push token gossip",
+            )?;
+            let payload: InboundPushTokenGossipPayload = serde_json::from_str(content)
+                .map_err(|_| AppError::InvalidPushGossip("malformed push token gossip".into()))?;
+            if payload.v != PUSH_VERSION {
+                return Err(AppError::InvalidPushGossip(
+                    "unsupported push token gossip version".into(),
+                ));
+            }
+            let mut seen = HashSet::new();
+            let records = payload
+                .tokens
+                .into_iter()
+                .filter_map(|entry| serde_json::from_value::<PushTokenGossipEntry>(entry).ok())
+                .map(PushTokenGossipEntry::normalize_relay_hint)
+                .filter(|entry| seen.insert(entry.clone()))
+                .filter_map(|entry| entry.into_record(group_id_hex).ok())
+                .collect();
+            Ok(PushGossipAction::Upsert(records))
+        }
+        MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL => {
+            preflight_push_gossip_array::<PushTokenRemovalShape>(
+                content,
+                "malformed push token removal",
+            )?;
+            let payload: InboundPushTokenRemovalPayload = serde_json::from_str(content)
+                .map_err(|_| AppError::InvalidPushGossip("malformed push token removal".into()))?;
+            if payload.v != PUSH_VERSION {
+                return Err(AppError::InvalidPushGossip(
+                    "unsupported push token removal version".into(),
+                ));
+            }
+            let mut seen = HashSet::new();
+            let removals = payload
+                .removals
+                .into_iter()
+                .filter_map(|entry| serde_json::from_value::<PushTokenRemovalEntry>(entry).ok())
+                .filter(|entry| seen.insert(entry.clone()))
+                .filter_map(|entry| entry.into_record().ok())
+                .collect();
+            Ok(PushGossipAction::Remove(removals))
+        }
+        _ => Err(AppError::InvalidPushGossip(
+            "unsupported push token gossip kind".into(),
+        )),
+    }
+}
+
+fn preflight_push_gossip_array<T>(content: &str, malformed: &'static str) -> Result<(), AppError>
+where
+    T: DeserializeOwned,
+{
+    serde_json::from_str::<T>(content)
+        .map(|_| ())
+        .map_err(|_| AppError::InvalidPushGossip(malformed.into()))
+}
+
+/// Drop push-gossip entries that are not owner-authenticated. Each surviving
+/// entry carries a valid `owner_sig` by its own `member_id_hex` and names a
+/// current group member. Verification is per entry and silent, so one bad entry
+/// never poisons the batch — and a verified entry is applied no matter which
+/// member relayed it (kind 447 self-update or kind 448 transitive list response),
+/// which is what makes offline-member bootstrap safe.
+pub(crate) fn verify_push_gossip_for_profile(
+    action: PushGossipAction,
+    group_id_hex: &str,
+    active_members: &[String],
+    profile: ProtocolProfile,
+) -> PushGossipAction {
+    let active: HashSet<&str> = active_members.iter().map(String::as_str).collect();
+    let latest_valid_owner_ts = unix_now_ms().saturating_add(PUSH_OWNER_TS_MAX_FUTURE_MS);
+    match action {
+        PushGossipAction::Upsert(records) => PushGossipAction::Upsert(
+            records
+                .into_iter()
+                .filter(|record| {
+                    active.contains(record.member_id_hex.as_str())
+                        && (0..=latest_valid_owner_ts).contains(&record.owner_ts)
+                        && record.verify_owner_sig(profile)
+                })
+                .collect(),
+        ),
+        PushGossipAction::Remove(removals) => PushGossipAction::Remove(
+            removals
+                .into_iter()
+                .filter(|removal| {
+                    active.contains(removal.member_id_hex.as_str())
+                        && (0..=latest_valid_owner_ts).contains(&removal.owner_ts)
+                        && removal.verify_owner_sig(group_id_hex, profile)
+                })
+                .collect(),
+        ),
+    }
+}
+
+#[cfg(test)]
+fn verify_push_gossip(
+    action: PushGossipAction,
+    group_id_hex: &str,
+    active_members: &[String],
+) -> PushGossipAction {
+    verify_push_gossip_for_profile(
+        action,
+        group_id_hex,
+        active_members,
+        ProtocolProfile::Current,
+    )
+}
+
+impl PushTokenGossipEntry {
+    fn normalize_relay_hint(mut self) -> Self {
+        self.relay_hint = normalized_relay_hint(self.relay_hint.as_deref()).map(str::to_owned);
+        self
+    }
+
+    fn from_record(record: &GroupPushTokenRecord) -> Self {
+        Self {
+            member_id_hex: record.member_id_hex.clone(),
+            leaf_index: record.leaf_index,
+            platform: record.platform.as_str().to_owned(),
+            token_fingerprint: record.token_fingerprint.clone(),
+            server_pubkey_hex: record.server_pubkey_hex.clone(),
+            relay_hint: record.relay_hint.clone(),
+            encrypted_token: BASE64_STANDARD.encode(&record.encrypted_token),
+            owner_ts: record.owner_ts,
+            owner_sig: record.owner_sig.clone(),
+        }
+    }
+
+    fn into_record(self, group_id_hex: &str) -> Result<GroupPushTokenRecord, AppError> {
+        let platform = PushPlatform::from_str(&self.platform)?;
+        let encrypted_token = BASE64_STANDARD
+            .decode(self.encrypted_token)
+            .map_err(|_| AppError::InvalidPushGossip("invalid encrypted token base64".into()))?;
+        if encrypted_token.len() != PUSH_ENCRYPTED_TOKEN_LEN {
+            return Err(AppError::InvalidPushGossip(
+                "invalid encrypted token length".into(),
+            ));
+        }
+        validate_account_hex(&self.member_id_hex, "member id")?;
+        validate_account_hex(&self.server_pubkey_hex, "server pubkey")?;
+        validate_fingerprint(&self.token_fingerprint)?;
+        validate_owner_sig_hex(&self.owner_sig)?;
+        Ok(GroupPushTokenRecord {
+            group_id_hex: group_id_hex.to_owned(),
+            member_id_hex: self.member_id_hex,
+            leaf_index: self.leaf_index,
+            platform,
+            token_fingerprint: self.token_fingerprint,
+            server_pubkey_hex: self.server_pubkey_hex,
+            relay_hint: self.relay_hint,
+            encrypted_token,
+            owner_ts: self.owner_ts,
+            owner_sig: self.owner_sig,
+            updated_at_ms: unix_now_ms(),
+        })
+    }
+}
+
+impl PushTokenRemovalEntry {
+    fn into_record(self) -> Result<PushTokenRemovalRecord, AppError> {
+        validate_account_hex(&self.member_id_hex, "member id")?;
+        validate_account_hex(&self.server_pubkey_hex, "server pubkey")?;
+        validate_fingerprint(&self.token_fingerprint)?;
+        validate_owner_sig_hex(&self.owner_sig)?;
+        Ok(PushTokenRemovalRecord {
+            member_id_hex: self.member_id_hex,
+            leaf_index: self.leaf_index,
+            platform: PushPlatform::from_str(&self.platform)?,
+            token_fingerprint: self.token_fingerprint,
+            server_pubkey_hex: self.server_pubkey_hex,
+            owner_ts: self.owner_ts,
+            owner_sig: self.owner_sig,
+        })
+    }
+}
+
+fn validate_account_hex(value: &str, name: &str) -> Result<(), AppError> {
+    let decoded = hex::decode(value).map_err(|_| {
+        AppError::InvalidPushGossip(format!("{name} must be 32-byte lowercase hex"))
+    })?;
+    if decoded.len() != 32 || value.chars().any(|c| c.is_ascii_uppercase()) {
+        return Err(AppError::InvalidPushGossip(format!(
+            "{name} must be 32-byte lowercase hex"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_fingerprint(value: &str) -> Result<(), AppError> {
+    let Some(rest) = value.strip_prefix("sha256:") else {
+        return Err(AppError::InvalidPushGossip(
+            "token fingerprint must be redacted sha256".into(),
+        ));
+    };
+    if rest.len() != 24
+        || !rest.chars().all(|c| c.is_ascii_hexdigit())
+        || rest.chars().any(|c| c.is_ascii_uppercase())
+    {
+        return Err(AppError::InvalidPushGossip(
+            "token fingerprint must be redacted sha256".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn is_push_gossip_kind(kind: u64) -> bool {
+    matches!(
+        kind,
+        MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE
+            | MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST
+            | MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL
+    )
+}
+
+/// Per-batch memoization of the notification-building lookups that repeat across
+/// the events drained in one `collect_notifications_after_wake` pass (#639):
+/// account notification settings (keyed by account_label), the group record
+/// (keyed by account_label + group_id_hex), and directory-derived users (keyed by
+/// account_id_hex — shared by the receiver and by every sender). Each backing
+/// lookup re-opens the per-account SQLCipher / directory caches and fans across
+/// accounts, so a busy multi-message batch would otherwise re-pay that per
+/// message. `reaction_target` is intentionally NOT cached — it is keyed by a
+/// distinct reacted-to message id per reaction, so there is nothing to reuse.
+///
+/// Cached values are message-agnostic: `user` stores the raw directory result,
+/// and the per-message sender-display-name fallback is applied to the returned
+/// clone by `notification_user_from_message`, never written back into the cache.
+#[derive(Default)]
+pub(crate) struct NotificationResolver {
+    settings: HashMap<String, NotificationSettings>,
+    chat_muted: HashMap<(String, String), bool>,
+    groups: HashMap<(String, String), Option<AppGroupRecord>>,
+    users: HashMap<String, NotificationUser>,
+}
+
+impl NotificationResolver {
+    fn settings(
+        &mut self,
+        app: &MarmotApp,
+        account_label: &str,
+    ) -> Result<NotificationSettings, AppError> {
+        if let Some(settings) = self.settings.get(account_label) {
+            return Ok(settings.clone());
+        }
+        let settings = app.notification_settings(account_label)?;
+        self.settings
+            .insert(account_label.to_owned(), settings.clone());
+        Ok(settings)
+    }
+
+    fn group(
+        &mut self,
+        app: &MarmotApp,
+        account_label: &str,
+        group_id_hex: &str,
+    ) -> Result<Option<AppGroupRecord>, AppError> {
+        let key = (account_label.to_owned(), group_id_hex.to_owned());
+        if let Some(group) = self.groups.get(&key) {
+            return Ok(group.clone());
+        }
+        let group = app.group(account_label, group_id_hex)?;
+        self.groups.insert(key, group.clone());
+        Ok(group)
+    }
+
+    fn chat_muted(
+        &mut self,
+        app: &MarmotApp,
+        account_label: &str,
+        group_id_hex: &str,
+    ) -> Result<bool, AppError> {
+        let key = (account_label.to_owned(), group_id_hex.to_owned());
+        if let Some(muted) = self.chat_muted.get(&key) {
+            return Ok(*muted);
+        }
+        let muted = app
+            .chat_notification_settings(account_label, group_id_hex)?
+            .muted;
+        self.chat_muted.insert(key, muted);
+        Ok(muted)
+    }
+
+    fn user(
+        &mut self,
+        app: &MarmotApp,
+        account_id_hex: &str,
+    ) -> Result<NotificationUser, AppError> {
+        if let Some(user) = self.users.get(account_id_hex) {
+            return Ok(user.clone());
+        }
+        let user = notification_user(app, account_id_hex)?;
+        self.users.insert(account_id_hex.to_owned(), user.clone());
+        Ok(user)
+    }
+}
+
+/// Build a notification for a single event with a throwaway resolver. Used by the
+/// live per-event notification stream, where events arrive one at a time and
+/// there is nothing to memoize across.
+pub(crate) fn notification_update_from_event(
+    app: &MarmotApp,
+    event: &MarmotAppEvent,
+) -> Result<Option<NotificationUpdate>, AppError> {
+    let mut resolver = NotificationResolver::default();
+    notification_update_from_event_cached(app, &mut resolver, event)
+}
+
+/// Re-derive candidate notifications from recent stored messages after the
+/// live broadcast ring overflows. Callers still dedupe against already-emitted
+/// `notification_key`s so recovery cannot replay a notification the subscriber
+/// already saw. `min_observed_at` is a per-subscription watermark in the same
+/// second-resolution units as `recorded_at` / `received_at`; rows strictly
+/// before it are pre-subscription history and must not become fresh OS alerts.
+/// Same-second rows stay eligible so in-session events are not dropped.
+pub(crate) fn recover_notification_updates(
+    app: &MarmotApp,
+    min_observed_at: Option<u64>,
+) -> Result<Vec<NotificationUpdate>, AppError> {
+    let mut resolver = NotificationResolver::default();
+    let mut updates = Vec::new();
+    for account in app.account_home().accounts()? {
+        let records = app.messages_with_query(
+            &account.label,
+            AppMessageQuery {
+                group_id_hex: None,
+                kinds: None,
+                limit: Some(NOTIFICATION_LAG_RECOVERY_LIMIT),
+            },
+        )?;
+        for record in records {
+            if !notification_recovery_should_project(&record, min_observed_at) {
+                continue;
+            }
+            let result = if record.kind == MARMOT_APP_EVENT_KIND_GROUP_SYSTEM {
+                notification_update_from_group_system_record(
+                    app,
+                    &mut resolver,
+                    &account.label,
+                    &account.account_id_hex,
+                    &record,
+                )
+            } else {
+                let Ok(group_id) = hex::decode(&record.group_id_hex) else {
+                    continue;
+                };
+                let sender_display_name = app
+                    .display_name_for_account_id(&record.sender)
+                    .ok()
+                    .flatten();
+                let event = MarmotAppEvent::MessageReceived(RuntimeMessageReceived {
+                    account_id_hex: account.account_id_hex.clone(),
+                    account_label: account.label.clone(),
+                    message: ReceivedMessage {
+                        authority: None,
+                        message_id_hex: record.message_id_hex,
+                        source_message_id_hex: String::new(),
+                        sender: record.sender,
+                        sender_display_name,
+                        group_id: GroupId::new(group_id),
+                        source_epoch: record.source_epoch.unwrap_or(0),
+                        retention: record.retention,
+                        plaintext: record.plaintext,
+                        kind: record.kind,
+                        tags: record.tags,
+                        recorded_at: record.recorded_at,
+                        received_at: record.received_at,
+                    },
+                });
+                notification_update_from_event_cached(app, &mut resolver, &event)
+            };
+            match result {
+                Ok(Some(update)) => updates.push(update),
+                Ok(None) | Err(AppError::NotificationsDisabled) => {}
+                Err(_) => {
+                    tracing::warn!(
+                        target: "marmot_app::notifications",
+                        method = "recover_notification_updates",
+                        error_code = "notification_projection_skipped",
+                        "recovered notification projection skipped",
+                    );
+                }
+            }
+        }
+    }
+    Ok(dedupe_notification_updates(updates))
+}
+
+pub(crate) fn notification_recovery_is_fresh(
+    record: &AppMessageRecord,
+    min_observed_at: Option<u64>,
+) -> bool {
+    // `recorded_at` is sender-authenticated and intentionally not clamped.
+    // Only this device's local observation time can define whether a row was
+    // received before or after the subscription boundary.
+    min_observed_at.is_none_or(|min| record.received_at >= min)
+}
+
+pub(crate) fn notification_recovery_should_project(
+    record: &AppMessageRecord,
+    min_observed_at: Option<u64>,
+) -> bool {
+    !record.invalidated && notification_recovery_is_fresh(record, min_observed_at)
+}
+
+/// Build a notification for one event, reusing `resolver`'s memoized
+/// settings/group/user lookups across a batch of events (#639).
+pub(crate) fn notification_update_from_event_cached(
+    app: &MarmotApp,
+    resolver: &mut NotificationResolver,
+    event: &MarmotAppEvent,
+) -> Result<Option<NotificationUpdate>, AppError> {
+    match event {
+        MarmotAppEvent::MessageReceived(message) => {
+            notification_update_from_message(app, resolver, message)
+        }
+        MarmotAppEvent::GroupJoined {
+            account_id_hex,
+            account_label,
+            group_id,
+        } => notification_update_from_group_join(
+            app,
+            resolver,
+            account_label,
+            account_id_hex,
+            group_id,
+        ),
+        MarmotAppEvent::GroupEvent(group_event) => {
+            notification_update_from_runtime_group_event(app, resolver, group_event)
+        }
+        MarmotAppEvent::GroupStateUpdated { .. }
+        | MarmotAppEvent::ProjectionUpdated(_)
+        | MarmotAppEvent::AgentStreamStarted(_)
+        | MarmotAppEvent::WelcomeDeliveryPending { .. }
+        | MarmotAppEvent::EpochStallEscalated { .. }
+        | MarmotAppEvent::GroupChangeSuperseded { .. }
+        | MarmotAppEvent::HistoryNoticesChanged { .. }
+        | MarmotAppEvent::AccountError(_) => Ok(None),
+    }
+}
+
+/// Classify an authenticated group-state change for the receiving local
+/// account. Only self-affecting `MemberRemoved`, `AdminAdded`, and non-self
+/// `AdminRemoved` notify. Voluntary leave, self-demotion, unrelated subjects,
+/// and changes without a local subject are suppressed. Inbound admin-policy
+/// diffs are commonly unattributed; self-demotion is the case whose actor is
+/// the local account.
+pub(crate) fn classify_local_group_state_notification(
+    local_account_id_hex: &str,
+    actor_account_id_hex: Option<&str>,
+    system_type: &str,
+    subject_account_id_hex: Option<&str>,
+) -> Option<NotificationTrigger> {
+    let subject = subject_account_id_hex.filter(|value| !value.is_empty())?;
+    if !subject.eq_ignore_ascii_case(local_account_id_hex) {
+        return None;
+    }
+    match system_type {
+        GROUP_SYSTEM_TYPE_MEMBER_REMOVED => Some(NotificationTrigger::RemovedFromGroup),
+        GROUP_SYSTEM_TYPE_ADMIN_ADDED => Some(NotificationTrigger::MadeAdmin),
+        GROUP_SYSTEM_TYPE_ADMIN_REMOVED => {
+            let is_self_demotion = actor_account_id_hex
+                .filter(|value| !value.is_empty())
+                .is_some_and(|actor| actor.eq_ignore_ascii_case(local_account_id_hex));
+            if is_self_demotion {
+                None
+            } else {
+                Some(NotificationTrigger::RemovedAsAdmin)
+            }
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn classify_group_state_change(
+    local_account_id_hex: &str,
+    actor: Option<&MemberId>,
+    change: &GroupStateChange,
+) -> Option<NotificationTrigger> {
+    let actor_hex = actor.map(|id| hex::encode(id.as_slice()));
+    let (system_type, subject) = match change {
+        GroupStateChange::MemberRemoved { member } => (GROUP_SYSTEM_TYPE_MEMBER_REMOVED, member),
+        GroupStateChange::AdminAdded { member } => (GROUP_SYSTEM_TYPE_ADMIN_ADDED, member),
+        GroupStateChange::AdminRemoved { member } => (GROUP_SYSTEM_TYPE_ADMIN_REMOVED, member),
+        _ => return None,
+    };
+    classify_local_group_state_notification(
+        local_account_id_hex,
+        actor_hex.as_deref(),
+        system_type,
+        Some(&hex::encode(subject.as_slice())),
+    )
+}
+
+/// Subjects of successful non-self membership/admin effects that should receive
+/// a context-free kind-446 wake from the mutating device.
+pub(crate) fn wake_member_id_hex_from_group_event(
+    local_account_id_hex: &str,
+    event: &GroupEvent,
+) -> Option<String> {
+    let GroupEvent::GroupStateChanged { change, .. } = event else {
+        return None;
+    };
+    let member = match change {
+        GroupStateChange::MemberRemoved { member }
+        | GroupStateChange::AdminAdded { member }
+        | GroupStateChange::AdminRemoved { member } => member,
+        _ => return None,
+    };
+    let member_hex = hex::encode(member.as_slice());
+    (!member_hex.eq_ignore_ascii_case(local_account_id_hex)).then_some(member_hex)
+}
+
+pub(crate) fn wake_member_ids_from_group_events(
+    local_account_id_hex: &str,
+    events: &[GroupEvent],
+) -> HashSet<String> {
+    events
+        .iter()
+        .filter_map(|event| wake_member_id_hex_from_group_event(local_account_id_hex, event))
+        .collect()
+}
+
+pub(crate) fn tokens_for_member_ids(
+    tokens: Vec<GroupPushTokenRecord>,
+    member_id_hexes: impl IntoIterator<Item = impl AsRef<str>>,
+) -> Vec<GroupPushTokenRecord> {
+    let wanted = member_id_hexes
+        .into_iter()
+        .map(|id| id.as_ref().to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    tokens
+        .into_iter()
+        .filter(|token| wanted.contains(&token.member_id_hex.to_ascii_lowercase()))
+        .collect()
+}
+
+fn notification_update_from_runtime_group_event(
+    app: &MarmotApp,
+    resolver: &mut NotificationResolver,
+    event: &RuntimeGroupEvent,
+) -> Result<Option<NotificationUpdate>, AppError> {
+    let GroupEvent::GroupStateChanged {
+        group_id,
+        epoch,
+        actor,
+        change,
+        ..
+    } = &event.event
+    else {
+        return Ok(None);
+    };
+    let Some(trigger) = classify_group_state_change(&event.account_id_hex, actor.as_ref(), change)
+    else {
+        return Ok(None);
+    };
+    let material = match group_system_event_material(group_id, epoch.0, actor.as_ref(), change) {
+        Ok(material) => material,
+        Err(_) => return Ok(None),
+    };
+    let actor_hex = actor.as_ref().map(|id| hex::encode(id.as_slice()));
+    notification_update_from_classified_group_state(
+        app,
+        resolver,
+        &event.account_label,
+        &event.account_id_hex,
+        ClassifiedGroupStateNotice {
+            group_id_hex: &material.group_id_hex,
+            trigger,
+            message_id_hex: &material.message_id_hex,
+            actor_account_id_hex: actor_hex.as_deref(),
+        },
+    )
+}
+
+fn notification_update_from_group_system_record(
+    app: &MarmotApp,
+    resolver: &mut NotificationResolver,
+    account_label: &str,
+    account_id_hex: &str,
+    record: &AppMessageRecord,
+) -> Result<Option<NotificationUpdate>, AppError> {
+    let Some(event) = group_system_event_from_message(record.kind, &record.plaintext) else {
+        return Ok(None);
+    };
+    let Some(trigger) = classify_local_group_state_notification(
+        account_id_hex,
+        event.actor_account_id_hex.as_deref(),
+        &event.system_type,
+        event.subject_account_id_hex.as_deref(),
+    ) else {
+        return Ok(None);
+    };
+    notification_update_from_classified_group_state(
+        app,
+        resolver,
+        account_label,
+        account_id_hex,
+        ClassifiedGroupStateNotice {
+            group_id_hex: &record.group_id_hex,
+            trigger,
+            message_id_hex: &record.message_id_hex,
+            actor_account_id_hex: event.actor_account_id_hex.as_deref(),
+        },
+    )
+}
+
+struct ClassifiedGroupStateNotice<'a> {
+    group_id_hex: &'a str,
+    trigger: NotificationTrigger,
+    message_id_hex: &'a str,
+    actor_account_id_hex: Option<&'a str>,
+}
+
+fn notification_update_from_classified_group_state(
+    app: &MarmotApp,
+    resolver: &mut NotificationResolver,
+    account_label: &str,
+    account_id_hex: &str,
+    notice: ClassifiedGroupStateNotice<'_>,
+) -> Result<Option<NotificationUpdate>, AppError> {
+    if app
+        .account_storage(account_label)?
+        .app_storage()
+        .suppress_blocked_notification(
+            notice.actor_account_id_hex.unwrap_or(""),
+            notice.group_id_hex,
+            notice.message_id_hex,
+        )?
+    {
+        return Ok(None);
+    }
+    let settings = resolver.settings(app, account_label)?;
+    if !settings.local_notifications_enabled {
+        return Err(AppError::NotificationsDisabled);
+    }
+    let group = match resolver.group(app, account_label, notice.group_id_hex) {
+        Ok(group) => group,
+        Err(AppError::UnknownGroup(_)) => None,
+        Err(err) => return Err(err),
+    };
+    let muted = match resolver.chat_muted(app, account_label, notice.group_id_hex) {
+        Ok(muted) => muted,
+        Err(AppError::UnknownGroup(_)) => false,
+        Err(err) => return Err(err),
+    };
+    if muted {
+        return Ok(None);
+    }
+    let receiver = resolver.user(app, account_id_hex)?;
+    let sender = match notice
+        .actor_account_id_hex
+        .filter(|value| !value.is_empty())
+    {
+        Some(actor_id) => resolver.user(app, actor_id)?,
+        None => NotificationUser {
+            account_id_hex: String::new(),
+            display_name: None,
+            picture_url: None,
+        },
+    };
+    let is_from_self = notice
+        .actor_account_id_hex
+        .is_some_and(|actor| !actor.is_empty() && actor.eq_ignore_ascii_case(account_id_hex));
+    Ok(Some(NotificationUpdate {
+        notification_key: format!("group-state:{account_id_hex}:{}", notice.message_id_hex),
+        conversation_key: conversation_key(account_id_hex, notice.group_id_hex),
+        trigger: notice.trigger,
+        traffic_class: NotificationTrafficClass::Standard,
+        account_ref: account_label.to_owned(),
+        account_id_hex: account_id_hex.to_owned(),
+        group_id_hex: notice.group_id_hex.to_owned(),
+        group_name: group_name(group.as_ref()),
+        is_dm: false,
+        is_mention: false,
+        message_id_hex: Some(notice.message_id_hex.to_owned()),
+        sender,
+        receiver,
+        preview_text: None,
+        reaction_emoji: None,
+        reacted_to_preview: None,
+        timestamp_ms: unix_now_ms(),
+        is_from_self,
+    }))
+}
+
+/// Classify every notification-eligible wire kind. Returning `None` for
+/// unknown kinds keeps notification eligibility and channel routing coupled:
+/// adding a kind cannot silently fall through to the audible standard channel.
+fn notification_traffic_for_kind(kind: u64) -> Option<NotificationTrafficClass> {
+    match kind {
+        MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY | MARMOT_APP_EVENT_KIND_AGENT_OPERATION => {
+            Some(NotificationTrafficClass::AgentActivity)
+        }
+        MARMOT_APP_EVENT_KIND_CHAT
+        | MARMOT_APP_EVENT_KIND_REACTION
+        | MARMOT_APP_EVENT_KIND_POLL => Some(NotificationTrafficClass::Standard),
+        _ => None,
+    }
+}
+
+/// Resolve one delivered message into a typed notification candidate.
+///
+/// Durable whole-chat mute filters ordinary traffic after blocked-sender and
+/// kind checks, while a direct mention of the receiving account remains
+/// eligible for the host's permission, channel, and foreground policy.
+fn notification_update_from_message(
+    app: &MarmotApp,
+    resolver: &mut NotificationResolver,
+    event: &RuntimeMessageReceived,
+) -> Result<Option<NotificationUpdate>, AppError> {
+    let storage = app.account_storage(&event.account_label)?;
+    if storage.app_storage().suppress_blocked_notification(
+        &event.message.sender,
+        &hex::encode(event.message.group_id.as_slice()),
+        &event.message.message_id_hex,
+    )? {
+        return Ok(None);
+    }
+    let settings = resolver.settings(app, &event.account_label)?;
+    if !settings.local_notifications_enabled {
+        return Err(AppError::NotificationsDisabled);
+    }
+    // Only chat messages, reactions, and explicitly classified agent activity
+    // alert. Deletes, edits, stream control events, and group-system rows never
+    // produce notifications (e.g. deleting a message must not push a "Deleted
+    // a message" alert).
+    let Some(traffic_class) = notification_traffic_for_kind(event.message.kind) else {
+        return Ok(None);
+    };
+    let group_id_hex = hex::encode(event.message.group_id.as_slice());
+    let group = match resolver.group(app, &event.account_label, &group_id_hex) {
+        Ok(group) => group,
+        Err(AppError::UnknownGroup(_)) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let muted = match resolver.chat_muted(app, &event.account_label, &group_id_hex) {
+        Ok(muted) => muted,
+        Err(AppError::UnknownGroup(_)) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    // Durable mute silences everything except a direct mention of this account.
+    let is_from_self = event.message.sender == event.account_id_hex;
+    let is_mention = notification_is_mention(&event.message, &event.account_id_hex, is_from_self);
+    if muted && !is_mention {
+        return Ok(None);
+    }
+    let receiver = resolver.user(app, &event.account_id_hex)?;
+    let sender = notification_user_from_message(app, resolver, &event.message)?;
+    // Resolve the reacted-to row from the materialized timeline by id (not raw
+    // app_events): the timeline reflects deletion/invalidation and never carries
+    // removed text, so a reaction can't leak it into a preview. Notify only the
+    // target's author; if this account didn't author it, or the target is gone
+    // (authorship unverifiable), emit nothing.
+    let reaction_target = if event.message.kind == MARMOT_APP_EVENT_KIND_REACTION {
+        match tag_value(&event.message.tags, EVENT_REF_TAG) {
+            Some(target_id) => {
+                app.reaction_target(&event.account_label, &group_id_hex, target_id)?
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+    if event.message.kind == MARMOT_APP_EVENT_KIND_REACTION
+        && reaction_target
+            .as_ref()
+            .map(|target| target.sender.as_str())
+            != Some(event.account_id_hex.as_str())
+    {
+        return Ok(None);
+    }
+    let (reaction_emoji, reacted_to_preview) =
+        reaction_notification_fields(&event.message, reaction_target.as_ref());
+    Ok(Some(NotificationUpdate {
+        notification_key: format!(
+            "message:{}:{}",
+            event.account_id_hex, event.message.message_id_hex
+        ),
+        conversation_key: conversation_key(&event.account_id_hex, &group_id_hex),
+        trigger: NotificationTrigger::NewMessage,
+        traffic_class,
+        account_ref: event.account_label.clone(),
+        account_id_hex: event.account_id_hex.clone(),
+        group_id_hex,
+        group_name: group_name(group.as_ref()),
+        is_dm: false,
+        is_mention,
+        message_id_hex: Some(event.message.message_id_hex.clone()),
+        sender,
+        receiver,
+        preview_text: preview_text_for_message(&event.message),
+        reaction_emoji,
+        reacted_to_preview,
+        timestamp_ms: unix_now_ms(),
+        is_from_self,
+    }))
+}
+
+fn notification_update_from_group_join(
+    app: &MarmotApp,
+    resolver: &mut NotificationResolver,
+    account_label: &str,
+    account_id_hex: &str,
+    group_id: &cgka_traits::GroupId,
+) -> Result<Option<NotificationUpdate>, AppError> {
+    let settings = resolver.settings(app, account_label)?;
+    if !settings.local_notifications_enabled {
+        return Err(AppError::NotificationsDisabled);
+    }
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let group = resolver.group(app, account_label, &group_id_hex)?;
+    let receiver = resolver.user(app, account_id_hex)?;
+    let sender_id = group
+        .as_ref()
+        .and_then(|group| group.welcomer_account_id_hex.clone())
+        .unwrap_or_else(|| account_id_hex.to_owned());
+    if app
+        .account_storage(account_label)?
+        .app_storage()
+        .suppress_blocked_notification(
+            &sender_id,
+            &group_id_hex,
+            &format!(
+                "invite:{}",
+                group
+                    .as_ref()
+                    .and_then(|g| g.via_welcome_message_id_hex.as_deref())
+                    .unwrap_or(&group_id_hex)
+            ),
+        )?
+    {
+        return Ok(None);
+    }
+    let sender = resolver.user(app, &sender_id)?;
+    let invite_ref = group
+        .as_ref()
+        .and_then(|group| group.via_welcome_message_id_hex.clone())
+        .unwrap_or_else(|| group_id_hex.clone());
+    Ok(Some(NotificationUpdate {
+        notification_key: format!("invite:{account_id_hex}:{invite_ref}"),
+        conversation_key: conversation_key(account_id_hex, &group_id_hex),
+        trigger: NotificationTrigger::GroupInvite,
+        traffic_class: NotificationTrafficClass::Standard,
+        account_ref: account_label.to_owned(),
+        account_id_hex: account_id_hex.to_owned(),
+        group_id_hex,
+        group_name: group_name(group.as_ref()),
+        is_dm: false,
+        is_mention: false,
+        message_id_hex: None,
+        sender,
+        receiver,
+        preview_text: None,
+        reaction_emoji: None,
+        reacted_to_preview: None,
+        timestamp_ms: unix_now_ms(),
+        is_from_self: sender_id == account_id_hex,
+    }))
+}
+
+fn group_name(group: Option<&AppGroupRecord>) -> Option<String> {
+    group
+        .map(|group| group.profile.name.trim().to_owned())
+        .filter(|name| !name.is_empty())
+}
+
+fn preview_text_for_message(message: &ReceivedMessage) -> Option<String> {
+    preview_text_for_kind(message.kind, &message.plaintext)
+}
+
+fn notification_is_mention(
+    message: &ReceivedMessage,
+    account_id_hex: &str,
+    is_from_self: bool,
+) -> bool {
+    !is_from_self && message_mentions_account(message, account_id_hex)
+}
+
+fn message_mentions_account(message: &ReceivedMessage, account_id_hex: &str) -> bool {
+    message_text_mentions_account(
+        message.kind,
+        &message.plaintext,
+        &message.tags,
+        account_id_hex,
+    )
+}
+
+/// Pure mention predicate over a timeline message's raw fields. A message
+/// mentions `account_id_hex` when it is a kind-9 chat that either carries a
+/// NIP-27 pubkey-reference (`p`) tag resolving to the account, or an inline
+/// nostr pubkey entity referencing it (a bare `@npub1…` handle or an explicit
+/// `nostr:` URI). Shared with the chat-list unread projection so the @-badge
+/// reuses the exact notification classification. The inline Markdown fallback
+/// is intentionally bounded (mdk#654); send-side / wire `p` tags are the
+/// authoritative mention signal for content beyond that cap.
+pub(crate) fn message_text_mentions_account(
+    kind: u64,
+    plaintext: &str,
+    tags: &[Vec<String>],
+    account_id_hex: &str,
+) -> bool {
+    if kind != MARMOT_APP_EVENT_KIND_CHAT || account_id_hex.is_empty() {
+        return false;
+    }
+    if tags.iter().any(|tag| {
+        tag.first().is_some_and(|name| name == PUBKEY_REF_TAG)
+            && tag
+                .get(1)
+                .and_then(|value| mention_pubkey_hex(value))
+                .is_some_and(|value| value.eq_ignore_ascii_case(account_id_hex))
+    }) {
+        return true;
+    }
+    // Keep this fallback bounded with the sender-side p-tag derivation. Do not
+    // reintroduce full-content Markdown parsing here: hostile received content
+    // can otherwise spend unbounded CPU before notification classification.
+    inline_mention_pubkey_hexes(plaintext)
+        .iter()
+        .any(|mentioned| mentioned.eq_ignore_ascii_case(account_id_hex))
+}
+
+/// Shared preview rule for an inner app event's kind/plaintext. Push-gossip
+/// kinds and blank text never produce a preview. Structured agent kinds expose
+/// only approved text/status fields; group-system rows expose supported parsed
+/// text only, so their JSON envelope never reaches a notification payload.
+fn preview_text_for_kind(kind: u64, plaintext: &str) -> Option<String> {
+    if is_push_gossip_kind(kind)
+        || kind == MARMOT_APP_EVENT_KIND_POLL
+        || plaintext.trim().is_empty()
+    {
+        None
+    } else if kind == MARMOT_APP_EVENT_KIND_GROUP_SYSTEM {
+        // Reuse the bounded, version-checked parser. This is fallback text,
+        // never authority derived from actor/subject claims in the payload.
+        group_system_event_from_message(kind, plaintext)
+            .map(|event| event.text)
+            .filter(|text| !text.trim().is_empty())
+    } else if kind == MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY {
+        structured_agent_preview(plaintext, &["text", "status"])
+    } else if kind == MARMOT_APP_EVENT_KIND_AGENT_OPERATION {
+        structured_agent_preview(plaintext, &["preview", "text", "status"])
+    } else {
+        // Custom app kinds retain the existing raw-content fallback. A broader
+        // custom-kind preview policy is separate from decoding MDK-owned kinds;
+        // new structured kinds must not rely on this branch for JSON-safe text.
+        Some(plaintext.to_owned())
+    }
+}
+
+fn structured_agent_preview(plaintext: &str, fields: &[&str]) -> Option<String> {
+    let payload = serde_json::from_str::<serde_json::Value>(plaintext).ok()?;
+    fields.iter().find_map(|field| {
+        payload
+            .get(field)?
+            .as_str()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned)
+    })
+}
+
+/// Shape the (emoji, preview) pair for a reaction from its already-resolved
+/// timeline target. Emoji is the trimmed event content. Preview is `None` for a
+/// `deleted`/`invalidated` target so removed text never reaches a preview;
+/// otherwise the normal preview rule applies. Pure; returns display text only.
+fn reaction_notification_fields(
+    message: &ReceivedMessage,
+    target: Option<&TimelineMessageTarget>,
+) -> (Option<String>, Option<String>) {
+    if message.kind != MARMOT_APP_EVENT_KIND_REACTION {
+        return (None, None);
+    }
+    let reaction_emoji = {
+        let trimmed = message.plaintext.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_owned())
+        }
+    };
+    let reacted_to_preview = target.and_then(|target| {
+        if target.deleted || target.invalidated {
+            None
+        } else {
+            preview_text_for_kind(target.kind, &target.plaintext)
+        }
+    });
+    (reaction_emoji, reacted_to_preview)
+}
+
+fn notification_user_from_message(
+    app: &MarmotApp,
+    resolver: &mut NotificationResolver,
+    message: &ReceivedMessage,
+) -> Result<NotificationUser, AppError> {
+    // Start from the cached directory-derived user, then apply THIS message's
+    // sender-display-name fallback to the returned clone — never written back
+    // into the resolver cache, so a later message from the same sender still
+    // applies its own fallback.
+    let mut user = resolver.user(app, &message.sender)?;
+    if user.display_name.is_none() {
+        user.display_name = message.sender_display_name.clone();
+    }
+    Ok(user)
+}
+
+fn notification_user(app: &MarmotApp, account_id_hex: &str) -> Result<NotificationUser, AppError> {
+    // #639: fetch the directory entry ONCE and derive both the display name and
+    // picture from it, instead of calling `directory_entry_for_account_id` here
+    // and again inside `display_name_for_account_id` (each re-opens the directory
+    // caches and fans across every account's SQLCipher cache).
+    let entry = app
+        .directory()
+        .directory_entry_for_account_id(account_id_hex)?;
+    let display_name = app.display_name_from_directory_entry(account_id_hex, entry.as_ref())?;
+    Ok(NotificationUser {
+        account_id_hex: account_id_hex.to_owned(),
+        display_name,
+        picture_url: entry.and_then(|entry| entry.profile.and_then(|profile| profile.picture)),
+    })
+}
+
+pub(crate) fn conversation_key(account_id_hex: &str, group_id_hex: &str) -> String {
+    format!("conversation:{account_id_hex}:{group_id_hex}")
+}
+
+pub(crate) fn dedupe_notification_updates(
+    updates: Vec<NotificationUpdate>,
+) -> Vec<NotificationUpdate> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for update in updates {
+        if seen.insert(update.notification_key.clone()) {
+            out.push(update);
+        }
+    }
+    out
+}
+
+pub(crate) fn group_debug_info(
+    settings: NotificationSettings,
+    registration: Option<StoredPushRegistration>,
+    tokens: Vec<GroupPushTokenRecord>,
+    local_account_id_hex: &str,
+    active_members: &[String],
+) -> GroupPushDebugInfo {
+    let active_by_member = active_members
+        .iter()
+        .enumerate()
+        .map(|(index, member)| (member.clone(), index as u32))
+        .collect::<BTreeMap<_, _>>();
+    let local_leaf_index = active_by_member.get(local_account_id_hex).copied();
+    let local_token_cached = registration.is_some();
+    let mut latest = None;
+    let mut active_count = 0_u32;
+    let mut missing_relay_hint_count = 0_u32;
+    let mut entries = Vec::with_capacity(tokens.len());
+    for token in &tokens {
+        latest = Some(latest.map_or(token.updated_at_ms, |value: i64| {
+            value.max(token.updated_at_ms)
+        }));
+        if token.relay_hint.is_none() {
+            missing_relay_hint_count += 1;
+        }
+        let active_leaf = active_by_member.contains_key(&token.member_id_hex);
+        let member_matches_active_leaf = active_by_member
+            .get(&token.member_id_hex)
+            .is_some_and(|leaf_index| *leaf_index == token.leaf_index);
+        if active_leaf && member_matches_active_leaf {
+            active_count += 1;
+        }
+        entries.push(GroupPushTokenDebugEntry {
+            member_id_hex: token.member_id_hex.clone(),
+            leaf_index: token.leaf_index,
+            platform: token.platform,
+            token_fingerprint: token.token_fingerprint.clone(),
+            server_pubkey_hex: token.server_pubkey_hex.clone(),
+            has_relay_hint: token.relay_hint.is_some(),
+            active_leaf,
+            member_matches_active_leaf,
+            is_local_member: token.member_id_hex == local_account_id_hex,
+            updated_at_ms: token.updated_at_ms,
+        });
+    }
+    entries.sort_by(|a, b| {
+        a.member_id_hex
+            .cmp(&b.member_id_hex)
+            .then_with(|| a.platform.as_str().cmp(b.platform.as_str()))
+            .then_with(|| a.server_pubkey_hex.cmp(&b.server_pubkey_hex))
+    });
+    GroupPushDebugInfo {
+        total_token_count: entries.len() as u32,
+        active_token_count: active_count,
+        stale_token_count: (entries.len() as u32).saturating_sub(active_count),
+        missing_relay_hint_count,
+        last_token_list_updated_at_ms: latest,
+        local_registration: LocalPushRegistrationDebug {
+            registered: registration.is_some(),
+            shareable: settings.native_push_enabled && registration.is_some(),
+            local_notifications_enabled: settings.local_notifications_enabled,
+            native_push_enabled: settings.native_push_enabled,
+            local_leaf_index,
+            local_token_cached,
+        },
+        tokens: entries,
+    }
+}
+
+pub(crate) fn token_records_by_server(
+    tokens: Vec<GroupPushTokenRecord>,
+    local_account_id_hex: &str,
+) -> BTreeMap<String, Vec<GroupPushTokenRecord>> {
+    let mut grouped: BTreeMap<String, Vec<GroupPushTokenRecord>> = BTreeMap::new();
+    let mut keys = BTreeSet::new();
+    for token in tokens {
+        // Keep records without a relay hint: the trigger publisher falls back to
+        // the server account's published kind-10050 inbox relays, so a missing
+        // hint is not an immediate drop (per features/push-notifications.md).
+        if token.member_id_hex == local_account_id_hex {
+            continue;
+        }
+        let key = (
+            token.member_id_hex.clone(),
+            token.platform.as_str().to_owned(),
+            token.server_pubkey_hex.clone(),
+        );
+        if keys.insert(key) {
+            grouped
+                .entry(token.server_pubkey_hex.clone())
+                .or_default()
+                .push(token);
+        }
+    }
+    grouped
+}
+
+/// Choose the relays to publish a notification trigger to for one server.
+///
+/// Per features/push-notifications.md the relay hints carried in stored token
+/// records are preferred; when none exist the fallback is the notification
+/// server account's published kind-10050 NIP-17 inbox relays. If neither is
+/// available the server is unreachable and the result is empty (the caller
+/// skips it as the genuine last resort). Blank entries are dropped and the
+/// result is de-duplicated with a stable order.
+pub(crate) fn select_notification_trigger_relays(
+    record_relay_hints: &[String],
+    server_inbox_relays: &[String],
+) -> Vec<String> {
+    let hints = dedup_non_empty_relays(record_relay_hints);
+    if !hints.is_empty() {
+        return hints;
+    }
+    dedup_non_empty_relays(server_inbox_relays)
+}
+
+fn dedup_non_empty_relays(relays: &[String]) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    relays
+        .iter()
+        .map(|relay| relay.trim())
+        .filter(|relay| !relay.is_empty())
+        .filter(|relay| seen.insert(relay.to_owned()))
+        .map(str::to_owned)
+        .collect()
+}
+
+pub(crate) fn unix_now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(i64::MAX)
+}
+
+pub(crate) fn unix_now_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+#[cfg(test)]
+pub(crate) fn decrypt_push_token_for_test(
+    blob: &[u8],
+    server_secret: &SecretKey,
+) -> Result<(PushPlatform, Vec<u8>), AppError> {
+    if blob.len() != PUSH_ENCRYPTED_TOKEN_LEN {
+        return Err(AppError::InvalidPushToken(
+            "invalid encrypted token length".into(),
+        ));
+    }
+    let ephemeral_xonly = XOnlyPublicKey::from_slice(&blob[..32])
+        .map_err(|_| AppError::InvalidPushToken("invalid encrypted token ephemeral key".into()))?;
+    let ephemeral_pubkey = SecpPublicKey::from_x_only_public_key(ephemeral_xonly, Parity::Even);
+    let shared_x = secp256k1_ecdh_x(&ephemeral_pubkey, server_secret);
+    let key = push_encryption_key(&shared_x)?;
+    let cipher = ChaCha20Poly1305::new_from_slice(&key)
+        .map_err(|_| AppError::InvalidPushToken("marmot-push-v1 key setup failed".into()))?;
+    let plaintext = cipher
+        .decrypt(
+            Nonce::from_slice(&blob[32..44]),
+            Payload {
+                msg: &blob[44..],
+                aad: &[],
+            },
+        )
+        .map_err(|_| AppError::InvalidPushToken("marmot-push-v1 token decrypt failed".into()))?;
+    if plaintext.len() != PUSH_TOKEN_PLAINTEXT_LEN {
+        return Err(AppError::InvalidPushToken(
+            "invalid token plaintext length".into(),
+        ));
+    }
+    let platform = PushPlatform::from_platform_byte(plaintext[0])?;
+    let token_len = u16::from_be_bytes([plaintext[1], plaintext[2]]) as usize;
+    validate_provider_token_len(&plaintext[3..3 + token_len])?;
+    Ok((platform, plaintext[3..3 + token_len].to_vec()))
+}
+
+#[cfg(test)]
+mod tests;

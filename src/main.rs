@@ -15,7 +15,11 @@ struct Args {
 #[derive(Subcommand)]
 enum Action {
     /// Print the worker's version and update compatibility cohort without opening state.
-    UpdateInfo,
+    UpdateInfo {
+        /// Include combined-runtime capabilities for 0.10 and newer helpers.
+        #[arg(long)]
+        full: bool,
+    },
     /// Run in the foreground. herdr starts this worker through the plugin manifest.
     Run {
         /// Enable the optional same-user portr desktop endpoint for this run.
@@ -24,6 +28,10 @@ enum Action {
         /// Disable the portr endpoint, including when enabled in configuration.
         #[arg(long = "no-portr", alias = "no-porter")]
         no_porter: bool,
+        /// Host MDK messaging inside this process using an existing account home.
+        /// Stop the external connector and back up its home before handover.
+        #[arg(long)]
+        messaging_home: Option<PathBuf>,
     },
     /// Forward desktop JSON requests to the running plugin.
     Porter {
@@ -73,8 +81,13 @@ enum ForwardingMode {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    if matches!(args.command, Some(Action::UpdateInfo)) {
-        println!("{}", herdr_white_noise_bridge::update::info()?);
+    if let Some(Action::UpdateInfo { full }) = &args.command {
+        let mut info = herdr_white_noise_bridge::update::info()?;
+        if !full {
+            info.as_object_mut().unwrap().remove("runtimes");
+            info.as_object_mut().unwrap().remove("storage_cohort");
+        }
+        println!("{info}");
         return Ok(());
     }
     let config_path = args.config.unwrap_or_else(|| {
@@ -142,12 +155,44 @@ async fn main() -> Result<()> {
     match args.command.unwrap_or(Action::Run {
         porter: false,
         no_porter: false,
+        messaging_home: None,
     }) {
-        Action::Run { porter, no_porter } => {
+        Action::Run {
+            porter,
+            no_porter,
+            messaging_home,
+        } => {
+            let messaging_home = messaging_home
+                .map(|home| -> Result<PathBuf> {
+                    anyhow::ensure!(home.is_absolute(), "Messaging home must be absolute");
+                    Ok(std::fs::canonicalize(home)?)
+                })
+                .transpose()?;
+            bridge.update_messaging_home = messaging_home.clone();
+            let messaging = match messaging_home {
+                Some(home) => Some(
+                    herdr_white_noise_bridge::messaging::EmbeddedMessaging::start(
+                        &bridge.config,
+                        home,
+                    )
+                    .await?,
+                ),
+                None => None,
+            };
             let enabled = !no_porter && (porter || bridge.config.portr_enabled);
-            bridge.run(enabled).await
+            let result = tokio::select! {
+                result = bridge.run(enabled) => result,
+                result = terminate_signal() => {
+                    result?;
+                    bridge.save()
+                }
+            };
+            if let Some(messaging) = messaging {
+                messaging.shutdown().await?;
+            }
+            result
         }
-        Action::Porter { .. } | Action::UpdateInfo => unreachable!(),
+        Action::Porter { .. } | Action::UpdateInfo { .. } => unreachable!(),
         Action::Notify { text, group } => {
             anyhow::ensure!(
                 bridge.state.forwarding_enabled,
@@ -226,6 +271,12 @@ async fn main() -> Result<()> {
         Action::CheckReaders => unreachable!(),
         Action::Forwarding { .. } => unreachable!(),
     }
+}
+
+async fn terminate_signal() -> Result<()> {
+    let mut signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    signal.recv().await;
+    Ok(())
 }
 
 async fn check_readers(config: BridgeConfig) -> Result<usize> {
