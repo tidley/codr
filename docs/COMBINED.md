@@ -1,4 +1,4 @@
-# Combined codr daemon (0.10.0 implementation, unreleased)
+# Combined codr daemon (0.10.0)
 
 This build can host the bridge and MDK 0.14 messaging runtime in one process.
 It does not spawn `wn-agent`. MDK keeps ownership of keys, account storage,
@@ -13,8 +13,9 @@ The repository pins Rust 1.97.1, matching the MDK build cohort.
 
 ## Chat-only upgrade from 0.9
 
-This path is implemented but not released. Do not expect the published 0.9
-release to offer an unpublished 0.10 build.
+The [0.10.0 release](https://github.com/tidley/codr/releases/tag/v0.10.0) contains
+the combined executable. Phone discovery also requires its verified ngit/Blossom
+mirror. The live 0.9-to-combined phone handover has not been verified.
 
 1. In 0.9, send `/update` and use the confirmation code that version displays.
    Its unchanged helper installs the signed 0.10 executable in bridge-only mode.
@@ -46,9 +47,9 @@ An uncertain result never authorises an automatic retry.
 
 ## Manual existing-installation handover
 
-Do not run both installations against the same account home. Do not run the
-release installer to obtain this unpublished preview: released 0.9.0 assets
-do not contain it.
+Do not run both installations against the same account home. Use the reviewed
+0.10.0 executable; 0.9.0 assets do not contain the combined runtime. Installing
+the new executable alone does not convert services or authorize storage migration.
 
 1. Stop the bridge and external connector during an agreed maintenance window.
 2. Make a private, device-local backup of the complete connector home, bridge
@@ -115,8 +116,8 @@ phone receipt; a live phone round trip remains a separate deployment check.
 
 ## Current limits
 
-- This is an opt-in local preview. Existing default startup and released
-  installation/update paths remain in external-connector mode.
+- The combined service requires an explicit handover. Installing 0.10.0 or
+  completing 0.9's first executable update does not convert existing services.
 - The immutable 0.9 bridge-only updater cannot perform a layout conversion in
   its first step. The new 0.10 external worker offers a second, explicit chat
   confirmation. Unsupported layouts still require the manual handover.
@@ -128,7 +129,7 @@ phone receipt; a live phone round trip remains a separate deployment check.
 - The existing bridge still has messaging waits in its event loop, and desktop
   queueing still requires a mapped White Noise group. Removing those contracts
   is a separate part of the architecture change; do not claim full desktop
-  independence from this first combined-runtime preview.
+  independence from this combined runtime.
 - Combining processes does not itself fix device-package selection or prove
   invitation delivery. The separate approved local combined rollout does not
   verify this new automated handover. Its tests use isolated fixtures only.

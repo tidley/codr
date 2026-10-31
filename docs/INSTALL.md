@@ -1,12 +1,12 @@
 # Install **codr**
 
 **0.10.0 targets existing accounts.** Fresh-account examples use
-current stable 0.9.0. For an existing account, use the explicit
+the supported 0.9.0 setup. For an existing account, use the explicit
 [combined-service handover](COMBINED.md), not the legacy two-service setup flow.
 Fresh identity creation still uses local 0.9 setup before that handover.
 
-The stable 0.9 **codr** plugin uses two per-user services: the Rust bridge and MDK transport.
-The upcoming 0.10 combined runtime uses one executable and one service after an
+The 0.9 **codr** plugin uses two per-user services: the Rust bridge and MDK transport.
+The released 0.10 combined runtime uses one executable and one service after an
 explicit handover. Linux uses systemd. macOS uses launchd LaunchAgents.
 
 ## One-prompt installation

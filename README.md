@@ -20,7 +20,7 @@ New bridge accounts introduce themselves as **Pat**, your messenger between Whit
 ## Install
 
 **0.10.0 targets existing accounts.** Fresh accounts use the
-stable 0.9.0 setup below, then the owner-confirmed chat handover. See the
+supported 0.9.0 setup below, then the owner-confirmed chat handover. See the
 [0.10.0 release notes](docs/releases/0.10.0.md) and
 [combined runtime/handover guide](docs/COMBINED.md).
 
@@ -83,7 +83,7 @@ retained. See the release notes for contributor credits and scope.
 | Command | What it does |
 | --- | --- |
 | `/help` | Show commands and the current sync mode. |
-| `/update` | Check the maintainer's stable ngit releases; install a verified bridge update only after confirmation. |
+| `/update` | Check stable ngit releases. Confirm an application update or the separate 0.9-to-combined service handover. |
 | `/status` | Show connection, state and pending deliveries; resume sync in automatic mode. |
 | `/recent [hours]` | Get the newest three text messages from each chat active in the past hour, or the specified number of hours. `/recent2` and `/recent 2` are equivalent. Skip messages already delivered or pending. |
 | `/last [count]` | Replay the newest message in this chat without unmuting. `/last4` and `/last 4` replay four messages, including already delivered text. Count: 1–100. |

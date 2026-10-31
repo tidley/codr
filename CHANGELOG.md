@@ -6,7 +6,7 @@ This release targets existing MDK 0.14 accounts. The local combined rollout does
 not verify the automated phone handover. No live handover is implied by these
 notes. Fresh identity creation still uses the supported 0.9.0 setup first.
 
-## Large OpenCode histories and chat reliability
+### Large OpenCode histories and chat reliability
 
 - Fix deferred phone messages when a full OpenCode export exceeds the 128 MiB
   reader limit and blocks the synchronization checkpoint. Read ascending pages
@@ -25,7 +25,7 @@ notes. Fresh identity creation still uses the supported 0.9.0 setup first.
   shorten workspace/agent titles, and move folder-list help to the bottom. Keep
   cancellation, navigation, restart-safe selection and timeout enforcement.
 
-## One executable with whole-application updates
+### One executable with whole-application updates
 
 - The existing same-process MDK host supports confirmed executable updates in
   one managed service. Chat upgrades keep `herdr-white-noise-bridge`; manual
@@ -44,9 +44,10 @@ notes. Fresh identity creation still uses the supported 0.9.0 setup first.
 - Failed startup restores the previous compatible executable without rewinding
   chat or MLS account state. No uncertain installation is retried automatically.
 
-## First handover from 0.9.0
+### First handover from 0.9.0
 
-Standard 0.9 installations can use two chat confirmations once 0.10 is published.
+Standard 0.9 installations can use two chat confirmations after the verified
+0.10 ngit/Blossom mirror is available.
 The unchanged 0.9 updater first installs the executable in external mode, with
 its old displayed confirmation code. It honours its bridge-only update promise.
 The new 0.10 `/update` then offers a separate private cold backup and service
@@ -55,14 +56,14 @@ The handover uses the installed executable, retains the existing worker service
 name for old plugin hooks, and stops the external connector. It does not create
 an identity, import a fabricated release or restore old MLS state. Unknown service
 overrides, nonstandard layouts and incompatible storage still require the
-[manual procedure](../COMBINED.md).
+[manual procedure](docs/COMBINED.md).
 
 This MVP targets existing 0.9.0 account homes. Fresh identity creation still uses
 the existing local 0.9 setup before handover; a new one-binary identity-creation
 wizard is not claimed by this change. Local tests do not replace cross-platform
 release checks or an explicitly approved live phone update test.
 
-## Packaging and safety
+### Packaging and safety
 
 Default application packages contain one combined executable and dependency
 notices. Connector protocol/upstream verification remains in CI; its separate
@@ -73,13 +74,13 @@ Foreman orchestration and unrelated worker-sharing changes are not implicitly
 approved by this implementation. Preserve existing accounts, keys, groups,
 native sessions, history, accepted deliveries and sync settings.
 
-## Contributors
+### Contributors
 
 - Tom Dwyer ([@tidley](https://github.com/tidley)): combined runtime, update
   handover, history-reader repairs, chat and prompt changes.
 - Juraj Bednar: retained macOS launchd fixes and the earlier contributions whose
   original commits/co-author credits remain in the 0.9.0 ancestry. The
-  [0.9.0 notes](0.9.0.md) retain their original GitHub/ngit contribution records.
+  [0.9.0 notes](docs/releases/0.9.0.md) retain their original GitHub/ngit contribution records.
 - Marmot MDK contributors: the same pinned MDK 0.14 source and security backports
   used by the existing connector. Packages retain its MIT/MPL licenses and
   source provenance. No new MDK storage migration is part of this release.
