@@ -9,7 +9,7 @@ The bridge uses one dedicated MDK identity across all mapped groups. Setup keeps
 ## Behaviour
 
 - New sessions create groups and invite the configured phone `npub`.
-- Group names pair the **herdr** tab label and workspace: `<tab name> (<workspace>)`, for example `review (Acme)`. Fresh sessions launched from an existing chat add the selected agent inside the parentheses, such as `review (Acme - codex)` or `review (Acme - claude)`, without renaming the original chat. Without a workspace label, these fresh chats use `review (codex)`; ordinary chats keep only `<tab name>`. The agent suffix survives restarts, pane moves, and metadata updates, and is kept when long titles are shortened. Workspace and agent details also appear in the group description. Repository names and agent-generated conversation topics do not determine the chat name.
+- Group names pair the **herdr** tab label and workspace: `<tab name> (<workspace>)`, for example `review (Acme)`. Fresh sessions launched from an existing chat add the selected agent only when another live chat has the same tab/workspace title, such as `review (Acme - codex)` or `review (Acme - claude)`. The original chat keeps its title. A unique project does not need an agent suffix, and automatic or explicit renaming removes it once the duplicate ends. Without a workspace label, a duplicate fresh chat uses `review (codex)`; ordinary chats keep only `<tab name>`. Suffix intent survives restarts and pane moves, but the visible suffix depends on current live duplicates. Workspace and agent details also appear in the group description. Repository names and agent-generated conversation topics do not determine the chat name.
 - A phone message prompts only the agent mapped to that group.
 - Complete owner text is handed to the agent immediately, even while it is working, without an interrupt. A blocked native dialog requires its supported answer or `/cancel`. Media and previously accepted deliveries remain durable; `/queue` inspects them. `/clear-queue` is retired and does not discard accepted work.
 - Final replies come from completed stored agent messages. They exclude reasoning and tool output.
@@ -32,7 +32,12 @@ This removes serial transcript exports from the main loop. **herdr** control req
 
 ### Start a workspace from your phone
 
-New bridge accounts use the display name **Pat**. New session chats introduce Pat as the messenger between White Noise and herdr and direct you to `/help`. Verify the account's full `npub`, not its display name. Setup preserves existing profiles and account keys. See [Pat onboarding](INSTALL.md#pat-your-bridge-identity).
+The current account-creation helper uses **👾** as the public name and display name. The supported 0.9.0 fresh-account bootstrap keeps its original default, and handover preserves that existing profile. Use `/help` in a session chat to see the available commands. Verify the account's full `npub`, not its display name. See [bridge identity setup](INSTALL.md#your-bridge-identity).
+
+Mobile-created agents use a temporary unique name during startup. After startup,
+Codr clears that name so herdr shows the normal agent label, such as `opencode`.
+If cleanup is not confirmed, the launch reply reports it without restarting the agent.
+Existing agents and custom names stay unchanged.
 
 The phone controls below do not require the optional **portr** desktop/SSH endpoint. That endpoint is disabled unless `portr_enabled = true` is configured or the worker is explicitly started with `run --portr`. See [optional installation](INSTALL.md#optional-portr-desktopssh-access).
 
@@ -294,7 +299,7 @@ Set `edit_responses = true` in the bridge configuration to enable editable progr
 
 Each response starts as one `> working...` progress message. The bridge edits that message with the current task list, when available. It sends the final answer as a separate message through the normal durable send path, with its own retry key. The bridge never edits that final answer. When possible, it marks the progress message `> done`.
 
-Phone follow-ups and blocked-to-working transitions reuse the current editable progress bubble; they do not append standalone `> working...` notices. The same bubble becomes `done` when the response completes. Without editable responses, follow-ups still do not emit extra working refreshes. Previously sent historical notices remain in the chat. Image acceptance says `Preparing image`, not `Queued prompt`: this is download preparation, not scheduling a future task. Media preparation never clears an existing response or submission receipt.
+Phone follow-ups while an agent is already working reuse the current editable progress bubble. When an agent resumes work after waiting for input, Codr starts a fresh working/checklist message below the conversation. Only after the replacement is confirmed does Codr attempt to edit the old progress to `Task continued below.` It does not delete the old message. This edit is best effort and is not retried if its result is uncertain; questions, answers, and final replies are preserved. The active bubble becomes `done` when the response completes. Without editable responses, follow-ups still do not emit extra working refreshes. Previously sent historical notices remain in the chat. Image acceptance says `Preparing image`, not `Queued prompt`: this is download preparation, not scheduling a future task. Media preparation never clears an existing response or submission receipt.
 
 OpenCode to-do writes, Codex plan updates, and Claude Code to-do/task tools supply structured task data. The bridge does not prompt a model to obtain progress. Message IDs and pending updates survive bridge restarts. Updates coalesce between snapshots, and edit attempts are at least two timestamp seconds apart.
 
@@ -310,6 +315,11 @@ Edit support is included in the dedicated connector; the flag controls whether *
 
 When OpenCode asks one single-choice question, **codr** sends a clean question card with numbered options. Reply with **1**, **2**, or an exact option label. The answer goes to the active question, even while **herdr** reports the agent as blocked; it is not submitted as a new chat prompt.
 
+The card starts with the question itself, without a `Decision needed` heading,
+internal request code, repeated title, or routine reply instructions. A code is
+shown only when a changed question requires it for safe answering. Terminal-only
+and already-submitted notices remain when needed.
+
 Decision cards and answers do not require editable progress.
 
 OpenCode V2 exports omit running questions. The bridge reads live session forms through the configured reader. For a question with a native form ID, numbered and labelled choices use the authenticated form reply API, as custom answers do. The bridge sends the selected option value, not the number as custom text. No terminal screen match or keystrokes are needed. Completed forms disappear from this read and cannot be replayed as pending questions.
@@ -317,6 +327,8 @@ OpenCode V2 exports omit running questions. The bridge reads live session forms 
 The bridge checks the session and exact pending question before a reply. Legacy questions without a native form ID also need an exact visible-question check before a terminal number shortcut. If an unanswered question is replaced, the new card requires its short code, for example `qabc123 1`. Duplicate deliveries and uncertain submissions are not sent again automatically.
 
 For supported OpenCode V2 questions that allow custom input, type a complete text answer directly, such as `v6.6.6`, or use `/answer TEXT`. The bridge sends it to the freshly checked native form through the authenticated API, not as a prompt or arbitrary terminal keys. A combined reply such as `1 v6.6.6` remains literal custom text. If the question changed, prefix the text with its current question code. Custom replies are limited to 4000 UTF-8 bytes; an answer beginning with `/` must use `/answer TEXT` so commands keep their meaning. Prepared media is not automatically submitted as custom text. Submission intent is saved before the API call, and an uncertain outcome is never automatically retried.
+
+Once the bridge has observed that the agent is no longer blocked, ordinary text such as `Retry ngit` starts a new prompt rather than answering a retained custom question. Numbers, option labels, question codes and `/answer TEXT` still count as explicit answer attempts and cannot turn into new prompts for an expired question. If a question stops waiting during a reply, the bridge keeps the fail-closed check and does not send that reply as a new prompt.
 
 Legacy shortcut routing was verified against OpenCode 1.18.35's single-choice question UI with 1–9 listed options. The gallery uses OpenCode 1.19.3, but does not verify live decision routing on that version. Custom text entry for legacy forms or questions that do not expose a native custom field, multi-select/multi-question dialogs, and decisions in other backends still require the terminal. Unsupported OpenCode blockers show a short notice instead of forwarding unrelated tool output.
 

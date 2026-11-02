@@ -1,6 +1,6 @@
 # Install **codr**
 
-**0.11.0 targets existing accounts.** Fresh-account examples use
+**0.11.1 is a release candidate for existing accounts.** Fresh-account examples use
 the supported 0.9.0 setup. For an existing account, use the explicit
 [combined-service handover](COMBINED.md), not the legacy two-service setup flow.
 Fresh identity creation still uses local 0.9 setup before that handover.
@@ -61,9 +61,9 @@ The Setup action opens a **herdr** tab. Enter your own White Noise public `npub`
 
 The dedicated connector uses a pinned MDK revision with **codr**'s founding-admin and media-recovery patch. See [connector source and provenance](../patches/README.md). Setup does not replace a shared `wn-agent` executable.
 
-### Pat, your bridge identity
+### Your bridge identity
 
-Fresh setup names a newly created bridge account **Pat** in White Noise. This publishes only the public profile name and display name, not your project names or other private details. Each new session chat introduces Pat and points you to `/help`.
+The current setup code names a newly created bridge account **👾** in White Noise. This publishes only the public profile name and display name, not your project names or other private details. The supported 0.9.0 fresh-account bootstrap keeps its original default. A later handover does not rename that existing profile. Use `/help` in a session chat to see the available commands.
 
 The display name is not proof of identity. Continue to verify invitations against the full bridge `npub` printed by setup. Existing and reused accounts keep their profile names and keys. Existing chats are not greeted again.
 

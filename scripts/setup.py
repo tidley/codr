@@ -106,7 +106,7 @@ def local_accounts(path):
             time.sleep(0.25)
 
 
-def publish_pat_profile(socket_path, result, record_path):
+def publish_default_profile(socket_path, result, record_path):
     """Name only a newly created identity, journalling before the public profile write."""
     account = result["account_id_hex"]
     if not isinstance(account, str) or not re.fullmatch(r"[0-9a-f]{64}", account):
@@ -125,15 +125,15 @@ def publish_pat_profile(socket_path, result, record_path):
         result["default_profile_status"] = "preserved"
         return result
     result["default_profile_status"] = "pending"
-    result["default_profile_name"] = "Pat"
+    result["default_profile_name"] = "👾"
     private_write(record_path, json.dumps(result, indent=2) + "\n")
     try:
         response = control_request(socket_path, {"marmot_agent_control": "marmot.agent-control.v2",
-            "type": "account_publish_profile", "account_id_hex": account, "name": "Pat", "display_name": "Pat"})
+            "type": "account_publish_profile", "account_id_hex": account, "name": "👾", "display_name": "👾"})
         expected = {"marmot_agent_control": "marmot.agent-control.v2", "type": "profile_published",
-            "account_id_hex": account, "name": "Pat", "display_name": "Pat"}
+            "account_id_hex": account, "name": "👾", "display_name": "👾"}
         if not isinstance(response, dict) or any(response.get(key) != value for key, value in expected.items()):
-            raise SetupError("Pat profile publication was not confirmed")
+            raise SetupError("Default profile publication was not confirmed")
     except (SetupError, OSError, ValueError):
         result["default_profile_status"] = "unconfirmed"
         return result
@@ -552,7 +552,7 @@ def _configure(owner, herdr_socket, runner, check, enable_audio, enable_portr):
         candidate = Path(temporary) / "config.toml"
         candidate.write_text(toml_text(values))
         runner([str(bridge), "--config", str(candidate), "status"])
-    result = publish_pat_profile(mdk_socket, result, mdk_home / "codr-bootstrap.json")
+    result = publish_default_profile(mdk_socket, result, mdk_home / "codr-bootstrap.json")
     private_write(mdk_home / "codr-bootstrap.json", json.dumps(result, indent=2) + "\n")
     private_write(config_path, toml_text(values))
     manager.start("herdr-white-noise-bridge")
@@ -714,7 +714,7 @@ def main():
         report = configure(args.npub, args.herdr_socket, check=args.check, enable_audio=args.enable_audio, enable_portr=args.enable_portr)
         print(json.dumps(report, indent=2))
         if report.get("default_profile_status") == "unconfirmed":
-            print("Pat's profile publication was not confirmed. The existing identity was kept; inspect its profile before trying another publication. Phone setup can still be used.")
+            print("Default profile publication was not confirmed. The existing identity was kept; inspect its profile before trying another publication. Phone setup can still be used.")
         if report.get("portr_restart_required"):
             print("Portr setting saved. Apply it by restarting only the codr worker after all active work is idle. Setup did not restart the worker for this setting.")
         print("Accept a verified bridge invitation in White Noise, then send /status and a harmless test prompt.")

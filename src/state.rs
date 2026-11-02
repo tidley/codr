@@ -127,6 +127,9 @@ pub struct ResponseDelivery {
     /// Keep completed notices until delivery succeeds, unlike best-effort progress.
     #[serde(default)]
     pub durable: bool,
+    /// A confirmed older progress message to retire after this replacement is sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -422,6 +425,36 @@ impl BridgeState {
             .response_completion_pending = false;
     }
 
+    pub fn resume_response(&mut self, key: &str, group: &str) {
+        if !self.forwarding_enabled {
+            return;
+        }
+        let previous = self.mappings.get_mut(key).unwrap().response_id.take();
+        let supersedes = previous.and_then(|id| {
+            let item = self.outbox.iter_mut().find(|item| item.id == id)?;
+            let delivery = item.response.as_mut()?;
+            if delivery.durable || delivery.finished || item.group != group {
+                return None;
+            }
+            delivery.finished = true;
+            delivery
+                .target
+                .clone()
+                .or_else(|| delivery.supersedes.take())
+        });
+        self.mappings.get_mut(key).unwrap().task_revision = None;
+        self.begin_response(key, group);
+        let id = self.mappings[key].response_id.as_ref().unwrap();
+        self.outbox
+            .iter_mut()
+            .find(|item| &item.id == id)
+            .unwrap()
+            .response
+            .as_mut()
+            .unwrap()
+            .supersedes = supersedes;
+    }
+
     pub fn begin_transcription(&mut self, group: &str) -> Option<String> {
         if !self.forwarding_enabled {
             return None;
@@ -479,6 +512,16 @@ impl BridgeState {
             return;
         };
         let delivery = item.response.as_mut().unwrap();
+        let inherited = if delivery.target.is_none() && delivery.initial_text.is_none() {
+            // If the final beats its replacement, finish the known old bubble
+            // rather than abandoning it or sending late working progress.
+            delivery.supersedes.take()
+        } else {
+            None
+        };
+        if let Some(target) = &inherited {
+            delivery.target = Some(target.clone());
+        }
         if delivery.target.is_none() && delivery.initial_text.is_none() {
             // Progress is best effort. Do not post a late working notice after the final.
             self.outbox.retain(|item| item.id != id);
@@ -494,6 +537,18 @@ impl BridgeState {
             "> done".into()
         };
         delivery.finished = true;
+        if let Some(target) = inherited {
+            let group = item.group.clone();
+            // One owner per edit target: an older pending blocked edit must
+            // never race or retry after this completion.
+            self.outbox.retain(|old| {
+                old.id == id
+                    || old.group != group
+                    || old.response.as_ref().is_none_or(|response| {
+                        response.durable || response.target.as_ref() != Some(&target)
+                    })
+            });
+        }
     }
 }
 

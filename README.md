@@ -4,11 +4,11 @@
 
 Supported agents: OpenCode, Codex, and Claude Code on Linux and macOS.
 
-New bridge accounts introduce themselves as **Pat**, your messenger between White Noise and herdr. Verify the full bridge public key printed by setup, not its display name.
+The current setup code uses **👾** as the public name and display name when it creates an account. The supported 0.9.0 fresh-account bootstrap keeps its original naming behaviour. Existing profiles stay unchanged. Verify the full bridge public key printed by setup, not its display name.
 
 ## Behaviour
 
-- Chat names pair the **herdr** tab and workspace: `review (Acme)`. Descriptions contain workspace and agent details.
+- Chat names pair the **herdr** tab and workspace: `review (Acme)`. Fresh-session chats add the agent name only to distinguish a matching live project in the same workspace. Descriptions contain workspace and agent details.
 - With editable progress enabled, one active bubble carries status and checklist updates. Final replies stay separate.
 - Phone text is handed straight to the agent, including while it is working. Images, files and voice follow as soon as download/transcription completes, without waiting for idle. The agent handles its own input; codr does not interrupt it. Send `/cancel` when you do want to interrupt the current task.
 - `/new` guides you through workspace, folder, installed agent, and model selection. Reply with numbers, use `0` to cancel, and type the repository folder name to confirm the final preview. The destination workspace is shown separately.
@@ -19,9 +19,9 @@ New bridge accounts introduce themselves as **Pat**, your messenger between Whit
 
 ## Install
 
-**0.11.0 targets existing accounts.** Fresh accounts use the
+**0.11.1 is a release candidate for existing accounts.** Fresh accounts use the
 supported 0.9.0 setup below, then the owner-confirmed chat handover. See the
-[0.11.0 release notes](docs/releases/0.11.0.md) and
+[0.11.1 release notes](docs/releases/0.11.1.md) and
 [combined runtime/handover guide](docs/COMBINED.md).
 
 Needs Linux x86_64 or aarch64 or macOS on Apple silicon or Intel, a per-user service manager (systemd or launchd), Python 3.11+, Git, and **herdr** 0.9.1+. No Rust toolchain required.
@@ -39,7 +39,21 @@ Or give your coding agent this prompt, with your own public key:
 
 [Full installation and upgrade guide →](docs/INSTALL.md)
 
-### New in 0.11.0
+### Planned in 0.11.1
+
+- Resuming after a question brings a fresh working/checklist bubble to the bottom
+  of the chat, leaving `Task continued below.` in the old progress message.
+- Ordinary follow-ups no longer answer a completed custom question. Explicit
+  stale answers remain blocked, including after a restart.
+- Mobile-created agents clear their temporary `codr-…` name after startup.
+- Fresh-session chat titles include an agent suffix only while another live
+  project chat shares the same tab/workspace title.
+- The current account-creation helper defaults to **👾**. Existing profiles and
+  the supported 0.9.0 bootstrap keep their naming behaviour.
+
+These fixes are under local testing. See the [readiness record](docs/releases/0.11.1-readiness.md).
+
+### Retained from 0.11.0
 
 - Completed Claude replies reach the phone while background tasks keep the
   session working. System task notifications do not count as local typing or
@@ -47,7 +61,7 @@ Or give your coding agent this prompt, with your own public key:
 - Progress keeps its existing bubble until the session settles, without leaving
   an unfinished replacement after a completed background reply.
 - A no-update check says **No new version available. Currently running codr
-  0.11.0.** It does not claim that an installation occurred.
+  VERSION.** It does not claim that an installation occurred.
 - Integrates Juraj Bednar's [PR #20](https://github.com/tidley/codr/pull/20).
   Corrected adaptations of PRs #17–19 remain from 0.9.0.
 

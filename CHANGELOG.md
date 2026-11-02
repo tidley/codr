@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.11.1] - Unreleased
+
+Release candidate only. See the [release notes](docs/releases/0.11.1.md) and
+[readiness record](docs/releases/0.11.1-readiness.md). No tag or release is published.
+
+### Fixed
+
+- Show OpenCode questions and choices without the internal decision heading,
+  request code, repeated title, or routine reply instructions. Keep required
+  changed-question and terminal-only safety notices.
+- Move the working/checklist bubble below the conversation when an agent resumes
+  after a question. Edit the old progress to `Task continued below.` only after
+  the replacement is confirmed; do not delete it. Preserve questions, answers,
+  and final replies.
+- Omit unnecessary agent suffixes from unique project/workspace chat titles.
+  Keep fresh-session suffixes only while another live project chat shares the
+  same title in that workspace.
+- Clear temporary `codr-…` startup labels after a confirmed mobile launch.
+  Preserve the started agent if name cleanup cannot be confirmed.
+- Fresh setup uses **👾** for the public name and display name of new accounts.
+  Existing profiles and account keys stay unchanged.
+
+- Forward ordinary new prompts after an OpenCode custom-answer question has
+  ended, including after a bridge restart. Keep explicit stale answers blocked
+  and preserve the guard for questions that stop waiting during a reply.
+
 ## [0.11.0] - 2026-10-31
 
 ### Fixed

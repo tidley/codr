@@ -98,9 +98,11 @@ async fn peer_for_agent(
                         assert_eq!(req["type"], "group_create_with_admins");
                         assert_eq!(req["members"], json!([phone_npub()]));
                         assert_eq!(req["admins"], json!([phone_npub()]));
+                        profile_name = req["name"].as_str().unwrap().into();
+                        profile_description = req["description"].as_str().unwrap_or("").into();
                         json!({"type":"group_created","group_id_hex":"bb".repeat(16)})
                     }
-                    "send_final" | "send_media" => {
+                    "send_final" | "send_media" | "delete_message" => {
                         json!({"type":"final_sent","message_ids_hex":["cc".repeat(32)]})
                     }
                     "edit_message" => {
@@ -999,52 +1001,6 @@ async fn delivered_followup_reuses_current_status_without_a_new_working_bubble()
         mdk.abort();
         herdr.abort();
     }
-}
-
-#[tokio::test]
-async fn resuming_a_decision_edits_the_existing_status_instead_of_posting_another() {
-    let root = tempfile::tempdir().unwrap();
-    let mut config = config(root.path());
-    config.edit_responses = true;
-    input_history(&config, "ses_1", &[("prior", "Prior task")], None);
-    let mut working = agent();
-    working.agent_status = "working".into();
-    let calls = Arc::new(Mutex::new(vec![]));
-    let mdk = peer(&config.wn_agent_socket, true, calls.clone()).await;
-    let mut bridge = Bridge::open(config.clone()).unwrap();
-    let key = working.key();
-    let group = "bb".repeat(16);
-    let mut mapping = activity_mapping(working.clone(), &group);
-    mapping.last_agent_status = "blocked".into();
-    mapping.pending_prompt = true;
-    bridge.state.mappings.insert(key.clone(), mapping);
-    bridge.state.begin_response(&key, &group);
-    let item = bridge.state.outbox.last_mut().unwrap();
-    item.text = "> blocked Waiting for your decision.".into();
-    item.response.as_mut().unwrap().target = Some("old-blocked-bubble".into());
-    item.response.as_mut().unwrap().sent_text = Some(item.text.clone());
-    bridge.reconcile(vec![working.clone()]).await.unwrap();
-    bridge.flush().await.unwrap();
-    drop(bridge);
-    let mut bridge = Bridge::open(config).unwrap();
-    bridge.reconcile(vec![working]).await.unwrap();
-    bridge.flush().await.unwrap();
-    let calls = calls.lock().unwrap();
-    assert_eq!(
-        calls
-            .iter()
-            .filter(|r| r["type"] == "send_final" && r["text"] == "> working...")
-            .count(),
-        0,
-        "Resume must reuse the existing editable status"
-    );
-    assert!(
-        calls
-            .iter()
-            .any(|r| r["type"] == "edit_message"
-                && r["target_message_id_hex"] == "old-blocked-bubble")
-    );
-    mdk.abort();
 }
 
 #[tokio::test]
@@ -5454,6 +5410,68 @@ sys.exit(2)
 }
 
 #[tokio::test]
+async fn ordinary_prompts_after_a_custom_question_reach_the_agent_across_restart() {
+    for status in ["idle", "working"] {
+        for submitted in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let config = config(root.path());
+            custom_decision_export(&config.opencode_bin);
+            let mut current = agent();
+            current.agent_status = status.into();
+            let key = current.key();
+            let calls = Arc::new(Mutex::new(vec![]));
+            let herdr =
+                peer_for_agent(&config.herdr_socket, false, calls.clone(), current.clone()).await;
+            let mut decision = herdr_white_noise_bridge::output::decision::read(
+                &config,
+                current.agent_session.as_ref().unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            decision.announced = true;
+            decision.submitted = submitted;
+            let mut bridge = Bridge::open(config.clone()).unwrap();
+            let mut mapping = activity_mapping(current.clone(), &"bb".repeat(16));
+            mapping.decision = Some(decision);
+            bridge.state.mappings.insert(key.clone(), mapping);
+            bridge.save().unwrap();
+            drop(bridge);
+
+            let mut bridge = Bridge::open(config).unwrap();
+            bridge.agents.insert(key.clone(), current);
+            bridge.herdr_available = true;
+            let mut event = inbound(HEX, "retry-ngit");
+            event["message"]["text"] = json!("Retry ngit");
+            bridge.inbound(&event).await.unwrap();
+            bridge.inbound(&event).await.unwrap();
+
+            let requests = calls.lock().unwrap();
+            let prompts: Vec<_> = requests
+                .iter()
+                .filter(|request| request["method"] == "agent.prompt")
+                .collect();
+            assert_eq!(prompts.len(), 1, "{status}, submitted={submitted}");
+            assert_eq!(prompts[0]["params"]["text"], "Retry ngit");
+            assert!(
+                !requests
+                    .iter()
+                    .any(|request| request["method"] == "agent.send_keys")
+            );
+            assert!(!root.path().join("question-posts.jsonl").exists());
+            assert!(
+                !bridge
+                    .state
+                    .outbox
+                    .iter()
+                    .any(|message| message.text.contains("no longer waiting"))
+            );
+            herdr.abort();
+        }
+    }
+}
+
+#[tokio::test]
 async fn custom_question_text_uses_the_request_bound_form_api_once_without_prompting_or_keys() {
     for lost_ack in [false, true] {
         let root = tempfile::tempdir().unwrap();
@@ -7197,6 +7215,211 @@ async fn long_final_replies_keep_all_text_without_waiting_for_progress_edits() {
         text
     );
     mdk.abort();
+}
+
+#[tokio::test]
+async fn answered_questions_move_progress_below_the_reply_without_losing_the_checklist() {
+    for (fail_new_once, fail_edit, known_old) in [
+        (false, false, true),
+        (false, true, true),
+        (true, false, true),
+        (false, false, false),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let config = editable_config(root.path());
+        export_script(&config.opencode_bin, "old", "old");
+        let export = json!({"messages":[{"info":{"id":"tasks","role":"assistant"},"parts":[
+            {"type":"tool","tool":"todowrite","state":{"status":"completed","input":{"todos":[{"content":"Run checks","status":"in_progress"}]}}}
+        ]}]});
+        std::fs::write(
+            &config.opencode_bin,
+            format!("#!/bin/sh\nprintf '%s' '{}'\n", export),
+        )
+        .unwrap();
+        let mut working = agent();
+        working.agent_status = "working".into();
+        working.state_change_seq = 2;
+        let key = working.key();
+        let group = "bb".repeat(16);
+        let old_target = "aa".repeat(32);
+        let mut bridge = mapped_bridge(config.clone(), &working);
+        bridge.state.begin_response(&key, &group);
+        let old_id = bridge.state.mappings[&key].response_id.clone().unwrap();
+        let item = bridge
+            .state
+            .outbox
+            .iter_mut()
+            .find(|item| item.id == old_id)
+            .unwrap();
+        item.text = "> blocked Waiting for your answer".into();
+        let delivery = item.response.as_mut().unwrap();
+        delivery.target = known_old.then(|| old_target.clone());
+        delivery.initial_text = Some(item.text.clone());
+        delivery.sent_text = known_old.then(|| item.text.clone());
+        let mapping = bridge.state.mappings.get_mut(&key).unwrap();
+        mapping.last_agent_status = "blocked".into();
+        mapping.pending_prompt = true;
+        mapping.task_revision = Some(
+            herdr_white_noise_bridge::output::tasks::read_session(
+                &config,
+                working.agent_session.as_ref().unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .revision,
+        );
+        bridge.state.enqueue(&group, "Your answer was sent.");
+        bridge.save().unwrap();
+        drop(bridge);
+
+        let calls = Arc::new(Mutex::new(vec![]));
+        let listener = UnixListener::bind(&config.wn_agent_socket).unwrap();
+        let captured = calls.clone();
+        let mdk = tokio::spawn(async move {
+            let mut reject_new = fail_new_once;
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut reader = tokio::io::BufReader::new(stream);
+                let request = read_line(&mut reader).await.unwrap();
+                captured.lock().unwrap().push(request.clone());
+                let is_new_progress = request["type"] == "send_final"
+                    && request["text"]
+                        .as_str()
+                        .is_some_and(|s| s.starts_with("> working"));
+                let mut response = if (is_new_progress && std::mem::take(&mut reject_new))
+                    || (request["type"] == "edit_message" && fail_edit)
+                {
+                    json!({"type":"error","code":"fixture_failure"})
+                } else {
+                    assert!(matches!(
+                        request["type"].as_str(),
+                        Some("send_final" | "edit_message" | "delete_message")
+                    ));
+                    json!({"type":"final_sent","message_ids_hex":["cc".repeat(32)]})
+                };
+                response["id"] = request["id"].clone();
+                response["marmot_agent_control"] = json!("marmot.agent-control.v2");
+                reader
+                    .get_mut()
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let mut bridge = Bridge::open(config.clone()).unwrap();
+        bridge.reconcile(vec![working.clone()]).await.unwrap();
+        let fresh_id = bridge.state.mappings[&key].response_id.clone().unwrap();
+        assert_ne!(
+            fresh_id, old_id,
+            "A question reply must bring progress to the bottom"
+        );
+        assert_eq!(
+            bridge
+                .state
+                .outbox
+                .iter()
+                .find(|i| i.id == fresh_id)
+                .unwrap()
+                .text,
+            "> working...\n\n▶ Run checks"
+        );
+        assert_eq!(
+            bridge
+                .state
+                .outbox
+                .iter()
+                .find(|i| i.id == old_id)
+                .unwrap()
+                .text,
+            "> blocked Waiting for your answer"
+        );
+        bridge.reconcile(vec![working.clone()]).await.unwrap();
+        assert_eq!(
+            bridge.state.mappings[&key].response_id.as_ref(),
+            Some(&fresh_id)
+        );
+        drop(bridge);
+        let mut bridge = Bridge::open(config.clone()).unwrap();
+        if fail_new_once {
+            assert!(bridge.flush().await.is_err());
+            assert!(
+                !calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|r| r["type"] == "delete_message" || r["type"] == "edit_message")
+            );
+            bridge
+                .state
+                .outbox
+                .iter_mut()
+                .find(|i| i.id == fresh_id)
+                .unwrap()
+                .response
+                .as_mut()
+                .unwrap()
+                .last_attempt_at = 0;
+            bridge.save().unwrap();
+            drop(bridge);
+            bridge = Bridge::open(config.clone()).unwrap();
+        }
+        bridge.flush().await.unwrap();
+        drop(bridge);
+        let mut bridge = Bridge::open(config).unwrap();
+        bridge.flush().await.unwrap();
+        let requests = calls.lock().unwrap();
+        let progress: Vec<_> = requests
+            .iter()
+            .filter(|r| {
+                r["type"] == "send_final"
+                    && r["text"]
+                        .as_str()
+                        .is_some_and(|s| s.starts_with("> working"))
+            })
+            .collect();
+        assert_eq!(progress.len(), if fail_new_once { 2 } else { 1 });
+        assert!(progress.iter().all(|r| r["idempotency_key"] == fresh_id));
+        let answer = requests
+            .iter()
+            .position(|r| r["type"] == "send_final" && r["text"] == "Your answer was sent.")
+            .unwrap();
+        let fresh = requests
+            .iter()
+            .position(|r| r["type"] == "send_final" && r["idempotency_key"] == fresh_id)
+            .unwrap();
+        assert!(answer < fresh);
+        assert!(
+            requests
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r["type"] == "edit_message" || r["type"] == "delete_message")
+                .all(|(index, _)| index > fresh)
+        );
+        let deletes: Vec<_> = requests
+            .iter()
+            .filter(|r| r["type"] == "delete_message")
+            .collect();
+        assert!(
+            deletes.is_empty(),
+            "Retired progress must remain in the chat"
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r["type"] == "edit_message")
+                .count(),
+            usize::from(known_old)
+        );
+        assert!(
+            requests
+                .iter()
+                .filter(|r| r["type"] == "edit_message")
+                .all(|r| r["target_message_id_hex"] == old_target
+                    && r["text"] == "> Task continued below.")
+        );
+        mdk.abort();
+    }
 }
 
 #[tokio::test]
@@ -9773,7 +9996,7 @@ async fn introduction_messages_use_the_current_agent_label() {
                 .insert(observed.terminal_id.clone(), suffix.into());
         }
         bridge.reconcile(vec![observed.clone()]).await.unwrap();
-        let name = observed.group_name_with_suffix(suffix);
+        let name = observed.group_name();
         let greeting = format!(
             "Hi! This is your chat with {name}.\n\nSend /help in any Codr chat to see available commands."
         );
@@ -9898,7 +10121,7 @@ async fn a_tab_rename_updates_the_group_once() {
 }
 
 #[tokio::test]
-async fn fresh_chat_agent_suffix_is_claimed_once_and_survives_restart_and_pane_moves() {
+async fn fresh_chat_agent_suffix_survives_restart_but_clears_when_the_duplicate_ends() {
     let root = tempfile::tempdir().unwrap();
     let config = config(root.path());
     export_script(&config.opencode_bin, "Prior reply", "old");
@@ -9964,6 +10187,11 @@ async fn fresh_chat_agent_suffix_is_claimed_once_and_survives_restart_and_pane_m
         bridge.state.mappings[&fresh.key()].group_name.as_deref(),
         Some("review (Acme - opencode)")
     );
+    bridge.reconcile(vec![fresh.clone()]).await.unwrap();
+    assert_eq!(
+        bridge.state.mappings[&fresh.key()].group_name.as_deref(),
+        Some("review (Acme)")
+    );
     let calls = calls.lock().unwrap();
     let creates: Vec<_> = calls
         .iter()
@@ -9971,8 +10199,50 @@ async fn fresh_chat_agent_suffix_is_claimed_once_and_survives_restart_and_pane_m
         .collect();
     assert_eq!(creates.len(), 1);
     assert_eq!(creates[0]["name"], "review (Acme - opencode)");
-    assert!(!calls.iter().any(|c| c["type"] == "group_profile_update"));
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|c| c["type"] == "group_profile_update")
+            .count(),
+        1
+    );
     mdk.abort();
+}
+
+#[tokio::test]
+async fn different_projects_or_workspaces_do_not_need_an_agent_suffix() {
+    for (tab, workspace) in [("other-project", "w1"), ("review", "w2")] {
+        let root = tempfile::tempdir().unwrap();
+        let config = config(root.path());
+        export_script(&config.opencode_bin, "Prior reply", "old");
+        let calls = Arc::new(Mutex::new(vec![]));
+        let mdk = peer(&config.wn_agent_socket, true, calls).await;
+        let mut observed = agent();
+        observed.tab_label = Some("review".into());
+        observed.workspace_label = Some("Acme".into());
+        observed.workspace_id = "w1".into();
+        let mut other = observed.clone();
+        other.tab_label = Some(tab.into());
+        other.workspace_id = workspace.into();
+        other.terminal_id = "other-terminal".into();
+        other.pane_id = format!("{workspace}:p2");
+        other.tab_id = format!("{workspace}:t2");
+        other.agent_session.as_mut().unwrap().value = "ses_other".into();
+        let mut bridge = Bridge::open(config).unwrap();
+        bridge
+            .state
+            .pending_chat_agents
+            .insert(observed.terminal_id.clone(), "opencode".into());
+        bridge
+            .reconcile(vec![observed.clone(), other])
+            .await
+            .unwrap();
+        assert_eq!(
+            bridge.state.mappings[&observed.key()].group_name.as_deref(),
+            Some("review (Acme)")
+        );
+        mdk.abort();
+    }
 }
 
 #[tokio::test]
@@ -10012,7 +10282,7 @@ async fn naming_intent_for_a_different_backend_cannot_label_an_unrelated_chat() 
 }
 
 #[tokio::test]
-async fn automatic_and_explicit_renames_keep_the_fresh_agent_suffix() {
+async fn automatic_and_explicit_renames_drop_an_unneeded_agent_suffix() {
     for explicit in [false, true] {
         let root = tempfile::tempdir().unwrap();
         let config = config(root.path());
@@ -10057,11 +10327,11 @@ async fn automatic_and_explicit_renames_keep_the_fresh_agent_suffix() {
             .await;
             bridge.rename_groups().await.unwrap();
             herdr.abort();
-            assert_eq!(profile.lock().unwrap().subject, "Review (Acme - opencode)");
+            assert_eq!(profile.lock().unwrap().subject, "Review (Acme)");
         } else {
             observed.tab_label = Some("Renamed".into());
             bridge.reconcile(vec![observed.clone()]).await.unwrap();
-            assert_eq!(profile.lock().unwrap().subject, "Renamed (Acme - opencode)");
+            assert_eq!(profile.lock().unwrap().subject, "Renamed (Acme)");
         }
         assert_eq!(
             calls

@@ -30,6 +30,31 @@ fn forms() -> Value {
 }
 
 #[test]
+fn phone_question_cards_show_the_question_and_choices_without_internal_headings() {
+    let mut value = forms();
+    value["data"][0]["id"] = json!("frm_amber");
+    let mut decision = decision::from_forms(&value, "ses_fixture")
+        .unwrap()
+        .unwrap();
+    let question = "Which next step?\n\n1. Proceed\nContinue with the plan\n\n2. Review\nReview the alternatives";
+    assert_eq!(decision.text(), question);
+    decision.requires_token = true;
+    assert!(decision.text().starts_with(question));
+    assert!(decision.text().contains(&format!(
+        "The question changed. Reply with {}",
+        decision.token()
+    )));
+    decision.requires_token = false;
+    decision.questions.push(decision.questions[0].clone());
+    assert_eq!(
+        decision.text(),
+        format!(
+            "{question}\n\n{question}\n\nAnswer this multi-question or multi-select dialog in the terminal."
+        )
+    );
+}
+
+#[test]
 fn live_forms_keep_question_identity_and_reject_ambiguous_or_foreign_requests() {
     let decision = decision::from_forms(&forms(), "ses_fixture")
         .unwrap()
@@ -150,6 +175,17 @@ fn native_custom_answers_keep_codes_limits_and_literal_text_separate_from_choice
     let mut decision = decision::from_forms(&value, "ses_fixture")
         .unwrap()
         .unwrap();
+    assert!(decision.looks_like_answer("Retry ngit"));
+    assert!(!decision.looks_like_explicit_answer("Retry ngit"));
+    for explicit in [
+        "1",
+        "ReView",
+        "/answer Retry ngit",
+        " Qold001 Retry ngit",
+        &format!("{} Retry ngit", decision.token().to_uppercase()),
+    ] {
+        assert!(decision.looks_like_explicit_answer(explicit), "{explicit}");
+    }
     assert_eq!(
         decision.answer("v6.6.6").unwrap(),
         Answer::Custom("v6.6.6".into())
@@ -164,7 +200,6 @@ fn native_custom_answers_keep_codes_limits_and_literal_text_separate_from_choice
         decision.answer("/answer /path/to/version").unwrap(),
         Answer::Custom("/path/to/version".into())
     );
-    assert!(decision.text().contains("type your custom answer directly"));
     assert!(
         !decision
             .text()

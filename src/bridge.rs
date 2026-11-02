@@ -522,13 +522,59 @@ impl Bridge {
                                 response["message_ids_hex"][0].as_str().map(str::to_owned);
                         }
                         pending.sent_text = Some(sent_text.clone());
+                        let supersedes = if delivery.target.is_none() {
+                            pending
+                                .supersedes
+                                .take()
+                                .filter(|old| Some(old) != pending.target.as_ref())
+                        } else {
+                            None
+                        };
                         if delivery.finished && sent_text == item.text {
                             self.state.outbox.retain(|m| m.id != item.id);
                         }
                         if delivery.target.is_none() {
                             self.state.last_confirmed_send_at = Some(now());
                         }
+                        if let Some(target) = &supersedes {
+                            // Never replay old progress after attempting cleanup.
+                            self.state.outbox.retain(|old| {
+                                old.group != item.group
+                                    || old.response.as_ref().is_none_or(|response| {
+                                        !response.finished
+                                            || response.durable
+                                            || response.target.as_ref() != Some(target)
+                                    })
+                            });
+                        }
                         self.save()?;
+                        if let Some(target) = supersedes {
+                            // Keep the old bubble as a breadcrumb, only after its
+                            // replacement is confirmed. Never delete chat messages.
+                            let edited = tokio::time::timeout(
+                                Duration::from_secs(3),
+                                self.marmot.marmot(json!({
+                                    "type":"edit_message",
+                                    "account_id_hex":self.config.account_id_hex,
+                                    "group_id_hex":item.group,
+                                    "target_message_id_hex":target,
+                                    "text":"> Task continued below.",
+                                })),
+                            )
+                            .await;
+                            if !edited.is_ok_and(|result| {
+                                result.is_ok_and(|response| {
+                                    response["type"] == "final_sent"
+                                        && response["message_ids_hex"]
+                                            .as_array()
+                                            .is_some_and(|ids| !ids.is_empty())
+                                })
+                            }) {
+                                eprintln_throttled!(
+                                    "Previous progress edit was not confirmed; the new bubble stays active and the old message will not be deleted."
+                                );
+                            }
+                        }
                     }
                     _ => {
                         if !delivery.finished || delivery.durable {
@@ -1061,8 +1107,7 @@ impl Bridge {
             self.observe_activity(key, &history)?;
         }
         self.refresh_forwarding()?;
-        let name =
-            agent.group_name_with_suffix(self.state.mappings[key].group_agent_suffix.as_deref());
+        let name = self.group_name_for(key, agent, &self.agents);
         let description = agent.group_description();
         let m = &self.state.mappings[key];
         // Muting suppresses messages, not group invitations or metadata updates.
@@ -1111,6 +1156,9 @@ impl Bridge {
         let previous_settled = matches!(previous.last_agent_status.as_str(), "idle" | "done");
         if self.config.edit_responses {
             if agent.agent_status == "working" {
+                if resumed {
+                    self.state.resume_response(key, &group);
+                }
                 if previous_settled
                     && !self.state.mappings[key].pending_prompt
                     && self.state.mappings[key].response_id.is_some()
@@ -2998,9 +3046,12 @@ impl Bridge {
         let numeric = text.trim().bytes().all(|byte| byte.is_ascii_digit());
         let looks_like_answer = numeric
             || text.trim().starts_with("/answer ")
-            || previous
-                .as_ref()
-                .is_some_and(|decision| decision.looks_like_answer(text));
+            || previous.as_ref().is_some_and(|decision| {
+                decision.looks_like_explicit_answer(text)
+                        // Retain the fail-closed guard for a question that stops
+                        // waiting during this reply, not for an old stored question.
+                        || (agent.agent_status == "blocked" && decision.looks_like_answer(text))
+            });
         if agent.agent_status != "blocked" && previous.is_none() && !looks_like_answer {
             return Ok(false);
         }
@@ -3182,6 +3233,22 @@ impl Bridge {
         Ok(())
     }
 
+    fn group_name_for(&self, key: &str, agent: &Agent, live: &BTreeMap<String, Agent>) -> String {
+        let base = agent.group_name();
+        let suffix = self.state.mappings[key]
+            .group_agent_suffix
+            .as_deref()
+            .filter(|_| {
+                live.values().any(|other| {
+                    other.key() != key
+                        && other.workspace_id == agent.workspace_id
+                        && other.agent_session.is_some()
+                        && other.group_name() == base
+                })
+            });
+        agent.group_name_with_suffix(suffix)
+    }
+
     pub async fn rename_groups(&mut self) -> Result<()> {
         let live: BTreeMap<_, _> = herdr::snapshot(&self.herdr)
             .await?
@@ -3208,7 +3275,7 @@ impl Bridge {
                 .as_ref()
                 .filter(|a| a.tab_label.is_some() || live.contains_key(&key))
             {
-                agent.group_name_with_suffix(mapping.group_agent_suffix.as_deref())
+                self.group_name_for(&key, agent, &live)
             } else {
                 let label = old
                     .strip_prefix("[cd] ")
@@ -3276,8 +3343,7 @@ impl Bridge {
         if self.state.mappings[key].control {
             return;
         }
-        let desired_name =
-            agent.group_name_with_suffix(self.state.mappings[key].group_agent_suffix.as_deref());
+        let desired_name = self.group_name_for(key, agent, &self.agents);
         let desired_description = agent.group_description();
         let (last_name, last_description) = {
             let mapping = &self.state.mappings[key];

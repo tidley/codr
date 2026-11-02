@@ -1975,6 +1975,19 @@ async fn host_with_workspaces(
                     let fresh = request["params"]["pane_id"] == "w1:p99";
                     json!({"type":"agent_started","agent":{"name":request["params"]["name"],"pane_id":request["params"]["pane_id"],"terminal_id":"t99","workspace_id":if fresh {"w1"}else{"w99"}}})
                 }
+                "agent.rename" => {
+                    let start = captured
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .rev()
+                        .find(|c| c["method"] == "agent.start")
+                        .cloned()
+                        .unwrap();
+                    let fresh = start["params"]["pane_id"] == "w1:p99";
+                    assert_eq!(request["params"]["target"], start["params"]["name"]);
+                    json!({"type":"agent_info","agent":{"name":null,"pane_id":start["params"]["pane_id"],"terminal_id":"t99","workspace_id":if fresh {"w1"}else{"w99"}}})
+                }
                 m => panic!("Unexpected terminal mutation: {m}"),
             };
             stream
@@ -2528,7 +2541,7 @@ async fn guided_new_creates_a_model_selected_native_session_only_after_confirmat
             .iter()
             .filter(|c| c["method"] != "workspace.list")
             .count(),
-        2
+        3
     );
     server.abort();
 }
