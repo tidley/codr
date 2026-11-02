@@ -5384,6 +5384,11 @@ fn decision_terminal(question: &str) -> String {
 
 fn custom_decision_export(path: &std::path::Path) -> std::path::PathBuf {
     let form = path.with_file_name("question-form.json");
+    std::fs::write(
+        path.with_file_name("question-history.json"),
+        r#"{"messages":[{"type":"user","id":"user","text":"Task"}]}"#,
+    )
+    .unwrap();
     std::fs::write(&form, json!({"id":"frm_amber","sessionID":"ses_1","metadata":{"kind":"question","tool":{"messageID":"msg_amber","id":"tool_amber"}},
         "fields":[{"key":"q0","type":"string","title":"Amber version","description":"Which Amber version is installed?","custom":true,
         "options":[{"value":"I can check","label":"I can check"},{"value":"Not sure","label":"Not sure"}]}]}).to_string()).unwrap();
@@ -5391,7 +5396,7 @@ fn custom_decision_export(path: &std::path::Path) -> std::path::PathBuf {
 import json,pathlib,sys
 root=pathlib.Path(__file__).parent;args=sys.argv[1:]
 if args[0]=='--pure':sys.exit(2)
-if args[0]=='session':print('{"messages":[{"type":"user","id":"user","text":"Task"}]}');sys.exit(0)
+if args[0]=='session':print((root/'question-history.json').read_text());sys.exit(0)
 if args[:2]==['api','get']:
  if args[2].endswith('/permission'):print('{"data":[]}');sys.exit(0)
  if args[2].endswith('/form'):print(json.dumps({'data':[json.loads((root/'question-form.json').read_text())]}));sys.exit(0)
@@ -5407,6 +5412,136 @@ sys.exit(2)
 "#).unwrap();
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
     form
+}
+
+#[tokio::test]
+async fn confirmed_phone_question_answers_resume_only_the_current_muted_turn() {
+    use herdr_white_noise_bridge::{forwarding, output};
+    for scenario in ["custom", "choice", "lost-ack", "off", "stale", "last"] {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = editable_config(root.path());
+        config.auto_forwarding = true;
+        let form = custom_decision_export(&config.opencode_bin);
+        let history_path = root.path().join("question-history.json");
+        let mut history = json!({"messages":[
+            {"type":"user","id":"old-turn","text":"Old task"},
+            {"type":"assistant","id":"old-final","finish":"stop","time":{"completed":1},"content":[{"type":"text","text":"Old muted final"}]},
+            {"type":"user","id":"current-turn","text":"Current task"},
+            {"type":"assistant","id":"prior-final","finish":"stop","time":{"completed":2},"content":[{"type":"text","text":"Earlier reply in current turn"}]}
+        ]});
+        std::fs::write(&history_path, history.to_string()).unwrap();
+        let mut blocked = agent();
+        blocked.agent_status = "blocked".into();
+        let key = blocked.key();
+        let calls = Arc::new(Mutex::new(vec![]));
+        let current = Arc::new(Mutex::new(blocked.clone()));
+        let herdr = decision_herdr(
+            &config.herdr_socket,
+            current.clone(),
+            Arc::new(Mutex::new(String::new())),
+            calls.clone(),
+        )
+        .await;
+        let mut bridge = Bridge::open(config.clone()).unwrap();
+        let mut mapping = activity_mapping(blocked.clone(), &"bb".repeat(16));
+        let snapshot = output::read_snapshot(&config, blocked.agent_session.as_ref().unwrap())
+            .await
+            .unwrap();
+        mapping.activity.baseline(&snapshot.history.user_inputs);
+        mapping.muted_turns = vec!["opencode:old-turn".into(), "opencode:current-turn".into()];
+        bridge.state.mappings.insert(key.clone(), mapping);
+        let mut other = agent();
+        other.agent_session.as_mut().unwrap().value = "ses_other".into();
+        let other_key = other.key();
+        let mut other_mapping = activity_mapping(other, &"dd".repeat(16));
+        other_mapping.muted_turns = vec!["opencode:other-turn".into()];
+        bridge
+            .state
+            .mappings
+            .insert(other_key.clone(), other_mapping);
+        bridge.reconcile(vec![blocked.clone()]).await.unwrap();
+        bridge.state.outbox.retain(|item| item.response.is_some());
+        if scenario == "off" {
+            forwarding::set_mode(&config.state_path, forwarding::Mode::Off).unwrap();
+        }
+        if scenario == "lost-ack" {
+            std::fs::write(root.path().join("drop-question-ack"), "").unwrap();
+        }
+        if scenario == "stale" {
+            let mut value: Value = serde_json::from_slice(&std::fs::read(&form).unwrap()).unwrap();
+            value["id"] = json!("frm_replaced");
+            std::fs::write(&form, value.to_string()).unwrap();
+        }
+        let mut event = inbound(HEX, "resume-muted-question");
+        event["message"]["text"] = json!(match scenario {
+            "choice" => "1",
+            "last" => "/last",
+            _ => "v6.6.6",
+        });
+        bridge.inbound(&event).await.unwrap();
+        bridge.inbound(&event).await.unwrap();
+        let resumed = matches!(scenario, "custom" | "choice");
+        if resumed {
+            assert!(
+                bridge.state.mappings[&key]
+                    .decision
+                    .as_ref()
+                    .unwrap()
+                    .submitted,
+                "The fixture must actually submit a verified answer"
+            );
+        }
+        assert_eq!(
+            !bridge.state.mappings[&key]
+                .muted_turns
+                .contains(&"opencode:current-turn".into()),
+            resumed,
+            "{scenario}"
+        );
+        assert!(
+            bridge.state.mappings[&key]
+                .muted_turns
+                .contains(&"opencode:old-turn".into())
+        );
+        assert_eq!(
+            bridge.state.mappings[&other_key].muted_turns,
+            ["opencode:other-turn"]
+        );
+        if scenario == "off" {
+            assert_eq!(
+                forwarding::load(&config.state_path).unwrap().mode,
+                forwarding::Mode::Off
+            );
+            assert!(!bridge.state.forwarding_enabled);
+        }
+        bridge.save().unwrap();
+        drop(bridge);
+        history["messages"].as_array_mut().unwrap().push(json!({"type":"assistant","id":"new-final","finish":"stop","time":{"completed":3},"content":[{"type":"text","text":"Final after phone answer"}]}));
+        std::fs::write(&history_path, history.to_string()).unwrap();
+        let mut working = blocked;
+        working.agent_status = "idle".into();
+        current.lock().unwrap().clone_from(&working);
+        let mut bridge = Bridge::open(config).unwrap();
+        bridge.reconcile(vec![working]).await.unwrap();
+        assert_eq!(
+            bridge
+                .state
+                .outbox
+                .iter()
+                .any(|item| item.text == "Final after phone answer"),
+            resumed,
+            "{scenario}"
+        );
+        assert!(
+            !bridge
+                .state
+                .outbox
+                .iter()
+                .any(|item| item.text == "Old muted final"
+                    || item.text == "Earlier reply in current turn")
+        );
+        herdr.abort();
+    }
 }
 
 #[tokio::test]

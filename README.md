@@ -41,6 +41,10 @@ Or give your coding agent this prompt, with your own public key:
 
 ### New in 0.11.1
 
+- Confirmed phone answers resume the current question turn's future replies,
+  without replaying old muted replies or overriding `/sync off`.
+- Project setup accepts nested paths and `ls apps/` to browse a subfolder's
+  directories and non-selectable files before confirmation.
 - Resuming after a question brings a fresh working/checklist bubble to the bottom
   of the chat, leaving `Task continued below.` in the old progress message.
 - Question cards show the question and choices without internal headings or

@@ -7,6 +7,10 @@ See the [release notes](docs/releases/0.11.1.md) and
 
 ### Fixed
 
+- A confirmed phone answer resumes the current question turn's future replies
+  without replaying muted history or overriding explicit sync-off.
+- Guided project setup lists nested folders with `ls path/`, shows regular files
+  as non-selectable entries, and accepts nested project paths before confirmation.
 - Show OpenCode questions and choices without the internal decision heading,
   request code, repeated title, or routine reply instructions. Keep required
   changed-question and terminal-only safety notices.

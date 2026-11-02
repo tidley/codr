@@ -72,6 +72,71 @@ async fn model_code(bridge: &mut Bridge, key: &str) -> String {
 }
 
 #[tokio::test]
+async fn folder_listing_browses_nested_paths_without_creating_or_escaping_the_root() {
+    let root = tempfile::tempdir().unwrap();
+    let config = config(root.path());
+    api(&config);
+    let (mut bridge, key) = bridge(&config, None);
+    let (server, _) = host(&config, None).await;
+    std::fs::create_dir_all(config.launch_root.join("Apps/Library/Existing")).unwrap();
+    std::fs::write(config.launch_root.join("Apps/Library/README.md"), "keep").unwrap();
+    std::os::unix::fs::symlink(root.path(), config.launch_root.join("escape")).unwrap();
+    bridge.inbound(&event("open-nested", "/new")).await.unwrap();
+    bridge
+        .inbound(&event("workspace-nested", "new"))
+        .await
+        .unwrap();
+    bridge
+        .inbound(&event("list-nested", "ls Apps/Library/"))
+        .await
+        .unwrap();
+    assert!(last(&bridge).contains("Apps/Library/Existing"));
+    assert!(last(&bridge).contains("Apps/Library/README.md"));
+    assert!(last(&bridge).contains("not selectable"));
+    let draft = bridge.state.mappings[&key].launch_draft.clone().unwrap();
+    assert_eq!(draft.folder_choices, ["Apps/Library/Existing"]);
+    drop(bridge);
+    let mut bridge = Bridge::open(config.clone()).unwrap();
+    assert_eq!(
+        bridge.state.mappings[&key].launch_draft.as_ref(),
+        Some(&draft)
+    );
+    for (id, text) in [
+        ("outside", "ls ../"),
+        ("symlink", "ls escape/"),
+        ("missing", "ls missing/"),
+    ] {
+        bridge.inbound(&event(id, text)).await.unwrap();
+        assert_eq!(
+            bridge.state.mappings[&key].launch_draft.as_ref(),
+            Some(&draft)
+        );
+    }
+    bridge
+        .inbound(&event("create-nested", "Apps/Library/NewProject"))
+        .await
+        .unwrap();
+    assert_eq!(
+        bridge.state.mappings[&key]
+            .launch_draft
+            .as_ref()
+            .unwrap()
+            .directory
+            .as_deref(),
+        Some(config.launch_root.join("Apps/Library/NewProject").as_path())
+    );
+    assert!(
+        !config.launch_root.join("Apps/Library/NewProject").exists(),
+        "Folder creation must still wait for confirmation"
+    );
+    assert_eq!(
+        std::fs::read_to_string(config.launch_root.join("Apps/Library/README.md")).unwrap(),
+        "keep"
+    );
+    server.abort();
+}
+
+#[tokio::test]
 async fn folder_pages_survive_restart_refresh_and_select_existing_projects() {
     let root = tempfile::tempdir().unwrap();
     let config = config(root.path());
@@ -715,7 +780,7 @@ async fn account_model_groups_and_variants_are_separate_restart_safe_menus() {
     bridge.inbound(&event("workspace", "3")).await.unwrap();
     assert_eq!(
         last(&bridge),
-        "Folder name:\nReply with your chosen folder name.\n\n**0. Cancel**\n\n**`ls`** to list existing folders, or **`ls <part>`** to filter them."
+        "Folder name:\nReply with your chosen folder path, such as apps/new-project.\n\n**0. Cancel**\n\n**`ls`** lists entries; **`ls apps/`** lists a subfolder; **`ls <part>`** filters folders."
     );
     bridge.inbound(&event("folder", "my-idea")).await.unwrap();
     assert!(last(&bridge).starts_with("Choose agent:\n"));
@@ -1170,7 +1235,7 @@ async fn location_steps_are_tidy_and_new_workspace_is_the_last_numbered_choice()
     );
     assert_eq!(
         last(&bridge),
-        "Folder name:\nReply with your chosen folder name.\n\n**0. Cancel**\n\n**`ls`** to list existing folders, or **`ls <part>`** to filter them."
+        "Folder name:\nReply with your chosen folder path, such as apps/new-project.\n\n**0. Cancel**\n\n**`ls`** lists entries; **`ls apps/`** lists a subfolder; **`ls <part>`** filters folders."
     );
     bridge
         .inbound(&event("folder", "side-project"))

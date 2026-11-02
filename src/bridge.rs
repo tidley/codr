@@ -3067,12 +3067,8 @@ impl Bridge {
             }
             return Ok(false);
         }
-        let active = if self.config.opencode_db.is_some() {
-            self.reads.fresh(&self.config, session).await?.decision
-        } else {
-            output::decision::read(&self.config, session).await?
-        };
-        let Some(active) = active else {
+        let snapshot = self.reads.fresh(&self.config, session).await?;
+        let Some(active) = snapshot.decision else {
             if looks_like_answer {
                 return self.decision_notice(key, group, id, "No supported decision is available yet. Wait for its question card or use the terminal. No answer was sent.");
             }
@@ -3155,6 +3151,23 @@ impl Bridge {
         };
         match result {
             Ok(()) => {
+                self.refresh_forwarding()?;
+                if self.state.forwarding_enabled
+                    && let Some(turn) = snapshot.history.latest_turn
+                {
+                    let mapping = self.state.mappings.get_mut(key).unwrap();
+                    // Resume only this accepted answer's unfinished turn. Keep
+                    // already completed replies suppressed, including this turn's
+                    // earlier replies, without replaying another chat's history.
+                    for reply in snapshot.history.finals {
+                        if reply.turn.as_ref() == Some(&turn)
+                            && !mapping.final_ids.contains(&reply.id)
+                        {
+                            mapping.final_ids.push(reply.id);
+                        }
+                    }
+                    mapping.muted_turns.retain(|muted| muted != &turn);
+                }
                 let message = match answer {
                     output::decision::Answer::Choice(choice) => format!("Sent choice {choice}: {}.", decision.questions[0].options[choice-1].label),
                     output::decision::Answer::Custom(_) => "Sent your custom answer to the current question.".into(),
