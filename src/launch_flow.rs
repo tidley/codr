@@ -62,6 +62,8 @@ pub struct Draft {
     #[serde(default)]
     pub folder_files: Vec<String>,
     #[serde(default)]
+    pub folder_cwd: PathBuf,
+    #[serde(default)]
     pub conversations: Vec<Agent>,
 }
 
@@ -95,6 +97,7 @@ impl Draft {
             visible_models: vec![],
             folder_choices: vec![],
             folder_files: vec![],
+            folder_cwd: PathBuf::new(),
             conversations: vec![],
         }
     }
@@ -172,7 +175,7 @@ impl Draft {
                 if self.page>0 {text.push_str("\nPrevious page: previous");}
                 text
             }
-            Step::Folder=>"Folder name:\nReply with your chosen folder path, such as apps/new-project.\n\n**0. Cancel**\n\n**`ls`** lists entries; **`ls apps/`** lists a subfolder; **`ls <part>`** filters folders.".to_string(),
+            Step::Folder=>"Folder name:\nReply with your chosen folder path, such as apps/new-project.\n\n**0. Cancel**\n\n**`ls`** lists entries; **`/cd folder`** enters an existing folder; **`/cd ..`** goes up. **`ls apps/`** lists a subfolder; **`ls <part>`** filters entries.".to_string(),
             Step::FolderList=>{
                 let mut text="Choose a folder:".to_string();
                 if self.folder_choices.is_empty() {
@@ -190,7 +193,7 @@ impl Draft {
                     for name in self.folder_files.iter().take(20) { text.push_str(&format!("\n- {name}")); }
                     if self.folder_files.len()>20 {text.push_str("\nMore files omitted. Use ls <path/part> to filter.");}
                 }
-                text.push_str("\n\n**0. Cancel**\nReply with a listed number or folder path. **`ls <part>`** filters the list; **`ls apps/`** lists a subfolder; **`ls`** returns to the root.");
+                text.push_str("\n\n**0. Cancel**\nReply with a listed number or folder path. **`ls`** lists the current folder; **`ls <part>`** filters entries. **`/cd folder`** enters a folder; **`/cd ..`** goes up.");
                 if (self.page+1)*FOLDER_PAGE_SIZE<self.folder_choices.len() {text.push_str("\nNext page: **`next`**");}
                 if self.page>0 {text.push_str("\nPrevious page: **`previous`**");}
                 text
@@ -238,6 +241,11 @@ impl Draft {
             Step::Applying|Step::Uncertain=>"Model selection was not confirmed. Inspect OpenCode locally. No automatic retry will run.".into(),
             Step::Applied=>"Model selection was confirmed. No change was repeated.".into(),
         };
+        if matches!(self.step, Step::Folder | Step::FolderList)
+            && !self.folder_cwd.as_os_str().is_empty()
+        {
+            text = format!("Current folder: {}\n\n{text}", self.folder_cwd.display());
+        }
         if matches!(self.mode, Mode::Fresh(_)) {
             text.push_str("\nThis starts a fresh session in a new tab and separate chat. Old history and queued work stay in the old chat.");
         }
@@ -339,6 +347,19 @@ pub fn short_reply(draft: &Draft, text: &str) -> Option<String> {
     let answer = text.trim().to_ascii_lowercase();
     let number = !answer.is_empty() && answer.bytes().all(|b| b.is_ascii_digit());
     let page = matches!(answer.as_str(), "next" | "previous");
+    if matches!(draft.step, Step::Folder | Step::FolderList) {
+        let mut words = text.split_whitespace();
+        if words
+            .next()
+            .is_some_and(|word| word.eq_ignore_ascii_case("/cd"))
+        {
+            return Some(format!(
+                "/new cd {} {}",
+                draft.code,
+                words.collect::<Vec<_>>().join(" ")
+            ));
+        }
+    }
     if matches!(draft.step, Step::Folder | Step::FolderList)
         && let Some(filter) = ls_filter(text.trim())
     {
@@ -708,11 +729,11 @@ async fn route(bridge: &mut Bridge, key: &str, group: &str, id: &str, text: &str
         && args.len() > 1
         && (!matches!(
             args[1].to_ascii_lowercase().as_str(),
-            "folder" | "workspace" | "list" | "pick" | "conversation"
+            "folder" | "workspace" | "list" | "pick" | "conversation" | "cd"
         ) || (args.len() == 4
             && matches!(
                 args[1].to_ascii_lowercase().as_str(),
-                "workspace" | "list" | "pick" | "conversation"
+                "workspace" | "list" | "pick" | "conversation" | "cd"
             )
             && draft.as_ref().is_none_or(|draft| args[2] != draft.code)
             && matches!(args[3], "opencode" | "codex" | "claude")))
@@ -854,13 +875,46 @@ async fn route(bridge: &mut Bridge, key: &str, group: &str, id: &str, text: &str
         draft.advance(Step::Folder);
         return show(bridge, key, group, id, draft);
     }
+    if command == "/new" && args.len() == 4 && args[1].eq_ignore_ascii_case("cd") {
+        ensure!(
+            matches!(draft.step, Step::Folder | Step::FolderList) && args[2] == draft.code,
+            "Use the current folder menu"
+        );
+        let mut relative = draft.folder_cwd.clone();
+        if args[3] == ".." {
+            ensure!(relative.pop(), "Already at the project root");
+        } else {
+            ensure!(
+                std::path::Path::new(args[3]).is_relative(),
+                "Use a relative folder below the project root"
+            );
+            relative.push(args[3]);
+        }
+        let destination = bridge.config.launch_root.join(&relative);
+        if !relative.as_os_str().is_empty() {
+            ensure!(
+                launch::inspect(&bridge.config.launch_root, &destination)?.exists(),
+                "Choose an existing folder to enter"
+            );
+        }
+        launch::directory(&destination)?;
+        draft.folder_cwd = relative;
+        draft.folder_choices.clear();
+        draft.folder_files.clear();
+        draft.page = 0;
+        draft.advance(Step::Folder);
+        return show(bridge, key, group, id, draft);
+    }
     if command == "/new" && args.len() == 4 && args[1].eq_ignore_ascii_case("folder") {
         ensure!(
             matches!(draft.step, Step::Folder | Step::FolderList) && args[2] == draft.code,
             "Use the current folder menu code"
         );
         let proposed = launch::proposal(
-            &format!("/new project {} opencode", args[3]),
+            &format!(
+                "/new project {} opencode",
+                draft.folder_cwd.join(args[3]).display()
+            ),
             &bridge.config.launch_root,
             &PathBuf::from(std::env::var_os("HOME").unwrap_or_default()),
             now(),
@@ -903,6 +957,15 @@ async fn route(bridge: &mut Bridge, key: &str, group: &str, id: &str, text: &str
             return show(bridge, key, group, id, draft);
         }
         let filter = args.get(4..).unwrap_or_default().join(" ");
+        ensure!(
+            std::path::Path::new(&filter).is_relative(),
+            "List a relative folder below the project root"
+        );
+        let filter = if draft.folder_cwd.as_os_str().is_empty() {
+            filter
+        } else {
+            format!("{}/{filter}", draft.folder_cwd.display())
+        };
         (draft.folder_choices, draft.folder_files) =
             folder_choices(&bridge.config.launch_root, &filter)?;
         draft.step = Step::FolderList;

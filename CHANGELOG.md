@@ -11,6 +11,8 @@ See the [release notes](docs/releases/0.11.1.md) and
   without replaying muted history or overriding explicit sync-off.
 - Guided project setup lists nested folders with `ls path/`, shows regular files
   as non-selectable entries, and accepts nested project paths before confirmation.
+  `/cd folder` changes the menu's location; `/cd ..` goes up without leaving the
+  configured project root. Plain `ls` and new paths use the current location.
 - Show OpenCode questions and choices without the internal decision heading,
   request code, repeated title, or routine reply instructions. Keep required
   changed-question and terminal-only safety notices.

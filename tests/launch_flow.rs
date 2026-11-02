@@ -72,6 +72,90 @@ async fn model_code(bridge: &mut Bridge, key: &str) -> String {
 }
 
 #[tokio::test]
+async fn folder_cd_keeps_ls_and_new_paths_relative_to_a_restart_safe_bounded_location() {
+    let root = tempfile::tempdir().unwrap();
+    let config = config(root.path());
+    api(&config);
+    let (mut bridge, key) = bridge(&config, None);
+    let (server, _) = host(&config, None).await;
+    std::fs::create_dir_all(config.launch_root.join("Apps/Library/Existing")).unwrap();
+    std::fs::write(config.launch_root.join("Apps/Library/README.md"), "keep").unwrap();
+    std::os::unix::fs::symlink(root.path(), config.launch_root.join("Apps/Library/escape"))
+        .unwrap();
+    bridge.inbound(&event("open-cd", "/new")).await.unwrap();
+    bridge.inbound(&event("workspace-cd", "new")).await.unwrap();
+    bridge.inbound(&event("cd-apps", "/cd Apps")).await.unwrap();
+    assert!(last(&bridge).contains("Current folder: Apps"));
+    bridge.inbound(&event("ls-apps", "ls")).await.unwrap();
+    assert_eq!(
+        bridge.state.mappings[&key]
+            .launch_draft
+            .as_ref()
+            .unwrap()
+            .folder_choices,
+        ["Apps/Library"]
+    );
+    bridge
+        .inbound(&event("cd-library", "/cd Library"))
+        .await
+        .unwrap();
+    drop(bridge);
+    let mut bridge = Bridge::open(config.clone()).unwrap();
+    bridge.inbound(&event("ls-library", "ls")).await.unwrap();
+    assert_eq!(
+        bridge.state.mappings[&key]
+            .launch_draft
+            .as_ref()
+            .unwrap()
+            .folder_choices,
+        ["Apps/Library/Existing"]
+    );
+    assert!(last(&bridge).contains("Apps/Library/README.md"));
+    let retained = bridge.state.mappings[&key].launch_draft.clone();
+    for (id, command) in [
+        ("cd-outside", "/cd ../../.."),
+        ("cd-absolute", "/cd /tmp"),
+        ("cd-missing", "/cd missing"),
+        ("cd-symlink", "/cd escape"),
+        ("cd-file", "/cd README.md"),
+    ] {
+        bridge.inbound(&event(id, command)).await.unwrap();
+        assert_eq!(
+            bridge.state.mappings[&key].launch_draft, retained,
+            "{command}"
+        );
+    }
+    bridge.inbound(&event("cd-up", "/cd ..")).await.unwrap();
+    assert!(last(&bridge).contains("Current folder: Apps"));
+    bridge.inbound(&event("cd-root", "/cd ..")).await.unwrap();
+    let at_root = bridge.state.mappings[&key].launch_draft.clone();
+    bridge
+        .inbound(&event("cd-above-root", "/cd .."))
+        .await
+        .unwrap();
+    assert_eq!(bridge.state.mappings[&key].launch_draft, at_root);
+    bridge
+        .inbound(&event("cd-nested", "/cd Apps/Library"))
+        .await
+        .unwrap();
+    bridge
+        .inbound(&event("relative-project", "NewProject"))
+        .await
+        .unwrap();
+    assert_eq!(
+        bridge.state.mappings[&key]
+            .launch_draft
+            .as_ref()
+            .unwrap()
+            .directory
+            .as_deref(),
+        Some(config.launch_root.join("Apps/Library/NewProject").as_path())
+    );
+    assert!(!config.launch_root.join("Apps/Library/NewProject").exists());
+    server.abort();
+}
+
+#[tokio::test]
 async fn folder_listing_browses_nested_paths_without_creating_or_escaping_the_root() {
     let root = tempfile::tempdir().unwrap();
     let config = config(root.path());
@@ -780,7 +864,7 @@ async fn account_model_groups_and_variants_are_separate_restart_safe_menus() {
     bridge.inbound(&event("workspace", "3")).await.unwrap();
     assert_eq!(
         last(&bridge),
-        "Folder name:\nReply with your chosen folder path, such as apps/new-project.\n\n**0. Cancel**\n\n**`ls`** lists entries; **`ls apps/`** lists a subfolder; **`ls <part>`** filters folders."
+        "Folder name:\nReply with your chosen folder path, such as apps/new-project.\n\n**0. Cancel**\n\n**`ls`** lists entries; **`/cd folder`** enters an existing folder; **`/cd ..`** goes up. **`ls apps/`** lists a subfolder; **`ls <part>`** filters entries."
     );
     bridge.inbound(&event("folder", "my-idea")).await.unwrap();
     assert!(last(&bridge).starts_with("Choose agent:\n"));
@@ -1235,7 +1319,7 @@ async fn location_steps_are_tidy_and_new_workspace_is_the_last_numbered_choice()
     );
     assert_eq!(
         last(&bridge),
-        "Folder name:\nReply with your chosen folder path, such as apps/new-project.\n\n**0. Cancel**\n\n**`ls`** lists entries; **`ls apps/`** lists a subfolder; **`ls <part>`** filters folders."
+        "Folder name:\nReply with your chosen folder path, such as apps/new-project.\n\n**0. Cancel**\n\n**`ls`** lists entries; **`/cd folder`** enters an existing folder; **`/cd ..`** goes up. **`ls apps/`** lists a subfolder; **`ls <part>`** filters entries."
     );
     bridge
         .inbound(&event("folder", "side-project"))
@@ -2526,21 +2610,26 @@ async fn saved_folder_drafts_from_before_workspace_selection_keep_the_new_worksp
 
 #[tokio::test]
 async fn the_legacy_shortcut_can_still_name_a_project_workspace() {
-    let root = tempfile::tempdir().unwrap();
-    let config = config(root.path());
-    api(&config);
-    let (mut bridge, key) = bridge(&config, None);
-    bridge
-        .inbound(&event("legacy", "/new workspace named-folder opencode"))
-        .await
-        .unwrap();
-    let request = bridge.state.mappings[&key]
-        .launch
-        .as_ref()
-        .expect("Legacy project name must remain available");
-    assert_eq!(request.label, "workspace");
-    assert!(request.target_workspace.is_none());
-    assert!(!config.launch_root.join("named-folder").exists());
+    for label in ["workspace", "cd"] {
+        let root = tempfile::tempdir().unwrap();
+        let config = config(root.path());
+        api(&config);
+        let (mut bridge, key) = bridge(&config, None);
+        bridge
+            .inbound(&event(
+                "legacy",
+                &format!("/new {label} named-folder opencode"),
+            ))
+            .await
+            .unwrap();
+        let request = bridge.state.mappings[&key]
+            .launch
+            .as_ref()
+            .expect("Legacy project name must remain available");
+        assert_eq!(request.label, label);
+        assert!(request.target_workspace.is_none());
+        assert!(!config.launch_root.join("named-folder").exists());
+    }
 }
 
 #[tokio::test]
