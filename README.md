@@ -19,7 +19,7 @@ The current setup code uses **👾** as the public name and display name when it
 
 ## Install
 
-**0.11.1 is a release candidate for existing accounts.** Fresh accounts use the
+**0.11.1 targets existing accounts.** Fresh accounts use the
 supported 0.9.0 setup below, then the owner-confirmed chat handover. See the
 [0.11.1 release notes](docs/releases/0.11.1.md) and
 [combined runtime/handover guide](docs/COMBINED.md).
@@ -39,10 +39,12 @@ Or give your coding agent this prompt, with your own public key:
 
 [Full installation and upgrade guide →](docs/INSTALL.md)
 
-### Planned in 0.11.1
+### New in 0.11.1
 
 - Resuming after a question brings a fresh working/checklist bubble to the bottom
   of the chat, leaving `Task continued below.` in the old progress message.
+- Question cards show the question and choices without internal headings or
+  repeated titles. Required changed-question safety notices remain.
 - Ordinary follow-ups no longer answer a completed custom question. Explicit
   stale answers remain blocked, including after a restart.
 - Mobile-created agents clear their temporary `codr-…` name after startup.
@@ -51,7 +53,8 @@ Or give your coding agent this prompt, with your own public key:
 - The current account-creation helper defaults to **👾**. Existing profiles and
   the supported 0.9.0 bootstrap keep their naming behaviour.
 
-These fixes are under local testing. See the [readiness record](docs/releases/0.11.1-readiness.md).
+See the [release notes](docs/releases/0.11.1.md) for scope and credits, and the
+[readiness record](docs/releases/0.11.1-readiness.md) for verification and publication gates.
 
 ### Retained from 0.11.0
 

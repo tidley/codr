@@ -1,6 +1,6 @@
 # Install **codr**
 
-**0.11.1 is a release candidate for existing accounts.** Fresh-account examples use
+**0.11.1 targets existing accounts.** Fresh-account examples use
 the supported 0.9.0 setup. For an existing account, use the explicit
 [combined-service handover](COMBINED.md), not the legacy two-service setup flow.
 Fresh identity creation still uses local 0.9 setup before that handover.

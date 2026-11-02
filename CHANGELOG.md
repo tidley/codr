@@ -1,9 +1,9 @@
 # Changelog
 
-## [0.11.1] - Unreleased
+## [0.11.1] - 2026-11-02
 
-Release candidate only. See the [release notes](docs/releases/0.11.1.md) and
-[readiness record](docs/releases/0.11.1-readiness.md). No tag or release is published.
+See the [release notes](docs/releases/0.11.1.md) and
+[verification and publication record](docs/releases/0.11.1-readiness.md).
 
 ### Fixed
 
