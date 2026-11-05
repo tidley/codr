@@ -294,7 +294,27 @@ prove failure or authorize a second install.
 
 ### Immediate text and persistent pending deliveries
 
-An ordinary complete owner text prompt goes directly to the freshly verified mapped agent, including while it is working. It does not wait in codr for idle or interrupt the current task. The agent may still use its own native inbox. A blocked native dialog is reported without silently making a future task; answer its supported decision or permission request, or use `/cancel`. Duplicate inbound events do not submit again. Phone text may reach the agent before an older media item finishes preparation.
+Herdr's terminal-write acknowledgement does not prove native acceptance. For
+supported transcript readers, Codr saves a private fingerprint and the native
+input IDs observed before submission. Only complete, matching new native input
+confirms acceptance, not execution or completion. Historical text, incomplete
+messages and ambiguous duplicates cannot confirm it. If the baseline read fails,
+acceptance remains unconfirmed.
+
+After 60 seconds without confirmed acceptance, Codr queues one durable warning
+per submission and pauses new prompts in that chat. An idle session's progress
+closes as uncertain, not successful. The check survives restarts, failed history
+reads, unavailable terminals and sync-off mode. Other chats and accepted queued
+or prepared deliveries are preserved. No uncertain prompt is automatically resent.
+Late matching native input can resolve the check. Otherwise inspect the native
+session, stop the bridge, and use its local `clear-prompt` command before restarting
+it. Clearing a marker cannot recall terminal input or prevent delayed execution.
+Phone `/queue` shows pending or overdue acceptance. Local `status` reports
+`native_acceptance_pending` and `native_acceptance_overdue` separately from
+terminal-write uncertainty. Pre-upgrade flights have no
+acceptance fingerprints and need separate inspection.
+
+Unless an earlier submission has overdue unconfirmed acceptance, an ordinary complete owner text prompt goes directly to the freshly verified mapped agent, including while it is working. It does not wait in codr for idle or interrupt the current task. The agent may still use its own native inbox. A blocked native dialog is reported without silently making a future task; answer its supported decision or permission request, or use `/cancel`. Duplicate inbound events do not submit again. Phone text may reach the agent before an older media item finishes preparation.
 
 Image preparation and legacy text/desktop deliveries share 16 accepted slots per chat and a 30000 UTF-8 byte caption/text limit on acceptance. A full preparation FIFO or oversized caption gets a rejection notice, not silent eviction. An image message occupies one slot, keeps its caption, and accepts up to four PNG, JPEG, WebP, or GIF attachments, with the existing 25 MiB-per-file download limit. Voice retains local transcription; it no longer waits for agent idle. New phone text has no 16-task waiting queue.
 
@@ -310,7 +330,7 @@ The bridge saves consumption and submission intent before native input. A proven
 
 Set `edit_responses = true` in the bridge configuration to enable editable progress. The release-matched connector includes the required `edit_message` API.
 
-Each response starts as one `> working...` progress message. The bridge edits that message with the current task list, when available. It sends the final answer as a separate message through the normal durable send path, with its own retry key. The bridge never edits that final answer. When possible, it marks the progress message `> done`.
+Each response uses one progress message, initially `> Request submitted...` for a phone request or `> Working...` for observed work. The bridge edits that message with the current task list, when available. It sends the final answer as a separate message through the normal durable send path, with its own retry key. The bridge never edits that final answer. When possible, it marks the progress message `> Done.`. Status labels use sentence case: transient states end in three full stops, such as `Working...` and `Blocked...`, while settled states use one, such as `Done.`, `Idle.`, and `Ended.`. Internal status values are unchanged.
 
 Phone follow-ups while an agent is already working reuse the current editable progress bubble. When an agent resumes work after waiting for input, Codr starts a fresh working/checklist message below the conversation. Only after the replacement is confirmed does Codr attempt to edit the old progress to `Task continued below.` It does not delete the old message. This edit is best effort and is not retried if its result is uncertain; questions, answers, and final replies are preserved. The active bubble becomes `done` when the response completes. Without editable responses, follow-ups still do not emit extra working refreshes. Previously sent historical notices remain in the chat. Image acceptance says `Preparing image`, not `Queued prompt`: this is download preparation, not scheduling a future task. Media preparation never clears an existing response or submission receipt.
 
@@ -388,7 +408,17 @@ Images and audio are available in **codr** 0.5.0. Voice prompts require a transc
 
 Audio goes through FFmpeg to 16 kHz mono WAV, then to a local Phonon-2 worker. Its transcript enters the same prompt route as typed text, without a confirmation step. Supported question answers also use that route. Download and local transcription add time before the agent starts.
 
-The phone sees `> transcribing` while audio processing runs. With `edit_responses = true` and an edit-capable MDK build, **codr** edits that bubble to `> transcribed` with the transcript quoted underneath. The edit survives restarts and retries independently of agent submission. Without edit support, the transcript arrives as a separate message. Images use `> downloading`. Long transcript displays are shortened with a notice; the agent receives the full prepared prompt.
+The phone sees `> Transcribing...` while audio processing runs. With `edit_responses = true` and an edit-capable MDK build, **codr** edits that bubble to `> Transcribed.` with the transcript quoted underneath. The edit survives restarts and retries independently of agent submission. Without edit support, the transcript arrives as a separate message. Long transcript displays are shortened with a notice; the agent receives the full prepared prompt.
+
+Accepted images and files get an owner-requested status receipt. With editable
+responses enabled, the same message changes from `Preparing image...` to
+`Downloading image...` to `Downloaded image.` (or `file`). Missing download
+references show `Waiting for image...`; preparation failures show a failure
+state. The edit target and pending update survive worker restarts. Fast stages
+may be combined, and edits follow the normal rate limit. Downloaded means MDK
+returned the file and Codr validated and copied it locally; it does not prove
+native-agent execution or a reply. Status receipts do not unmute other output.
+Without editable responses, the initial preparation receipt remains standalone.
 
 Downloads and transcription run separately from session updates, one media message at a time. Pending messages survive bridge restarts. Sender checks and session checks still apply. A preparation failure sends no agent prompt. An uncertain terminal submission is not repeated automatically.
 

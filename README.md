@@ -10,7 +10,7 @@ The current setup code uses **👾** as the public name and display name when it
 
 - Chat names pair the **herdr** tab and workspace: `review (Acme)`. Fresh-session chats add the agent name only to distinguish a matching live project in the same workspace. Descriptions contain workspace and agent details.
 - With editable progress enabled, one active bubble carries status and checklist updates. Final replies stay separate.
-- Phone text is handed straight to the agent, including while it is working. Images, files and voice follow as soon as download/transcription completes, without waiting for idle. The agent handles its own input; codr does not interrupt it. Send `/cancel` when you do want to interrupt the current task.
+- Phone text is handed straight to the agent, including while it is working, unless an earlier submission has unconfirmed native acceptance. Images, files and voice follow as soon as download/transcription completes, without waiting for idle. The agent handles its own input; codr does not interrupt it. Send `/cancel` when you do want to interrupt the current task.
 - `/new` guides you through workspace, folder, installed agent, and model selection. Reply with numbers, use `0` to cancel, and type the repository folder name to confirm the final preview. The destination workspace is shown separately.
 - Choose the default model or browse a provider's full model list. OpenCode uses its authenticated model catalogue; variants are selected separately. `/agent` opens a separate chat without moving old history.
 - Supported OpenCode questions accept a number or option label as a reply. V2 questions with custom input also accept text answers, such as a version number.
@@ -41,6 +41,12 @@ Or give your coding agent this prompt, with your own public key:
 
 ### New in 0.11.1
 
+- Clear status labels use `Request submitted...` and `Working...` for progress,
+  then `Done.` for completion. Acceptance checks and safety warnings remain.
+- Native acceptance checks distinguish terminal delivery from agent receipt.
+  Unconfirmed submissions produce a warning and pause that chat, without retries.
+- Editable image/file receipts show preparation, download, completion, waiting,
+  or failure without adding a new bubble for each stage.
 - Confirmed phone answers resume the current question turn's future replies,
   without replaying old muted replies or overriding `/sync off`.
 - Project setup accepts nested paths and `ls apps/` to browse a subfolder's
@@ -125,7 +131,7 @@ retained. See the release notes for contributor credits and scope.
 | `/agent` | Choose an agent in a separate session and chat. |
 | `/model` | Choose a model; OpenCode supports a confirmed idle-session change in place. |
 | `/cancel` | Clear pending questions and menus in this chat and interrupt its current task, keeping history and accepted deliveries. |
-| `/queue` | Inspect pending media and deliveries accepted before the update. |
+| `/queue` | Inspect pending media, accepted deliveries and native-acceptance state. |
 | `/unmute` | Resume all chats and clear a forced sync mode. |
 | `/sync auto\|on\|off` | Use automatic sync, always on, or always off. The choice persists across restarts. |
 
@@ -141,7 +147,7 @@ It does not restart services, stop other sessions, change the selected model, or
 discard accepted deliveries. Records of uncertain external operations remain for
 reconciliation. An interrupt acknowledgement does not prove the agent has stopped.
 
-New phone text does not join a worker-scheduled task queue. Messages are delivered without an interrupt; a backend can still use its own native inbox. A blocked permission or decision requires its supported answer or `/cancel`, not an arbitrary prompt. Media still needs download/transcription, and existing accepted deliveries are preserved across upgrades. `/clear-queue` is retired and does not discard those deliveries. A lost submission acknowledgement is never automatically retried.
+New phone text does not join a worker-scheduled task queue. Messages are delivered without an interrupt; a backend can still use its own native inbox. A blocked permission or decision requires its supported answer or `/cancel`, not an arbitrary prompt. After 60 seconds without confirmed native acceptance, Codr warns and pauses new submissions in that chat; inspect the native session before local `clear-prompt`. Media still needs download/transcription, and accepted deliveries are preserved across upgrades. `/clear-queue` is retired and does not discard those deliveries. An uncertain submission is never automatically retried.
 
 Handoff is automatic. Manual controls remain available through **herdr**'s **White Noise forwarding: At desk / Away** action. [Controls and limits →](docs/REFERENCE.md#at-desk--away-forwarding)
 

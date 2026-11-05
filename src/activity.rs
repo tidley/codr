@@ -30,6 +30,121 @@ impl UserInput {
     }
 }
 
+/// Terminal delivery is not native acceptance. Keep an independent, private
+/// receipt until an unambiguous new native input has the submitted fingerprint.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Submission {
+    pub receipt: String,
+    before: Option<Vec<String>>,
+    fingerprint: Option<String>,
+    pub submitted_at: u64,
+    pub warned: bool,
+}
+
+impl Submission {
+    pub fn new(receipt: &str, text: &str, inputs: Option<&[UserInput]>, at: u64) -> Self {
+        Self {
+            receipt: receipt.into(),
+            before: inputs.map(|inputs| inputs.iter().map(|input| input.id.clone()).collect()),
+            fingerprint: UserInput::new(String::new(), text).fingerprint,
+            submitted_at: at,
+            warned: false,
+        }
+    }
+
+    pub fn overdue(&self, at: u64) -> bool {
+        at.saturating_sub(self.submitted_at) >= 60
+    }
+
+    pub fn observe(submissions: &mut Vec<Self>, inputs: &[UserInput]) {
+        // Match the whole group: one echo must not confirm two equal submissions,
+        // nor may two equal native inputs be attributed to one phone receipt.
+        let accepted: Vec<_> = submissions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, submission)| {
+                let fingerprint = submission.fingerprint.as_ref()?;
+                let peers: Vec<_> = submissions
+                    .iter()
+                    .filter(|other| other.fingerprint.as_ref() == Some(fingerprint))
+                    .collect();
+                let mut ids = HashSet::new();
+                let echoes: Vec<_> = inputs
+                    .iter()
+                    .filter(|input| {
+                        input.complete
+                            && input.fingerprint.as_ref() == Some(fingerprint)
+                            && peers.iter().any(|peer| {
+                                peer.before
+                                    .as_ref()
+                                    .is_some_and(|before| !before.contains(&input.id))
+                            })
+                            && ids.insert(input.id.as_str())
+                    })
+                    .collect();
+                if echoes.len() != peers.len() {
+                    return None;
+                }
+                let candidates: Vec<Vec<usize>> = peers
+                    .iter()
+                    .map(|peer| {
+                        echoes
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, input)| {
+                                peer.before
+                                    .as_ref()
+                                    .is_some_and(|before| !before.contains(&input.id))
+                            })
+                            .map(|(index, _)| index)
+                            .collect()
+                    })
+                    .collect();
+                let mut owners = vec![None; echoes.len()];
+                (0..peers.len())
+                    .all(|peer| {
+                        assign_native_input(
+                            peer,
+                            &candidates,
+                            &mut owners,
+                            &mut vec![false; echoes.len()],
+                        )
+                    })
+                    .then_some(index)
+            })
+            .collect();
+        let mut index = 0;
+        submissions.retain(|_| {
+            let keep = !accepted.contains(&index);
+            index += 1;
+            keep
+        });
+    }
+}
+
+// Each receipt must own a different eligible native message. Reassign an earlier
+// match if a later receipt has a narrower baseline (for example, an incomplete echo).
+fn assign_native_input(
+    receipt: usize,
+    candidates: &[Vec<usize>],
+    owners: &mut [Option<usize>],
+    seen: &mut [bool],
+) -> bool {
+    for &input in &candidates[receipt] {
+        if seen[input] {
+            continue;
+        }
+        seen[input] = true;
+        if owners[input]
+            .is_none_or(|previous| assign_native_input(previous, candidates, owners, seen))
+        {
+            owners[input] = Some(receipt);
+            return true;
+        }
+    }
+    false
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct PhoneInput {
     receipt: String,

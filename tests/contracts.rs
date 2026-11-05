@@ -3,6 +3,23 @@ use herdr_white_noise_bridge::{config::phone_hex, herdr::Agent, output::final_me
 use serde_json::json;
 
 #[test]
+fn status_labels_distinguish_progress_from_settled_states() {
+    for (status, expected) in [
+        ("working", "Working..."),
+        ("blocked", "Blocked..."),
+        ("done", "Done."),
+        ("idle", "Idle."),
+        ("ended", "Ended."),
+        ("unknown", "Unknown."),
+    ] {
+        assert_eq!(
+            herdr_white_noise_bridge::herdr::status_label(status),
+            expected
+        );
+    }
+}
+
+#[test]
 fn npub_checksum_is_verified_and_decodes_a_synthetic_public_key() {
     let key = [0x11u8; 32];
     let npub = bech32::encode("npub", key.to_base32(), bech32::Variant::Bech32).unwrap();

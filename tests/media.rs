@@ -258,7 +258,7 @@ async fn audio_becomes_the_prompt_text_without_a_confirmation_round_trip() {
 fn transcript_notices_quote_every_line_and_bound_long_unicode_text() {
     assert_eq!(
         media::transcript_notice("First line\n\nSecond line"),
-        "> transcribed\n\n> First line\n> \n> Second line"
+        "> Transcribed.\n\n> First line\n> \n> Second line"
     );
     let text = "😀\n".repeat(5000);
     let notice = media::transcript_notice(&text);

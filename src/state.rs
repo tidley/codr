@@ -31,7 +31,8 @@ impl QueuedPrompt {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct QueueFlight {
     pub before_final: Option<String>,
-    /// False also covers a restart between durable intent and submission acknowledgement.
+    /// Herdr terminal-write acknowledgement only, NOT native message acceptance.
+    /// False also covers a restart between durable intent and acknowledgement.
     pub confirmed: bool,
 }
 
@@ -105,6 +106,9 @@ pub struct Mapping {
     pub prompt_queue: Vec<QueuedPrompt>,
     #[serde(default)]
     pub queue_flight: Option<QueueFlight>,
+    /// Pending native acceptance, independent of forwarding and terminal acks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub submissions: Vec<crate::activity::Submission>,
     #[serde(default)]
     pub permission: Option<crate::output::permission::Permission>,
     #[serde(default)]
@@ -252,7 +256,7 @@ impl BridgeState {
     pub fn enqueue_working_notice(&mut self, group: &str) {
         let pending = self.outbox.iter().any(|item| {
             item.group == group
-                && item.text.starts_with("> working")
+                && (item.text.starts_with("> Working.") || item.text.starts_with("> working"))
                 && item
                     .response
                     .as_ref()
@@ -260,7 +264,7 @@ impl BridgeState {
         });
         if !pending {
             let start = self.outbox.len();
-            self.enqueue(group, "> working...");
+            self.enqueue(group, "> Working...");
             if let Some(item) = self.outbox.get_mut(start) {
                 item.working_notice = true;
             }
@@ -411,7 +415,7 @@ impl BridgeState {
         self.outbox.push(Outgoing {
             id: id.clone(),
             group: group.into(),
-            text: "> working...".into(),
+            text: "> Working...".into(),
             working_notice: false,
             attachments: vec![],
             response: Some(ResponseDelivery::default()),
@@ -463,7 +467,7 @@ impl BridgeState {
         self.outbox.push(Outgoing {
             id: id.clone(),
             group: group.into(),
-            text: "> transcribing".into(),
+            text: "> Transcribing...".into(),
             working_notice: false,
             attachments: vec![],
             response: Some(ResponseDelivery {
@@ -529,12 +533,14 @@ impl BridgeState {
         }
         item.text = if let Some(tasks) = item
             .text
-            .strip_prefix("> working...\n")
+            .strip_prefix("> Working...\n")
+            .or_else(|| item.text.strip_prefix("> Working.\n"))
+            .or_else(|| item.text.strip_prefix("> working...\n"))
             .or_else(|| item.text.strip_prefix("> working\n"))
         {
-            format!("> done\n{tasks}")
+            format!("> Done.\n{tasks}")
         } else {
-            "> done".into()
+            "> Done.".into()
         };
         delivery.finished = true;
         if let Some(target) = inherited {

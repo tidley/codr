@@ -376,7 +376,15 @@ pub fn short_reply(draft: &Draft, text: &str) -> Option<String> {
         Step::FolderList if page => Some(format!("/new list {} {answer}", draft.code)),
         Step::FolderList if number => Some(format!("/new pick {} {answer}", draft.code)),
         Step::FolderList if !text.trim().is_empty() && !text.trim().starts_with('/') => {
-            Some(format!("/new folder {} {}", draft.code, text.trim()))
+            if let Some(index) = draft
+                .folder_choices
+                .iter()
+                .position(|path| path == text.trim())
+            {
+                Some(format!("/new pick {} {}", draft.code, index + 1))
+            } else {
+                Some(format!("/new folder {} {}", draft.code, text.trim()))
+            }
         }
         Step::Conversation if number => Some(format!("/new conversation {} {answer}", draft.code)),
         Step::Workspace if number || page || answer == "new" => {

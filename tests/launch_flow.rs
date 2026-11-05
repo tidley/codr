@@ -72,6 +72,38 @@ async fn model_code(bridge: &mut Bridge, key: &str) -> String {
 }
 
 #[tokio::test]
+async fn displayed_folder_paths_and_numbers_select_the_same_directory_after_cd() {
+    for selection in ["Apps/Library", "1"] {
+        let root = tempfile::tempdir().unwrap();
+        let config = config(root.path());
+        api(&config);
+        let (mut bridge, key) = bridge(&config, None);
+        let (server, _) = host(&config, None).await;
+        std::fs::create_dir_all(config.launch_root.join("Apps/Library")).unwrap();
+        bridge.inbound(&event("open", "/new")).await.unwrap();
+        bridge.inbound(&event("workspace", "new")).await.unwrap();
+        bridge.inbound(&event("cd", "/cd Apps")).await.unwrap();
+        bridge.inbound(&event("list", "ls")).await.unwrap();
+        assert!(last(&bridge).contains("Apps/Library"));
+        drop(bridge);
+        let mut bridge = Bridge::open(config.clone()).unwrap();
+        bridge.inbound(&event("select", selection)).await.unwrap();
+        assert_eq!(
+            bridge.state.mappings[&key]
+                .launch_draft
+                .as_ref()
+                .unwrap()
+                .directory
+                .as_deref(),
+            Some(config.launch_root.join("Apps/Library").as_path()),
+            "{selection}"
+        );
+        assert!(!config.launch_root.join("Apps/Apps").exists());
+        server.abort();
+    }
+}
+
+#[tokio::test]
 async fn folder_cd_keeps_ls_and_new_paths_relative_to_a_restart_safe_bounded_location() {
     let root = tempfile::tempdir().unwrap();
     let config = config(root.path());

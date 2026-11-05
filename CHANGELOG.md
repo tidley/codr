@@ -1,18 +1,29 @@
 # Changelog
 
-## [0.11.1] - 2026-11-02
+## [0.11.1] - 2026-11-05
 
 See the [release notes](docs/releases/0.11.1.md) and
 [verification and publication record](docs/releases/0.11.1-readiness.md).
 
 ### Fixed
 
+- Use sentence-case status labels: `Request submitted...`, `Working...` and
+  other transient updates use three full stops; completed states use `Done.`
+  and similar labels. Preserve checklists from earlier progress formats.
+- Track native prompt acceptance separately from terminal-write acknowledgement.
+  Warn once after 60 seconds without matching native input, pause new submissions
+  in that chat, and preserve uncertain work without automatic resubmission.
+- Edit one image/file receipt from preparing to downloading to downloaded, with
+  explicit waiting and failure states instead of a stale preparation message.
+  Download completion does not claim that the agent started or answered.
 - A confirmed phone answer resumes the current question turn's future replies
   without replaying muted history or overriding explicit sync-off.
 - Guided project setup lists nested folders with `ls path/`, shows regular files
   as non-selectable entries, and accepts nested project paths before confirmation.
   `/cd folder` changes the menu's location; `/cd ..` goes up without leaving the
   configured project root. Plain `ls` and new paths use the current location.
+  Typing a displayed folder path selects the same directory as its number,
+  including after changing location or restarting the worker.
 - Show OpenCode questions and choices without the internal decision heading,
   request code, repeated title, or routine reply instructions. Keep required
   changed-question and terminal-only safety notices.
@@ -27,7 +38,6 @@ See the [release notes](docs/releases/0.11.1.md) and
   Preserve the started agent if name cleanup cannot be confirmed.
 - Fresh setup uses **👾** for the public name and display name of new accounts.
   Existing profiles and account keys stay unchanged.
-
 - Forward ordinary new prompts after an OpenCode custom-answer question has
   ended, including after a bridge restart. Keep explicit stale answers blocked
   and preserve the guard for questions that stop waiting during a reply.

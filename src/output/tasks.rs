@@ -18,7 +18,7 @@ pub struct TaskList {
 
 impl TaskList {
     pub fn text(&self) -> String {
-        let mut text = "> working...".to_string();
+        let mut text = "> Working...".to_string();
         if !self.items.is_empty() {
             text.push('\n');
         }

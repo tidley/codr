@@ -49,6 +49,169 @@ fn inbound(sender: &str, id: &str) -> Value {
     json!({"marmot_agent_control":"marmot.agent-control.v2","type":"inbound_message","account_id_hex":"aa".repeat(32),"group_id_hex":"bb".repeat(16),"message":{"message_id_hex":id,"sender":{"account_id_hex":sender},"text":"test prompt","recorded_at":u64::MAX}})
 }
 
+#[tokio::test]
+async fn missing_transcript_cannot_hide_uncertain_delivery_or_consume_prepared_work() {
+    let root = tempfile::tempdir().unwrap();
+    let config = editable_config(root.path());
+    input_history(&config, "ses_1", &[], None);
+    let calls = Arc::new(Mutex::new(vec![]));
+    let mdk = peer(&config.wn_agent_socket, true, calls.clone()).await;
+    let herdr = peer(&config.herdr_socket, false, calls.clone()).await;
+    let agent = agent();
+    let key = agent.key();
+    let mut bridge = mapped_bridge(config.clone(), &agent);
+    bridge.agents.insert(key.clone(), agent.clone());
+    bridge.herdr_available = true;
+    herdr_white_noise_bridge::forwarding::set_mode(
+        &config.state_path,
+        herdr_white_noise_bridge::forwarding::Mode::Off,
+    )
+    .unwrap();
+    bridge.inbound(&inbound(HEX, "silent")).await.unwrap();
+    bridge.state.mappings.get_mut(&key).unwrap().submissions[0].submitted_at = now() - 120;
+    accept_legacy_text(&mut bridge, &key, "kept", "Accepted work");
+    let mut prepared = inbound(HEX, "kept-media");
+    prepared["_codr_prepared_text"] = json!("Inspect /private/prepared.png");
+    prepared["_codr_retry_at"] = json!(0);
+    bridge.state.media_pending.push(prepared);
+    std::fs::remove_file(&config.opencode_bin).unwrap();
+    bridge.save().unwrap();
+    herdr_white_noise_bridge::forwarding::set_mode(
+        &config.state_path,
+        herdr_white_noise_bridge::forwarding::Mode::Auto,
+    )
+    .unwrap();
+    assert!(
+        bridge.reconcile(vec![agent]).await.is_err(),
+        "A failed resume checkpoint must still report overdue acceptance"
+    );
+    assert!(
+        bridge
+            .state
+            .outbox
+            .iter()
+            .any(|item| item.manual && item.text.contains("Native acceptance is unconfirmed"))
+    );
+    assert!(!bridge.state.forwarding_enabled);
+    assert!(bridge.process_media().await.is_err());
+    assert_eq!(bridge.state.media_pending.len(), 1);
+    assert_eq!(bridge.state.mappings[&key].prompt_queue.len(), 1);
+    assert_eq!(
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call["method"] == "agent.prompt")
+            .count(),
+        1
+    );
+    mdk.abort();
+    herdr.abort();
+}
+
+#[tokio::test]
+async fn terminal_ack_without_native_input_warns_once_and_never_retries_after_restart() {
+    let root = tempfile::tempdir().unwrap();
+    let config = editable_config(root.path());
+    export_script(&config.opencode_bin, "old", "old");
+    let calls = Arc::new(Mutex::new(vec![]));
+    let mdk = peer(&config.wn_agent_socket, true, calls.clone()).await;
+    let herdr = peer(&config.herdr_socket, false, calls.clone()).await;
+    let agent = agent();
+    let key = agent.key();
+    let mut bridge = mapped_bridge(config.clone(), &agent);
+    bridge.agents.insert(key.clone(), agent.clone());
+    bridge.herdr_available = true;
+    bridge.inbound(&inbound(HEX, "silent-input")).await.unwrap();
+    assert!(
+        bridge
+            .state
+            .outbox
+            .iter()
+            .any(|item| item.text == "> Request submitted..."),
+        "A terminal write must not be described as native work"
+    );
+    let mut saved = serde_json::to_value(&bridge.state).unwrap();
+    assert_eq!(
+        saved["mappings"][&key]["submissions"]
+            .as_array()
+            .map(Vec::len),
+        Some(1),
+        "A terminal acknowledgement must retain native acceptance intent"
+    );
+    saved["mappings"][&key]["submissions"][0]["submitted_at"] = json!(now() - 120);
+    bridge.state = serde_json::from_value(saved).unwrap();
+    bridge.save().unwrap();
+    drop(bridge);
+    let mut bridge = Bridge::open(config.clone()).unwrap();
+    bridge.reconcile(vec![agent.clone()]).await.unwrap();
+    bridge.reconcile(vec![agent.clone()]).await.unwrap();
+    let warnings: Vec<_> = bridge
+        .state
+        .outbox
+        .iter()
+        .filter(|item| item.text.contains("Native acceptance is unconfirmed"))
+        .collect();
+    assert_eq!(warnings.len(), 1);
+    assert!(
+        warnings[0].manual,
+        "An owner submission needs a durable warning even with sync off"
+    );
+    assert!(
+        bridge.state.mappings[&key].queue_flight.is_some(),
+        "Do not silently release uncertain work"
+    );
+    assert!(
+        bridge.state.mappings[&key].response_id.is_none(),
+        "Idle native session must not show indefinite work"
+    );
+    bridge.inbound(&inbound(HEX, "followup")).await.unwrap();
+    assert_eq!(
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call["method"] == "agent.prompt")
+            .count(),
+        1
+    );
+    assert!(
+        bridge
+            .state
+            .outbox
+            .iter()
+            .any(|item| item.text.contains("No new prompt was sent"))
+    );
+    input_history(
+        &config,
+        "ses_1",
+        &[("native-input", "test prompt")],
+        Some(("native-final", "Completed")),
+    );
+    bridge.reconcile(vec![agent]).await.unwrap();
+    assert!(
+        bridge.state.mappings[&key].submissions.is_empty(),
+        "Late native evidence releases the safety latch"
+    );
+    assert!(bridge.state.mappings[&key].queue_flight.is_none());
+    bridge
+        .inbound(&inbound(HEX, "after-late-acceptance"))
+        .await
+        .unwrap();
+    assert_eq!(
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| call["method"] == "agent.prompt")
+            .count(),
+        2,
+        "Only explicit new input may be submitted, not a retry"
+    );
+    mdk.abort();
+    herdr.abort();
+}
+
 fn accept_legacy_text(bridge: &mut Bridge, key: &str, id: &str, text: &str) {
     let mapping = bridge.state.mappings.get_mut(key).unwrap();
     if mapping.last_agent_status == "working" {
@@ -964,7 +1127,7 @@ async fn delivered_followup_reuses_current_status_without_a_new_working_bubble()
                 .as_mut()
                 .unwrap();
             response.target = Some("old-progress".into());
-            response.sent_text = Some("> working...".into());
+            response.sent_text = Some("> Working...".into());
         }
         bridge.reconcile(vec![working.clone()]).await.unwrap();
         bridge.flush().await.unwrap();
@@ -1028,7 +1191,7 @@ async fn failed_working_refresh_cannot_hold_back_a_final_answer() {
             let mut reader = tokio::io::BufReader::new(stream);
             let request = read_line(&mut reader).await.unwrap();
             requests.lock().unwrap().push(request.clone());
-            let mut response = if request["text"] == "> working..." {
+            let mut response = if request["text"] == "> Working..." {
                 json!({"type":"error","code":"temporary_failure"})
             } else {
                 json!({"type":"final_sent","message_ids_hex":["cc".repeat(32)]})
@@ -1086,7 +1249,7 @@ async fn legacy_working_refresh_is_dropped_instead_of_adding_another_bubble() {
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|request| request["text"] == "> working..."),
+                .any(|request| request["text"] == "> Working..."),
             "Do not deliver an obsolete working status for {status}"
         );
         assert!(bridge.state.outbox.is_empty());
@@ -1125,7 +1288,7 @@ async fn delivered_or_rejected_followup_does_not_claim_working_for_a_blocked_or_
                 .state
                 .outbox
                 .iter()
-                .any(|item| item.text.starts_with("> working"))
+                .any(|item| item.text.starts_with("> Working..."))
         );
         herdr.abort();
     }
@@ -1138,6 +1301,130 @@ fn inbound_image(path: &std::path::Path, id: &str, caption: &str) -> Value {
         "ciphertext_sha256":"aa".repeat(32),"plaintext_sha256":"bb".repeat(32),"nonce_hex":"00".repeat(12),
         "version":"encrypted-media-v1","source_epoch":1,"locators":[{"kind":"blossom-v1","value":"https://example.com/fixture"}]}]);
     event
+}
+
+#[tokio::test]
+async fn attachment_receipts_edit_one_message_through_download_and_survive_restart() {
+    for (kind, fail, off) in [
+        ("image", false, false),
+        ("file", false, false),
+        ("image", true, false),
+        ("file", true, false),
+        ("image", false, true),
+        ("file", false, true),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let config = editable_config(root.path());
+        export_script(&config.opencode_bin, "old", "old");
+        let path = root.path().join("attachment.png");
+        std::fs::write(&path, if fail { &b""[..] } else { &b"fixture"[..] }).unwrap();
+        let calls = Arc::new(Mutex::new(vec![]));
+        let mdk = peer(&config.wn_agent_socket, true, calls.clone()).await;
+        let mut working = agent();
+        working.agent_status = "working".into();
+        let herdr =
+            peer_for_agent(&config.herdr_socket, false, calls.clone(), working.clone()).await;
+        let key = working.key();
+        let mut bridge = mapped_bridge(config.clone(), &working);
+        bridge.agents.insert(key.clone(), working.clone());
+        bridge.herdr_available = true;
+        if off {
+            herdr_white_noise_bridge::forwarding::set_mode(
+                &config.state_path,
+                herdr_white_noise_bridge::forwarding::Mode::Off,
+            )
+            .unwrap();
+        }
+        let mut event = inbound_image(&path, "status-image", "Inspect this");
+        if kind == "file" {
+            event["message"]["media"][0]["media_type"] = json!("application/zip");
+            event["message"]["media"][0]["file_name"] = json!("archive.zip");
+        }
+        bridge.inbound(&event).await.unwrap();
+        let receipt = bridge
+            .state
+            .outbox
+            .iter()
+            .find(|item| item.text.contains("Preparing"))
+            .unwrap();
+        let receipt_id = receipt.id.clone();
+        assert!(
+            receipt.response.is_some(),
+            "An accepted attachment needs an editable receipt"
+        );
+        bridge.flush().await.unwrap();
+        bridge.reconcile(vec![working.clone()]).await.unwrap();
+        bridge.process_media().await.unwrap();
+        let receipt = bridge
+            .state
+            .outbox
+            .iter_mut()
+            .find(|item| item.id == receipt_id)
+            .unwrap();
+        assert_eq!(receipt.text, format!("> Downloading {kind}..."));
+        receipt.response.as_mut().unwrap().last_attempt_at = 0;
+        bridge.flush().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                bridge.process_media().await.unwrap();
+                if bridge.state.media_pending.is_empty()
+                    && bridge.state.mappings[&key].prompt_queue.is_empty()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let expected = if fail {
+            format!("> Download failed for {kind}.")
+        } else {
+            format!("> Downloaded {kind}.")
+        };
+        let receipt = bridge
+            .state
+            .outbox
+            .iter_mut()
+            .find(|item| item.id == receipt_id)
+            .unwrap();
+        assert_eq!(receipt.text, expected);
+        receipt.response.as_mut().unwrap().last_attempt_at = 0;
+        bridge.save().unwrap();
+        drop(bridge);
+        let mut bridge = Bridge::open(config).unwrap();
+        bridge.flush().await.unwrap();
+        bridge.flush().await.unwrap();
+        if off {
+            assert!(!bridge.state.forwarding_enabled);
+        }
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.iter().filter(|call| call["type"] == "send_final" && call["idempotency_key"] == receipt_id).count(), 1);
+        let edits: Vec<_> = calls
+            .iter()
+            .filter(|call| {
+                call["type"] == "edit_message" && call["target_message_id_hex"] == "cc".repeat(32)
+            })
+            .collect();
+        assert!(
+            edits
+                .iter()
+                .any(|call| call["text"] == format!("> Downloading {kind}..."))
+        );
+        assert_eq!(
+            edits.iter().filter(|call| call["text"] == expected).count(),
+            1
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call["method"] == "agent.prompt")
+                .count(),
+            usize::from(!fail)
+        );
+        mdk.abort();
+        herdr.abort();
+    }
 }
 
 #[tokio::test]
@@ -1379,11 +1666,11 @@ async fn zip_files_survive_preparation_restart_and_reach_a_working_agent_once_ev
         assert_eq!(bridge.state.mappings[&key].queue_flight, flight);
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
         assert!(
-            !bridge
-                .state
-                .outbox
-                .iter()
-                .any(|item| item.text.contains("transcrib") || item.text == "> downloading")
+            !bridge.state.outbox.iter().any(|item| item
+                .text
+                .to_ascii_lowercase()
+                .contains("transcrib")
+                || item.text == "> downloading")
         );
         let requests = calls.lock().unwrap();
         let prompts: Vec<_> = requests
@@ -1786,7 +2073,7 @@ async fn image_prompt_queue_preserves_caption_fifo_and_prepared_files_across_res
             .state
             .outbox
             .iter()
-            .any(|m| m.text.starts_with("Preparing image."))
+            .any(|m| m.text == "> Preparing image...")
     );
     accept_legacy_text(&mut bridge, &agent().key(), "text-after-image", "Next task");
     assert!(prompts().is_empty());
@@ -3181,7 +3468,7 @@ async fn sync_reference_records_new_progress_and_help_but_not_edits_or_inbound_r
     bridge.state.update_response(
         &agent().key(),
         &"bb".repeat(16),
-        "> working...\nnew tasks",
+        "> Working...\nnew tasks",
         false,
     );
     bridge.flush().await.unwrap();
@@ -3952,7 +4239,8 @@ async fn phone_echo_concatenation_controls_muting_and_late_final_delivery() {
                         .lock()
                         .unwrap()
                         .iter()
-                        .any(|c| c["type"] == "send_final" && c["text"] == "> working...")
+                        .any(|c| c["type"] == "send_final"
+                            && c["text"] == "> Request submitted...")
                 );
                 assert_eq!(
                     calls
@@ -3982,13 +4270,19 @@ async fn phone_echo_concatenation_controls_muting_and_late_final_delivery() {
                 bridge.flush().await.unwrap();
                 assert_eq!(bridge.state.forwarding_enabled, !concatenated);
                 assert!(!calls.lock().unwrap().iter().any(|c| c["text"] == "Hello."));
-                assert!(!bridge.state.outbox.iter().any(|item| item.text == "> done"));
+                assert!(
+                    !bridge
+                        .state
+                        .outbox
+                        .iter()
+                        .any(|item| item.text == "> Done.")
+                );
                 assert!(
                     !calls
                         .lock()
                         .unwrap()
                         .iter()
-                        .any(|c| c["type"] == "edit_message" && c["text"] == "> done")
+                        .any(|c| c["type"] == "edit_message" && c["text"] == "> Done.")
                 );
                 write_history(Some(if concatenated { COMBINED } else { PHONE }), true);
                 // No new agent state event accompanies the late transcript record.
@@ -4028,7 +4322,7 @@ async fn phone_echo_concatenation_controls_muting_and_late_final_delivery() {
                 );
                 assert_eq!(
                     sent.iter()
-                        .filter(|c| c["type"] == "edit_message" && c["text"] == "> done")
+                        .filter(|c| c["type"] == "edit_message" && c["text"] == "> Done.")
                         .count(),
                     usize::from(!concatenated)
                 );
@@ -4872,7 +5166,7 @@ async fn completion_wakes_keep_uncertain_sessions_active_and_do_not_restart_work
             .state
             .outbox
             .iter()
-            .any(|item| item.text.starts_with("> ended"))
+            .any(|item| item.text.starts_with("> Ended."))
     );
     assert_eq!(
         std::fs::read_to_string(&starts).unwrap().lines().count(),
@@ -5011,7 +5305,7 @@ async fn background_task_export_failure_does_not_hide_working_status() {
             .state
             .outbox
             .iter()
-            .any(|item| item.text == "> working...")
+            .any(|item| item.text == "> Working...")
     );
 }
 
@@ -6136,7 +6430,7 @@ async fn a_phone_choice_answers_the_blocked_question_instead_of_becoming_a_promp
             .lock()
             .unwrap()
             .iter()
-            .any(|call| { call["text"] == "> blocked Waiting for your decision." })
+            .any(|call| { call["text"] == "> Blocked... Waiting for your decision." })
     );
     let mut answer = inbound(HEX, "choice-1");
     let mut next_task = inbound(HEX, "task-during-decision");
@@ -6322,7 +6616,7 @@ async fn only_a_new_authorised_phone_message_wakes_forwarding_for_all_sessions()
     bridge.flush().await.unwrap();
     assert!(
         calls.lock().unwrap().iter().any(|call| {
-            call["text"] == "> idle herdr session: connected. 0 waiting prompt(s)."
+            call["text"] == "> Idle. Herdr session: connected. 0 waiting prompt(s)."
         })
     );
     assert_eq!(
@@ -6344,7 +6638,7 @@ async fn only_a_new_authorised_phone_message_wakes_forwarding_for_all_sessions()
             .unwrap()
             .iter()
             .any(|request| request["group_id_hex"] == "dd".repeat(16)
-                && request["text"] == "> working...")
+                && request["text"] == "> Working...")
     );
     assert!(forwarding_command(&config, "desk").await.status.success());
     restarted.reconcile(vec![agent()]).await.unwrap();
@@ -7128,7 +7422,7 @@ async fn progress_is_edited_but_the_final_is_a_separate_message_across_restart()
         2,
         "One progress message and one immutable final reply"
     );
-    assert_eq!(sends[0]["text"], "> working...");
+    assert_eq!(sends[0]["text"], "> Request submitted...");
     assert_eq!(sends[1]["text"], "The final answer");
     assert_ne!(sends[0]["idempotency_key"], sends[1]["idempotency_key"]);
     let edits: Vec<_> = requests
@@ -7147,9 +7441,9 @@ async fn progress_is_edited_but_the_final_is_a_separate_message_across_restart()
         edits[0]["text"]
             .as_str()
             .unwrap()
-            .starts_with("> working...\n\n✓ Inspect code")
+            .starts_with("> Working...\n\n✓ Inspect code")
     );
-    assert!(edits[1]["text"].as_str().unwrap().starts_with("> done"));
+    assert!(edits[1]["text"].as_str().unwrap().starts_with("> Done."));
     assert!(
         edits[1]["text"]
             .as_str()
@@ -7340,7 +7634,7 @@ async fn long_final_replies_keep_all_text_without_waiting_for_progress_edits() {
     assert_eq!(calls[1]["type"], "send_final");
     assert_eq!(calls[2]["type"], "send_final");
     assert_eq!(calls[3]["type"], "edit_message");
-    assert_eq!(calls[3]["text"], "> done");
+    assert_eq!(calls[3]["text"], "> Done.");
     assert_eq!(
         format!(
             "{}{}",
@@ -7386,7 +7680,7 @@ async fn answered_questions_move_progress_below_the_reply_without_losing_the_che
             .iter_mut()
             .find(|item| item.id == old_id)
             .unwrap();
-        item.text = "> blocked Waiting for your answer".into();
+        item.text = "> Blocked... Waiting for your answer".into();
         let delivery = item.response.as_mut().unwrap();
         delivery.target = known_old.then(|| old_target.clone());
         delivery.initial_text = Some(item.text.clone());
@@ -7421,7 +7715,7 @@ async fn answered_questions_move_progress_below_the_reply_without_losing_the_che
                 let is_new_progress = request["type"] == "send_final"
                     && request["text"]
                         .as_str()
-                        .is_some_and(|s| s.starts_with("> working"));
+                        .is_some_and(|s| s.starts_with("> Working..."));
                 let mut response = if (is_new_progress && std::mem::take(&mut reject_new))
                     || (request["type"] == "edit_message" && fail_edit)
                 {
@@ -7457,7 +7751,7 @@ async fn answered_questions_move_progress_below_the_reply_without_losing_the_che
                 .find(|i| i.id == fresh_id)
                 .unwrap()
                 .text,
-            "> working...\n\n▶ Run checks"
+            "> Working...\n\n▶ Run checks"
         );
         assert_eq!(
             bridge
@@ -7467,7 +7761,7 @@ async fn answered_questions_move_progress_below_the_reply_without_losing_the_che
                 .find(|i| i.id == old_id)
                 .unwrap()
                 .text,
-            "> blocked Waiting for your answer"
+            "> Blocked... Waiting for your answer"
         );
         bridge.reconcile(vec![working.clone()]).await.unwrap();
         assert_eq!(
@@ -7510,7 +7804,7 @@ async fn answered_questions_move_progress_below_the_reply_without_losing_the_che
                 r["type"] == "send_final"
                     && r["text"]
                         .as_str()
-                        .is_some_and(|s| s.starts_with("> working"))
+                        .is_some_and(|s| s.starts_with("> Working..."))
             })
             .collect();
         assert_eq!(progress.len(), if fail_new_once { 2 } else { 1 });
@@ -7596,7 +7890,7 @@ async fn early_idle_keeps_the_working_checklist_until_the_final_reply() {
         .unwrap()
         .text
         .clone();
-    assert_eq!(progress, "> working...\n\n▶ Run checks");
+    assert_eq!(progress, "> Working...\n\n▶ Run checks");
     let mut idle = agent();
     idle.state_change_seq = 3;
     bridge.reconcile(vec![idle.clone()]).await.unwrap();
@@ -7621,7 +7915,7 @@ async fn early_idle_keeps_the_working_checklist_until_the_final_reply() {
             .state
             .outbox
             .iter()
-            .any(|item| item.id == response && item.text == "> working...\n\n✓ Run checks")
+            .any(|item| item.id == response && item.text == "> Working...\n\n✓ Run checks")
         {
             break;
         }
@@ -7635,7 +7929,7 @@ async fn early_idle_keeps_the_working_checklist_until_the_final_reply() {
             .find(|item| item.id == response)
             .unwrap()
             .text,
-        "> working...\n\n✓ Run checks"
+        "> Working...\n\n✓ Run checks"
     );
     // Keep the same progress bubble when the runtime reports working again.
     drop(bridge);
@@ -7669,7 +7963,7 @@ async fn early_idle_keeps_the_working_checklist_until_the_final_reply() {
             .find(|item| item.id == response)
             .unwrap()
             .text,
-        "> done\n\n✓ Run checks"
+        "> Done.\n\n✓ Run checks"
     );
     assert!(
         bridge
@@ -7714,7 +8008,7 @@ async fn late_final_is_resolved_before_opening_the_next_response() {
             .find(|item| item.id == first)
             .unwrap()
             .text,
-        "> working..."
+        "> Request submitted..."
     );
     export_script(&config.opencode_bin, "First final", "first-final");
     bridge.inbound(&inbound(HEX, "second")).await.unwrap();
@@ -7731,7 +8025,7 @@ async fn late_final_is_resolved_before_opening_the_next_response() {
             .find(|m| m.id == first)
             .unwrap()
             .text,
-        "> done"
+        "> Done."
     );
     assert!(
         bridge
@@ -7748,7 +8042,7 @@ async fn late_final_is_resolved_before_opening_the_next_response() {
             .find(|m| m.id == second)
             .unwrap()
             .text,
-        "> working..."
+        "> Request submitted..."
     );
     assert_eq!(
         calls
@@ -7787,7 +8081,7 @@ async fn an_ended_session_closes_an_unfinished_response_before_restoration() {
     assert!(bridge.state.mappings[&key].response_id.is_none());
     let closed = bridge.state.outbox.iter().find(|m| m.id == first).unwrap();
     assert!(closed.response.as_ref().unwrap().finished);
-    assert!(closed.text.contains("ended"));
+    assert!(closed.text.starts_with("> Ended."));
     let mut working = agent();
     working.agent_status = "working".into();
     bridge.reconcile(vec![working]).await.unwrap();
@@ -7859,6 +8153,12 @@ async fn clear_prompt_releases_an_awaiting_final_after_restart() {
             agent_record: Some(agent()),
             active: true,
             pending_prompt: true,
+            submissions: vec![herdr_white_noise_bridge::activity::Submission::new(
+                "uncertain",
+                "test prompt",
+                Some(&[]),
+                now() - 120,
+            )],
             completion_pending: true,
             last_agent_status: "idle".into(),
             last_state_change_seq: 1,
@@ -7872,6 +8172,15 @@ async fn clear_prompt_releases_an_awaiting_final_after_restart() {
     std::fs::write(&path,format!("phone_npub = {:?}\naccount_id_hex = {:?}\nherdr_socket = {:?}\nwn_agent_socket = {:?}\nstate_path = {:?}\nopencode_bin = {:?}\ncodex_home = {:?}\nclaude_home = {:?}\nedit_responses = true\n",config.phone_npub,config.account_id_hex,config.herdr_socket,config.wn_agent_socket,config.state_path,config.opencode_bin,config.codex_home,config.claude_home)).unwrap();
     drop(bridge);
     let status = tokio::process::Command::new(env!("CARGO_BIN_EXE_herdr-white-noise-bridge"))
+        .args(["--config", path.to_str().unwrap(), "status"])
+        .output()
+        .await
+        .unwrap();
+    assert!(status.status.success());
+    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["native_acceptance_pending"], 1);
+    assert_eq!(status["native_acceptance_overdue"], 1);
+    let status = tokio::process::Command::new(env!("CARGO_BIN_EXE_herdr-white-noise-bridge"))
         .args(["--config", path.to_str().unwrap(), "clear-prompt", &key])
         .status()
         .await
@@ -7882,6 +8191,7 @@ async fn clear_prompt_releases_an_awaiting_final_after_restart() {
     assert!(!restarted.state.mappings[&key].pending_prompt);
     assert!(!restarted.state.mappings[&key].completion_pending);
     assert!(restarted.state.mappings[&key].response_id.is_none());
+    assert!(restarted.state.mappings[&key].submissions.is_empty());
     assert!(
         restarted
             .state
@@ -7942,7 +8252,7 @@ async fn a_failed_progress_edit_does_not_block_the_standalone_final() {
     assert_eq!(requests[0]["type"], "send_final");
     assert_eq!(requests[0]["text"], "Final reply");
     assert_eq!(requests[1]["type"], "edit_message");
-    assert_eq!(requests[1]["text"], "> done");
+    assert_eq!(requests[1]["text"], "> Done.");
     assert_eq!(
         bridge.state.outbox.len(),
         1,
@@ -7973,7 +8283,7 @@ async fn a_failed_progress_edit_does_not_block_the_standalone_final() {
         requests.last().unwrap()["target_message_id_hex"],
         "cc".repeat(32)
     );
-    assert_eq!(requests.last().unwrap()["text"], "> done");
+    assert_eq!(requests.last().unwrap()["text"], "> Done.");
     recovered.abort();
 }
 
@@ -7994,7 +8304,7 @@ async fn a_completed_progress_send_with_a_lost_ack_is_retained_without_creating_
         .response
         .as_mut()
         .unwrap()
-        .initial_text = Some("> working...".into());
+        .initial_text = Some("> Working...".into());
     bridge.state.complete_progress(&key);
     assert_eq!(
         bridge.state.outbox.len(),
@@ -8061,8 +8371,8 @@ async fn mute_resume_keeps_one_progress_bubble_until_a_real_completed_reply() {
         let id = bridge.state.mappings[&key].response_id.clone().unwrap();
         let delivery = bridge.state.outbox[0].response.as_mut().unwrap();
         delivery.target = Some("same-progress".into());
-        delivery.initial_text = Some("> working...".into());
-        delivery.sent_text = Some("> working...".into());
+        delivery.initial_text = Some("> Working...".into());
+        delivery.sent_text = Some("> Working...".into());
         herdr_white_noise_bridge::forwarding::set(&config.state_path, false).unwrap();
         bridge.flush().await.unwrap();
         herdr_white_noise_bridge::forwarding::set(&config.state_path, true).unwrap();
@@ -8094,14 +8404,14 @@ async fn mute_resume_keeps_one_progress_bubble_until_a_real_completed_reply() {
                 .iter()
                 .filter(|r| r["type"] == "edit_message"
                     && r["target_message_id_hex"] == "same-progress"
-                    && r["text"] == "> done")
+                    && r["text"] == "> Done.")
                 .count(),
             1
         );
         assert!(
             !requests
                 .iter()
-                .any(|r| r["type"] == "send_final" && r["text"] == "> working...")
+                .any(|r| r["type"] == "send_final" && r["text"] == "> Working...")
         );
         server.abort();
     }
@@ -8125,8 +8435,8 @@ async fn resume_remembers_a_completed_muted_reply_until_runtime_idle_across_rest
     bridge.state.begin_response(&key, &group);
     let delivery = bridge.state.outbox[0].response.as_mut().unwrap();
     delivery.target = Some("muted-progress".into());
-    delivery.initial_text = Some("> working...".into());
-    delivery.sent_text = Some("> working...".into());
+    delivery.initial_text = Some("> Working...".into());
+    delivery.sent_text = Some("> Working...".into());
     herdr_white_noise_bridge::forwarding::set(&config.state_path, false).unwrap();
     bridge.flush().await.unwrap();
     herdr_white_noise_bridge::forwarding::set(&config.state_path, true).unwrap();
@@ -8145,7 +8455,7 @@ async fn resume_remembers_a_completed_muted_reply_until_runtime_idle_across_rest
         "A completed muted reply observed before idle must still finish its progress later"
     );
     assert_eq!(calls[0]["type"], "edit_message");
-    assert_eq!(calls[0]["text"], "> done");
+    assert_eq!(calls[0]["text"], "> Done.");
     assert_eq!(calls[0]["target_message_id_hex"], "muted-progress");
     assert!(bridge.state.outbox.is_empty());
     server.abort();
@@ -8169,8 +8479,8 @@ async fn muting_keeps_the_published_progress_target_and_resume_finishes_it_witho
     let id = bridge.state.mappings[&key].response_id.clone().unwrap();
     let delivery = bridge.state.outbox[0].response.as_mut().unwrap();
     delivery.target = Some("old-progress".into());
-    delivery.initial_text = Some("> working...".into());
-    delivery.sent_text = Some("> working...".into());
+    delivery.initial_text = Some("> Working...".into());
+    delivery.sent_text = Some("> Working...".into());
     herdr_white_noise_bridge::forwarding::set(&config.state_path, false).unwrap();
     bridge.flush().await.unwrap();
     assert_eq!(
@@ -8191,7 +8501,7 @@ async fn muting_keeps_the_published_progress_target_and_resume_finishes_it_witho
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0]["type"], "edit_message");
     assert_eq!(calls[0]["target_message_id_hex"], "old-progress");
-    assert_eq!(calls[0]["text"], "> done");
+    assert_eq!(calls[0]["text"], "> Done.");
     server.abort();
 }
 
@@ -8403,10 +8713,10 @@ async fn working_notice_remains_but_done_only_forwards_the_final_reply() {
         .map(|m| m.text.as_str())
         .collect();
     assert_eq!(
-        texts.iter().filter(|text| **text == "> working...").count(),
+        texts.iter().filter(|text| **text == "> Working...").count(),
         1
     );
-    assert!(!texts.contains(&"> done"));
+    assert!(!texts.contains(&"> Done."));
     assert_eq!(
         texts
             .iter()
@@ -8476,10 +8786,11 @@ async fn native_round_trip(provider: &str, legacy_mapping: bool) {
         };
         if new_reply {
             if provider == "codex" {
+                rows.push(json!({"type":"event_msg","payload":{"type":"user_message","message":"test prompt"}}));
                 rows.push(json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"new","last_agent_message":"Native new final"}}));
             } else {
                 rows.extend([
-                json!({"type":"user","uuid":"u1","parentUuid":"old","sessionId":ID,"message":{"role":"user","content":"New prompt"}}),
+                json!({"type":"user","uuid":"u1","parentUuid":"old","sessionId":ID,"message":{"role":"user","content":"test prompt"}}),
                 json!({"type":"assistant","uuid":"new","parentUuid":"u1","sessionId":ID,"message":{"role":"assistant","id":"api-new","stop_reason":"end_turn","content":[{"type":"text","text":"Native new final"}]}}),
             ]);
             }
@@ -8539,7 +8850,7 @@ async fn native_round_trip(provider: &str, legacy_mapping: bool) {
     assert!(
         !calls
             .iter()
-            .any(|call| call["text"] == "Native old final" || call["text"] == "> done")
+            .any(|call| call["text"] == "Native old final" || call["text"] == "> Done.")
     );
     if legacy_mapping {
         assert!(
@@ -8609,7 +8920,7 @@ async fn legacy_native_session_that_exited_before_upgrade_does_not_replay_histor
         );
         bridge.reconcile(vec![]).await.unwrap();
         assert_eq!(bridge.state.outbox.len(), 1);
-        assert!(bridge.state.outbox[0].text.starts_with("> ended"));
+        assert!(bridge.state.outbox[0].text.starts_with("> Ended."));
         assert!(bridge.state.mappings[&key].output_initialised);
         assert!(!bridge.state.mappings[&key].active);
     }
@@ -9253,7 +9564,7 @@ async fn final_output_is_collected_even_if_the_agent_exits_between_snapshots() {
     );
     bridge.reconcile(vec![]).await.unwrap();
     assert_eq!(bridge.state.outbox[0].text, "last answer");
-    assert!(bridge.state.outbox[1].text.starts_with("> ended"));
+    assert!(bridge.state.outbox[1].text.starts_with("> Ended."));
     bridge.reconcile(vec![]).await.unwrap();
     assert_eq!(bridge.state.outbox.len(), 2);
 }
@@ -9398,7 +9709,7 @@ async fn failed_export_does_not_repeat_a_lifecycle_notice() {
             .state
             .outbox
             .iter()
-            .filter(|m| m.text == "> idle")
+            .filter(|m| m.text == "> Idle.")
             .count(),
         1
     );
@@ -9426,7 +9737,7 @@ async fn temporarily_missing_backend_keeps_an_existing_session_present() {
             .state
             .outbox
             .iter()
-            .any(|m| m.text.starts_with("> ended"))
+            .any(|m| m.text.starts_with("> Ended."))
     );
 }
 
@@ -9778,7 +10089,7 @@ async fn a_transcript_notice_survives_lost_send_and_edit_responses_across_restar
         .iter_mut()
         .find(|item| item.id == id)
         .unwrap();
-    item.text = "> transcribed\n\n> A spoken request.".into();
+    item.text = "> Transcribed.\n\n> A spoken request.".into();
     item.response.as_mut().unwrap().finished = true;
     item.response.as_mut().unwrap().last_attempt_at = 0;
     bridge.save().unwrap();
@@ -9805,12 +10116,12 @@ async fn a_transcript_notice_survives_lost_send_and_edit_responses_across_restar
     assert_eq!(calls[0]["type"], "send_final");
     assert_eq!(calls[1]["type"], "send_final");
     assert_eq!(calls[0]["idempotency_key"], calls[1]["idempotency_key"]);
-    assert_eq!(calls[0]["text"], "> transcribing");
-    assert_eq!(calls[1]["text"], "> transcribing");
+    assert_eq!(calls[0]["text"], "> Transcribing...");
+    assert_eq!(calls[1]["text"], "> Transcribing...");
     for call in &calls[2..] {
         assert_eq!(call["type"], "edit_message");
         assert_eq!(call["target_message_id_hex"], "cc".repeat(32));
-        assert_eq!(call["text"], "> transcribed\n\n> A spoken request.");
+        assert_eq!(call["text"], "> Transcribed.\n\n> A spoken request.");
     }
     server.abort();
 }
@@ -9829,14 +10140,14 @@ async fn a_transcript_ready_before_its_first_send_uses_one_completed_bubble() {
         .iter_mut()
         .find(|item| item.id == id)
         .unwrap();
-    item.text = "> transcribed\n\n> Already prepared.".into();
+    item.text = "> Transcribed.\n\n> Already prepared.".into();
     item.response.as_mut().unwrap().finished = true;
     bridge.flush().await.unwrap();
     assert!(bridge.state.outbox.is_empty());
     let calls = calls.lock().unwrap();
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0]["type"], "send_final");
-    assert_eq!(calls[0]["text"], "> transcribed\n\n> Already prepared.");
+    assert_eq!(calls[0]["text"], "> Transcribed.\n\n> Already prepared.");
     server.abort();
 }
 
@@ -9916,7 +10227,7 @@ async fn audio_queue_survives_restart_and_submits_the_transcript_once_without_co
                 .state
                 .outbox
                 .iter()
-                .filter(|m| m.text == "> transcribing")
+                .filter(|m| m.text == "> Transcribing...")
                 .count(),
             1,
             "Unavailable history references must not repeat the preparation notice"
@@ -9961,7 +10272,7 @@ async fn audio_queue_survives_restart_and_submits_the_transcript_once_without_co
     assert_eq!(
         requests
             .iter()
-            .filter(|call| call["type"] == "send_final" && call["text"] == "> transcribing")
+            .filter(|call| call["type"] == "send_final" && call["text"] == "> Transcribing...")
             .count(),
         1
     );
@@ -9971,13 +10282,13 @@ async fn audio_queue_survives_restart_and_submits_the_transcript_once_without_co
             call["type"] == "edit_message"
                 && call["text"]
                     .as_str()
-                    .is_some_and(|text| text.starts_with("> transcribed"))
+                    .is_some_and(|text| text.starts_with("> Transcribed."))
         })
         .collect();
     assert_eq!(edits.len(), 1);
     assert_eq!(
         edits[0]["text"],
-        "> transcribed\n\n> Inspect the blue button."
+        "> Transcribed.\n\n> Inspect the blue button."
     );
     assert_eq!(edits[0]["target_message_id_hex"], "cc".repeat(32));
     assert_eq!(

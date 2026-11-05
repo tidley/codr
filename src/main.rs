@@ -144,7 +144,7 @@ async fn main() -> Result<()> {
         for (key, m) in s.mappings {
             println!(
                 "{}",
-                serde_json::json!({"session":key,"group":m.group_id_hex,"control":m.control,"creating_uncertain":m.creating,"active":m.active,"state":m.last_agent_status,"session_change_from":m.session_change_from,"pending_prompt":m.pending_prompt,"queued_prompts":m.prompt_queue.len(),"queue_submission_uncertain":m.queue_flight.as_ref().is_some_and(|flight| !flight.confirmed),"unresolved_progress":s.outbox.iter().filter(|item| Some(&item.group)==m.group_id_hex.as_ref() && item.response.as_ref().is_some_and(|delivery| delivery.finished && delivery.target.is_none() && delivery.initial_text.is_some() && !delivery.durable)).count(),"forwarding_enabled":forwarding_enabled,"forwarding_resume_pending":resume_pending})
+                serde_json::json!({"session":key,"group":m.group_id_hex,"control":m.control,"creating_uncertain":m.creating,"active":m.active,"state":m.last_agent_status,"session_change_from":m.session_change_from,"pending_prompt":m.pending_prompt,"queued_prompts":m.prompt_queue.len(),"queue_submission_uncertain":m.queue_flight.as_ref().is_some_and(|flight| !flight.confirmed),"native_acceptance_pending":m.submissions.len(),"native_acceptance_overdue":m.submissions.iter().filter(|submission| submission.overdue(herdr_white_noise_bridge::bridge::now())).count(),"unresolved_progress":s.outbox.iter().filter(|item| Some(&item.group)==m.group_id_hex.as_ref() && item.response.as_ref().is_some_and(|delivery| delivery.finished && delivery.target.is_none() && delivery.initial_text.is_some() && !delivery.durable)).count(),"forwarding_enabled":forwarding_enabled,"forwarding_resume_pending":resume_pending})
             );
         }
         return Ok(());
@@ -246,6 +246,7 @@ async fn main() -> Result<()> {
             mapping.pending_prompt = false;
             mapping.completion_pending = false;
             mapping.queue_flight = None;
+            mapping.submissions.clear();
             if let Some(decision) = mapping.decision.as_mut() {
                 decision.submitted = false;
                 decision.announced = false;
