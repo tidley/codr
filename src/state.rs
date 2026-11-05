@@ -31,7 +31,8 @@ impl QueuedPrompt {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct QueueFlight {
     pub before_final: Option<String>,
-    /// False also covers a restart between durable intent and submission acknowledgement.
+    /// Herdr terminal-write acknowledgement only, NOT native message acceptance.
+    /// False also covers a restart between durable intent and acknowledgement.
     pub confirmed: bool,
 }
 
@@ -105,6 +106,9 @@ pub struct Mapping {
     pub prompt_queue: Vec<QueuedPrompt>,
     #[serde(default)]
     pub queue_flight: Option<QueueFlight>,
+    /// Pending native acceptance, independent of forwarding and terminal acks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub submissions: Vec<crate::activity::Submission>,
     #[serde(default)]
     pub permission: Option<crate::output::permission::Permission>,
     #[serde(default)]
@@ -127,6 +131,9 @@ pub struct ResponseDelivery {
     /// Keep completed notices until delivery succeeds, unlike best-effort progress.
     #[serde(default)]
     pub durable: bool,
+    /// A confirmed older progress message to retire after this replacement is sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -249,7 +256,7 @@ impl BridgeState {
     pub fn enqueue_working_notice(&mut self, group: &str) {
         let pending = self.outbox.iter().any(|item| {
             item.group == group
-                && item.text.starts_with("> working")
+                && (item.text.starts_with("> Working.") || item.text.starts_with("> working"))
                 && item
                     .response
                     .as_ref()
@@ -257,7 +264,7 @@ impl BridgeState {
         });
         if !pending {
             let start = self.outbox.len();
-            self.enqueue(group, "> working...");
+            self.enqueue(group, "> Working...");
             if let Some(item) = self.outbox.get_mut(start) {
                 item.working_notice = true;
             }
@@ -408,7 +415,7 @@ impl BridgeState {
         self.outbox.push(Outgoing {
             id: id.clone(),
             group: group.into(),
-            text: "> working...".into(),
+            text: "> Working...".into(),
             working_notice: false,
             attachments: vec![],
             response: Some(ResponseDelivery::default()),
@@ -422,6 +429,36 @@ impl BridgeState {
             .response_completion_pending = false;
     }
 
+    pub fn resume_response(&mut self, key: &str, group: &str) {
+        if !self.forwarding_enabled {
+            return;
+        }
+        let previous = self.mappings.get_mut(key).unwrap().response_id.take();
+        let supersedes = previous.and_then(|id| {
+            let item = self.outbox.iter_mut().find(|item| item.id == id)?;
+            let delivery = item.response.as_mut()?;
+            if delivery.durable || delivery.finished || item.group != group {
+                return None;
+            }
+            delivery.finished = true;
+            delivery
+                .target
+                .clone()
+                .or_else(|| delivery.supersedes.take())
+        });
+        self.mappings.get_mut(key).unwrap().task_revision = None;
+        self.begin_response(key, group);
+        let id = self.mappings[key].response_id.as_ref().unwrap();
+        self.outbox
+            .iter_mut()
+            .find(|item| &item.id == id)
+            .unwrap()
+            .response
+            .as_mut()
+            .unwrap()
+            .supersedes = supersedes;
+    }
+
     pub fn begin_transcription(&mut self, group: &str) -> Option<String> {
         if !self.forwarding_enabled {
             return None;
@@ -430,7 +467,7 @@ impl BridgeState {
         self.outbox.push(Outgoing {
             id: id.clone(),
             group: group.into(),
-            text: "> transcribing".into(),
+            text: "> Transcribing...".into(),
             working_notice: false,
             attachments: vec![],
             response: Some(ResponseDelivery {
@@ -479,6 +516,16 @@ impl BridgeState {
             return;
         };
         let delivery = item.response.as_mut().unwrap();
+        let inherited = if delivery.target.is_none() && delivery.initial_text.is_none() {
+            // If the final beats its replacement, finish the known old bubble
+            // rather than abandoning it or sending late working progress.
+            delivery.supersedes.take()
+        } else {
+            None
+        };
+        if let Some(target) = &inherited {
+            delivery.target = Some(target.clone());
+        }
         if delivery.target.is_none() && delivery.initial_text.is_none() {
             // Progress is best effort. Do not post a late working notice after the final.
             self.outbox.retain(|item| item.id != id);
@@ -486,14 +533,28 @@ impl BridgeState {
         }
         item.text = if let Some(tasks) = item
             .text
-            .strip_prefix("> working...\n")
+            .strip_prefix("> Working...\n")
+            .or_else(|| item.text.strip_prefix("> Working.\n"))
+            .or_else(|| item.text.strip_prefix("> working...\n"))
             .or_else(|| item.text.strip_prefix("> working\n"))
         {
-            format!("> done\n{tasks}")
+            format!("> Done.\n{tasks}")
         } else {
-            "> done".into()
+            "> Done.".into()
         };
         delivery.finished = true;
+        if let Some(target) = inherited {
+            let group = item.group.clone();
+            // One owner per edit target: an older pending blocked edit must
+            // never race or retry after this completion.
+            self.outbox.retain(|old| {
+                old.id == id
+                    || old.group != group
+                    || old.response.as_ref().is_none_or(|response| {
+                        response.durable || response.target.as_ref() != Some(&target)
+                    })
+            });
+        }
     }
 }
 

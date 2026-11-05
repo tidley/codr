@@ -126,7 +126,9 @@ impl Bridge {
                     .iter()
                     .filter(|item| {
                         !item.manual
-                            && item.text.starts_with("> blocked Agent needs input")
+                            && (item.text.starts_with("> Blocked... Agent needs input")
+                                || item.text.starts_with("> Blocked. Agent needs input")
+                                || item.text.starts_with("> blocked Agent needs input"))
                             && item.response.as_ref().is_none_or(|response| {
                                 (response.durable
                                     || (response.target.is_none()
@@ -522,13 +524,59 @@ impl Bridge {
                                 response["message_ids_hex"][0].as_str().map(str::to_owned);
                         }
                         pending.sent_text = Some(sent_text.clone());
+                        let supersedes = if delivery.target.is_none() {
+                            pending
+                                .supersedes
+                                .take()
+                                .filter(|old| Some(old) != pending.target.as_ref())
+                        } else {
+                            None
+                        };
                         if delivery.finished && sent_text == item.text {
                             self.state.outbox.retain(|m| m.id != item.id);
                         }
                         if delivery.target.is_none() {
                             self.state.last_confirmed_send_at = Some(now());
                         }
+                        if let Some(target) = &supersedes {
+                            // Never replay old progress after attempting cleanup.
+                            self.state.outbox.retain(|old| {
+                                old.group != item.group
+                                    || old.response.as_ref().is_none_or(|response| {
+                                        !response.finished
+                                            || response.durable
+                                            || response.target.as_ref() != Some(target)
+                                    })
+                            });
+                        }
                         self.save()?;
+                        if let Some(target) = supersedes {
+                            // Keep the old bubble as a breadcrumb, only after its
+                            // replacement is confirmed. Never delete chat messages.
+                            let edited = tokio::time::timeout(
+                                Duration::from_secs(3),
+                                self.marmot.marmot(json!({
+                                    "type":"edit_message",
+                                    "account_id_hex":self.config.account_id_hex,
+                                    "group_id_hex":item.group,
+                                    "target_message_id_hex":target,
+                                    "text":"> Task continued below.",
+                                })),
+                            )
+                            .await;
+                            if !edited.is_ok_and(|result| {
+                                result.is_ok_and(|response| {
+                                    response["type"] == "final_sent"
+                                        && response["message_ids_hex"]
+                                            .as_array()
+                                            .is_some_and(|ids| !ids.is_empty())
+                                })
+                            }) {
+                                eprintln_throttled!(
+                                    "Previous progress edit was not confirmed; the new bubble stays active and the old message will not be deleted."
+                                );
+                            }
+                        }
                     }
                     _ => {
                         if !delivery.finished || delivery.durable {
@@ -741,7 +789,13 @@ impl Bridge {
                 self.sync_group_profile(key, &agent, &group).await;
             }
         }
-        self.activate_forwarding().await?;
+        let activation = self.activate_forwarding().await;
+        if activation.is_err() || self.state.forwarding_resume_pending {
+            // A broken checkpoint in any chat must not hide acceptance warnings
+            // in this or another chat. These are explicit owner-requested replies.
+            self.check_submission_acceptances()?;
+        }
+        activation?;
         ensure!(
             !self.state.forwarding_resume_pending,
             "Forwarding resume awaits its current history checkpoint"
@@ -795,12 +849,12 @@ impl Bridge {
                     self.state.update_response(
                         &key,
                         &group,
-                        "> ended No completed reply was recorded.",
+                        "> Ended. No completed reply was recorded.",
                         true,
                     );
                 }
                 if !baselining {
-                    self.state.enqueue(&group, "> ended This group retains its history. A restored native session will reconnect here.");
+                    self.state.enqueue(&group, "> Ended. This group retains its history. A restored native session will reconnect here.");
                 }
             }
             if self.config.auto_forwarding && self.state.mappings[&key].activity.unresolved() {
@@ -813,7 +867,7 @@ impl Bridge {
             m.pending_prompt = false;
             m.completion_pending = false;
         }
-        self.save()?;
+        self.check_submission_acceptances()?;
         self.process_prompt_queues().await;
         Ok(())
     }
@@ -1051,7 +1105,7 @@ impl Bridge {
         // Older bridge versions created these groups without a transcript watermark.
         // Seed their existing history once when enabling native reply support.
         self.seed_native_history(key, agent).await?;
-        if self.config.auto_forwarding
+        if (self.config.auto_forwarding || !self.state.mappings[key].submissions.is_empty())
             && agent
                 .agent_session
                 .as_ref()
@@ -1061,8 +1115,7 @@ impl Bridge {
             self.observe_activity(key, &history)?;
         }
         self.refresh_forwarding()?;
-        let name =
-            agent.group_name_with_suffix(self.state.mappings[key].group_agent_suffix.as_deref());
+        let name = self.group_name_for(key, agent, &self.agents);
         let description = agent.group_description();
         let m = &self.state.mappings[key];
         // Muting suppresses messages, not group invitations or metadata updates.
@@ -1111,6 +1164,9 @@ impl Bridge {
         let previous_settled = matches!(previous.last_agent_status.as_str(), "idle" | "done");
         if self.config.edit_responses {
             if agent.agent_status == "working" {
+                if resumed {
+                    self.state.resume_response(key, &group);
+                }
                 if previous_settled
                     && !self.state.mappings[key].pending_prompt
                     && self.state.mappings[key].response_id.is_some()
@@ -1118,14 +1174,14 @@ impl Bridge {
                     self.state.update_response(
                         key,
                         &group,
-                        "> idle No completed reply was recorded.",
+                        "> Idle. No completed reply was recorded.",
                         true,
                     );
                 }
                 self.state.begin_response(key, &group);
                 if resumed {
                     self.state
-                        .update_response(key, &group, "> working...", false);
+                        .update_response(key, &group, "> Working...", false);
                 }
             } else if status_changed
                 && !agent.settled()
@@ -1134,16 +1190,12 @@ impl Bridge {
                 self.state.update_response(
                     key,
                     &group,
-                    &format!("> {}", agent.agent_status),
+                    &format!("> {}", herdr::status_label(&agent.agent_status)),
                     false,
                 );
             }
         } else if previous.last_agent_status != agent.agent_status && agent.agent_status != "done" {
-            let status = if agent.agent_status == "working" {
-                "working..."
-            } else {
-                &agent.agent_status
-            };
+            let status = herdr::status_label(&agent.agent_status);
             self.state.enqueue(&group, &format!("> {status}"));
         }
         let m = self.state.mappings.get_mut(key).unwrap();
@@ -1221,7 +1273,7 @@ impl Bridge {
                     _ if self.state.mappings[key].blocked_context_seq
                         != Some(agent.state_change_seq) =>
                     {
-                        let notice = "> blocked Agent needs input in the terminal. No supported decision is available yet.";
+                        let notice = "> Blocked... Agent needs input in the terminal. No supported decision is available yet.";
                         if self.config.edit_responses {
                             self.state.update_response(key, &group, notice, false);
                         } else {
@@ -1249,7 +1301,7 @@ impl Bridge {
                 .await?;
             herdr::get(&self.herdr, agent).await?;
             if let Some(text) = response["result"]["read"]["text"].as_str() {
-                let text = format!("> blocked Agent needs input (terminal context):\n{text}");
+                let text = format!("> Blocked... Agent needs input (terminal context):\n{text}");
                 if self.config.edit_responses {
                     self.state.update_response(key, &group, &text, false);
                 } else {
@@ -1310,7 +1362,66 @@ impl Bridge {
         Ok(())
     }
 
+    fn check_submission_acceptances(&mut self) -> Result<()> {
+        let checks: Vec<_> = self
+            .state
+            .mappings
+            .iter()
+            .filter(|(_, mapping)| {
+                mapping
+                    .submissions
+                    .iter()
+                    .any(|submission| submission.overdue(now()))
+            })
+            .filter_map(|(key, mapping)| {
+                self.agents
+                    .get(key)
+                    .or(mapping.agent_record.as_ref())
+                    .map(|agent| (key.clone(), agent.clone()))
+            })
+            .collect();
+        for (key, agent) in checks {
+            self.check_submission_acceptance(&key, &agent);
+        }
+        self.save()
+    }
+
+    fn check_submission_acceptance(&mut self, key: &str, agent: &Agent) {
+        let mapping = self.state.mappings.get_mut(key).unwrap();
+        let Some(group) = mapping.group_id_hex.clone() else {
+            return;
+        };
+        let mut warnings = Vec::new();
+        for submission in &mut mapping.submissions {
+            if submission.overdue(now()) && !submission.warned {
+                submission.warned = true;
+                warnings.push(submission.receipt.clone());
+            }
+        }
+        let overdue = mapping
+            .submissions
+            .iter()
+            .any(|submission| submission.overdue(now()));
+        let notice = "Native acceptance is unconfirmed. Terminal input was attempted, but no matching native message was observed. No automatic retry will run. Inspect the agent before using local clear-prompt; new submissions in this chat are paused.";
+        for receipt in warnings {
+            self.state
+                .enqueue_manual(&group, notice, &format!("acceptance:{group}:{receipt}"));
+        }
+        if overdue && agent.settled() && self.state.mappings[key].response_id.is_some() {
+            self.state.update_response(
+                key,
+                &group,
+                "> Delivery uncertain. Native acceptance is unconfirmed; no automatic retry.",
+                true,
+            );
+        }
+    }
+
     fn observe_activity(&mut self, key: &str, history: &output::SessionHistory) -> Result<()> {
+        crate::activity::Submission::observe(
+            &mut self.state.mappings.get_mut(key).unwrap().submissions,
+            &history.user_inputs,
+        );
         if !self.config.auto_forwarding {
             return Ok(());
         }
@@ -1387,6 +1498,10 @@ impl Bridge {
 
     fn finish_queued_prompt(&mut self, key: &str, history: &output::SessionHistory) {
         let mapping = self.state.mappings.get_mut(key).unwrap();
+        crate::activity::Submission::observe(&mut mapping.submissions, &history.user_inputs);
+        if !mapping.submissions.is_empty() {
+            return;
+        }
         if mapping.queue_flight.as_ref().is_some_and(|flight| {
             flight.confirmed
                 && history
@@ -2131,6 +2246,14 @@ impl Bridge {
                 format!(
                     "Pending deliveries: {count}, {}. New phone text is handed directly to the agent. Media preparation and previously accepted deliveries are preserved.",
                     if mapping
+                        .submissions
+                        .iter()
+                        .any(|submission| submission.overdue(now()))
+                    {
+                        "paused: native acceptance is unconfirmed; inspect the agent before local clear-prompt"
+                    } else if !mapping.submissions.is_empty() {
+                        "terminal submission recorded; awaiting native acceptance"
+                    } else if mapping
                         .queue_flight
                         .as_ref()
                         .is_some_and(|flight| !flight.confirmed)
@@ -2274,6 +2397,24 @@ impl Bridge {
         {
             return Ok(());
         }
+        if !status_command
+            && self.state.mappings[&key]
+                .submissions
+                .iter()
+                .any(|submission| submission.overdue(now()))
+        {
+            ensure!(
+                !queued && !prepared,
+                "Accepted delivery awaits inspection of an uncertain native submission"
+            );
+            return crate::launch::reply(
+                self,
+                &key,
+                group,
+                id,
+                "An earlier submission has unconfirmed native acceptance. No new prompt was sent. Inspect the agent before using local clear-prompt. No automatic retry will run.",
+            );
+        }
         // A final transcript record can lag herdr's idle state. Resolve it before
         // opening another response, so it cannot overwrite the next prompt's message.
         if self.config.edit_responses
@@ -2298,20 +2439,20 @@ impl Bridge {
             let before = self.state.clone();
             let mapping = self.state.mappings.get_mut(&key).unwrap();
             let accepted = mapping.prompt_queue.len() < 16 && text.len() <= 30000;
-            let response: String = if !accepted {
-                "Media preparation limit reached (16 accepted deliveries, 30000 UTF-8 bytes per caption). No image was accepted.".into()
-            } else {
+            if accepted {
                 mapping.prompt_queue.push(crate::state::QueuedPrompt {
                     id: id.into(),
                     group: group.into(),
                     text: text.into(),
                     media: queue_image.then(|| msg.clone()),
                 });
-                "Preparing image. It will be delivered as soon as the download is ready.".into()
-            };
+            }
             mapping.seen_messages.push(id.into());
-            self.state
-                .enqueue_manual(group, &response, &format!("queued:{group}:{id}"));
+            if accepted {
+                self.begin_attachment_notice(group, id, msg);
+            } else {
+                self.state.enqueue_manual(group, "Media preparation limit reached (16 accepted deliveries, 30000 UTF-8 bytes per caption). No image was accepted.", &format!("queued:{group}:{id}"));
+            }
             if let Err(error) = self.save() {
                 self.state = before;
                 return Err(error);
@@ -2357,15 +2498,10 @@ impl Bridge {
             if crate::media::audio(msg) && self.config.edit_responses {
                 pending["_codr_transcription_notice"] =
                     json!(self.state.begin_transcription(group));
+            } else if !crate::media::audio(msg) {
+                self.begin_attachment_notice(group, id, msg);
             } else {
-                self.state.enqueue(
-                    group,
-                    if crate::media::audio(msg) {
-                        "> transcribing"
-                    } else {
-                        "Preparing attachment. It will be delivered as soon as the download is ready."
-                    },
-                );
+                self.state.enqueue(group, "> Transcribing...");
             }
             self.state.media_pending.push(pending);
             return self.save();
@@ -2403,7 +2539,34 @@ impl Bridge {
         } else {
             None
         };
-        if immediate_prompt && let Some(agent) = self.agents.get(&key) {
+        let acceptance_history = if !status_command
+            && !text.trim().is_empty()
+            && msg["media"].as_array().is_none_or(|media| media.is_empty())
+            && let Some(session) = self
+                .agents
+                .get(&key)
+                .and_then(|agent| agent.agent_session.as_ref())
+                .filter(|session| output::supported(&session.agent))
+        {
+            match &phone_history {
+                Some(history) => Some(history.clone()),
+                None => self
+                    .reads
+                    .fresh(&self.config, session)
+                    .await
+                    .ok()
+                    .map(|snapshot| snapshot.history),
+            }
+        } else {
+            None
+        };
+        if !status_command
+            && msg["text_truncated"] != true
+            && msg["attachments_truncated"] != true
+            && msg["media"].as_array().is_none_or(|media| media.is_empty())
+            && !text.trim().is_empty()
+            && let Some(agent) = self.agents.get(&key)
+        {
             let current = herdr::get(&self.herdr, agent).await?;
             ensure!(
                 current.key() == key,
@@ -2469,8 +2632,8 @@ impl Bridge {
         }
         let response = if status_command {
             Some(format!(
-                "> {} herdr session: {}. {} waiting prompt(s).",
-                self.state.mappings[&key].last_agent_status,
+                "> {} Herdr session: {}. {} waiting prompt(s).",
+                herdr::status_label(&self.state.mappings[&key].last_agent_status),
                 if self.agents.contains_key(&key) {
                     "connected"
                 } else {
@@ -2490,12 +2653,13 @@ impl Bridge {
             } else if text.trim().is_empty() {
                 Some("Send a non-empty text message.".into())
             } else {
+                let before_submission = self.state.clone();
                 let mapping = self.state.mappings.get_mut(&key).unwrap();
                 let was_pending = mapping.pending_prompt;
                 let new_flight = immediate_prompt && mapping.queue_flight.is_none();
                 if new_flight {
                     mapping.queue_flight = Some(crate::state::QueueFlight {
-                        before_final: phone_history
+                        before_final: acceptance_history
                             .as_ref()
                             .and_then(|history| history.finals.last().map(|reply| reply.id.clone()))
                             .or_else(|| mapping.final_ids.last().cloned()),
@@ -2503,15 +2667,33 @@ impl Bridge {
                     });
                 }
                 mapping.pending_prompt = true;
+                if let Some(history) = &acceptance_history {
+                    crate::activity::Submission::observe(
+                        &mut mapping.submissions,
+                        &history.user_inputs,
+                    );
+                }
+                if agent
+                    .agent_session
+                    .as_ref()
+                    .is_some_and(|session| output::supported(&session.agent))
+                {
+                    mapping.submissions.push(crate::activity::Submission::new(
+                        id,
+                        text,
+                        acceptance_history
+                            .as_ref()
+                            .map(|history| history.user_inputs.as_slice()),
+                        now(),
+                    ));
+                }
                 if let Some(history) = phone_history {
                     mapping.activity.start_phone(id, text, &history.user_inputs);
                 } else if immediate_prompt && self.config.auto_forwarding {
                     mapping.activity.start_phone_current(id, text);
                 }
                 if let Err(error) = self.save() {
-                    if prepared && let Some(before) = before_consumption {
-                        self.state = before;
-                    }
+                    self.state = before_consumption.unwrap_or(before_submission);
                     return Err(error);
                 }
                 match herdr::prompt(&self.herdr, &agent, text).await {
@@ -2542,11 +2724,14 @@ impl Bridge {
                                 self.state.update_response(
                                     &key,
                                     group,
-                                    "> idle No completed reply was recorded.",
+                                    "> Idle. No completed reply was recorded.",
                                     true,
                                 );
                             }
                             if !was_pending || self.state.mappings[&key].response_id.is_none() {self.state.begin_response(&key, group);}
+                            if !was_pending && !self.state.mappings[&key].submissions.is_empty() {
+                                self.state.update_response(&key, group, "> Request submitted...", false);
+                            }
                         }
                         None
                     }
@@ -2557,6 +2742,7 @@ impl Bridge {
                             m.pending_prompt = was_pending;
                             if new_flight {m.queue_flight=None;}
                             m.activity.cancel_phone(id);
+                            m.submissions.retain(|submission| submission.receipt != id);
                             if let Some(prompt) = queued_prompt {
                                 if !prepared {m.queue_flight = None;}
                                 m.prompt_queue.insert(queued_index, prompt);
@@ -2591,6 +2777,8 @@ impl Bridge {
                 // lookup was in flight. Never consume an incomplete recovery row.
                 if !crate::media::complete_refs(&self.state.media_pending[0]["message"]) {
                     self.state.media_pending[0]["_codr_retry_at"] = json!(now() + 60);
+                    let event = self.state.media_pending[0].clone();
+                    self.update_attachment_notice(&event, "Waiting for", false);
                     self.save()?;
                     return Ok(());
                 }
@@ -2599,6 +2787,8 @@ impl Bridge {
                     Ok(Ok(prepared)) => {
                         // Retain references and prepared text until inbound consumption.
                         self.state.media_pending[0]["_codr_prepared_text"] = json!(prepared.prompt);
+                        let event = self.state.media_pending[0].clone();
+                        self.update_attachment_notice(&event, "Downloaded", true);
                         if let Some(transcript) = prepared.transcript {
                             let event = self.state.media_pending[0].clone();
                             self.finish_transcription_notice(
@@ -2610,7 +2800,8 @@ impl Bridge {
                     }
                     _ => {
                         let event = self.state.media_pending.remove(0);
-                        self.finish_transcription_notice(&event, "> transcription failed");
+                        self.update_attachment_notice(&event, "Download failed for", true);
+                        self.finish_transcription_notice(&event, "> Transcription failed.");
                         let group = event["group_id_hex"].as_str().unwrap_or("");
                         if let Some(mapping) = self
                             .state
@@ -2751,6 +2942,8 @@ impl Bridge {
             let config = self.config.clone();
             let socket = self.marmot.clone();
             let event = event.clone();
+            self.update_attachment_notice(&event, "Downloading", false);
+            self.save()?;
             self.media_job = Some(tokio::spawn(async move {
                 crate::media::prepare(
                     &config,
@@ -2762,6 +2955,51 @@ impl Bridge {
             }));
         }
         routing_result
+    }
+
+    fn begin_attachment_notice(&mut self, group: &str, id: &str, message: &Value) {
+        let kind = if crate::media::images(message) {
+            "image"
+        } else {
+            "file"
+        };
+        self.state.enqueue_manual(
+            group,
+            &format!("> Preparing {kind}..."),
+            &format!("attachment:{group}:{id}"),
+        );
+        if !self.config.edit_responses {
+            return;
+        }
+        let item = self.state.outbox.last_mut().unwrap();
+        item.response = Some(crate::state::ResponseDelivery {
+            durable: true,
+            ..Default::default()
+        });
+    }
+
+    fn update_attachment_notice(&mut self, event: &Value, stage: &str, finished: bool) {
+        let message = &event["message"];
+        let Some(message_id) = message["message_id_hex"].as_str() else {
+            return;
+        };
+        let group = event["group_id_hex"].as_str().unwrap_or("");
+        let id = format!("attachment:{group}:{message_id}:0");
+        let Some(item) = self.state.outbox.iter_mut().find(|item| {
+            item.id == id && Some(item.group.as_str()) == event["group_id_hex"].as_str()
+        }) else {
+            return;
+        };
+        let Some(delivery) = item.response.as_mut() else {
+            return;
+        };
+        let kind = if crate::media::images(message) {
+            "image"
+        } else {
+            "file"
+        };
+        item.text = format!("> {stage} {kind}{}", if finished { "." } else { "..." });
+        delivery.finished = finished;
     }
 
     fn finish_transcription_notice(&mut self, event: &Value, text: &str) {
@@ -2957,7 +3195,7 @@ impl Bridge {
                 self.state.update_response(
                     key,
                     group,
-                    "> blocked Waiting for your decision.",
+                    "> Blocked... Waiting for your decision.",
                     false,
                 );
             }
@@ -2998,9 +3236,12 @@ impl Bridge {
         let numeric = text.trim().bytes().all(|byte| byte.is_ascii_digit());
         let looks_like_answer = numeric
             || text.trim().starts_with("/answer ")
-            || previous
-                .as_ref()
-                .is_some_and(|decision| decision.looks_like_answer(text));
+            || previous.as_ref().is_some_and(|decision| {
+                decision.looks_like_explicit_answer(text)
+                        // Retain the fail-closed guard for a question that stops
+                        // waiting during this reply, not for an old stored question.
+                        || (agent.agent_status == "blocked" && decision.looks_like_answer(text))
+            });
         if agent.agent_status != "blocked" && previous.is_none() && !looks_like_answer {
             return Ok(false);
         }
@@ -3016,12 +3257,8 @@ impl Bridge {
             }
             return Ok(false);
         }
-        let active = if self.config.opencode_db.is_some() {
-            self.reads.fresh(&self.config, session).await?.decision
-        } else {
-            output::decision::read(&self.config, session).await?
-        };
-        let Some(active) = active else {
+        let snapshot = self.reads.fresh(&self.config, session).await?;
+        let Some(active) = snapshot.decision else {
             if looks_like_answer {
                 return self.decision_notice(key, group, id, "No supported decision is available yet. Wait for its question card or use the terminal. No answer was sent.");
             }
@@ -3104,6 +3341,23 @@ impl Bridge {
         };
         match result {
             Ok(()) => {
+                self.refresh_forwarding()?;
+                if self.state.forwarding_enabled
+                    && let Some(turn) = snapshot.history.latest_turn
+                {
+                    let mapping = self.state.mappings.get_mut(key).unwrap();
+                    // Resume only this accepted answer's unfinished turn. Keep
+                    // already completed replies suppressed, including this turn's
+                    // earlier replies, without replaying another chat's history.
+                    for reply in snapshot.history.finals {
+                        if reply.turn.as_ref() == Some(&turn)
+                            && !mapping.final_ids.contains(&reply.id)
+                        {
+                            mapping.final_ids.push(reply.id);
+                        }
+                    }
+                    mapping.muted_turns.retain(|muted| muted != &turn);
+                }
                 let message = match answer {
                     output::decision::Answer::Choice(choice) => format!("Sent choice {choice}: {}.", decision.questions[0].options[choice-1].label),
                     output::decision::Answer::Custom(_) => "Sent your custom answer to the current question.".into(),
@@ -3182,6 +3436,22 @@ impl Bridge {
         Ok(())
     }
 
+    fn group_name_for(&self, key: &str, agent: &Agent, live: &BTreeMap<String, Agent>) -> String {
+        let base = agent.group_name();
+        let suffix = self.state.mappings[key]
+            .group_agent_suffix
+            .as_deref()
+            .filter(|_| {
+                live.values().any(|other| {
+                    other.key() != key
+                        && other.workspace_id == agent.workspace_id
+                        && other.agent_session.is_some()
+                        && other.group_name() == base
+                })
+            });
+        agent.group_name_with_suffix(suffix)
+    }
+
     pub async fn rename_groups(&mut self) -> Result<()> {
         let live: BTreeMap<_, _> = herdr::snapshot(&self.herdr)
             .await?
@@ -3208,7 +3478,7 @@ impl Bridge {
                 .as_ref()
                 .filter(|a| a.tab_label.is_some() || live.contains_key(&key))
             {
-                agent.group_name_with_suffix(mapping.group_agent_suffix.as_deref())
+                self.group_name_for(&key, agent, &live)
             } else {
                 let label = old
                     .strip_prefix("[cd] ")
@@ -3276,8 +3546,7 @@ impl Bridge {
         if self.state.mappings[key].control {
             return;
         }
-        let desired_name =
-            agent.group_name_with_suffix(self.state.mappings[key].group_agent_suffix.as_deref());
+        let desired_name = self.group_name_for(key, agent, &self.agents);
         let desired_description = agent.group_description();
         let (last_name, last_description) = {
             let mapping = &self.state.mappings[key];
@@ -3476,6 +3745,11 @@ impl Bridge {
             if self.process_media().await.is_err() {
                 recovery_due = true;
                 eprintln_throttled!("Prepared media input deferred; will reconcile history.");
+            }
+            if self.check_submission_acceptances().is_err() {
+                eprintln_throttled!(
+                    "Native acceptance warning remains pending; private state could not be saved."
+                );
             }
             if self.flush().await.is_err() {
                 eprintln_throttled!("MDK send unavailable; private outbox retained for retry.");

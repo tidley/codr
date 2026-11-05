@@ -866,13 +866,39 @@ async fn start(
         Phase::Uncertain
     };
     if confirmed {
+        bridge.save()?;
+        // Startup requires a unique name. Clear only that temporary label once
+        // herdr permits renaming. Its rename API accepts agent names, not terminal
+        // IDs; the unique startup name also avoids targeting a reused pane.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        let renamed = loop {
+            let renamed = bridge
+                .herdr
+                .herdr("agent.rename", json!({"target":name,"name":null}))
+                .await;
+            let pending = renamed.as_ref().is_err_and(|error| {
+                error.to_string() == "Remote request failed: agent_launch_pending"
+            });
+            if !pending || tokio::time::Instant::now() >= deadline {
+                break renamed;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        };
+        let name_cleared = renamed.as_ref().is_ok_and(|response| {
+            let result = &response["result"];
+            result["type"] == "agent_info"
+                && result["agent"]["name"].is_null()
+                && result["agent"]["pane_id"] == pane
+                && result["agent"]["workspace_id"] == workspace
+                && result["agent"]["terminal_id"] == terminal
+        });
         reply(
             bridge,
             key,
             group,
             id,
             &format!(
-                "Started {} in workspace {}. {} A White Noise invitation follows once herdr reports its native session. No initial prompt was sent.",
+                "Started {} in workspace {}. {} A White Noise invitation follows once herdr reports its native session. No initial prompt was sent.{}",
                 request.kind,
                 request
                     .target_workspace
@@ -883,7 +909,12 @@ async fn start(
                     "The existing folder and its contents were kept."
                 } else {
                     "The confirmed folder was created."
-                }
+                },
+                if name_cleared {
+                    ""
+                } else {
+                    " The agent started, but its temporary display name could not be cleared. No agent restart was attempted."
+                },
             ),
         )
     } else {

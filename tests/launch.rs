@@ -107,6 +107,13 @@ fn code(bridge: &Bridge) -> String {
         .clone()
 }
 async fn host(config: &BridgeConfig, calls: Arc<Mutex<Vec<Value>>>) -> tokio::task::JoinHandle<()> {
+    host_with_rename_response(config, calls, None).await
+}
+async fn host_with_rename_response(
+    config: &BridgeConfig,
+    calls: Arc<Mutex<Vec<Value>>>,
+    mut rename_response: Option<Value>,
+) -> tokio::task::JoinHandle<()> {
     let listener = UnixListener::bind(&config.herdr_socket).unwrap();
     tokio::spawn(async move {
         loop {
@@ -114,12 +121,36 @@ async fn host(config: &BridgeConfig, calls: Arc<Mutex<Vec<Value>>>) -> tokio::ta
             let mut reader = tokio::io::BufReader::new(stream);
             let request = read_line(&mut reader).await.unwrap();
             calls.lock().unwrap().push(request.clone());
+            if request["method"] == "agent.rename" {
+                let started = calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|c| c["method"] == "agent.start")
+                    .cloned()
+                    .unwrap();
+                assert_eq!(request["params"]["target"], started["params"]["name"]);
+            }
+            if request["method"] == "agent.rename"
+                && let Some(mut response) = rename_response.take()
+            {
+                response["id"] = request["id"].clone();
+                reader
+                    .get_mut()
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+                continue;
+            }
             let result = match request["method"].as_str().unwrap() {
                 "workspace.create" => {
                     json!({"type":"workspace_created","workspace":{"workspace_id":"w99"},"root_pane":{"pane_id":"w99:p1","terminal_id":"term_new"}})
                 }
                 "agent.start" => {
                     json!({"type":"agent_started","agent":{"name":request["params"]["name"],"pane_id":"w99:p1","terminal_id":"term_new","workspace_id":"w99"}})
+                }
+                "agent.rename" => {
+                    json!({"type":"agent_info","agent":{"name":null,"pane_id":"w99:p1","terminal_id":"term_new","workspace_id":"w99"}})
                 }
                 method => panic!("Unexpected mutation or shell call: {method}"),
             };
@@ -173,7 +204,7 @@ async fn preview_requires_confirmation_before_creating_a_folder_or_starting_an_a
         .await
         .unwrap();
     let calls = calls.lock().unwrap();
-    assert_eq!(calls.len(), 2);
+    assert_eq!(calls.len(), 3);
     assert_eq!(calls[0]["method"], "workspace.create");
     assert_eq!(calls[0]["params"]["cwd"], target.to_str().unwrap());
     assert_eq!(calls[0]["params"]["label"], "my-idea");
@@ -182,7 +213,76 @@ async fn preview_requires_confirmation_before_creating_a_folder_or_starting_an_a
     assert_eq!(calls[1]["params"]["kind"], "opencode");
     assert_eq!(calls[1]["params"]["pane_id"], "w99:p1");
     assert_eq!(calls[1]["params"]["args"], json!([]));
+    assert_eq!(calls[2]["method"], "agent.rename");
+    assert_eq!(
+        calls[2]["params"],
+        json!({"target":calls[1]["params"]["name"],"name":null})
+    );
     server.abort();
+}
+
+#[tokio::test]
+async fn display_name_cleanup_retries_only_pending_and_keeps_the_agent_started() {
+    for (response, attempts, warning) in [
+        (json!({"error":{"code":"agent_launch_pending"}}), 2, false),
+        (json!({"error":{"code":"unsupported_method"}}), 1, true),
+        (
+            json!({"result":{"type":"agent_info","agent":{"name":null,"pane_id":"w99:p1","terminal_id":"other","workspace_id":"w99"}}}),
+            1,
+            true,
+        ),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let config = config(root.path());
+        std::fs::create_dir(&config.launch_root).unwrap();
+        let mut bridge = bridge(&config);
+        bridge
+            .inbound(&inbound("preview", "/new idea idea opencode"))
+            .await
+            .unwrap();
+        let token = code(&bridge);
+        let calls = Arc::new(Mutex::new(vec![]));
+        let server = host_with_rename_response(&config, calls.clone(), Some(response)).await;
+        let confirmation = inbound("confirm", &format!("/new confirm {token}"));
+        bridge.inbound(&confirmation).await.unwrap();
+        assert_eq!(
+            bridge.state.mappings["source"]
+                .launch
+                .as_ref()
+                .unwrap()
+                .phase,
+            herdr_white_noise_bridge::launch::Phase::Started
+        );
+        assert_eq!(
+            bridge
+                .state
+                .outbox
+                .last()
+                .unwrap()
+                .text
+                .contains("temporary display name could not be cleared"),
+            warning
+        );
+        drop(bridge);
+        let mut restarted = Bridge::open(config).unwrap();
+        restarted.inbound(&confirmation).await.unwrap();
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|c| c["method"] == "agent.start")
+                .count(),
+            1
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|c| c["method"] == "agent.rename")
+                .count(),
+            attempts
+        );
+        server.abort();
+    }
 }
 
 #[tokio::test]
@@ -219,7 +319,7 @@ async fn existing_folder_is_reported_and_kept_after_confirmation_survives_restar
         std::fs::read_to_string(target.join("keep.txt")).unwrap(),
         "original project"
     );
-    assert_eq!(calls.lock().unwrap().len(), 2);
+    assert_eq!(calls.lock().unwrap().len(), 3);
     assert_eq!(calls.lock().unwrap()[1]["params"]["kind"], "claude");
     assert!(
         bridge
@@ -272,7 +372,7 @@ async fn a_folder_that_appears_after_preview_requires_a_new_confirmation() {
         .inbound(&inbound("new-confirm", &format!("/new confirm {new}")))
         .await
         .unwrap();
-    assert_eq!(calls.lock().unwrap().len(), 2);
+    assert_eq!(calls.lock().unwrap().len(), 3);
     server.abort();
 }
 

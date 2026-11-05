@@ -60,6 +60,10 @@ pub struct Draft {
     #[serde(default)]
     pub folder_choices: Vec<String>,
     #[serde(default)]
+    pub folder_files: Vec<String>,
+    #[serde(default)]
+    pub folder_cwd: PathBuf,
+    #[serde(default)]
     pub conversations: Vec<Agent>,
 }
 
@@ -92,6 +96,8 @@ impl Draft {
             model_group: None,
             visible_models: vec![],
             folder_choices: vec![],
+            folder_files: vec![],
+            folder_cwd: PathBuf::new(),
             conversations: vec![],
         }
     }
@@ -169,7 +175,7 @@ impl Draft {
                 if self.page>0 {text.push_str("\nPrevious page: previous");}
                 text
             }
-            Step::Folder=>"Folder name:\nReply with your chosen folder name.\n\n**0. Cancel**\n\n**`ls`** to list existing folders, or **`ls <part>`** to filter them.".to_string(),
+            Step::Folder=>"Folder name:\nReply with your chosen folder path, such as apps/new-project.\n\n**0. Cancel**\n\n**`ls`** lists entries; **`/cd folder`** enters an existing folder; **`/cd ..`** goes up. **`ls apps/`** lists a subfolder; **`ls <part>`** filters entries.".to_string(),
             Step::FolderList=>{
                 let mut text="Choose a folder:".to_string();
                 if self.folder_choices.is_empty() {
@@ -182,7 +188,12 @@ impl Draft {
                         text.push_str(&format!("\n{}. {name}",i+1));
                     }
                 }
-                text.push_str("\n\n**0. Cancel**\nReply with a listed number or folder name. **`ls <part>`** filters the list; **`ls`** refreshes all folders.");
+                if !self.folder_files.is_empty() {
+                    text.push_str("\n\nFiles (not selectable):");
+                    for name in self.folder_files.iter().take(20) { text.push_str(&format!("\n- {name}")); }
+                    if self.folder_files.len()>20 {text.push_str("\nMore files omitted. Use ls <path/part> to filter.");}
+                }
+                text.push_str("\n\n**0. Cancel**\nReply with a listed number or folder path. **`ls`** lists the current folder; **`ls <part>`** filters entries. **`/cd folder`** enters a folder; **`/cd ..`** goes up.");
                 if (self.page+1)*FOLDER_PAGE_SIZE<self.folder_choices.len() {text.push_str("\nNext page: **`next`**");}
                 if self.page>0 {text.push_str("\nPrevious page: **`previous`**");}
                 text
@@ -230,6 +241,11 @@ impl Draft {
             Step::Applying|Step::Uncertain=>"Model selection was not confirmed. Inspect OpenCode locally. No automatic retry will run.".into(),
             Step::Applied=>"Model selection was confirmed. No change was repeated.".into(),
         };
+        if matches!(self.step, Step::Folder | Step::FolderList)
+            && !self.folder_cwd.as_os_str().is_empty()
+        {
+            text = format!("Current folder: {}\n\n{text}", self.folder_cwd.display());
+        }
         if matches!(self.mode, Mode::Fresh(_)) {
             text.push_str("\nThis starts a fresh session in a new tab and separate chat. Old history and queued work stay in the old chat.");
         }
@@ -240,39 +256,69 @@ impl Draft {
     }
 }
 
-fn folder_choices(root: &std::path::Path, filter: &str) -> Vec<String> {
+fn folder_choices(root: &std::path::Path, query: &str) -> Result<(Vec<String>, Vec<String>)> {
+    ensure!(
+        !query.starts_with('/'),
+        "List a relative folder below the launch root"
+    );
+    let (parent, filter) = query.rsplit_once('/').unwrap_or(("", query));
+    let path = root.join(parent);
+    if !parent.is_empty() {
+        ensure!(
+            launch::inspect(root, &path)?.exists(),
+            "Choose an existing folder to list"
+        );
+    }
+    let directory = launch::directory(&path)?;
+    let entries = rustix::fs::Dir::read_from(&directory)?;
     let filter = filter.trim().to_ascii_lowercase();
-    let Ok(directory) = launch::directory(root) else {
-        return Vec::new();
-    };
-    let Ok(entries) = rustix::fs::Dir::read_from(&directory) else {
-        return Vec::new();
-    };
-    let mut names: Vec<String> = entries
-        .flatten()
-        .filter_map(|entry| {
+    let mut names = Vec::new();
+    let mut files = Vec::new();
+    for entry in entries.flatten() {
+        let found = (|| {
             let stat = rustix::fs::statat(
                 &directory,
                 entry.file_name(),
                 rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
             )
             .ok()?;
-            if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::Directory
-            {
+            let kind = rustix::fs::FileType::from_raw_mode(stat.st_mode);
+            if !matches!(
+                kind,
+                rustix::fs::FileType::Directory | rustix::fs::FileType::RegularFile
+            ) {
                 return None;
             }
             let name = entry.file_name().to_str().ok()?.to_owned();
             // Same rule as a typed folder name, so every listed entry can be picked.
             let valid = !name.is_empty()
-                && name.len() <= 48
+                && !name.starts_with('.')
+                && name.len() <= 128
                 && name
                     .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'));
-            (valid && name.to_ascii_lowercase().contains(&filter)).then_some(name)
-        })
-        .collect();
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'));
+            (valid && name.to_ascii_lowercase().contains(&filter)).then_some((
+                kind,
+                if parent.is_empty() {
+                    name
+                } else {
+                    format!("{parent}/{name}")
+                },
+            ))
+        })();
+        if let Some((kind, name)) = found {
+            if kind == rustix::fs::FileType::Directory {
+                if std::path::Path::new(&name).components().count() <= 8 {
+                    names.push(name);
+                }
+            } else {
+                files.push(name);
+            }
+        }
+    }
     names.sort_by_key(|name| name.to_ascii_lowercase());
-    names
+    files.sort_by_key(|name| name.to_ascii_lowercase());
+    Ok((names, files))
 }
 
 pub fn is_command(text: &str) -> bool {
@@ -286,7 +332,9 @@ pub fn is_command(text: &str) -> bool {
 
 fn ls_filter(answer: &str) -> Option<&str> {
     answer
-        .strip_prefix("ls")
+        .get(..2)
+        .filter(|word| word.eq_ignore_ascii_case("ls"))
+        .and_then(|_| answer.get(2..))
         .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
         .map(str::trim)
 }
@@ -299,8 +347,21 @@ pub fn short_reply(draft: &Draft, text: &str) -> Option<String> {
     let answer = text.trim().to_ascii_lowercase();
     let number = !answer.is_empty() && answer.bytes().all(|b| b.is_ascii_digit());
     let page = matches!(answer.as_str(), "next" | "previous");
+    if matches!(draft.step, Step::Folder | Step::FolderList) {
+        let mut words = text.split_whitespace();
+        if words
+            .next()
+            .is_some_and(|word| word.eq_ignore_ascii_case("/cd"))
+        {
+            return Some(format!(
+                "/new cd {} {}",
+                draft.code,
+                words.collect::<Vec<_>>().join(" ")
+            ));
+        }
+    }
     if matches!(draft.step, Step::Folder | Step::FolderList)
-        && let Some(filter) = ls_filter(&answer)
+        && let Some(filter) = ls_filter(text.trim())
     {
         return Some(if filter.is_empty() {
             format!("/new list {}", draft.code)
@@ -315,7 +376,15 @@ pub fn short_reply(draft: &Draft, text: &str) -> Option<String> {
         Step::FolderList if page => Some(format!("/new list {} {answer}", draft.code)),
         Step::FolderList if number => Some(format!("/new pick {} {answer}", draft.code)),
         Step::FolderList if !text.trim().is_empty() && !text.trim().starts_with('/') => {
-            Some(format!("/new folder {} {}", draft.code, text.trim()))
+            if let Some(index) = draft
+                .folder_choices
+                .iter()
+                .position(|path| path == text.trim())
+            {
+                Some(format!("/new pick {} {}", draft.code, index + 1))
+            } else {
+                Some(format!("/new folder {} {}", draft.code, text.trim()))
+            }
         }
         Step::Conversation if number => Some(format!("/new conversation {} {answer}", draft.code)),
         Step::Workspace if number || page || answer == "new" => {
@@ -668,11 +737,11 @@ async fn route(bridge: &mut Bridge, key: &str, group: &str, id: &str, text: &str
         && args.len() > 1
         && (!matches!(
             args[1].to_ascii_lowercase().as_str(),
-            "folder" | "workspace" | "list" | "pick" | "conversation"
+            "folder" | "workspace" | "list" | "pick" | "conversation" | "cd"
         ) || (args.len() == 4
             && matches!(
                 args[1].to_ascii_lowercase().as_str(),
-                "workspace" | "list" | "pick" | "conversation"
+                "workspace" | "list" | "pick" | "conversation" | "cd"
             )
             && draft.as_ref().is_none_or(|draft| args[2] != draft.code)
             && matches!(args[3], "opencode" | "codex" | "claude")))
@@ -814,13 +883,46 @@ async fn route(bridge: &mut Bridge, key: &str, group: &str, id: &str, text: &str
         draft.advance(Step::Folder);
         return show(bridge, key, group, id, draft);
     }
+    if command == "/new" && args.len() == 4 && args[1].eq_ignore_ascii_case("cd") {
+        ensure!(
+            matches!(draft.step, Step::Folder | Step::FolderList) && args[2] == draft.code,
+            "Use the current folder menu"
+        );
+        let mut relative = draft.folder_cwd.clone();
+        if args[3] == ".." {
+            ensure!(relative.pop(), "Already at the project root");
+        } else {
+            ensure!(
+                std::path::Path::new(args[3]).is_relative(),
+                "Use a relative folder below the project root"
+            );
+            relative.push(args[3]);
+        }
+        let destination = bridge.config.launch_root.join(&relative);
+        if !relative.as_os_str().is_empty() {
+            ensure!(
+                launch::inspect(&bridge.config.launch_root, &destination)?.exists(),
+                "Choose an existing folder to enter"
+            );
+        }
+        launch::directory(&destination)?;
+        draft.folder_cwd = relative;
+        draft.folder_choices.clear();
+        draft.folder_files.clear();
+        draft.page = 0;
+        draft.advance(Step::Folder);
+        return show(bridge, key, group, id, draft);
+    }
     if command == "/new" && args.len() == 4 && args[1].eq_ignore_ascii_case("folder") {
         ensure!(
             matches!(draft.step, Step::Folder | Step::FolderList) && args[2] == draft.code,
             "Use the current folder menu code"
         );
         let proposed = launch::proposal(
-            &format!("/new project {} opencode", args[3]),
+            &format!(
+                "/new project {} opencode",
+                draft.folder_cwd.join(args[3]).display()
+            ),
             &bridge.config.launch_root,
             &PathBuf::from(std::env::var_os("HOME").unwrap_or_default()),
             now(),
@@ -863,7 +965,17 @@ async fn route(bridge: &mut Bridge, key: &str, group: &str, id: &str, text: &str
             return show(bridge, key, group, id, draft);
         }
         let filter = args.get(4..).unwrap_or_default().join(" ");
-        draft.folder_choices = folder_choices(&bridge.config.launch_root, &filter);
+        ensure!(
+            std::path::Path::new(&filter).is_relative(),
+            "List a relative folder below the project root"
+        );
+        let filter = if draft.folder_cwd.as_os_str().is_empty() {
+            filter
+        } else {
+            format!("{}/{filter}", draft.folder_cwd.display())
+        };
+        (draft.folder_choices, draft.folder_files) =
+            folder_choices(&bridge.config.launch_root, &filter)?;
         draft.step = Step::FolderList;
         draft.page = 0;
         return show(bridge, key, group, id, draft);
@@ -1175,7 +1287,9 @@ mod folder_choice_tests {
             std::fs::create_dir(directory.path().join(name)).unwrap();
         }
         assert_eq!(
-            folder_choices(&directory.path().canonicalize().unwrap(), ""),
+            folder_choices(&directory.path().canonicalize().unwrap(), "")
+                .unwrap()
+                .0,
             expected
         );
     }
@@ -1219,12 +1333,22 @@ mod folder_choice_tests {
         std::fs::create_dir_all(root.join("real/projects/secret")).unwrap();
         std::os::unix::fs::symlink(root.join("real/projects"), root.join("linked-root")).unwrap();
         std::os::unix::fs::symlink(root.join("real"), root.join("linked-parent")).unwrap();
-        assert!(folder_choices(&root.join("linked-root"), "").is_empty());
-        assert!(folder_choices(&root.join("linked-parent/projects"), "").is_empty());
+        assert!(
+            folder_choices(&root.join("linked-root"), "")
+                .unwrap_err()
+                .to_string()
+                .contains("symlinks")
+        );
+        assert!(
+            folder_choices(&root.join("linked-parent/projects"), "")
+                .unwrap_err()
+                .to_string()
+                .contains("symlinks")
+        );
     }
 
     #[test]
-    fn ls_lists_only_selectable_directories() {
+    fn ls_separates_selectable_directories_from_files_and_omits_symlinks() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir(directory.path().join("alpha")).unwrap();
         std::fs::create_dir(directory.path().join("Beta")).unwrap();
@@ -1237,14 +1361,36 @@ mod folder_choice_tests {
         )
         .unwrap();
         assert_eq!(
-            folder_choices(&directory.path().canonicalize().unwrap(), ""),
-            vec!["alpha", "Beta"]
+            folder_choices(&directory.path().canonicalize().unwrap(), "").unwrap(),
+            (
+                vec![
+                    "alpha".to_string(),
+                    "Beta".to_string(),
+                    "dotted.name".to_string()
+                ],
+                vec!["file".to_string()]
+            )
         );
         assert_eq!(
-            folder_choices(&directory.path().canonicalize().unwrap(), " BE "),
-            vec!["Beta"]
+            folder_choices(&directory.path().canonicalize().unwrap(), " BE ").unwrap(),
+            (vec!["Beta".to_string()], vec![])
         );
-        assert!(folder_choices(&directory.path().canonicalize().unwrap(), "link").is_empty());
+        assert_eq!(
+            folder_choices(&directory.path().canonicalize().unwrap(), "link").unwrap(),
+            (vec![], vec![])
+        );
+        let parent = "one/two/three/four/five/six/seven/eight";
+        std::fs::create_dir_all(directory.path().join(parent).join("too-deep")).unwrap();
+        assert!(
+            folder_choices(
+                &directory.path().canonicalize().unwrap(),
+                &format!("{parent}/")
+            )
+            .unwrap()
+            .0
+            .is_empty(),
+            "Listings must not offer paths beyond the launch depth limit"
+        );
     }
 
     #[test]
@@ -1270,7 +1416,8 @@ mod folder_choice_tests {
         for step in [Step::Folder, Step::FolderList] {
             let mut draft = Draft::new(Mode::New, step);
             for (input, query) in [
-                ("ls BeTa", "beta"),
+                ("ls BeTa", "BeTa"),
+                ("LS Apps/Library/", "Apps/Library/"),
                 ("LS next", "next"),
                 ("ls previous", "previous"),
                 ("ls filter", "filter"),

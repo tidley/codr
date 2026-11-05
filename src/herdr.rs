@@ -127,6 +127,7 @@ impl Agent {
     pub fn settled(&self) -> bool {
         matches!(self.agent_status.as_str(), "idle" | "done")
     }
+
     /// Format the introduction label using current bracketed agent codes.
     pub fn title(&self) -> String {
         let raw = self
@@ -194,6 +195,23 @@ impl Agent {
 
 pub fn group_name(label: &str) -> String {
     group_name_with_workspace(label, None, None)
+}
+
+pub fn status_label(status: &str) -> String {
+    let mut characters = status.chars();
+    let punctuation = if matches!(status, "working" | "blocked") {
+        "..."
+    } else {
+        "."
+    };
+    match characters.next() {
+        Some(first) => format!(
+            "{}{}{punctuation}",
+            first.to_uppercase(),
+            characters.as_str()
+        ),
+        None => "Unknown.".into(),
+    }
 }
 
 /// `<tab> (<workspace>)`, trimmed to MDK's 256-byte title limit.

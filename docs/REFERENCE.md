@@ -9,7 +9,7 @@ The bridge uses one dedicated MDK identity across all mapped groups. Setup keeps
 ## Behaviour
 
 - New sessions create groups and invite the configured phone `npub`.
-- Group names pair the **herdr** tab label and workspace: `<tab name> (<workspace>)`, for example `review (Acme)`. Fresh sessions launched from an existing chat add the selected agent inside the parentheses, such as `review (Acme - codex)` or `review (Acme - claude)`, without renaming the original chat. Without a workspace label, these fresh chats use `review (codex)`; ordinary chats keep only `<tab name>`. The agent suffix survives restarts, pane moves, and metadata updates, and is kept when long titles are shortened. Workspace and agent details also appear in the group description. Repository names and agent-generated conversation topics do not determine the chat name.
+- Group names pair the **herdr** tab label and workspace: `<tab name> (<workspace>)`, for example `review (Acme)`. Fresh sessions launched from an existing chat add the selected agent only when another live chat has the same tab/workspace title, such as `review (Acme - codex)` or `review (Acme - claude)`. The original chat keeps its title. A unique project does not need an agent suffix, and automatic or explicit renaming removes it once the duplicate ends. Without a workspace label, a duplicate fresh chat uses `review (codex)`; ordinary chats keep only `<tab name>`. Suffix intent survives restarts and pane moves, but the visible suffix depends on current live duplicates. Workspace and agent details also appear in the group description. Repository names and agent-generated conversation topics do not determine the chat name.
 - A phone message prompts only the agent mapped to that group.
 - Complete owner text is handed to the agent immediately, even while it is working, without an interrupt. A blocked native dialog requires its supported answer or `/cancel`. Media and previously accepted deliveries remain durable; `/queue` inspects them. `/clear-queue` is retired and does not discard accepted work.
 - Final replies come from completed stored agent messages. They exclude reasoning and tool output.
@@ -32,14 +32,32 @@ This removes serial transcript exports from the main loop. **herdr** control req
 
 ### Start a workspace from your phone
 
-New bridge accounts use the display name **Pat**. New session chats introduce Pat as the messenger between White Noise and herdr and direct you to `/help`. Verify the account's full `npub`, not its display name. Setup preserves existing profiles and account keys. See [Pat onboarding](INSTALL.md#pat-your-bridge-identity).
+The current account-creation helper uses **👾** as the public name and display name. The supported 0.9.0 fresh-account bootstrap keeps its original default, and handover preserves that existing profile. Use `/help` in a session chat to see the available commands. Verify the account's full `npub`, not its display name. See [bridge identity setup](INSTALL.md#your-bridge-identity).
+
+Mobile-created agents use a temporary unique name during startup. After startup,
+Codr clears that name so herdr shows the normal agent label, such as `opencode`.
+If cleanup is not confirmed, the launch reply reports it without restarting the agent.
+Existing agents and custom names stay unchanged.
 
 The phone controls below do not require the optional **portr** desktop/SSH endpoint. That endpoint is disabled unless `portr_enabled = true` is configured or the worker is explicitly started with `run --portr`. See [optional installation](INSTALL.md#optional-portr-desktopssh-access).
 
 Send `/new` in any linked chat or the control chat (below). The plugin guides you through **existing or new herdr workspace → folder name → installed agent → model → confirmation**. The four selection headings use bracketed progress: `[1/4] Choose a herdr workspace:`, `[2/4] Folder name:`, `[3/4] Choose an installed agent:`, and `[4/4] Choose a model for OpenCode:` (or the selected agent). The title is outside the brackets. Each prompt explains how to reply:
 
 1. Existing workspaces are listed first. The final numbered choice is **Create new workspace**, followed by **0. Cancel**. With two workspaces, reply `3` to create a new one. Labels and stable IDs distinguish workspaces with the same name. Use `next` or `previous` for ten-item pages; numbers are global across pages, and the new-workspace number is always one higher than the total workspace count. Page counters appear only when there is more than one page. `/new workspace 1` and `new` also work.
-2. Reply with your chosen folder name, such as `my-idea`, or `0` to cancel. Reply with **`ls`** to list selectable directories under the launch root, 200 per page, and choose one by its displayed number. **`ls <part>`**, for example `ls api`, filters folder names by a case-insensitive substring. All matching folders remain available through **`next`** and **`previous`** pages; numbers refer to the saved filtered list and selections must belong to the displayed page. A new filter starts at page one. Bare **`ls`** clears the filter, refreshes all folders and returns to page one. `ls next` searches for folders containing `next`; bare `next` changes pages. `/new folder my-idea` remains supported. Existing conversations are reused as described below. For a new conversation, a new workspace uses the folder's final component as its name, or an existing workspace receives a new project tab with an explicit cwd. Existing tabs and workspace names stay unchanged.
+2. Reply with your chosen folder name, such as `my-idea`, or `0` to cancel. Reply with **`ls`** to list selectable directories in the current folder (initially the launch root), 200 per page, and choose one by its displayed number. **`ls <part>`**, for example `ls api`, filters folder names by a case-insensitive substring. All matching folders remain available through **`next`** and **`previous`** pages; numbers refer to the saved filtered list and selections must belong to the displayed page. A new filter starts at page one. Bare **`ls`** clears the filter, refreshes the current folder and returns to page one. `ls next` searches for folders containing `next`; bare `next` changes pages. `/new folder my-idea` remains supported. Existing conversations are reused as described below. For a new conversation, a new workspace uses the folder's final component as its name, or an existing workspace receives a new project tab with an explicit cwd. Existing tabs and workspace names stay unchanged.
+
+   Nested paths such as `apps/new-project` use the same confirmation and root
+   restrictions. **`ls Apps/Library/`** lists that existing subfolder, preserving
+   path case; **`ls Apps/Library/part`** filters its entries. The listing shows up
+   to 20 matching regular files separately as non-selectable information.
+   Parent traversal and symlinks are rejected. Listing never creates a folder.
+
+   During the folder prompt, **`/cd Apps`** enters an existing folder, then
+   **`/cd Library`** enters its child. Plain **`ls`** now lists that folder, and
+   `NewProject` selects a new project path relative to it. **`/cd ..`** goes up
+   one level but cannot leave the launch root. The menu shows the current
+   location, which survives worker restarts. Navigation never creates folders
+   or changes the agent's working directory; creation still needs confirmation.
 3. Reply with a listed number to choose an installed agent: OpenCode, Codex, or Claude Code. `/agent 1` also works.
 4. Model selection starts with **Backend default**, when supported, then provider groups such as **View OpenAI / Codex models**, **View Claude models**, and **View Free models**. Select a provider/category to receive its **full available model list**, with no pagination. This also applies when only one provider is available. Variants appear only after selecting a model that has them, as a separate full list. Use `back` to return to the preceding model menu. Long lists use the existing encrypted message-size limit and are delivered in consecutive messages without dropping options. `/model 2` also works. A default-only catalogue shows just its default choice. Older saved flat menus keep their original numbering and pagination until you start a fresh selection.
 5. The complete preview shows the workspace destination, full folder path, agent, model, and whether the folder exists or will be created. It says **Confirm within ten minutes**. Reply `confirm`, `yes` or `y`, or type the displayed **repository folder name**, not the workspace label. For `tools/repo.v2` inside workspace `Main`, type `repo.v2`, not `Main`. Reply `0` to cancel. A wrong name stays within confirmation and creates nothing. Destination workspace renames require a fresh preview and confirmation. After expiry, the next plain reply closes the confirmation and reports expiry. Later messages follow normal chat routing. `/new confirm` remains supported, including for a repository folder named `0`.
@@ -276,7 +294,27 @@ prove failure or authorize a second install.
 
 ### Immediate text and persistent pending deliveries
 
-An ordinary complete owner text prompt goes directly to the freshly verified mapped agent, including while it is working. It does not wait in codr for idle or interrupt the current task. The agent may still use its own native inbox. A blocked native dialog is reported without silently making a future task; answer its supported decision or permission request, or use `/cancel`. Duplicate inbound events do not submit again. Phone text may reach the agent before an older media item finishes preparation.
+Herdr's terminal-write acknowledgement does not prove native acceptance. For
+supported transcript readers, Codr saves a private fingerprint and the native
+input IDs observed before submission. Only complete, matching new native input
+confirms acceptance, not execution or completion. Historical text, incomplete
+messages and ambiguous duplicates cannot confirm it. If the baseline read fails,
+acceptance remains unconfirmed.
+
+After 60 seconds without confirmed acceptance, Codr queues one durable warning
+per submission and pauses new prompts in that chat. An idle session's progress
+closes as uncertain, not successful. The check survives restarts, failed history
+reads, unavailable terminals and sync-off mode. Other chats and accepted queued
+or prepared deliveries are preserved. No uncertain prompt is automatically resent.
+Late matching native input can resolve the check. Otherwise inspect the native
+session, stop the bridge, and use its local `clear-prompt` command before restarting
+it. Clearing a marker cannot recall terminal input or prevent delayed execution.
+Phone `/queue` shows pending or overdue acceptance. Local `status` reports
+`native_acceptance_pending` and `native_acceptance_overdue` separately from
+terminal-write uncertainty. Pre-upgrade flights have no
+acceptance fingerprints and need separate inspection.
+
+Unless an earlier submission has overdue unconfirmed acceptance, an ordinary complete owner text prompt goes directly to the freshly verified mapped agent, including while it is working. It does not wait in codr for idle or interrupt the current task. The agent may still use its own native inbox. A blocked native dialog is reported without silently making a future task; answer its supported decision or permission request, or use `/cancel`. Duplicate inbound events do not submit again. Phone text may reach the agent before an older media item finishes preparation.
 
 Image preparation and legacy text/desktop deliveries share 16 accepted slots per chat and a 30000 UTF-8 byte caption/text limit on acceptance. A full preparation FIFO or oversized caption gets a rejection notice, not silent eviction. An image message occupies one slot, keeps its caption, and accepts up to four PNG, JPEG, WebP, or GIF attachments, with the existing 25 MiB-per-file download limit. Voice retains local transcription; it no longer waits for agent idle. New phone text has no 16-task waiting queue.
 
@@ -292,9 +330,9 @@ The bridge saves consumption and submission intent before native input. A proven
 
 Set `edit_responses = true` in the bridge configuration to enable editable progress. The release-matched connector includes the required `edit_message` API.
 
-Each response starts as one `> working...` progress message. The bridge edits that message with the current task list, when available. It sends the final answer as a separate message through the normal durable send path, with its own retry key. The bridge never edits that final answer. When possible, it marks the progress message `> done`.
+Each response uses one progress message, initially `> Request submitted...` for a phone request or `> Working...` for observed work. The bridge edits that message with the current task list, when available. It sends the final answer as a separate message through the normal durable send path, with its own retry key. The bridge never edits that final answer. When possible, it marks the progress message `> Done.`. Status labels use sentence case: transient states end in three full stops, such as `Working...` and `Blocked...`, while settled states use one, such as `Done.`, `Idle.`, and `Ended.`. Internal status values are unchanged.
 
-Phone follow-ups and blocked-to-working transitions reuse the current editable progress bubble; they do not append standalone `> working...` notices. The same bubble becomes `done` when the response completes. Without editable responses, follow-ups still do not emit extra working refreshes. Previously sent historical notices remain in the chat. Image acceptance says `Preparing image`, not `Queued prompt`: this is download preparation, not scheduling a future task. Media preparation never clears an existing response or submission receipt.
+Phone follow-ups while an agent is already working reuse the current editable progress bubble. When an agent resumes work after waiting for input, Codr starts a fresh working/checklist message below the conversation. Only after the replacement is confirmed does Codr attempt to edit the old progress to `Task continued below.` It does not delete the old message. This edit is best effort and is not retried if its result is uncertain; questions, answers, and final replies are preserved. The active bubble becomes `done` when the response completes. Without editable responses, follow-ups still do not emit extra working refreshes. Previously sent historical notices remain in the chat. Image acceptance says `Preparing image`, not `Queued prompt`: this is download preparation, not scheduling a future task. Media preparation never clears an existing response or submission receipt.
 
 OpenCode to-do writes, Codex plan updates, and Claude Code to-do/task tools supply structured task data. The bridge does not prompt a model to obtain progress. Message IDs and pending updates survive bridge restarts. Updates coalesce between snapshots, and edit attempts are at least two timestamp seconds apart.
 
@@ -310,6 +348,11 @@ Edit support is included in the dedicated connector; the flag controls whether *
 
 When OpenCode asks one single-choice question, **codr** sends a clean question card with numbered options. Reply with **1**, **2**, or an exact option label. The answer goes to the active question, even while **herdr** reports the agent as blocked; it is not submitted as a new chat prompt.
 
+The card starts with the question itself, without a `Decision needed` heading,
+internal request code, repeated title, or routine reply instructions. A code is
+shown only when a changed question requires it for safe answering. Terminal-only
+and already-submitted notices remain when needed.
+
 Decision cards and answers do not require editable progress.
 
 OpenCode V2 exports omit running questions. The bridge reads live session forms through the configured reader. For a question with a native form ID, numbered and labelled choices use the authenticated form reply API, as custom answers do. The bridge sends the selected option value, not the number as custom text. No terminal screen match or keystrokes are needed. Completed forms disappear from this read and cannot be replayed as pending questions.
@@ -317,6 +360,15 @@ OpenCode V2 exports omit running questions. The bridge reads live session forms 
 The bridge checks the session and exact pending question before a reply. Legacy questions without a native form ID also need an exact visible-question check before a terminal number shortcut. If an unanswered question is replaced, the new card requires its short code, for example `qabc123 1`. Duplicate deliveries and uncertain submissions are not sent again automatically.
 
 For supported OpenCode V2 questions that allow custom input, type a complete text answer directly, such as `v6.6.6`, or use `/answer TEXT`. The bridge sends it to the freshly checked native form through the authenticated API, not as a prompt or arbitrary terminal keys. A combined reply such as `1 v6.6.6` remains literal custom text. If the question changed, prefix the text with its current question code. Custom replies are limited to 4000 UTF-8 bytes; an answer beginning with `/` must use `/answer TEXT` so commands keep their meaning. Prepared media is not automatically submitted as custom text. Submission intent is saved before the API call, and an uncertain outcome is never automatically retried.
+
+When a supported question answer is confirmed and forwarding is enabled, Codr
+removes only the current turn's mute marker. Future replies from that turn can
+reach the phone. Already completed replies, other muted turns, and other chats
+are not replayed. A failed, stale, or uncertain answer does not remove the marker;
+explicit `/sync off` remains respected. `/last` is a read-only replay and does
+not resume a muted turn. Permission controls keep their separate no-unmute rule.
+
+Once the bridge has observed that the agent is no longer blocked, ordinary text such as `Retry ngit` starts a new prompt rather than answering a retained custom question. Numbers, option labels, question codes and `/answer TEXT` still count as explicit answer attempts and cannot turn into new prompts for an expired question. If a question stops waiting during a reply, the bridge keeps the fail-closed check and does not send that reply as a new prompt.
 
 Legacy shortcut routing was verified against OpenCode 1.18.35's single-choice question UI with 1–9 listed options. The gallery uses OpenCode 1.19.3, but does not verify live decision routing on that version. Custom text entry for legacy forms or questions that do not expose a native custom field, multi-select/multi-question dialogs, and decisions in other backends still require the terminal. Unsupported OpenCode blockers show a short notice instead of forwarding unrelated tool output.
 
@@ -356,7 +408,17 @@ Images and audio are available in **codr** 0.5.0. Voice prompts require a transc
 
 Audio goes through FFmpeg to 16 kHz mono WAV, then to a local Phonon-2 worker. Its transcript enters the same prompt route as typed text, without a confirmation step. Supported question answers also use that route. Download and local transcription add time before the agent starts.
 
-The phone sees `> transcribing` while audio processing runs. With `edit_responses = true` and an edit-capable MDK build, **codr** edits that bubble to `> transcribed` with the transcript quoted underneath. The edit survives restarts and retries independently of agent submission. Without edit support, the transcript arrives as a separate message. Images use `> downloading`. Long transcript displays are shortened with a notice; the agent receives the full prepared prompt.
+The phone sees `> Transcribing...` while audio processing runs. With `edit_responses = true` and an edit-capable MDK build, **codr** edits that bubble to `> Transcribed.` with the transcript quoted underneath. The edit survives restarts and retries independently of agent submission. Without edit support, the transcript arrives as a separate message. Long transcript displays are shortened with a notice; the agent receives the full prepared prompt.
+
+Accepted images and files get an owner-requested status receipt. With editable
+responses enabled, the same message changes from `Preparing image...` to
+`Downloading image...` to `Downloaded image.` (or `file`). Missing download
+references show `Waiting for image...`; preparation failures show a failure
+state. The edit target and pending update survive worker restarts. Fast stages
+may be combined, and edits follow the normal rate limit. Downloaded means MDK
+returned the file and Codr validated and copied it locally; it does not prove
+native-agent execution or a reply. Status receipts do not unmute other output.
+Without editable responses, the initial preparation receipt remains standalone.
 
 Downloads and transcription run separately from session updates, one media message at a time. Pending messages survive bridge restarts. Sender checks and session checks still apply. A preparation failure sends no agent prompt. An uncertain terminal submission is not repeated automatically.
 

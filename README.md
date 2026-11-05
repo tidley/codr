@@ -4,13 +4,13 @@
 
 Supported agents: OpenCode, Codex, and Claude Code on Linux and macOS.
 
-New bridge accounts introduce themselves as **Pat**, your messenger between White Noise and herdr. Verify the full bridge public key printed by setup, not its display name.
+The current setup code uses **👾** as the public name and display name when it creates an account. The supported 0.9.0 fresh-account bootstrap keeps its original naming behaviour. Existing profiles stay unchanged. Verify the full bridge public key printed by setup, not its display name.
 
 ## Behaviour
 
-- Chat names pair the **herdr** tab and workspace: `review (Acme)`. Descriptions contain workspace and agent details.
+- Chat names pair the **herdr** tab and workspace: `review (Acme)`. Fresh-session chats add the agent name only to distinguish a matching live project in the same workspace. Descriptions contain workspace and agent details.
 - With editable progress enabled, one active bubble carries status and checklist updates. Final replies stay separate.
-- Phone text is handed straight to the agent, including while it is working. Images, files and voice follow as soon as download/transcription completes, without waiting for idle. The agent handles its own input; codr does not interrupt it. Send `/cancel` when you do want to interrupt the current task.
+- Phone text is handed straight to the agent, including while it is working, unless an earlier submission has unconfirmed native acceptance. Images, files and voice follow as soon as download/transcription completes, without waiting for idle. The agent handles its own input; codr does not interrupt it. Send `/cancel` when you do want to interrupt the current task.
 - `/new` guides you through workspace, folder, installed agent, and model selection. Reply with numbers, use `0` to cancel, and type the repository folder name to confirm the final preview. The destination workspace is shown separately.
 - Choose the default model or browse a provider's full model list. OpenCode uses its authenticated model catalogue; variants are selected separately. `/agent` opens a separate chat without moving old history.
 - Supported OpenCode questions accept a number or option label as a reply. V2 questions with custom input also accept text answers, such as a version number.
@@ -19,9 +19,9 @@ New bridge accounts introduce themselves as **Pat**, your messenger between Whit
 
 ## Install
 
-**0.11.0 targets existing accounts.** Fresh accounts use the
+**0.11.1 targets existing accounts.** Fresh accounts use the
 supported 0.9.0 setup below, then the owner-confirmed chat handover. See the
-[0.11.0 release notes](docs/releases/0.11.0.md) and
+[0.11.1 release notes](docs/releases/0.11.1.md) and
 [combined runtime/handover guide](docs/COMBINED.md).
 
 Needs Linux x86_64 or aarch64 or macOS on Apple silicon or Intel, a per-user service manager (systemd or launchd), Python 3.11+, Git, and **herdr** 0.9.1+. No Rust toolchain required.
@@ -39,7 +39,35 @@ Or give your coding agent this prompt, with your own public key:
 
 [Full installation and upgrade guide →](docs/INSTALL.md)
 
-### New in 0.11.0
+### New in 0.11.1
+
+- Clear status labels use `Request submitted...` and `Working...` for progress,
+  then `Done.` for completion. Acceptance checks and safety warnings remain.
+- Native acceptance checks distinguish terminal delivery from agent receipt.
+  Unconfirmed submissions produce a warning and pause that chat, without retries.
+- Editable image/file receipts show preparation, download, completion, waiting,
+  or failure without adding a new bubble for each stage.
+- Confirmed phone answers resume the current question turn's future replies,
+  without replaying old muted replies or overriding `/sync off`.
+- Project setup accepts nested paths and `ls apps/` to browse a subfolder's
+  directories and non-selectable files before confirmation. Use `/cd apps`
+  during folder selection so plain `ls` and new paths use that location.
+- Resuming after a question brings a fresh working/checklist bubble to the bottom
+  of the chat, leaving `Task continued below.` in the old progress message.
+- Question cards show the question and choices without internal headings or
+  repeated titles. Required changed-question safety notices remain.
+- Ordinary follow-ups no longer answer a completed custom question. Explicit
+  stale answers remain blocked, including after a restart.
+- Mobile-created agents clear their temporary `codr-…` name after startup.
+- Fresh-session chat titles include an agent suffix only while another live
+  project chat shares the same tab/workspace title.
+- The current account-creation helper defaults to **👾**. Existing profiles and
+  the supported 0.9.0 bootstrap keep their naming behaviour.
+
+See the [release notes](docs/releases/0.11.1.md) for scope and credits, and the
+[readiness record](docs/releases/0.11.1-readiness.md) for verification and publication gates.
+
+### Retained from 0.11.0
 
 - Completed Claude replies reach the phone while background tasks keep the
   session working. System task notifications do not count as local typing or
@@ -47,7 +75,7 @@ Or give your coding agent this prompt, with your own public key:
 - Progress keeps its existing bubble until the session settles, without leaving
   an unfinished replacement after a completed background reply.
 - A no-update check says **No new version available. Currently running codr
-  0.11.0.** It does not claim that an installation occurred.
+  VERSION.** It does not claim that an installation occurred.
 - Integrates Juraj Bednar's [PR #20](https://github.com/tidley/codr/pull/20).
   Corrected adaptations of PRs #17–19 remain from 0.9.0.
 
@@ -103,7 +131,7 @@ retained. See the release notes for contributor credits and scope.
 | `/agent` | Choose an agent in a separate session and chat. |
 | `/model` | Choose a model; OpenCode supports a confirmed idle-session change in place. |
 | `/cancel` | Clear pending questions and menus in this chat and interrupt its current task, keeping history and accepted deliveries. |
-| `/queue` | Inspect pending media and deliveries accepted before the update. |
+| `/queue` | Inspect pending media, accepted deliveries and native-acceptance state. |
 | `/unmute` | Resume all chats and clear a forced sync mode. |
 | `/sync auto\|on\|off` | Use automatic sync, always on, or always off. The choice persists across restarts. |
 
@@ -119,7 +147,7 @@ It does not restart services, stop other sessions, change the selected model, or
 discard accepted deliveries. Records of uncertain external operations remain for
 reconciliation. An interrupt acknowledgement does not prove the agent has stopped.
 
-New phone text does not join a worker-scheduled task queue. Messages are delivered without an interrupt; a backend can still use its own native inbox. A blocked permission or decision requires its supported answer or `/cancel`, not an arbitrary prompt. Media still needs download/transcription, and existing accepted deliveries are preserved across upgrades. `/clear-queue` is retired and does not discard those deliveries. A lost submission acknowledgement is never automatically retried.
+New phone text does not join a worker-scheduled task queue. Messages are delivered without an interrupt; a backend can still use its own native inbox. A blocked permission or decision requires its supported answer or `/cancel`, not an arbitrary prompt. After 60 seconds without confirmed native acceptance, Codr warns and pauses new submissions in that chat; inspect the native session before local `clear-prompt`. Media still needs download/transcription, and accepted deliveries are preserved across upgrades. `/clear-queue` is retired and does not discard those deliveries. An uncertain submission is never automatically retried.
 
 Handoff is automatic. Manual controls remain available through **herdr**'s **White Noise forwarding: At desk / Away** action. [Controls and limits →](docs/REFERENCE.md#at-desk--away-forwarding)
 

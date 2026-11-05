@@ -77,7 +77,7 @@ pub fn transcript_notice(text: &str) -> String {
         .map(|line| format!("> {line}"))
         .collect::<Vec<_>>()
         .join("\n");
-    let mut notice = format!("> transcribed\n\n{quote}");
+    let mut notice = format!("> Transcribed.\n\n{quote}");
     const SUFFIX: &str = "\n\n> … Transcript shortened for display.";
     if notice.len() > 30000 {
         let mut end = 30000 - SUFFIX.len();

@@ -2,6 +2,53 @@ use bech32::ToBase32;
 use herdr_white_noise_bridge::{BridgeConfig, BridgeState};
 
 #[test]
+fn repeated_question_resumes_preserve_cleanup_and_finish_the_original_progress() {
+    let mut state = BridgeState::with_mapping("session", "group".into());
+    state.begin_response("session", "group");
+    let text = state.outbox[0].text.clone();
+    let delivery = state.outbox[0].response.as_mut().unwrap();
+    delivery.target = Some("original-progress".into());
+    delivery.sent_text = Some(text);
+    state.outbox[0].text = "> blocked Waiting for input".into();
+    for _ in 0..2 {
+        state.resume_response("session", "group");
+        state = serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        let id = state.mappings["session"].response_id.as_ref().unwrap();
+        let fresh = state.outbox.iter().find(|item| &item.id == id).unwrap();
+        assert_eq!(
+            fresh.response.as_ref().unwrap().supersedes.as_deref(),
+            Some("original-progress")
+        );
+    }
+    state.complete_progress("session");
+    assert_eq!(
+        state
+            .outbox
+            .iter()
+            .filter(|item| item
+                .response
+                .as_ref()
+                .is_some_and(|delivery| delivery.target.as_deref() == Some("original-progress")))
+            .count(),
+        1,
+        "Retired pending edits must not overwrite completion"
+    );
+    assert!(state.outbox.iter().any(|item| {
+        item.text == "> Done."
+            && item.response.as_ref().is_some_and(|delivery| {
+                delivery.target.as_deref() == Some("original-progress") && delivery.finished
+            })
+    }));
+    assert!(!state.outbox.iter().any(|item| {
+        item.text.starts_with("> Working.")
+            && item
+                .response
+                .as_ref()
+                .is_some_and(|delivery| !delivery.finished)
+    }));
+}
+
+#[test]
 fn working_notice_refreshes_old_bubbles_but_deduplicates_unsent_notices_and_respects_mute() {
     let mut state = BridgeState::with_mapping("session", "group".into());
     state.begin_response("session", "group");
@@ -105,7 +152,7 @@ fn legacy_state_and_outbox_do_not_invent_source_delivery_records() {
 
 #[test]
 fn completed_progress_keeps_tasks_from_current_and_previous_working_labels() {
-    for label in ["> working...", "> working"] {
+    for label in ["> Working...", "> Working.", "> working...", "> working"] {
         let mut state = BridgeState::with_mapping("session", "ab".repeat(16));
         state.forwarding_enabled = true;
         state.update_response(
@@ -116,7 +163,7 @@ fn completed_progress_keeps_tasks_from_current_and_previous_working_labels() {
         );
         state.outbox[0].response.as_mut().unwrap().target = Some("sent-progress".into());
         state.complete_progress("session");
-        assert_eq!(state.outbox[0].text, "> done\n\n✓ Keep this task");
+        assert_eq!(state.outbox[0].text, "> Done.\n\n✓ Keep this task");
     }
 }
 

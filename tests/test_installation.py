@@ -105,7 +105,7 @@ class ManifestTests(unittest.TestCase):
 
 
 class SetupTests(unittest.TestCase):
-    def test_new_bridge_identity_publishes_the_pat_display_name(self):
+    def test_new_bridge_identity_publishes_the_alien_display_name(self):
         opencode = self.home / ".local/bin/opencode"
         opencode.write_text("fixture")
         opencode.chmod(0o700)
@@ -113,12 +113,14 @@ class SetupTests(unittest.TestCase):
             return str(opencode) if name == "opencode" else "/usr/bin/" + name
         with self.mocks(), patch.object(setup, "find_executable", side_effect=find):
             report = setup.configure("npub1fixture", self.socket, self.runner)
-        self.assertEqual(self.profile_calls, [{"marmot_agent_control":"marmot.agent-control.v2", "type":"account_publish_profile", "account_id_hex":"ab" * 32, "name":"Pat", "display_name":"Pat"}])
+        self.assertEqual(self.profile_calls, [{"marmot_agent_control":"marmot.agent-control.v2", "type":"account_publish_profile", "account_id_hex":"ab" * 32, "name":"👾", "display_name":"👾"}])
         self.assertEqual(report["default_profile_status"], "published")
+        self.assertEqual(report["default_profile_name"], "👾")
         self.assertEqual(setup.tomllib.loads(self.config.read_text())["account_id_hex"], "ab" * 32)
         stored = json.loads((self.home / ".marmot-agents/herdr/codr-bootstrap.json").read_text())
         self.assertEqual(stored["label"], "herdr-bridge")
         self.assertEqual(stored["default_profile_status"], "published")
+        self.assertEqual(stored["default_profile_name"], "👾")
         self.profile_calls.clear()
         with self.mocks(), patch.object(setup, "find_executable", side_effect=find):
             setup.configure(None, self.socket, self.runner)
@@ -148,28 +150,29 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(report["default_profile_status"], "unconfirmed")
 
     def test_profile_acknowledgements_must_match_protocol_identity_and_name(self):
-        good={"marmot_agent_control":"marmot.agent-control.v2","type":"profile_published","account_id_hex":"ab" * 32,"name":"Pat","display_name":"Pat"}
+        good={"marmot_agent_control":"marmot.agent-control.v2","type":"profile_published","account_id_hex":"ab" * 32,"name":"👾","display_name":"👾"}
         for field,wrong in [("marmot_agent_control","wrong"),("type","ack"),("account_id_hex","99" * 32),("name","Other"),("display_name","Other")]:
             with self.subTest(field=field), patch.object(setup,"control_request",return_value={**good,field:wrong}) as request:
                 path=self.home / f"profile-{field}.json"
-                result=setup.publish_pat_profile(self.socket,{"account_id_hex":"ab" * 32,"created":True},path)
+                result=setup.publish_default_profile(self.socket,{"account_id_hex":"ab" * 32,"created":True},path)
                 self.assertEqual(result["default_profile_status"],"unconfirmed")
-                result=setup.publish_pat_profile(self.socket,{"account_id_hex":"ab" * 32,"created":True},path)
+                result=setup.publish_default_profile(self.socket,{"account_id_hex":"ab" * 32,"created":True},path)
                 self.assertEqual(result["default_profile_status"],"unconfirmed")
                 self.assertEqual(request.call_count,1)
 
     def test_profile_publication_requires_a_saved_intent(self):
         with patch.object(setup,"private_write",side_effect=OSError("cannot save intent")), patch.object(setup,"control_request") as request:
             with self.assertRaises(OSError):
-                setup.publish_pat_profile(self.socket,{"account_id_hex":"ab" * 32,"created":True},self.home / "profile.json")
+                setup.publish_default_profile(self.socket,{"account_id_hex":"ab" * 32,"created":True},self.home / "profile.json")
         request.assert_not_called()
 
     def test_pending_profile_intent_is_not_republished_after_a_crash(self):
         path = self.home / "profile-pending.json"
-        path.write_text(json.dumps({"account_id_hex":"ab" * 32,"default_profile_status":"pending"}))
+        path.write_text(json.dumps({"account_id_hex":"ab" * 32,"default_profile_status":"pending","default_profile_name":"Pat"}))
         with patch.object(setup, "control_request") as request:
-            result = setup.publish_pat_profile(self.socket, {"account_id_hex":"ab" * 32,"created":True}, path)
+            result = setup.publish_default_profile(self.socket, {"account_id_hex":"ab" * 32,"created":True}, path)
         self.assertEqual(result["default_profile_status"], "unconfirmed")
+        self.assertEqual(result["default_profile_name"], "Pat")
         request.assert_not_called()
 
     def test_profile_record_cannot_be_reused_for_another_identity(self):
@@ -177,7 +180,7 @@ class SetupTests(unittest.TestCase):
         path.write_text(json.dumps({"account_id_hex":"99" * 32,"default_profile_status":"published"}))
         with patch.object(setup, "control_request") as request:
             with self.assertRaises(setup.SetupError):
-                setup.publish_pat_profile(self.socket, {"account_id_hex":"ab" * 32,"created":True}, path)
+                setup.publish_default_profile(self.socket, {"account_id_hex":"ab" * 32,"created":True}, path)
         request.assert_not_called()
 
     def test_fresh_portr_access_is_off_unless_explicitly_selected(self):
@@ -343,7 +346,7 @@ class SetupTests(unittest.TestCase):
     def profile_control(self, path, payload):
         self.profile_calls.append(payload)
         self.assertEqual(payload["type"], "account_publish_profile")
-        return {"marmot_agent_control":"marmot.agent-control.v2","type":"profile_published","account_id_hex":payload["account_id_hex"],"name":"Pat","display_name":"Pat"}
+        return {"marmot_agent_control":"marmot.agent-control.v2","type":"profile_published","account_id_hex":payload["account_id_hex"],"name":"👾","display_name":"👾"}
 
     def test_connector_selection_uses_the_release_owned_path_not_a_shared_executable(self):
         dedicated = installer.connector_path(installer.version())

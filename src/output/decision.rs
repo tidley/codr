@@ -82,14 +82,12 @@ impl Decision {
     }
 
     pub fn text(&self) -> String {
-        let mut text = format!("Decision needed [{}]", self.token());
+        let mut text = String::new();
         for (index, question) in self.questions.iter().enumerate() {
-            if self.questions.len() > 1 {
-                text.push_str(&format!("\n\nQuestion {}: {}", index + 1, question.header));
-            } else if !question.header.is_empty() {
-                text.push_str(&format!(": {}", question.header));
+            if index > 0 {
+                text.push_str("\n\n");
             }
-            text.push_str(&format!("\n\n{}", question.question));
+            text.push_str(&question.question);
             for (index, option) in question.options.iter().enumerate() {
                 text.push_str(&format!("\n\n{}. {}", index + 1, option.label));
                 if !option.description.is_empty() {
@@ -110,15 +108,8 @@ impl Decision {
             if self.supports_custom() {
                 text.push_str(" A custom text answer can follow the same question code.");
             }
-        } else {
-            text.push_str("\n\nReply with the option number or its label.");
-            if self.supports_custom() {
-                text.push_str(
-                    " Or type your custom answer directly; /answer TEXT is also supported.",
-                );
-            } else if self.questions[0].custom {
-                text.push_str(" Use the terminal for a custom answer.");
-            }
+        } else if self.questions[0].custom && !self.supports_custom() {
+            text.push_str("\n\nUse the terminal for a custom answer.");
         }
         text
     }
@@ -193,6 +184,11 @@ impl Decision {
     }
 
     pub fn looks_like_answer(&self, text: &str) -> bool {
+        self.looks_like_explicit_answer(text)
+            || (self.supports_custom() && !text.trim().is_empty() && !text.trim().starts_with('/'))
+    }
+
+    pub fn looks_like_explicit_answer(&self, text: &str) -> bool {
         let text = text.trim();
         let first = text
             .split_whitespace()
@@ -204,7 +200,6 @@ impl Decision {
             || text.starts_with("/answer ")
             || first.eq_ignore_ascii_case(&self.token())
             || coded
-            || (self.supports_custom() && !text.is_empty() && !text.starts_with('/'))
             || self
                 .questions
                 .iter()
