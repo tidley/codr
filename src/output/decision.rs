@@ -39,6 +39,9 @@ pub struct Decision {
     pub submitted: bool,
     #[serde(default)]
     pub requires_token: bool,
+    /// Completed parts of a native form, in field order. No partial form is posted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub answers: Vec<String>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -62,8 +65,11 @@ impl Decision {
 
     pub fn token(&self) -> String {
         if let Some(form) = &self.form_id {
-            let identity = serde_json::to_vec(&(&self.id, form, &self.questions))
+            let mut identity = serde_json::to_vec(&(&self.id, form, &self.questions))
                 .expect("Question identity serializes");
+            if self.questions.len() > 1 {
+                identity.push(self.answers.len() as u8);
+            }
             let digest = hex::encode(Sha256::digest(identity));
             return format!("q{}", &digest[..16]);
         }
@@ -72,19 +78,38 @@ impl Decision {
     }
 
     pub fn supported(&self) -> bool {
-        self.questions.len() == 1
-            && !self.questions[0].multiple
-            && (1..=9).contains(&self.questions[0].options.len())
+        !self.questions.is_empty()
+            && self.questions.len() <= 8
+            && self.answers.len() < self.questions.len()
+            && (self.questions.len() == 1 || self.form_id.is_some())
+            && self
+                .questions
+                .iter()
+                .all(|question| !question.multiple && (1..=9).contains(&question.options.len()))
+    }
+
+    pub fn current_question(&self) -> &Question {
+        &self.questions[self.answers.len()]
     }
 
     pub fn supports_custom(&self) -> bool {
-        self.supported() && self.questions[0].custom && self.form_id.is_some()
+        self.supported() && self.current_question().custom && self.form_id.is_some()
     }
 
     pub fn text(&self) -> String {
         let mut text = String::new();
+        if self.supported() && self.questions.len() > 1 {
+            text.push_str(&format!(
+                "Question {} of {}\n\n",
+                self.answers.len() + 1,
+                self.questions.len()
+            ));
+        }
         for (index, question) in self.questions.iter().enumerate() {
-            if index > 0 {
+            if self.supported() && index != self.answers.len() {
+                continue;
+            }
+            if index > 0 && !self.supported() {
                 text.push_str("\n\n");
             }
             text.push_str(&question.question);
@@ -108,7 +133,7 @@ impl Decision {
             if self.supports_custom() {
                 text.push_str(" A custom text answer can follow the same question code.");
             }
-        } else if self.questions[0].custom && !self.supports_custom() {
+        } else if self.current_question().custom && !self.supports_custom() {
             text.push_str("\n\nUse the terminal for a custom answer.");
         }
         text
@@ -145,11 +170,12 @@ impl Decision {
         if !answer.is_empty()
             && answer.bytes().all(|byte| byte.is_ascii_digit())
             && let Ok(index) = answer.parse::<usize>()
-            && (1..=self.questions[0].options.len()).contains(&index)
+            && (1..=self.current_question().options.len()).contains(&index)
         {
             return Ok(index);
         }
-        let matches: Vec<_> = self.questions[0]
+        let matches: Vec<_> = self
+            .current_question()
             .options
             .iter()
             .enumerate()
@@ -208,7 +234,7 @@ impl Decision {
     }
 
     pub fn matches_visible(&self, visible: &str) -> bool {
-        if !self.supported() {
+        if !self.supported() || self.questions.len() != 1 {
             return false;
         }
         let question = &self.questions[0];
@@ -356,6 +382,7 @@ pub(super) fn from_data(export: &super::Export) -> Result<Option<Decision>> {
                 announced: false,
                 submitted: false,
                 requires_token: false,
+                answers: Vec::new(),
             });
         }
     }

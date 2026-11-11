@@ -238,7 +238,7 @@ impl Reader {
                     .collect(),
             };
             cache.snapshot = SessionSnapshot {
-                history: super::history_from_data(&export),
+                history: std::sync::Arc::new(super::history_from_data(&export)),
                 tasks: super::tasks::from_data(&export),
                 decision: super::decision::from_data(&export).ok().flatten(),
                 permission: None,

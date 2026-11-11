@@ -1,5 +1,61 @@
 # Changelog
 
+## [0.11.2] - 2026-11-11
+
+See the [release notes](docs/releases/0.11.2.md) for upgrade limits, measured
+performance results and contributor credits. The MDK pin, dependencies, control
+protocol, state version and storage cohort remain unchanged.
+
+### Added
+
+- Answer OpenCode V2 multi-part questions from White Noise, one part at a time.
+  Save answers across restarts and submit the complete form after the final answer.
+  Recheck the form on each reply and reject stale question codes.
+  Multi-select fields and legacy multi-question dialogs still need the terminal.
+
+### Changed
+
+- Reuse parsed forwarding controls while their file metadata is unchanged, and
+  compare saved state before JSON encoding. Build desktop updates only while a
+  watcher is connected. Keep mute checks and durable writes at their existing
+  safety boundaries.
+- Apply completed native reads by session instead of repeating discovery for
+  every completion. Share immutable history snapshots and the native reader
+  cache between polling, phone history commands and desktop history.
+- Collect `/last` and `/recent` outside the worker's serial input loop. Keep a
+  bounded, restart-safe request queue and recheck session/group bindings before
+  applying results. Preserve `/recent` ordering and delivery spacing.
+- Collect recovery history in the background with page-sized payload storage
+  and an eight-event channel. Stream unseen owner input oldest-first, including
+  media needing richer references, and apply at most eight events per loop pass.
+  Back off failed recovery from two to sixty seconds. Keep fresh phone validation
+  independent of unrelated background reader queues.
+  Keep full history traversal so older late deliveries are not skipped.
+- Send `/recent` conversations oldest-first and keep each conversation's messages
+  together. Wait five seconds after a confirmed batch before the next conversation.
+  Preserve the queue across restarts without delaying live replies.
+
+### Fixed
+
+- Stop rewriting and syncing unchanged bridge state during polling. Keep polling
+  clocks in memory and save delivery, permission and setup changes immediately.
+  Preserve atomic replacement, private file modes and file/directory syncs.
+- Make White Noise permission cards easier to use on a phone. Keep the scrolling
+  command block and omit empty metadata, duplicate commands and visible approval codes.
+  Send a normal message containing `1` for **Allow once** or `2` for **Deny**.
+  No card selection, quoted reply or approval code is required. Check the exact
+  pending request before replying. If an unanswered request changes, ask for a
+  plain-text confirmation before allowing the replacement.
+  Show `Waiting for your permission...` while
+  waiting, then `Allowed once.` or `Denied.` after a confirmed reply.
+- Clear stale delivery warnings when late native acceptance confirms the message.
+  Remove queued warnings and send a durable confirmation, including after a lost acknowledgement.
+  Keep genuinely unconfirmed messages paused and never resend them automatically.
+- Retry an interrupted OpenCode local-service GET once before reporting failure.
+  Keep failed reads from advancing history checkpoints. Report local-service
+  failures separately from transcript or CLI failures. Do not retry form submissions
+  or HTTP rejections, and do not start or replace the OpenCode server. See #22.
+
 ## [0.11.1] - 2026-11-05
 
 See the [release notes](docs/releases/0.11.1.md) and

@@ -45,6 +45,7 @@ fn phone_question_cards_show_the_question_and_choices_without_internal_headings(
         decision.token()
     )));
     decision.requires_token = false;
+    decision.form_id = None; // Legacy keyboard shortcuts remain single-question only.
     decision.questions.push(decision.questions[0].clone());
     assert_eq!(
         decision.text(),
@@ -52,6 +53,59 @@ fn phone_question_cards_show_the_question_and_choices_without_internal_headings(
             "{question}\n\n{question}\n\nAnswer this multi-question or multi-select dialog in the terminal."
         )
     );
+}
+
+#[test]
+fn multipart_native_cards_parse_the_current_part_and_bind_codes_to_that_part() {
+    use decision::Answer;
+    let mut value = forms();
+    value["data"][0]["id"] = json!("frm_multi");
+    let mut second = value["data"][0]["fields"][0].clone();
+    second["key"] = json!("q1");
+    second["description"] = json!("Which client?");
+    second["custom"] = json!(false);
+    second["options"] = json!([{"value":"Android","label":"Android"}]);
+    value["data"][0]["fields"]
+        .as_array_mut()
+        .unwrap()
+        .push(second);
+    let mut decision = decision::from_forms(&value, "ses_fixture")
+        .unwrap()
+        .unwrap();
+    assert!(decision.supported());
+    assert!(
+        decision
+            .text()
+            .starts_with("Question 1 of 2\n\nWhich next step?")
+    );
+    assert!(!decision.text().contains("Which client?"));
+    assert_eq!(
+        decision.answer("A custom plan").unwrap(),
+        Answer::Custom("A custom plan".into())
+    );
+    let original = decision.clone();
+    let code = decision.token();
+    decision.answers.push("A custom plan".into());
+    assert!(decision.same_request(&original));
+    assert_ne!(decision.token(), code);
+    assert!(
+        decision
+            .text()
+            .starts_with("Question 2 of 2\n\nWhich client?")
+    );
+    assert_eq!(decision.answer("1").unwrap(), Answer::Choice(1));
+    assert_eq!(decision.answer("Android").unwrap(), Answer::Choice(1));
+    assert!(decision.answer("2").is_err());
+    assert!(decision.answer("Another client").is_err());
+    assert!(decision.answer(&format!("{code} 1")).is_err());
+    decision.requires_token = true;
+    assert!(decision.answer("1").is_err());
+    assert_eq!(
+        decision.answer(&format!("{} 1", decision.token())).unwrap(),
+        Answer::Choice(1)
+    );
+    decision.questions[1].multiple = true;
+    assert!(!decision.supported());
 }
 
 #[test]

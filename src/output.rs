@@ -77,7 +77,7 @@ impl SessionHistory {
         Self::excerpt(&self.last_messages[self.last_messages.len().saturating_sub(count)..])
     }
 
-    fn excerpt(messages: &[ConversationMessage]) -> Option<String> {
+    pub(crate) fn excerpt(messages: &[ConversationMessage]) -> Option<String> {
         (!messages.is_empty()).then(|| {
             messages
                 .iter()
@@ -130,9 +130,9 @@ pub async fn read_history(
         "Unsupported native session reference kind"
     );
     match session.agent.as_str() {
-        "opencode" if config.opencode_db.is_some() || config.opencode_service_file.is_some() => {
-            Ok(read_snapshot(config, session).await?.history)
-        }
+        "opencode" if config.opencode_db.is_some() || config.opencode_service_file.is_some() => Ok(
+            std::sync::Arc::unwrap_or_clone(read_snapshot(config, session).await?.history),
+        ),
         "opencode" => Ok(select_history(
             export_data(&config.opencode_bin, &session.value).await?,
         )),
@@ -597,7 +597,7 @@ fn part_from_v2(part: PartV2) -> Part {
 
 #[derive(Clone, Debug, Default)]
 pub struct SessionSnapshot {
-    pub history: SessionHistory,
+    pub history: std::sync::Arc<SessionHistory>,
     pub tasks: Option<tasks::TaskList>,
     pub decision: Option<decision::Decision>,
     pub permission: Option<permission::Permission>,
@@ -605,6 +605,17 @@ pub struct SessionSnapshot {
 
 /// Fixed diagnostics never include transcript content, IDs, paths, or CLI stderr.
 pub fn read_error_message(error: &anyhow::Error) -> &'static str {
+    if let Some(failure) = error.downcast_ref::<service::ReadFailure>() {
+        return if failure
+            .0
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(|error| error.is_timeout())
+        {
+            "OpenCode local service read timed out; retry later"
+        } else {
+            "OpenCode local service read failed; retry later"
+        };
+    }
     if error.is::<IncompleteExport>()
         || error
             .downcast_ref::<ExportFailed>()
@@ -659,7 +670,7 @@ pub(crate) async fn read_opencode_snapshot(
     }
     let (export, api) = export_with_api(&config.opencode_bin, &session.value).await?;
     Ok(SessionSnapshot {
-        history: history_from_data(&export),
+        history: std::sync::Arc::new(history_from_data(&export)),
         tasks: tasks::from_data(&export),
         decision: if api == EXPORT_V2 {
             decision::read_v2(&config.opencode_bin, &session.value)
@@ -706,7 +717,7 @@ pub async fn read_snapshot(
                     claude::snapshot(&home, &id)?
                 };
                 Ok(SessionSnapshot {
-                    history,
+                    history: std::sync::Arc::new(history),
                     tasks,
                     decision: None,
                     permission: None,

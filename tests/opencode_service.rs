@@ -54,10 +54,13 @@ async fn service_reads_reuse_history_and_never_launch_the_cli() {
     value["opencode_bin"] = "/nonexistent/cli-must-not-run".into();
     let config: BridgeConfig = value.try_into().unwrap();
     let reader = output::service::Reader::default();
-    for _ in 0..2 {
-        let snapshot = reader.read(&config, "ses_fixture").await.unwrap();
-        assert_eq!(snapshot.history.recent_messages[0].text, "Hello");
-    }
+    let first = reader.read(&config, "ses_fixture").await.unwrap();
+    let second = reader.read(&config, "ses_fixture").await.unwrap();
+    assert_eq!(second.history.recent_messages[0].text, "Hello");
+    assert!(
+        Arc::ptr_eq(&first.history, &second.history),
+        "Unchanged histories must share immutable storage"
+    );
     server.join().unwrap();
     let paths = paths.lock().unwrap();
     assert_eq!(
@@ -112,12 +115,10 @@ async fn missing_service_is_retryable_without_cli_fallback() {
         kind: "id".into(),
         value: "ses_fixture".into(),
     };
-    assert!(
-        output::read_history(&config, &session)
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("registration unavailable")
+    let error = output::read_history(&config, &session).await.unwrap_err();
+    assert_eq!(
+        output::read_error_message(&error),
+        "OpenCode local service read failed; retry later"
     );
 }
 
@@ -158,6 +159,20 @@ fn fixture(responses: Vec<(u16, String)>) -> (String, std::thread::JoinHandle<Ve
                     .unwrap()
                     .to_string(),
             );
+            if status == 0 {
+                // Close an accepted request without a response, as during a service restart.
+                // A nonempty body disconnects after only part of the declared response.
+                if !body.is_empty() {
+                    write!(
+                        socket,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len() + 1,
+                        body
+                    )
+                    .unwrap();
+                }
+                continue;
+            }
             if let Err(error) = write!(
                 socket,
                 "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -218,6 +233,90 @@ fn log(seq: u64) -> String {
         "event: message\r\ndata: {}\r\n\r\n",
         json!({"type":"log.synced","aggregateID":"ses_fixture","seq":seq})
     )
+}
+
+#[tokio::test]
+async fn a_transient_service_disconnect_retries_the_same_read_without_cli_fallback() {
+    for interrupted_body in ["", "event: message\ndata: {"] {
+        let root = tempfile::tempdir().unwrap();
+        let (url, server) = fixture(vec![
+            (0, interrupted_body.into()),
+            (200, log(5)),
+            (200, history_page("Recovered reply")),
+            (200, json!({"data":[]}).to_string()),
+            (200, json!({"data":[]}).to_string()),
+        ]);
+        let file = root.path().join("service.json");
+        std::fs::write(&file, json!({"url":url,"pid":1}).to_string()).unwrap();
+        let snapshot = output::service::Reader::default()
+            .read(&config(&file), "ses_fixture")
+            .await
+            .unwrap();
+        assert_eq!(snapshot.history.recent_messages[0].text, "Recovered reply");
+        let paths = server.join().unwrap();
+        assert_eq!(paths.len(), 5);
+        assert_eq!(paths[0], paths[1]);
+    }
+}
+
+#[tokio::test]
+async fn service_http_rejections_are_not_retried_or_reported_as_transcript_failures() {
+    for status in [401, 503] {
+        let root = tempfile::tempdir().unwrap();
+        let (url, server) = fixture(vec![(status, "PRIVATE RESPONSE".into())]);
+        let file = root.path().join("service.json");
+        std::fs::write(&file, json!({"url":url,"pid":1}).to_string()).unwrap();
+        let error = output::service::Reader::default()
+            .read(&config(&file), "ses_fixture")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains(&format!("HTTP {status}")));
+        assert_eq!(
+            output::read_error_message(&error),
+            "OpenCode local service read failed; retry later"
+        );
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn persistent_service_disconnect_is_bounded_and_reports_the_service_not_the_transcript() {
+    let root = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (finished, mut done) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        let mut attempts = 0;
+        loop {
+            tokio::select! {
+                _ = &mut done => return attempts,
+                connection = listener.accept() => {
+                    let (mut socket, _) = connection.unwrap();
+                    let mut request = Vec::new();
+                    while !request.ends_with(b"\r\n\r\n") {
+                        let mut byte = [0];
+                        let read = tokio::io::AsyncReadExt::read(&mut socket, &mut byte).await.unwrap();
+                        if read == 0 { break; }
+                        request.push(byte[0]);
+                    }
+                    attempts += 1;
+                }
+            }
+        }
+    });
+    let file = root.path().join("service.json");
+    std::fs::write(&file, json!({"url":url,"pid":1}).to_string()).unwrap();
+    let error = output::service::Reader::default()
+        .read(&config(&file), "ses_fixture")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        output::read_error_message(&error),
+        "OpenCode local service read failed; retry later"
+    );
+    assert!(!error.to_string().contains("ses_fixture"));
+    finished.send(()).unwrap();
+    assert_eq!(server.await.unwrap(), 2);
 }
 
 fn history_page(text: &str) -> String {

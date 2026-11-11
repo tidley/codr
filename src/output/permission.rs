@@ -12,6 +12,14 @@ pub struct Permission {
     pub announced: bool,
     #[serde(default)]
     pub submitted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card_delivery_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card_message_id: Option<String>,
+    #[serde(default)]
+    pub changed: bool,
+    #[serde(default)]
+    pub confirming: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -33,26 +41,42 @@ impl Permission {
     }
 
     pub fn text(&self) -> String {
-        let resources = self.request["resources"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|resource| resource.as_str().unwrap())
-            .collect::<Vec<_>>()
-            .join("\n");
+        let resources = self.request["resources"].as_array().unwrap();
+        let action = self.request["action"].as_str().unwrap();
+        let mut text = if action == "shell" {
+            if resources.len() == 1 {
+                "**Run this command?**".to_owned()
+            } else {
+                "**Run these commands?**".to_owned()
+            }
+        } else {
+            format!("**Allow `{action}` access?**")
+        };
         let command = self.request["metadata"]["command"]
             .as_str()
-            .map(|command| format!("Command:\n{command}\n"))
-            .unwrap_or_default();
-        let metadata =
-            serde_json::to_string_pretty(&self.request["metadata"]).expect("JSON serializes");
-        format!(
-            "Permission [{}] — {}\n```text\n{command}Resources:\n{resources}\nMetadata:\n{metadata}\n```\n/allow {}\n/reject {}",
-            self.token(),
-            self.request["action"].as_str().unwrap(),
-            self.token(),
-            self.token()
-        )
+            .filter(|command| !command.is_empty());
+        let resource_text: Vec<_> = resources
+            .iter()
+            .map(|resource| resource.as_str().unwrap())
+            .collect();
+        let mut body = String::new();
+        if let Some(command) = command.filter(|command| *command != resource_text.join("\n")) {
+            body.push_str(&format!("Command:\n{command}\n\nRequested access:\n"));
+        }
+        body.push_str(&resource_text.join("\n"));
+        text.push_str(&format!("\n\n```text\n{body}\n```"));
+        let mut details = self.request["metadata"].clone();
+        if command.is_some()
+            && let Some(fields) = details.as_object_mut()
+        {
+            fields.remove("command");
+        }
+        if !details.is_null() && details.as_object().is_none_or(|fields| !fields.is_empty()) {
+            let details = serde_json::to_string_pretty(&details).expect("JSON serializes");
+            text.push_str(&format!("\n\n**Details**\n\n```json\n{details}\n```"));
+        }
+        text.push_str("\n\nSend a normal message:\n\n1. Allow once\n2. Deny\n\nSaved permissions stay unchanged.");
+        text
     }
 }
 
@@ -144,6 +168,10 @@ pub fn from_response(value: &Value, session: &str) -> Result<Option<Permission>>
         request: request.clone(),
         announced: false,
         submitted: false,
+        card_delivery_id: None,
+        card_message_id: None,
+        changed: false,
+        confirming: false,
     }))
 }
 
@@ -155,10 +183,12 @@ pub fn is_reply(text: &str, active: bool) -> bool {
         .unwrap_or("")
         .to_ascii_lowercase();
     matches!(first.as_str(), "/allow" | "/reject" | "/allow-always")
-        || ["allow once", "always allow", "reject"]
+        || ["allow", "allow once", "always allow", "deny", "reject"]
             .iter()
             .any(|label| text.eq_ignore_ascii_case(label))
-        || (active && !text.is_empty() && text.bytes().all(|c| c.is_ascii_digit()))
+        || (active
+            && ((!text.is_empty() && text.bytes().all(|c| c.is_ascii_digit()))
+                || text.eq_ignore_ascii_case("confirm")))
 }
 
 pub fn parse_reply(text: &str) -> Option<(Reply, &str)> {
@@ -174,6 +204,15 @@ pub fn parse_reply(text: &str) -> Option<(Reply, &str)> {
         return None;
     };
     Some((reply, words[1]))
+}
+
+/// Code-free choices apply only to the freshly verified, current permission request.
+pub fn parse_card_reply(text: &str) -> Option<Reply> {
+    match text.trim().to_ascii_lowercase().as_str() {
+        "1" | "allow" | "allow once" | "/allow" | "confirm" => Some(Reply::Once),
+        "2" | "deny" | "reject" | "/reject" => Some(Reply::Reject),
+        _ => None,
+    }
 }
 
 pub async fn read(bin: &Path, session: &str) -> Result<Option<Permission>> {

@@ -14,14 +14,18 @@ The current setup code uses **👾** as the public name and display name when it
 - `/new` guides you through workspace, folder, installed agent, and model selection. Reply with numbers, use `0` to cancel, and type the repository folder name to confirm the final preview. The destination workspace is shown separately.
 - Choose the default model or browse a provider's full model list. OpenCode uses its authenticated model catalogue; variants are selected separately. `/agent` opens a separate chat without moving old history.
 - Supported OpenCode questions accept a number or option label as a reply. V2 questions with custom input also accept text answers, such as a version number.
+- For OpenCode V2 permission cards, send `1` to allow once or `2` to deny as a normal chat message. No quoted reply or approval code is needed.
+- OpenCode V2 multi-part forms show one question at a time. Saved answers survive restart; the final answer submits the complete form together.
 - New groups make your configured account an admin, so you can invite participants and rename the group. Only the owner can prompt the agent. [Group setup](docs/REFERENCE.md#shared-chats-and-owner-only-control)
 - In automatic sync mode, local prompts mute all chats and an owner phone message resumes them. `/sync on` or `/sync off` keeps your explicit choice across restarts; `/unmute` restores automatic mode.
+- Phone history commands collect in the background without holding the worker's
+  input loop. Pending requests survive restart and reuse the native history cache.
 
 ## Install
 
-**0.11.1 targets existing accounts.** Fresh accounts use the
+**0.11.2 targets existing accounts.** Fresh accounts use the
 supported 0.9.0 setup below, then the owner-confirmed chat handover. See the
-[0.11.1 release notes](docs/releases/0.11.1.md) and
+[0.11.2 release notes](docs/releases/0.11.2.md) and
 [combined runtime/handover guide](docs/COMBINED.md).
 
 Needs Linux x86_64 or aarch64 or macOS on Apple silicon or Intel, a per-user service manager (systemd or launchd), Python 3.11+, Git, and **herdr** 0.9.1+. No Rust toolchain required.
@@ -39,7 +43,28 @@ Or give your coding agent this prompt, with your own public key:
 
 [Full installation and upgrade guide →](docs/INSTALL.md)
 
-### New in 0.11.1
+### New in 0.11.2
+
+- Phone permission cards accept ordinary `1` or `2` replies for allow-once or
+  deny. Scrolling command blocks remain, without approval codes or quoted replies.
+- OpenCode V2 multi-part questions save each answer across restarts and submit
+  the complete form after the final part.
+- `/recent` sends conversations oldest-first with five seconds between confirmed
+  conversation batches. Live replies do not wait for catch-up.
+- `/last` and `/recent` use shared native readers and collect in the background.
+  Their pending requests survive restarts without holding phone input dispatch.
+- Unchanged state no longer causes repeated writes, syncs or JSON encoding.
+  Cached forwarding controls, targeted read completion and shared histories reduce
+  repeated reads, copies and session scans.
+- Background recovery uses bounded payload storage and retry backoff. Full-history
+  scans still recover unseen older messages without pruning receipts.
+- Late native acceptance clears stale delivery warnings. Interrupted OpenCode
+  service reads retry once, without retrying submissions or replacing the server.
+
+See the [release notes](docs/releases/0.11.2.md) for measurements, verification
+limits, upgrade guidance and contributor credits.
+
+### Retained from 0.11.1
 
 - Clear status labels use `Request submitted...` and `Working...` for progress,
   then `Done.` for completion. Acceptance checks and safety warnings remain.
@@ -125,7 +150,7 @@ retained. See the release notes for contributor credits and scope.
 | `/help` | Show commands and the current sync mode. |
 | `/update` | Check stable ngit releases. Confirm an application update or the separate 0.9-to-combined service handover. |
 | `/status` | Show connection, state and pending deliveries; resume sync in automatic mode. |
-| `/recent [hours]` | Get the newest three text messages from each chat active in the past hour, or the specified number of hours. `/recent2` and `/recent 2` are equivalent. Skip messages already delivered or pending. |
+| `/recent [hours]` | Get the newest three text messages from each chat active in the past hour, or the specified number of hours. `/recent2` and `/recent 2` are equivalent. Send conversations oldest-first, with five seconds between confirmed batches. Skip messages already delivered or pending. |
 | `/last [count]` | Replay the newest message in this chat without unmuting. `/last4` and `/last 4` replay four messages, including already delivered text. Count: 1–100. |
 | `/new` | Set up a project, with a final name confirmation. |
 | `/agent` | Choose an agent in a separate session and chat. |

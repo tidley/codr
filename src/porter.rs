@@ -27,6 +27,9 @@ static WATCH_SLOTS: LazyLock<Arc<tokio::sync::Semaphore>> =
 
 /// Invalidate desktops only when their session/queue projection changes.
 pub fn publish(bridge: &Bridge) {
+    if bridge.porter_updates.receiver_count() == 0 {
+        return;
+    }
     let (metadata, forwarding) = snapshot_metadata(bridge);
     let value = json!({"agents":bridge.last_snapshot, "metadata":metadata,
         "forwarding":forwarding, "available":bridge.herdr_available});
@@ -179,8 +182,9 @@ pub async fn serve(bridge: &mut Bridge, stream: UnixStream) -> Result<()> {
     if request["method"] == "watch" {
         ensure!(request["version"] == 1, "Unsupported desktop version");
         let permit = WATCH_SLOTS.clone().try_acquire_owned()?;
-        publish(bridge);
         let mut updates = bridge.porter_updates.subscribe();
+        publish(bridge);
+        updates.borrow_and_update();
         tokio::spawn(async move {
             let _permit = permit;
             let result: Result<()> = async {
@@ -218,10 +222,11 @@ pub async fn serve(bridge: &mut Bridge, stream: UnixStream) -> Result<()> {
     if request["method"] == "history" {
         let permit = READ_SLOTS.clone().try_acquire_owned()?;
         let config = bridge.config.clone();
+        let reader = bridge.native_reader();
         // Slow native transcript I/O must not hold the phone/queue event loop.
         tokio::spawn(async move {
             let _permit = permit;
-            let result = history(&config, &request).await;
+            let result = history(&config, &request, reader).await;
             let _ = reply(&mut stream, &request, result).await;
         });
         return Ok(());
@@ -269,7 +274,7 @@ pub async fn handle(bridge: &mut Bridge, request: Value) -> Result<Value> {
         );
     }
     if method == "history" {
-        return history(&bridge.config, &request).await;
+        return history(&bridge.config, &request, bridge.native_reader()).await;
     }
     if method == "snapshot" {
         let (metadata, forwarding) = snapshot_metadata(bridge);
@@ -404,7 +409,11 @@ async fn snapshot(
         "forwarding_enabled":control.enabled && forwarding, "sessions":sessions}))
 }
 
-async fn history(config: &crate::BridgeConfig, request: &Value) -> Result<Value> {
+async fn history(
+    config: &crate::BridgeConfig,
+    request: &Value,
+    reader: crate::reads::Reader,
+) -> Result<Value> {
     ensure!(request["version"] == 1, "Unsupported Porter version");
     ensure!(
         request["bridge_account"] == config.account_id_hex,
@@ -426,7 +435,7 @@ async fn history(config: &crate::BridgeConfig, request: &Value) -> Result<Value>
         .as_ref()
         .filter(|session| output::supported(&session.agent))
         .ok_or_else(|| anyhow::anyhow!("Unsupported session reader"))?;
-    let history = output::read_history(config, session).await?;
+    let history = reader.read(config, session).await?.history;
     // Recheck after slow transcript I/O; never attribute history to a replaced terminal.
     herdr::get(&socket, agent).await?;
     let messages: Vec<_> = history.recent_messages.iter().map(|message| {
@@ -435,4 +444,26 @@ async fn history(config: &crate::BridgeConfig, request: &Value) -> Result<Value>
         json!({"id":message.id,"speaker":message.speaker,"text":&message.text[..end],"truncated":end < message.text.len()})
     }).collect();
     Ok(json!({"session_key":key,"messages":messages}))
+}
+
+#[cfg(test)]
+mod projection_tests {
+    use super::*;
+    use bech32::ToBase32;
+
+    #[test]
+    fn desktop_projection_is_lazy_until_a_subscriber_exists() {
+        let root = tempfile::tempdir().unwrap();
+        let config: BridgeConfig = serde_json::from_value(json!({
+            "phone_npub": bech32::encode("npub", [0x11u8; 32].to_base32(), bech32::Variant::Bech32).unwrap(),
+            "account_id_hex": "aa".repeat(32), "herdr_socket":root.path().join("h.sock"),
+            "wn_agent_socket":root.path().join("w.sock"), "state_path":root.path().join("state.json")
+        })).unwrap();
+        let bridge = Bridge::open(config).unwrap();
+        publish(&bridge);
+        assert!(bridge.porter_updates.borrow().is_null());
+        let _subscriber = bridge.porter_updates.subscribe();
+        publish(&bridge);
+        assert!(bridge.porter_updates.borrow().is_object());
+    }
 }
