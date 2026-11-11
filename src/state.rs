@@ -5,8 +5,9 @@ use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::Write,
-    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
-    path::Path,
+    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+    path::{Path, PathBuf},
+    sync::Mutex,
 };
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -74,7 +75,8 @@ pub struct Mapping {
     /// A new identity appeared on an established terminal. No routing until confirmed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_change_from: Option<String>,
-    #[serde(default)]
+    /// Runtime polling clock; a restart can safely refresh history sooner.
+    #[serde(default, skip_serializing)]
     pub last_export_at: u64,
     /// Local observation time of a new final reply, not baseline history.
     #[serde(default)]
@@ -96,7 +98,8 @@ pub struct Mapping {
     pub muted_turns: Vec<String>,
     #[serde(default)]
     pub decision: Option<crate::output::decision::Decision>,
-    #[serde(default)]
+    /// Runtime polling clock, not a durable decision or acceptance checkpoint.
+    #[serde(default, skip_serializing)]
     pub decision_checked_at: u64,
     #[serde(default)]
     pub decision_refresh_pending: bool,
@@ -113,6 +116,12 @@ pub struct Mapping {
     pub permission: Option<crate::output::permission::Permission>,
     #[serde(default)]
     pub permission_attempts: Vec<String>,
+    /// Previously confirmed permission cards remain identifiable after the request ends.
+    #[serde(default)]
+    pub permission_card_ids: Vec<String>,
+    /// Unconfirmed card sends may already be visible after a lost acknowledgement.
+    #[serde(default)]
+    pub permission_card_deliveries: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch: Option<crate::launch::Request>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -158,6 +167,12 @@ pub struct Outgoing {
     /// An explicit owner command may reply once even while automatic forwarding is muted.
     #[serde(default)]
     pub manual: bool,
+    /// Owner-requested catch-up; serialized in outbox order across conversations.
+    #[serde(default)]
+    pub recent: bool,
+    /// Preserve permission-card provenance even if the current request changes before send.
+    #[serde(default)]
+    pub permission_card: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<SourceDelivery>,
 }
@@ -173,6 +188,9 @@ pub struct BridgeState {
     /// Edits and incoming phone commands do not advance it.
     #[serde(default)]
     pub last_confirmed_send_at: Option<u64>,
+    /// Earliest Unix millisecond for the next catch-up conversation after confirmation.
+    #[serde(default)]
+    pub recent_after: i64,
     /// Per-group source messages confirmed after every chunk in their batch was sent.
     #[serde(default)]
     pub delivered_messages: BTreeMap<String, Vec<String>>,
@@ -190,6 +208,9 @@ pub struct BridgeState {
     pub media_pending: Vec<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update_job: Option<crate::update::Job>,
+    /// Authorized read-only commands waiting for collection and serial delivery.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history_requests: Vec<crate::history::Request>,
 }
 
 fn forwarding_default() -> bool {
@@ -205,6 +226,7 @@ impl Default for BridgeState {
             mappings: BTreeMap::new(),
             outbox: vec![],
             last_confirmed_send_at: None,
+            recent_after: 0,
             delivered_messages: BTreeMap::new(),
             pending_chat_agents: BTreeMap::new(),
             forwarding_enabled: true,
@@ -212,6 +234,7 @@ impl Default for BridgeState {
             forwarding_resume_pending: false,
             media_pending: vec![],
             update_job: None,
+            history_requests: Vec::new(),
         }
     }
 }
@@ -368,6 +391,8 @@ impl BridgeState {
                 attachments,
                 response: None,
                 manual: false,
+                recent: false,
+                permission_card: false,
                 source: Some(source),
             });
         }
@@ -393,6 +418,8 @@ impl BridgeState {
                 attachments: vec![],
                 response: None,
                 manual: request.is_some(),
+                recent: false,
+                permission_card: false,
                 source: None,
             });
             rest = &rest[end..];
@@ -420,6 +447,8 @@ impl BridgeState {
             attachments: vec![],
             response: Some(ResponseDelivery::default()),
             manual: false,
+            recent: false,
+            permission_card: false,
             source: None,
         });
         self.mappings.get_mut(key).unwrap().response_id = Some(id);
@@ -475,6 +504,8 @@ impl BridgeState {
                 ..ResponseDelivery::default()
             }),
             manual: false,
+            recent: false,
+            permission_card: false,
             source: None,
         });
         Some(id)
@@ -583,7 +614,69 @@ pub(crate) fn lock_file(path: &Path) -> Result<File> {
     Ok(file)
 }
 
+struct SavedState {
+    path: PathBuf,
+    state: BridgeState,
+    metadata: fs::Metadata,
+}
+
+/// The worker holds the state lock; other processes only read this file.
+#[derive(Default)]
+pub(crate) struct Writer {
+    saved: Mutex<Option<SavedState>>,
+}
+
+impl Writer {
+    pub fn save(&self, path: &Path, state: &BridgeState) -> Result<bool> {
+        let mut saved = self
+            .saved
+            .lock()
+            .map_err(|_| anyhow::anyhow!("State writer lock failed"))?;
+        if saved.as_mut().is_some_and(|saved| {
+            // Polling clocks are deliberately not part of the persisted state.
+            for (key, mapping) in &mut saved.state.mappings {
+                if let Some(current) = state.mappings.get(key) {
+                    mapping.last_export_at = current.last_export_at;
+                    mapping.decision_checked_at = current.decision_checked_at;
+                }
+            }
+            saved.path == path
+                && saved.state == *state
+                && fs::symlink_metadata(path)
+                    .is_ok_and(|metadata| same_file(&metadata, &saved.metadata))
+        }) {
+            return Ok(false);
+        }
+        // Even a failure after rename can change disk state. Never reuse an
+        // older cache entry when the caller rolls back an unsuccessful change.
+        *saved = None;
+        let bytes = serde_json::to_vec(state)?;
+        save_bytes(path, &bytes)?;
+        *saved = Some(SavedState {
+            path: path.to_owned(),
+            state: state.clone(),
+            metadata: fs::symlink_metadata(path)?,
+        });
+        Ok(true)
+    }
+}
+
+pub(crate) fn same_file(a: &fs::Metadata, b: &fs::Metadata) -> bool {
+    a.is_file()
+        && a.dev() == b.dev()
+        && a.ino() == b.ino()
+        && a.len() == b.len()
+        && a.mtime() == b.mtime()
+        && a.mtime_nsec() == b.mtime_nsec()
+        && a.ctime() == b.ctime()
+        && a.ctime_nsec() == b.ctime_nsec()
+}
+
 pub(crate) fn save_json(path: &Path, value: &impl Serialize) -> Result<()> {
+    save_bytes(path, &serde_json::to_vec(value)?)
+}
+
+fn save_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -595,9 +688,48 @@ pub(crate) fn save_json(path: &Path, value: &impl Serialize) -> Result<()> {
     let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
     tmp.as_file()
         .set_permissions(fs::Permissions::from_mode(0o600))?;
-    tmp.write_all(&serde_json::to_vec(value)?)?;
+    tmp.write_all(bytes)?;
     tmp.as_file().sync_all()?;
     tmp.persist(path)?;
     File::open(parent)?.sync_all()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod writer_tests {
+    use super::*;
+
+    #[test]
+    fn typed_save_cache_ignores_only_runtime_clocks_and_retries_errors() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("state.json");
+        let writer = Writer::default();
+        let mut state = BridgeState::with_mapping("session", "group".into());
+        assert!(writer.save(&path, &state).unwrap());
+        assert!(!writer.save(&path, &state).unwrap());
+        state.mappings.get_mut("session").unwrap().last_export_at = 20;
+        state
+            .mappings
+            .get_mut("session")
+            .unwrap()
+            .decision_checked_at = 30;
+        assert!(!writer.save(&path, &state).unwrap());
+        state
+            .mappings
+            .get_mut("session")
+            .unwrap()
+            .manual_reply_after = 40;
+        assert!(writer.save(&path, &state).unwrap());
+        assert_eq!(
+            BridgeState::load(&path).unwrap().mappings["session"].manual_reply_after,
+            40
+        );
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        state.enqueue("group", "reply");
+        assert!(writer.save(&path, &state).is_err());
+        fs::remove_dir(&path).unwrap();
+        assert!(writer.save(&path, &state).unwrap());
+        assert_eq!(BridgeState::load(&path).unwrap().outbox[0].text, "reply");
+    }
 }

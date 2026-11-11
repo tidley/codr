@@ -74,6 +74,67 @@ fn permission_card_displays_literal_command_metadata_and_all_resources() {
     assert!(text.contains("```text\n"));
     assert!(text.contains("git commit *"));
     assert!(text.contains("git commit -m '[safe](actual text)'\nprintf done"));
+    assert!(text.contains("Requested access:"));
+}
+
+#[test]
+fn phone_permission_card_has_clear_actions_without_empty_metadata_or_repeated_ids() {
+    let mut request = request();
+    let long_command = format!("git diff -- {}", "src/long-directory-name/".repeat(5));
+    request["resources"] = json!([long_command, "git remote -v"]);
+    request["metadata"] = Value::Null;
+    let permission = permission::from_response(&json!({"data":[request]}), "ses_fixture")
+        .unwrap()
+        .unwrap();
+    let text = permission.text();
+    assert!(text.starts_with("**Run these commands?**\n\n"));
+    assert!(
+        text.contains(&long_command),
+        "Show the entire command without truncation"
+    );
+    assert!(text.contains("```text\n"));
+    assert!(!text.contains("Metadata"));
+    assert!(!text.contains("Resources:"));
+    assert!(!text.contains("null"));
+    assert!(!text.contains("Permission ["));
+    assert!(!text.contains(&permission.token()));
+    assert!(text.contains("Send a normal message"));
+    assert!(!text.contains("Reply to this message"));
+    assert!(text.contains("1. Allow once"));
+    assert!(text.contains("2. Deny"));
+    assert!(text.contains("Saved permissions stay unchanged."));
+}
+
+#[test]
+fn phone_permission_card_deduplicates_commands_but_preserves_other_details() {
+    let mut request = request();
+    request["metadata"]["cwd"] = json!("/workspace/review");
+    request["metadata"]["note"] = json!("[keep this literal](not-a-link)");
+    let permission = permission::from_response(&json!({"data":[request]}), "ses_fixture")
+        .unwrap()
+        .unwrap();
+    let text = permission.text();
+    assert!(text.starts_with("**Run this command?**"));
+    assert_eq!(text.matches("git commit -m 'Fix bug'").count(), 1);
+    assert!(text.contains("**Details**"));
+    assert!(text.contains("/workspace/review"));
+    assert!(text.contains("[keep this literal](not-a-link)"));
+}
+
+#[test]
+fn phone_permission_commands_preserve_quoted_boundary_whitespace() {
+    for line in [" middle ", " middle", "middle ", "   "] {
+        let mut request = request();
+        request["resources"] = json!([format!("printf '%s' 'first\n{line}\nlast'")]);
+        request["metadata"] = Value::Null;
+        let permission = permission::from_response(&json!({"data":[request]}), "ses_fixture")
+            .unwrap()
+            .unwrap();
+        assert!(
+            permission.text().contains(&format!("\n{line}\n")),
+            "Whitespace changed for {line:?}"
+        );
+    }
 }
 
 #[test]
@@ -100,4 +161,23 @@ fn only_explicit_once_and_reject_with_one_code_are_parsed() {
     }
     assert!(permission::is_reply("2", true));
     assert!(!permission::is_reply("Do the next task", true));
+}
+
+#[test]
+fn code_free_card_choices_are_limited_to_once_or_deny() {
+    for text in ["1", "Allow once", " /ALLOW "] {
+        assert!(matches!(
+            permission::parse_card_reply(text),
+            Some(Reply::Once)
+        ));
+    }
+    for text in ["2", "Deny", "/reject"] {
+        assert!(matches!(
+            permission::parse_card_reply(text),
+            Some(Reply::Reject)
+        ));
+    }
+    for text in ["3", "Always allow", "/allow-always", "1 and then 2", "yes"] {
+        assert!(permission::parse_card_reply(text).is_none());
+    }
 }

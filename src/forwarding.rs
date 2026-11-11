@@ -3,7 +3,9 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
+    io::Read,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,6 +59,53 @@ pub fn load(state_path: &Path) -> Result<Forwarding> {
         Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Forwarding::default()),
         Err(error) => Err(error.into()),
+    }
+}
+
+type CachedControl = (PathBuf, fs::Metadata, Arc<Forwarding>);
+
+/// Worker-local cache. Locked mutations below always read fresh data.
+#[derive(Default)]
+pub(crate) struct Reader(Mutex<Option<CachedControl>>);
+
+impl Reader {
+    pub fn load(&self, state_path: &Path) -> Result<Arc<Forwarding>> {
+        let path = path(state_path);
+        let mut cached = self
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Control reader lock failed"))?;
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                *cached = None;
+                return if error.kind() == std::io::ErrorKind::NotFound {
+                    Ok(Arc::new(Forwarding::default()))
+                } else {
+                    Err(error.into())
+                };
+            }
+        };
+        if let Some((old_path, old, value)) = cached.as_ref()
+            && old_path == &path
+            && crate::state::same_file(&metadata, old)
+        {
+            return Ok(value.clone());
+        }
+        *cached = None;
+        let mut file = fs::File::open(&path)?;
+        let before = file.metadata()?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        let after = file.metadata()?;
+        anyhow::ensure!(
+            crate::state::same_file(&before, &after)
+                && crate::state::same_file(&after, &fs::metadata(&path)?),
+            "Forwarding controls changed during read; retry"
+        );
+        let value: Arc<Forwarding> = Arc::new(serde_json::from_slice(&bytes)?);
+        *cached = Some((path, after, value.clone()));
+        Ok(value)
     }
 }
 
@@ -121,4 +170,44 @@ pub fn set_mode(state_path: &Path, mode: Mode) -> Result<Forwarding> {
         control.enabled = enabled;
         changed
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn cached_controls_reuse_unchanged_reads_and_observe_atomic_updates() {
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("state.json");
+        set_mode(&state, Mode::On).unwrap();
+        let reader = Reader::default();
+        let first = reader.load(&state).unwrap();
+        assert!(Arc::ptr_eq(&first, &reader.load(&state).unwrap()));
+        // Wake receipts can change without a mode/revision change.
+        wake(&state, "group", "receipt").unwrap();
+        let updated = reader.load(&state).unwrap();
+        assert_eq!(first.revision, updated.revision);
+        assert_eq!(updated.wake_messages.len(), 1);
+        assert!(!Arc::ptr_eq(&first, &updated));
+        set_mode(&state, Mode::Off).unwrap();
+        assert!(!reader.load(&state).unwrap().enabled);
+    }
+
+    #[test]
+    fn cached_controls_never_hide_corruption_deletion_or_recreation() {
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("state.json");
+        set_mode(&state, Mode::Off).unwrap();
+        let reader = Reader::default();
+        assert!(!reader.load(&state).unwrap().enabled);
+        fs::write(path(&state), b"bad").unwrap();
+        assert!(reader.load(&state).is_err());
+        assert!(reader.load(&state).is_err());
+        fs::remove_file(path(&state)).unwrap();
+        assert_eq!(reader.load(&state).unwrap().revision, "initial");
+        set_mode(&state, Mode::Off).unwrap();
+        assert!(!reader.load(&state).unwrap().enabled);
+    }
 }

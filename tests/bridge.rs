@@ -49,6 +49,274 @@ fn inbound(sender: &str, id: &str) -> Value {
     json!({"marmot_agent_control":"marmot.agent-control.v2","type":"inbound_message","account_id_hex":"aa".repeat(32),"group_id_hex":"bb".repeat(16),"message":{"message_id_hex":id,"sender":{"account_id_hex":sender},"text":"test prompt","recorded_at":u64::MAX}})
 }
 
+#[test]
+fn state_save_skips_unchanged_snapshots_but_persists_delivery_changes_immediately() {
+    use std::os::unix::fs::MetadataExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let config = config(root.path());
+    let mut bridge = Bridge::open(config.clone()).unwrap();
+    for n in 0..36 {
+        bridge.state.mappings.insert(
+            format!("session-{n}"),
+            Mapping {
+                seen_messages: vec!["x".repeat(150); 128],
+                ..Mapping::default()
+            },
+        );
+    }
+    bridge.save().unwrap();
+    // Hold the old inode open so a replacement cannot reuse its number.
+    let saved = std::fs::File::open(&config.state_path).unwrap();
+    let before = saved.metadata().unwrap();
+    for _ in 0..100 {
+        bridge.save().unwrap();
+        assert_eq!(
+            std::fs::metadata(&config.state_path).unwrap().ino(),
+            before.ino(),
+            "An unchanged snapshot must not replace or sync the state file"
+        );
+    }
+    bridge.state.enqueue("group", "durable reply");
+    bridge.save().unwrap();
+    let after = std::fs::metadata(&config.state_path).unwrap();
+    assert_ne!(before.ino(), after.ino());
+    assert_eq!(after.permissions().mode() & 0o777, 0o600);
+    assert_eq!(BridgeState::load(&config.state_path).unwrap(), bridge.state);
+    drop(bridge);
+    let restored = Bridge::open(config).unwrap();
+    assert_eq!(restored.state.outbox[0].text, "durable reply");
+}
+
+#[test]
+fn state_save_does_not_persist_polling_clocks() {
+    use std::os::unix::fs::MetadataExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let config = config(root.path());
+    let mut bridge = Bridge::open(config.clone()).unwrap();
+    bridge
+        .state
+        .mappings
+        .insert("session".into(), Mapping::default());
+    bridge.save().unwrap();
+    let saved = std::fs::File::open(&config.state_path).unwrap();
+    let before = saved.metadata().unwrap();
+    let mapping = bridge.state.mappings.get_mut("session").unwrap();
+    mapping.last_export_at = 123;
+    mapping.decision_checked_at = 456;
+    bridge.save().unwrap();
+    assert_eq!(
+        std::fs::metadata(&config.state_path).unwrap().ino(),
+        before.ino()
+    );
+    let persisted: Value =
+        serde_json::from_slice(&std::fs::read(&config.state_path).unwrap()).unwrap();
+    assert!(
+        persisted["mappings"]["session"]
+            .get("last_export_at")
+            .is_none()
+    );
+    assert!(
+        persisted["mappings"]["session"]
+            .get("decision_checked_at")
+            .is_none()
+    );
+    // A legacy file still loads; the next restart can safely poll sooner.
+    let mut legacy = persisted;
+    legacy["mappings"]["session"]["last_export_at"] = json!(123);
+    legacy["mappings"]["session"]["decision_checked_at"] = json!(456);
+    let state: BridgeState = serde_json::from_value(legacy).unwrap();
+    assert_eq!(state.mappings["session"].last_export_at, 123);
+    assert_eq!(state.mappings["session"].decision_checked_at, 456);
+    let restored = Bridge::open(config).unwrap();
+    assert_eq!(restored.state.mappings["session"].last_export_at, 0);
+    assert_eq!(restored.state.mappings["session"].decision_checked_at, 0);
+}
+
+#[test]
+fn state_save_repairs_missing_or_replaced_files_and_tracks_the_destination() {
+    let root = tempfile::tempdir().unwrap();
+    let config = config(root.path());
+    let mut bridge = Bridge::open(config.clone()).unwrap();
+    let saved = std::fs::File::open(&config.state_path).unwrap();
+    std::fs::remove_file(&config.state_path).unwrap();
+    bridge.save().unwrap();
+    assert_eq!(BridgeState::load(&config.state_path).unwrap(), bridge.state);
+    // Same-inode edits also invalidate the saved-file observation.
+    std::fs::write(&config.state_path, b"invalid state").unwrap();
+    bridge.save().unwrap();
+    assert_eq!(BridgeState::load(&config.state_path).unwrap(), bridge.state);
+    bridge.config.state_path = root.path().join("other.json");
+    bridge.save().unwrap();
+    assert_eq!(
+        BridgeState::load(&bridge.config.state_path).unwrap(),
+        bridge.state
+    );
+    drop(saved);
+}
+
+#[test]
+fn state_save_retries_failed_changes_and_can_restore_an_earlier_snapshot() {
+    let root = tempfile::tempdir().unwrap();
+    let config = config(root.path());
+    let mut bridge = Bridge::open(config.clone()).unwrap();
+    let previous = bridge.state.clone();
+    std::fs::remove_file(&config.state_path).unwrap();
+    std::fs::create_dir(&config.state_path).unwrap();
+    bridge.state.enqueue("group", "must survive retry");
+    assert!(bridge.save().is_err());
+    std::fs::remove_dir(&config.state_path).unwrap();
+    bridge.save().unwrap();
+    assert_eq!(BridgeState::load(&config.state_path).unwrap(), bridge.state);
+    bridge.state = previous;
+    bridge.save().unwrap();
+    assert_eq!(BridgeState::load(&config.state_path).unwrap(), bridge.state);
+}
+
+#[tokio::test]
+async fn background_recovery_does_not_hold_dispatch_or_spin_after_failures() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let root = tempfile::tempdir().unwrap();
+    let config = config(root.path());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    let listener = UnixListener::bind(&config.wn_agent_socket).unwrap();
+    let server = tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = tokio::io::BufReader::new(stream);
+            let request = read_line(&mut reader).await.unwrap();
+            count.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let response = json!({"id":request["id"],"marmot_agent_control":"marmot.agent-control.v2","type":"error","code":"fixture_error"});
+            reader
+                .get_mut()
+                .write_all(format!("{response}\n").as_bytes())
+                .await
+                .unwrap();
+        }
+    });
+    let agent = agent();
+    let mut bridge = mapped_bridge(config, &agent);
+    bridge.poll_sessions(vec![agent]).await.unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        bridge.recover_inbound(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    for _ in 0..60 {
+        bridge.process_recovery().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "Failed recovery must back off despite frequent loop events"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn background_last_collection_is_durable_and_does_not_hold_dispatch() {
+    let root = tempfile::tempdir().unwrap();
+    let config = config(root.path());
+    export_script(&config.opencode_bin, "history reply", "reply");
+    let script = std::fs::read_to_string(&config.opencode_bin).unwrap();
+    std::fs::write(
+        &config.opencode_bin,
+        script.replacen("#!/bin/sh\n", "#!/bin/sh\nsleep 0.3\n", 1),
+    )
+    .unwrap();
+    let agent = agent();
+    let mut bridge = mapped_bridge(config.clone(), &agent);
+    bridge.poll_sessions(vec![agent.clone()]).await.unwrap();
+    let mut event = inbound(HEX, "background-last");
+    event["message"]["text"] = json!("/last");
+    tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        bridge.inbound(&event),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        BridgeState::load(&config.state_path)
+            .unwrap()
+            .history_requests
+            .len(),
+        1
+    );
+    drop(bridge);
+    let mut bridge = Bridge::open(config.clone()).unwrap();
+    bridge.poll_sessions(vec![agent]).await.unwrap();
+    let durable = std::fs::read(&config.state_path).unwrap();
+    std::fs::remove_file(&config.state_path).unwrap();
+    std::fs::create_dir(&config.state_path).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if bridge.process_history_requests().await.is_err() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(bridge.state.history_requests.len(), 1);
+    assert!(
+        !bridge
+            .state
+            .mappings
+            .values()
+            .any(|m| m.seen_messages.contains(&"background-last".into()))
+    );
+    std::fs::remove_dir(&config.state_path).unwrap();
+    std::fs::write(&config.state_path, durable).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !bridge.state.history_requests.is_empty() {
+            bridge.process_history_requests().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        bridge
+            .state
+            .outbox
+            .iter()
+            .any(|item| item.text.contains("history reply"))
+    );
+    assert_eq!(
+        bridge
+            .state
+            .mappings
+            .values()
+            .flat_map(|m| &m.seen_messages)
+            .filter(|id| *id == "background-last")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn reader_completion_without_a_result_does_not_reconcile_unrelated_sessions() {
+    let root = tempfile::tempdir().unwrap();
+    let config = config(root.path());
+    let agent = agent();
+    let key = agent.key();
+    let mut bridge = mapped_bridge(config, &agent);
+    bridge.agents.insert(key.clone(), agent);
+    bridge.herdr_available = true;
+    let before = bridge.state.clone();
+    bridge.poll_ready_sessions().await.unwrap();
+    assert!(bridge.agents.contains_key(&key));
+    assert_eq!(before, bridge.state);
+}
+
 #[tokio::test]
 async fn missing_transcript_cannot_hide_uncertain_delivery_or_consume_prepared_work() {
     let root = tempfile::tempdir().unwrap();
@@ -182,6 +450,7 @@ async fn terminal_ack_without_native_input_warns_once_and_never_retries_after_re
             .iter()
             .any(|item| item.text.contains("No new prompt was sent"))
     );
+    bridge.flush().await.unwrap();
     input_history(
         &config,
         "ses_1",
@@ -194,6 +463,12 @@ async fn terminal_ack_without_native_input_warns_once_and_never_retries_after_re
         "Late native evidence releases the safety latch"
     );
     assert!(bridge.state.mappings[&key].queue_flight.is_none());
+    assert_eq!(bridge.state.outbox.iter().filter(|item| item.text == "The agent has now received your earlier message. This chat's delivery pause is cleared.").count(), 1);
+    bridge.save().unwrap();
+    drop(bridge);
+    let mut bridge = Bridge::open(config.clone()).unwrap();
+    bridge.reconcile(vec![self::agent()]).await.unwrap();
+    assert_eq!(bridge.state.outbox.iter().filter(|item| item.text == "The agent has now received your earlier message. This chat's delivery pause is cleared.").count(), 1);
     bridge
         .inbound(&inbound(HEX, "after-late-acceptance"))
         .await
@@ -721,6 +996,125 @@ async fn cancel_and_sync_mode_controls_reject_foreign_truncated_or_attached_inpu
             .enabled
     );
     server.abort();
+}
+
+#[tokio::test]
+async fn late_acceptance_keeps_other_uncertain_messages_paused_and_replaces_pending_warnings() {
+    for queued_warning in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let config = editable_config(root.path());
+        input_history(
+            &config,
+            "ses_1",
+            &[("native-first", "first")],
+            Some(("final", "Done")),
+        );
+        let observed = agent();
+        let key = observed.key();
+        let mut bridge = mapped_bridge(config, &observed);
+        let group = bridge.state.mappings[&key].group_id_hex.clone().unwrap();
+        let submissions = &mut bridge.state.mappings.get_mut(&key).unwrap().submissions;
+        for (receipt, text) in [("first-receipt", "first"), ("second-receipt", "second")] {
+            let mut submission = herdr_white_noise_bridge::activity::Submission::new(
+                receipt,
+                text,
+                Some(&[]),
+                now() - 120,
+            );
+            submission.warned = true;
+            submissions.push(submission);
+        }
+        if queued_warning {
+            bridge.state.enqueue_manual(
+                &group,
+                "Unsent old warning",
+                &format!("acceptance:{group}:first-receipt"),
+            );
+        }
+        bridge.reconcile(vec![observed]).await.unwrap();
+        assert_eq!(bridge.state.mappings[&key].submissions.len(), 1);
+        assert_eq!(
+            bridge.state.mappings[&key].submissions[0].receipt,
+            "second-receipt"
+        );
+        assert!(
+            !bridge
+                .state
+                .outbox
+                .iter()
+                .any(|item| item.text.contains("delivery pause is cleared")
+                    || item.text == "Unsent old warning")
+        );
+        assert_eq!(
+            bridge
+                .state
+                .outbox
+                .iter()
+                .filter(|item| item.text.contains("Another message is still unconfirmed"))
+                .count(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn late_acceptance_confirms_recovery_when_a_warning_acknowledgement_was_lost() {
+    let root = tempfile::tempdir().unwrap();
+    let config = config(root.path());
+    let observed = agent();
+    let key = observed.key();
+    let mut bridge = mapped_bridge(config.clone(), &observed);
+    let group = bridge.state.mappings[&key].group_id_hex.clone().unwrap();
+    let mut submission = herdr_white_noise_bridge::activity::Submission::new(
+        "lost-warning",
+        "first",
+        Some(&[]),
+        now() - 120,
+    );
+    submission.warned = true;
+    bridge
+        .state
+        .mappings
+        .get_mut(&key)
+        .unwrap()
+        .submissions
+        .push(submission);
+    bridge.state.enqueue_manual(
+        &group,
+        "Native acceptance is unconfirmed",
+        &format!("acceptance:{group}:lost-warning"),
+    );
+    bridge.save().unwrap();
+    let listener = UnixListener::bind(&config.wn_agent_socket).unwrap();
+    let transport = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut reader = tokio::io::BufReader::new(stream);
+        // The transport accepted the warning, but its response is lost.
+        read_line(&mut reader).await.unwrap()
+    });
+    assert!(bridge.flush().await.is_err());
+    assert_eq!(
+        transport.await.unwrap()["text"],
+        "Native acceptance is unconfirmed"
+    );
+    drop(bridge);
+    input_history(
+        &config,
+        "ses_1",
+        &[("native-first", "first")],
+        Some(("final", "Done")),
+    );
+    let mut bridge = Bridge::open(config).unwrap();
+    bridge.reconcile(vec![observed]).await.unwrap();
+    assert!(bridge.state.mappings[&key].submissions.is_empty());
+    assert!(
+        !bridge
+            .state
+            .outbox
+            .iter()
+            .any(|item| item.text == "Native acceptance is unconfirmed")
+    );
+    assert_eq!(bridge.state.outbox.iter().filter(|item| item.text == "The agent has now received your earlier message. This chat's delivery pause is cleared.").count(), 1);
 }
 
 #[tokio::test]
@@ -2426,6 +2820,9 @@ async fn shortcut_sync_sends_recent_excerpts_to_their_own_chats_without_unmuting
         let mut data: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         data["messages"][0]["info"]["time"] =
             json!({"created":(if age == 0 { now()+3600 } else { now()-age })*1000});
+        data["messages"][1]["info"]["time"] = data["messages"][0]["info"]["time"].clone();
+        data["messages"][1]["info"]["time"]["completed"] =
+            data["messages"][0]["info"]["time"]["created"].clone();
         std::fs::write(path, data.to_string()).unwrap();
     }
     let mut missing = agent();
@@ -2440,6 +2837,46 @@ async fn shortcut_sync_sends_recent_excerpts_to_their_own_chats_without_unmuting
     let mut event = inbound(HEX, "sync-command");
     event["message"]["text"] = json!("/recent");
     bridge.inbound(&event).await.unwrap();
+    bridge.flush().await.unwrap();
+    let first: Vec<_> = calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|call| {
+            call["type"] == "send_final"
+                && call["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("**Agent:**"))
+        })
+        .cloned()
+        .collect();
+    assert_eq!(
+        first.len(),
+        1,
+        "Only the oldest conversation should send immediately"
+    );
+    assert_eq!(first[0]["group_id_hex"], "dd".repeat(16));
+    // The pause survives restart, but does not hold unrelated manual replies.
+    drop(bridge);
+    let mut bridge = Bridge::open(config.clone()).unwrap();
+    bridge
+        .state
+        .enqueue_manual(&"cc".repeat(16), "Live reply.", "live-reply");
+    bridge.flush().await.unwrap();
+    assert!(
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|call| call["text"] == "Live reply.")
+    );
+    assert!(!calls.lock().unwrap().iter().any(|call| {
+        call["type"] == "send_final"
+            && call["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("ses_1"))
+    }));
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     bridge.flush().await.unwrap();
     assert!(!bridge.state.forwarding_enabled);
     assert!(
@@ -2508,6 +2945,68 @@ async fn shortcut_sync_sends_recent_excerpts_to_their_own_chats_without_unmuting
         count
     );
     mdk.abort();
+}
+
+/// A failed continuation holds later chats until the complete batch is confirmed.
+#[tokio::test]
+async fn recent_continuations_finish_before_the_next_conversation() {
+    let root = tempfile::tempdir().unwrap();
+    let config = config(root.path());
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let listener = UnixListener::bind(&config.wn_agent_socket).unwrap();
+    let recorded = calls.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = tokio::io::BufReader::new(stream);
+            let request = read_line(&mut reader).await.unwrap();
+            let attempt = {
+                let mut calls = recorded.lock().unwrap();
+                calls.push(request.clone());
+                calls.len()
+            };
+            let mut response = if attempt == 2 {
+                json!({"type":"error","code":"test_failure","message":"Not sent","retryable":true})
+            } else {
+                json!({"type":"final_sent","message_ids_hex":["cc".repeat(32)]})
+            };
+            response["id"] = request["id"].clone();
+            response["marmot_agent_control"] = json!("marmot.agent-control.v2");
+            let mut bytes = serde_json::to_vec(&response).unwrap();
+            bytes.push(b'\n');
+            reader.get_mut().write_all(&bytes).await.unwrap();
+        }
+    });
+    let mut bridge = Bridge::open(config.clone()).unwrap();
+    bridge.state.enqueue_tracked(
+        "older",
+        &"x".repeat(30001),
+        Some("older"),
+        vec!["source-a".into()],
+    );
+    bridge.state.enqueue_tracked(
+        "newer",
+        "Newer conversation",
+        Some("newer"),
+        vec!["source-b".into()],
+    );
+    for item in &mut bridge.state.outbox {
+        item.recent = true;
+    }
+    assert!(bridge.flush().await.is_err());
+    assert_eq!(calls.lock().unwrap().len(), 2);
+    assert_eq!(bridge.state.recent_after, 0);
+    assert!(!bridge.state.delivered_messages.contains_key("older"));
+    drop(bridge);
+    let mut bridge = Bridge::open(config).unwrap();
+    bridge.flush().await.unwrap();
+    assert_eq!(calls.lock().unwrap().len(), 3);
+    assert_eq!(calls.lock().unwrap()[2]["idempotency_key"], "older:1");
+    assert!(bridge.state.recent_after >= chrono::Utc::now().timestamp_millis() + 4000);
+    assert_eq!(bridge.state.delivered_messages["older"], vec!["source-a"]);
+    assert_eq!(bridge.state.outbox.len(), 1);
+    assert_eq!(bridge.state.outbox[0].group, "newer");
+    server.abort();
 }
 
 /// Catch-up includes conversational context, not only the most recent answer.
@@ -3268,13 +3767,23 @@ async fn recent_uses_the_past_hour_independently_of_the_persisted_send_clock() {
             >= now() - 5
     );
     event["message"]["message_id_hex"] = json!("next-global-sync");
+    let pending: Vec<_> = bridge
+        .state
+        .outbox
+        .iter()
+        .filter(|item| item.recent)
+        .cloned()
+        .collect();
     bridge.inbound(&event).await.unwrap();
-    assert!(
-        !bridge
+    assert_eq!(
+        bridge
             .state
             .outbox
             .iter()
-            .any(|item| item.text.starts_with("**You:**"))
+            .filter(|item| item.recent)
+            .cloned()
+            .collect::<Vec<_>>(),
+        pending
     );
     mdk.abort();
 }
@@ -5502,14 +6011,23 @@ sys.exit(2)
 
 #[tokio::test]
 async fn permission_card_uses_request_bound_once_or_reject_without_keys_prompts_or_unmuting() {
-    for (verb, expected) in [("/allow", "once"), ("/reject", "reject")] {
+    for (verb, expected, quoted) in [
+        ("/allow", "once", false),
+        ("/reject", "reject", false),
+        ("1", "once", true),
+        ("2", "reject", true),
+        ("1", "once", false),
+        ("2", "reject", false),
+    ] {
         let root = tempfile::tempdir().unwrap();
-        let config = config(root.path());
+        let mut config = config(root.path());
+        config.edit_responses = true;
         permission_export(&config.opencode_bin);
         let mut blocked = agent();
         blocked.agent_status = "blocked".into();
         blocked.state_change_seq = 2;
         let calls = Arc::new(Mutex::new(vec![]));
+        let mdk = peer(&config.wn_agent_socket, true, calls.clone()).await;
         let herdr =
             peer_for_agent(&config.herdr_socket, false, calls.clone(), blocked.clone()).await;
         let mut bridge = Bridge::open(config.clone()).unwrap();
@@ -5518,24 +6036,61 @@ async fn permission_card_uses_request_bound_once_or_reject_without_keys_prompts_
             activity_mapping(blocked.clone(), &"bb".repeat(16)),
         );
         bridge.reconcile(vec![blocked.clone()]).await.unwrap();
+        assert!(
+            bridge
+                .state
+                .outbox
+                .iter()
+                .any(|item| item.response.is_some()
+                    && item.text == "> Waiting for your permission...")
+        );
         let card = bridge
             .state
             .outbox
             .iter()
-            .find(|item| item.text.starts_with("Permission ["))
+            .find(|item| item.text.starts_with("**Run this command?**"))
             .expect("The blocked permission must produce a phone approval card")
             .text
             .clone();
         assert!(card.contains("git commit -m 'Test change'"));
         assert!(!card.contains("Always allow"));
-        let code = card
-            .lines()
-            .find_map(|line| line.strip_prefix("/allow "))
-            .unwrap();
+        assert!(card.contains("1. Allow once"));
+        let code = bridge.state.mappings[&blocked.key()]
+            .permission
+            .as_ref()
+            .unwrap()
+            .token();
+        bridge.flush().await.unwrap();
+        let card_message = serde_json::to_value(
+            bridge.state.mappings[&blocked.key()]
+                .permission
+                .as_ref()
+                .unwrap(),
+        )
+        .unwrap()["card_message_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        drop(bridge);
+        let mut bridge = Bridge::open(config.clone()).unwrap();
+        bridge.reconcile(vec![blocked.clone()]).await.unwrap();
         herdr_white_noise_bridge::forwarding::set(&config.state_path, false).unwrap();
         let mut event = inbound(HEX, "permission-reply");
-        event["message"]["text"] = json!(format!("{verb} {code}"));
+        if verb.starts_with('/') {
+            event["message"]["text"] = json!(format!("{verb} {code}"));
+        } else {
+            event["message"]["text"] = json!(verb);
+            if quoted {
+                event["reply_to"] = json!({"message_id_hex":card_message});
+            }
+        }
         bridge.inbound(&event).await.unwrap();
+        assert!(bridge.state.outbox.iter().any(|item| item.text
+            == if expected == "once" {
+                "Allowed once."
+            } else {
+                "Denied."
+            }));
         assert!(!bridge.state.forwarding_enabled);
         assert!(
             bridge.state.mappings[&blocked.key()]
@@ -5567,6 +6122,89 @@ async fn permission_card_uses_request_bound_once_or_reject_without_keys_prompts_
             1
         );
         herdr.abort();
+        mdk.abort();
+    }
+}
+
+#[tokio::test]
+async fn plain_permission_approval_requires_confirmation_after_an_unanswered_request_changes() {
+    for scenario in ["confirm", "deny", "replace-again"] {
+        let root = tempfile::tempdir().unwrap();
+        let config = config(root.path());
+        let request_path = permission_export(&config.opencode_bin);
+        let mut blocked = agent();
+        blocked.agent_status = "blocked".into();
+        blocked.state_change_seq = 2;
+        let key = blocked.key();
+        let calls = Arc::new(Mutex::new(vec![]));
+        let current = Arc::new(Mutex::new(blocked.clone()));
+        let herdr = decision_herdr(
+            &config.herdr_socket,
+            current.clone(),
+            Arc::new(Mutex::new(String::new())),
+            calls.clone(),
+        )
+        .await;
+        let mdk = peer(&config.wn_agent_socket, true, calls.clone()).await;
+        let mut bridge = Bridge::open(config.clone()).unwrap();
+        bridge.state.mappings.insert(
+            key.clone(),
+            activity_mapping(blocked.clone(), &"bb".repeat(16)),
+        );
+        bridge.reconcile(vec![blocked.clone()]).await.unwrap();
+        bridge.flush().await.unwrap();
+        let mut request: Value =
+            serde_json::from_slice(&std::fs::read(&request_path).unwrap()).unwrap();
+        request["metadata"]["command"] = json!("A changed command");
+        std::fs::write(&request_path, request.to_string()).unwrap();
+        blocked.state_change_seq += 1;
+        *current.lock().unwrap() = blocked.clone();
+        bridge.reconcile(vec![blocked.clone()]).await.unwrap();
+        bridge.flush().await.unwrap();
+        let mut first = inbound(HEX, "plain-changed-approval");
+        first["message"]["text"] = json!("1");
+        bridge.inbound(&first).await.unwrap();
+        assert!(!root.path().join("permission-posts.jsonl").exists());
+        assert!(
+            bridge
+                .state
+                .outbox
+                .iter()
+                .any(|item| item.text.contains("Send confirm"))
+        );
+        drop(bridge);
+        let mut bridge = Bridge::open(config).unwrap();
+        if scenario == "replace-again" {
+            request["id"] = json!("per_other");
+            std::fs::write(&request_path, request.to_string()).unwrap();
+            blocked.state_change_seq += 1;
+            *current.lock().unwrap() = blocked.clone();
+        }
+        bridge.reconcile(vec![blocked]).await.unwrap();
+        bridge.flush().await.unwrap();
+        let mut confirm = inbound(HEX, "confirm-current-permission");
+        confirm["message"]["text"] = json!(if scenario == "deny" { "2" } else { "confirm" });
+        bridge.inbound(&confirm).await.unwrap();
+        if scenario == "replace-again" {
+            assert!(
+                !root.path().join("permission-posts.jsonl").exists(),
+                "An old confirmation cannot approve a replacement"
+            );
+        } else {
+            let posts: Vec<Value> =
+                std::fs::read_to_string(root.path().join("permission-posts.jsonl"))
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+            assert_eq!(posts.len(), 1);
+            assert_eq!(
+                posts[0]["body"],
+                json!({"decision":if scenario == "deny" { "reject" } else { "once" }})
+            );
+        }
+        herdr.abort();
+        mdk.abort();
     }
 }
 
@@ -5581,6 +6219,19 @@ async fn permission_replies_fail_closed_for_stale_foreign_malformed_and_uncertai
         "numeric",
         "attachment",
         "unknown-result",
+        "quoted-old-card",
+        "quoted-no-card",
+        "quoted-changed",
+        "quoted-foreign",
+        "quoted-attachment",
+        "quoted-truncated",
+        "quoted-unknown-result",
+        "plain-changed",
+        "plain-foreign",
+        "plain-attachment",
+        "plain-truncated",
+        "plain-unknown-result",
+        "plain-unrequested-confirm",
     ] {
         let root = tempfile::tempdir().unwrap();
         let config = config(root.path());
@@ -5589,6 +6240,7 @@ async fn permission_replies_fail_closed_for_stale_foreign_malformed_and_uncertai
         blocked.agent_status = "blocked".into();
         blocked.state_change_seq = 2;
         let calls = Arc::new(Mutex::new(vec![]));
+        let mdk = peer(&config.wn_agent_socket, true, calls.clone()).await;
         let herdr =
             peer_for_agent(&config.herdr_socket, false, calls.clone(), blocked.clone()).await;
         let mut bridge = Bridge::open(config.clone()).unwrap();
@@ -5601,30 +6253,51 @@ async fn permission_replies_fail_closed_for_stale_foreign_malformed_and_uncertai
             .state
             .outbox
             .iter()
-            .find(|item| item.text.starts_with("Permission ["))
+            .find(|item| item.text.starts_with("**Run this command?**"))
             .unwrap()
             .text
             .clone();
-        let code = card
-            .lines()
-            .find_map(|line| line.strip_prefix("/allow "))
-            .unwrap();
+        assert!(card.contains("1. Allow once"));
+        let code = bridge.state.mappings[&blocked.key()]
+            .permission
+            .as_ref()
+            .unwrap()
+            .token();
         let mut event = inbound(HEX, "permission-fail-closed");
         event["message"]["text"] = json!(format!("/allow {code}"));
+        if scenario.starts_with("quoted-") || scenario.starts_with("plain-") {
+            if scenario != "quoted-no-card" {
+                bridge.flush().await.unwrap();
+            }
+            event["message"]["text"] = json!("1");
+            if scenario.starts_with("quoted-") {
+                event["reply_to"] = json!({"message_id_hex":"cc".repeat(32)});
+            }
+        }
         match scenario {
-            "changed" => {
+            "changed" | "quoted-changed" | "plain-changed" => {
                 let mut request: Value =
                     serde_json::from_slice(&std::fs::read(&request_path).unwrap()).unwrap();
                 request["metadata"]["command"] = json!("different command");
                 std::fs::write(&request_path, request.to_string()).unwrap();
             }
             "gone" => std::fs::write(&request_path, "null").unwrap(),
-            "foreign" => event["message"]["sender"]["account_id_hex"] = json!("cc".repeat(32)),
+            "foreign" | "quoted-foreign" | "plain-foreign" => {
+                event["message"]["sender"]["account_id_hex"] = json!("cc".repeat(32))
+            }
             "wrong-code" => event["message"]["text"] = json!("/allow pwrong"),
             "persistent" => event["message"]["text"] = json!(format!("/allow-always {code}")),
             "numeric" => event["message"]["text"] = json!("2"),
-            "attachment" => event["message"]["attachments"] = json!([{"name":"input.txt"}]),
-            "unknown-result" => {
+            "attachment" | "quoted-attachment" | "plain-attachment" => {
+                event["message"]["attachments"] = json!([{"name":"input.txt"}])
+            }
+            "quoted-truncated" | "plain-truncated" => {
+                event["message"]["text_truncated"] = json!(true)
+            }
+            "plain-unrequested-confirm" => event["message"]["text"] = json!("confirm"),
+            "quoted-old-card" => event["reply_to"]["message_id_hex"] = json!("ee".repeat(32)),
+            "quoted-no-card" => {}
+            "unknown-result" | "quoted-unknown-result" | "plain-unknown-result" => {
                 std::fs::write(root.path().join("drop-permission-ack"), "").unwrap()
             }
             _ => unreachable!(),
@@ -5639,7 +6312,7 @@ async fn permission_replies_fail_closed_for_stale_foreign_malformed_and_uncertai
             std::fs::read_to_string(root.path().join("permission-posts.jsonl")).unwrap_or_default();
         assert_eq!(
             posts.lines().count(),
-            usize::from(scenario == "unknown-result"),
+            usize::from(scenario.ends_with("unknown-result")),
             "{scenario}"
         );
         assert!(
@@ -5650,6 +6323,7 @@ async fn permission_replies_fail_closed_for_stale_foreign_malformed_and_uncertai
         );
         assert!(!calls.lock().unwrap().iter().any(|call| call["method"] == "agent.send_keys" || call["method"] == "agent.prompt"), "{scenario}");
         herdr.abort();
+        mdk.abort();
     }
 }
 
@@ -5897,6 +6571,150 @@ async fn ordinary_prompts_after_a_custom_question_reach_the_agent_across_restart
             );
             herdr.abort();
         }
+    }
+}
+
+#[tokio::test]
+async fn multipart_questions_keep_answers_across_restart_and_submit_the_whole_form_once() {
+    for scenario in [
+        "success",
+        "lost-ack",
+        "changed-form",
+        "failed-save",
+        "failed-part-save",
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let config = editable_config(root.path());
+        let form_path = custom_decision_export(&config.opencode_bin);
+        let mut form: Value = serde_json::from_slice(&std::fs::read(&form_path).unwrap()).unwrap();
+        let mut second = form["fields"][0].clone();
+        second["key"] = json!("q1");
+        second["description"] = json!("How should the Android client be updated?");
+        second["options"] = json!([{"value":"Prepare dev client","label":"Prepare dev client"}]);
+        form["fields"].as_array_mut().unwrap().push(second);
+        std::fs::write(&form_path, form.to_string()).unwrap();
+        let mut blocked = agent();
+        blocked.agent_status = "blocked".into();
+        let key = blocked.key();
+        let calls = Arc::new(Mutex::new(vec![]));
+        let herdr = decision_herdr(
+            &config.herdr_socket,
+            Arc::new(Mutex::new(blocked.clone())),
+            Arc::new(Mutex::new(String::new())),
+            calls.clone(),
+        )
+        .await;
+        let mut bridge = Bridge::open(config.clone()).unwrap();
+        bridge.state.mappings.insert(
+            key.clone(),
+            activity_mapping(blocked.clone(), &"bb".repeat(16)),
+        );
+        bridge.reconcile(vec![blocked.clone()]).await.unwrap();
+        assert!(
+            bridge
+                .state
+                .outbox
+                .iter()
+                .any(|item| item.text.starts_with("Question 1 of 2"))
+        );
+        let first_code = bridge.state.mappings[&key]
+            .decision
+            .as_ref()
+            .unwrap()
+            .token();
+        let mut first = inbound(HEX, "multipart-first");
+        first["message"]["text"] = json!("2");
+        if scenario == "failed-part-save" {
+            let saved = std::fs::read(&config.state_path).unwrap();
+            std::fs::remove_file(&config.state_path).unwrap();
+            std::fs::create_dir(&config.state_path).unwrap();
+            assert!(bridge.inbound(&first).await.is_err());
+            assert!(
+                bridge.state.mappings[&key]
+                    .decision
+                    .as_ref()
+                    .unwrap()
+                    .answers
+                    .is_empty()
+            );
+            assert!(
+                !bridge.state.mappings[&key]
+                    .seen_messages
+                    .contains(&"multipart-first".into())
+            );
+            std::fs::remove_dir(&config.state_path).unwrap();
+            std::fs::write(&config.state_path, saved).unwrap();
+        }
+        bridge.inbound(&first).await.unwrap();
+        bridge.inbound(&first).await.unwrap();
+        assert!(
+            !root.path().join("question-posts.jsonl").exists(),
+            "Do not submit a partial form"
+        );
+        assert!(
+            bridge
+                .state
+                .outbox
+                .iter()
+                .any(|item| item.manual && item.text.starts_with("Question 2 of 2")),
+            "Next part missing in scenario {scenario}; decision: {:?}",
+            bridge.state.mappings[&key].decision
+        );
+        drop(bridge);
+        let mut bridge = Bridge::open(config.clone()).unwrap();
+        bridge.reconcile(vec![blocked.clone()]).await.unwrap();
+        bridge.inbound(&first).await.unwrap();
+        let mut stale = inbound(HEX, "multipart-old-part");
+        stale["message"]["text"] = json!(format!("{first_code} 1"));
+        bridge.inbound(&stale).await.unwrap();
+        assert!(!root.path().join("question-posts.jsonl").exists());
+        match scenario {
+            "lost-ack" => std::fs::write(root.path().join("drop-question-ack"), "").unwrap(),
+            "changed-form" => {
+                form["id"] = json!("frm_replaced");
+                std::fs::write(&form_path, form.to_string()).unwrap();
+            }
+            "failed-save" => {
+                std::fs::remove_file(&config.state_path).unwrap();
+                std::fs::create_dir(&config.state_path).unwrap();
+            }
+            _ => {}
+        }
+        let mut last = inbound(HEX, "multipart-last");
+        last["message"]["text"] = json!("Prepare dev client");
+        let result = bridge.inbound(&last).await;
+        if scenario == "failed-save" {
+            assert!(result.is_err());
+        } else {
+            result.unwrap();
+        }
+        if matches!(scenario, "changed-form" | "failed-save") {
+            assert!(!root.path().join("question-posts.jsonl").exists());
+        } else {
+            drop(bridge);
+            let mut bridge = Bridge::open(config).unwrap();
+            bridge.agents.insert(key, blocked);
+            bridge.herdr_available = true;
+            bridge.inbound(&last).await.unwrap();
+            last["message"]["message_id_hex"] = json!("multipart-again");
+            bridge.inbound(&last).await.unwrap();
+            let posts: Vec<Value> =
+                std::fs::read_to_string(root.path().join("question-posts.jsonl"))
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+            assert_eq!(posts.len(), 1);
+            assert_eq!(
+                posts[0]["body"],
+                json!({"answer":{"q0":"Not sure","q1":"Prepare dev client"}})
+            );
+        }
+        assert!(!calls.lock().unwrap().iter().any(|request| matches!(
+            request["method"].as_str(),
+            Some("agent.prompt" | "agent.send_keys" | "agent.read")
+        )));
+        herdr.abort();
     }
 }
 
@@ -6299,52 +7117,73 @@ async fn coded_decision_with_repository_footer_answers_once_without_clearing_the
 
 #[tokio::test]
 async fn a_permission_card_does_not_intercept_a_later_numeric_question_answer_after_restart() {
-    let root = tempfile::tempdir().unwrap();
-    let config = config(root.path());
-    permission_export(&config.opencode_bin);
-    let mut blocked = agent();
-    blocked.agent_status = "blocked".into();
-    blocked.state_change_seq = 2;
-    let observed = Arc::new(Mutex::new(blocked.clone()));
-    let calls = Arc::new(Mutex::new(vec![]));
-    let herdr = decision_herdr(
-        &config.herdr_socket,
-        observed.clone(),
-        Arc::new(Mutex::new(decision_terminal("Which next step?"))),
-        calls.clone(),
-    )
-    .await;
-    let mut bridge = Bridge::open(config.clone()).unwrap();
-    bridge.state.mappings.insert(
-        blocked.key(),
-        activity_mapping(blocked.clone(), &"bb".repeat(16)),
-    );
-    bridge.reconcile(vec![blocked.clone()]).await.unwrap();
-    assert!(bridge.state.mappings[&blocked.key()].permission.is_some());
-    drop(bridge);
-    decision_export(
-        &config.opencode_bin,
-        "question-after-permission",
-        "Which next step?",
-    );
-    blocked.state_change_seq += 1;
-    *observed.lock().unwrap() = blocked.clone();
-    let mut bridge = Bridge::open(config).unwrap();
-    bridge.reconcile(vec![blocked.clone()]).await.unwrap();
-    assert!(bridge.state.mappings[&blocked.key()].permission.is_none());
-    let mut answer = inbound(HEX, "later-numeric-question");
-    answer["message"]["text"] = json!("1");
-    bridge.inbound(&answer).await.unwrap();
-    assert_eq!(
-        calls
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|call| call["method"] == "agent.send_keys")
-            .count(),
-        1
-    );
-    herdr.abort();
+    for card_delivery in 0..3 {
+        let root = tempfile::tempdir().unwrap();
+        let config = config(root.path());
+        permission_export(&config.opencode_bin);
+        let mut blocked = agent();
+        blocked.agent_status = "blocked".into();
+        blocked.state_change_seq = 2;
+        let observed = Arc::new(Mutex::new(blocked.clone()));
+        let calls = Arc::new(Mutex::new(vec![]));
+        let mdk = peer(&config.wn_agent_socket, true, calls.clone()).await;
+        let herdr = decision_herdr(
+            &config.herdr_socket,
+            observed.clone(),
+            Arc::new(Mutex::new(decision_terminal("Which next step?"))),
+            calls.clone(),
+        )
+        .await;
+        let mut bridge = Bridge::open(config.clone()).unwrap();
+        bridge.state.mappings.insert(
+            blocked.key(),
+            activity_mapping(blocked.clone(), &"bb".repeat(16)),
+        );
+        bridge.reconcile(vec![blocked.clone()]).await.unwrap();
+        assert!(bridge.state.mappings[&blocked.key()].permission.is_some());
+        if card_delivery == 0 {
+            bridge.flush().await.unwrap();
+        }
+        drop(bridge);
+        decision_export(
+            &config.opencode_bin,
+            "question-after-permission",
+            "Which next step?",
+        );
+        blocked.state_change_seq += 1;
+        *observed.lock().unwrap() = blocked.clone();
+        let mut bridge = Bridge::open(config).unwrap();
+        bridge.reconcile(vec![blocked.clone()]).await.unwrap();
+        assert!(bridge.state.mappings[&blocked.key()].permission.is_none());
+        if card_delivery == 1 {
+            bridge.flush().await.unwrap();
+        }
+        let mut stale = inbound(HEX, "reply-to-expired-permission");
+        stale["message"]["text"] = json!("1");
+        stale["reply_to"] = json!({"message_id_hex":"cc".repeat(32)});
+        bridge.inbound(&stale).await.unwrap();
+        assert!(
+            !calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|call| call["method"] == "agent.send_keys")
+        );
+        let mut answer = inbound(HEX, "later-numeric-question");
+        answer["message"]["text"] = json!("1");
+        bridge.inbound(&answer).await.unwrap();
+        assert_eq!(
+            calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| call["method"] == "agent.send_keys")
+                .count(),
+            1
+        );
+        herdr.abort();
+        mdk.abort();
+    }
 }
 
 async fn decision_herdr(
@@ -9635,20 +10474,29 @@ async fn recovery_uses_real_cursors_pages_all_history_and_recovers_late_deliveri
             let mut reader = tokio::io::BufReader::new(stream);
             let req = read_line(&mut reader).await.unwrap();
             assert_eq!(req["type"], "timeline_list");
-            assert!(req.get("after").is_none());
             let mut response = if req["group_id_hex"] == "dd".repeat(16) {
                 json!({"type":"error","code":"app_error"})
             } else {
                 let rows = data.lock().unwrap();
-                let end = if let Some(cursor) = req.get("before") {
-                    rows.iter()
+                let (start, end) = if let Some(cursor) = req.get("after") {
+                    let start = rows
+                        .iter()
                         .position(|row| row["message_id_hex"] == cursor["message_id_hex"])
-                        .expect("MDK requires an existing cursor row")
+                        .expect("Existing forward cursor")
+                        + 1;
+                    (start, (start + 50).min(rows.len()))
                 } else {
-                    rows.len()
+                    let end = if let Some(cursor) = req.get("before") {
+                        rows.iter()
+                            .position(|row| row["message_id_hex"] == cursor["message_id_hex"])
+                            .expect("MDK requires an existing cursor row")
+                    } else {
+                        rows.len()
+                    };
+                    let start = end.saturating_sub(50);
+                    (start, end)
                 };
-                let start = end.saturating_sub(50);
-                json!({"type":"timeline_page","messages":rows[start..end],"has_more_before":start>0,"has_more_after":false})
+                json!({"type":"timeline_page","messages":rows[start..end],"has_more_before":start>0,"has_more_after":end<rows.len()})
             };
             response["id"] = req["id"].clone();
             response["marmot_agent_control"] = json!("marmot.agent-control.v2");

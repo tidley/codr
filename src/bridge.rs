@@ -32,6 +32,10 @@ pub struct Bridge {
     reads: crate::reads::Reads,
     pub(crate) last_snapshot: Vec<Agent>,
     pub(crate) porter_updates: tokio::sync::watch::Sender<Value>,
+    state_writer: crate::state::Writer,
+    forwarding: forwarding::Reader,
+    history_job: Option<tokio::task::JoinHandle<crate::history::Collection>>,
+    recovery: crate::recovery::Recovery,
 }
 
 impl Drop for Bridge {
@@ -40,6 +44,9 @@ impl Drop for Bridge {
             check.task.abort();
         }
         if let Some(job) = self.media_job.take() {
+            job.abort();
+        }
+        if let Some(job) = self.history_job.take() {
             job.abort();
         }
     }
@@ -59,7 +66,8 @@ impl Bridge {
         );
         state.account = Some(config.account_id_hex.clone());
         state.phone = Some(phone.clone());
-        state.save(&config.state_path)?;
+        let state_writer = crate::state::Writer::default();
+        state_writer.save(&config.state_path, &state)?;
         let mut bridge = Self {
             herdr: Socket {
                 path: config.herdr_socket.clone(),
@@ -79,6 +87,10 @@ impl Bridge {
             reads: crate::reads::Reads::default(),
             last_snapshot: vec![],
             porter_updates: tokio::sync::watch::channel(Value::Null).0,
+            state_writer,
+            forwarding: forwarding::Reader::default(),
+            history_job: None,
+            recovery: crate::recovery::Recovery::default(),
         };
         bridge.refresh_forwarding()?;
         if bridge.config.control_chat {
@@ -94,13 +106,17 @@ impl Bridge {
     }
 
     pub fn save(&self) -> Result<()> {
-        self.state.save(&self.config.state_path)?;
-        crate::porter::publish(self);
+        if self
+            .state_writer
+            .save(&self.config.state_path, &self.state)?
+        {
+            crate::porter::publish(self);
+        }
         Ok(())
     }
 
     fn refresh_forwarding(&mut self) -> Result<()> {
-        let control = forwarding::load(&self.config.state_path)?;
+        let control = self.forwarding.load(&self.config.state_path)?;
         if self.state.forwarding_revision.as_deref() != Some(&control.revision) {
             let before = self.state.clone();
             // Preserve the old outbox on the first upgrade, unless a mode was already selected.
@@ -177,7 +193,7 @@ impl Bridge {
             }
             self.state.forwarding_enabled = control.enabled && !reset;
             self.state.forwarding_resume_pending = control.enabled && reset;
-            self.state.forwarding_revision = Some(control.revision);
+            self.state.forwarding_revision = Some(control.revision.clone());
             if let Err(error) = self.save() {
                 self.state = before;
                 return Err(error);
@@ -345,7 +361,7 @@ impl Bridge {
         &mut self,
         key: &str,
         agent: &Agent,
-        history: Option<output::SessionHistory>,
+        history: Option<std::sync::Arc<output::SessionHistory>>,
     ) -> Result<()> {
         let mut completed_response = false;
         if let Some(history) = history {
@@ -371,17 +387,21 @@ impl Bridge {
             mapping.final_ids.extend(
                 history
                     .finals
-                    .into_iter()
-                    .map(|reply| reply.id)
+                    .iter()
+                    .map(|reply| reply.id.clone())
                     .filter(|id| !known.contains(id)),
             );
             let muted: HashSet<_> = mapping.muted_turns.iter().cloned().collect();
-            mapping
-                .muted_turns
-                .extend(history.turns.into_iter().filter(|turn| {
-                    (agent.settled() || Some(turn) != history.latest_turn.as_ref())
-                        && !muted.contains(turn)
-                }));
+            mapping.muted_turns.extend(
+                history
+                    .turns
+                    .iter()
+                    .filter(|turn| {
+                        (agent.settled() || Some(*turn) != history.latest_turn.as_ref())
+                            && !muted.contains(*turn)
+                    })
+                    .cloned(),
+            );
             mapping.output_initialised = true;
             mapping.last_export_at = now();
         }
@@ -409,6 +429,17 @@ impl Bridge {
         outbox.sort_by_key(|item| (item.working_notice, !item.manual, item.response.is_some()));
         for item in outbox {
             self.refresh_forwarding()?;
+            if item.recent
+                && (chrono::Utc::now().timestamp_millis() < self.state.recent_after
+                    || self
+                        .state
+                        .outbox
+                        .iter()
+                        .find(|pending| pending.recent)
+                        .is_some_and(|first| first.source != item.source))
+            {
+                continue;
+            }
             if item.manual
                 && self.state.mappings.values().any(|mapping| {
                     mapping.group_id_hex.as_deref() == Some(item.group.as_str())
@@ -606,7 +637,34 @@ impl Bridge {
                         }) =>
                 {
                     self.state.last_confirmed_send_at = Some(now());
+                    for mapping in self.state.mappings.values_mut().filter(|mapping| {
+                        item.permission_card
+                            && mapping.group_id_hex.as_deref() == Some(item.group.as_str())
+                    }) {
+                        let card = response["message_ids_hex"][0].as_str().unwrap().to_owned();
+                        if !mapping.permission_card_ids.contains(&card) {
+                            mapping.permission_card_ids.push(card.clone());
+                        }
+                        mapping
+                            .permission_card_deliveries
+                            .retain(|delivery| delivery != &item.id);
+                        if let Some(permission) = mapping.permission.as_mut().filter(|permission| {
+                            permission.card_delivery_id.as_deref() == Some(item.id.as_str())
+                        }) {
+                            permission.card_message_id = Some(card);
+                        }
+                    }
                     self.state.confirm_send(&item.id);
+                    if item.recent
+                        && !self
+                            .state
+                            .outbox
+                            .iter()
+                            .any(|pending| pending.recent && pending.source == item.source)
+                    {
+                        self.state.recent_after =
+                            chrono::Utc::now().timestamp_millis().saturating_add(5000);
+                    }
                     self.save()?;
                     for attachment in &item.attachments {
                         if !self.state.outbox.iter().any(|pending| {
@@ -762,18 +820,23 @@ impl Bridge {
         for key in self.agents.keys() {
             self.reads.set_ended(key, false);
         }
-        let read_keys = self
-            .agents
-            .keys()
-            .cloned()
-            .chain(
-                self.state
-                    .mappings
-                    .iter()
-                    .filter(|(_, mapping)| mapping.active)
-                    .map(|(key, _)| key.clone()),
-            )
-            .collect();
+        let read_keys =
+            self.agents
+                .keys()
+                .cloned()
+                .chain(
+                    self.state
+                        .mappings
+                        .iter()
+                        .filter(|(_, mapping)| mapping.active)
+                        .map(|(key, _)| key.clone()),
+                )
+                .chain(
+                    self.state.history_requests.iter().flat_map(|request| {
+                        request.targets.iter().map(|target| target.key.clone())
+                    }),
+                )
+                .collect();
         self.reads.retain(&read_keys);
         self.herdr_available = true;
         let keys: Vec<_> = self.agents.keys().cloned().collect();
@@ -915,7 +978,7 @@ impl Bridge {
             mapping.activity.baseline(&history.user_inputs);
             mapping
                 .final_ids
-                .extend(history.finals.into_iter().map(|reply| reply.id));
+                .extend(history.finals.iter().map(|reply| reply.id.clone()));
             mapping.output_initialised = true;
             mapping.last_export_at = now();
             self.save()?;
@@ -946,12 +1009,13 @@ impl Bridge {
                 mapping.muted_turns.extend(
                     history
                         .turns
-                        .into_iter()
-                        .filter(|turn| !muted.contains(turn)),
+                        .iter()
+                        .filter(|turn| !muted.contains(*turn))
+                        .cloned(),
                 );
             }
             let known: HashSet<_> = self.state.mappings[key].final_ids.iter().cloned().collect();
-            for reply in history.finals {
+            for reply in &history.finals {
                 if !known.contains(&reply.id) {
                     self.state.mappings.get_mut(key).unwrap().last_received_at = now();
                     if self.config.edit_responses {
@@ -1005,7 +1069,7 @@ impl Bridge {
                         .get_mut(key)
                         .unwrap()
                         .final_ids
-                        .push(reply.id);
+                        .push(reply.id.clone());
                 }
             }
             self.state.mappings.get_mut(key).unwrap().last_export_at = now();
@@ -1073,7 +1137,7 @@ impl Bridge {
             {
                 let history = self.read_history(agent).await?;
                 m.activity.baseline(&history.user_inputs);
-                m.final_ids = history.finals.into_iter().map(|f| f.id).collect();
+                m.final_ids = history.finals.iter().map(|f| f.id.clone()).collect();
                 m.output_initialised = true;
                 if self.config.edit_responses && agent.settled() {
                     m.task_revision = self
@@ -1417,13 +1481,50 @@ impl Bridge {
         }
     }
 
+    fn observe_submission_acceptances(&mut self, key: &str, inputs: &[crate::activity::UserInput]) {
+        let mapping = self.state.mappings.get_mut(key).unwrap();
+        let warned: Vec<_> = mapping
+            .submissions
+            .iter()
+            .filter(|submission| submission.warned)
+            .map(|submission| submission.receipt.clone())
+            .collect();
+        crate::activity::Submission::observe(&mut mapping.submissions, inputs);
+        let resolved: Vec<_> = warned
+            .into_iter()
+            .filter(|receipt| {
+                !mapping
+                    .submissions
+                    .iter()
+                    .any(|submission| &submission.receipt == receipt)
+            })
+            .collect();
+        let paused = mapping
+            .submissions
+            .iter()
+            .any(|submission| submission.overdue(now()));
+        let Some(group) = mapping.group_id_hex.clone() else {
+            return;
+        };
+        for receipt in resolved {
+            let prefix = format!("acceptance:{group}:{receipt}:");
+            self.state
+                .outbox
+                .retain(|item| !item.id.starts_with(&prefix));
+            // A queued warning may already be visible after a lost acknowledgement.
+            // Always confirm late acceptance, even if its warning remains queued.
+            self.state.enqueue_manual(&group, if paused {
+                    "The agent has now received one earlier message. Another message is still unconfirmed, so this chat remains paused."
+                } else {
+                    "The agent has now received your earlier message. This chat's delivery pause is cleared."
+                }, &format!("acceptance-resolved:{group}:{receipt}"));
+        }
+    }
+
     fn observe_activity(&mut self, key: &str, history: &output::SessionHistory) -> Result<()> {
-        crate::activity::Submission::observe(
-            &mut self.state.mappings.get_mut(key).unwrap().submissions,
-            &history.user_inputs,
-        );
+        self.observe_submission_acceptances(key, &history.user_inputs);
         if !self.config.auto_forwarding {
-            return Ok(());
+            return self.save();
         }
         let previous = self.state.mappings[key].activity.clone();
         if self
@@ -1449,7 +1550,9 @@ impl Bridge {
     }
 
     fn activity_unresolved(&self) -> bool {
-        !forwarding::load(&self.config.state_path)
+        !self
+            .forwarding
+            .load(&self.config.state_path)
             .is_ok_and(|control| control.mode == forwarding::Mode::On)
             && self.config.auto_forwarding
             && self
@@ -1459,7 +1562,10 @@ impl Bridge {
                 .any(|mapping| mapping.activity.unresolved())
     }
 
-    async fn read_history(&mut self, agent: &Agent) -> Result<output::SessionHistory> {
+    async fn read_history(
+        &mut self,
+        agent: &Agent,
+    ) -> Result<std::sync::Arc<output::SessionHistory>> {
         Ok(self
             .reads
             .read(&self.config, agent, self.state.forwarding_revision.clone())
@@ -1484,10 +1590,35 @@ impl Bridge {
     }
 
     pub async fn poll_ready_sessions(&mut self) -> Result<()> {
-        // Completion wakes apply existing reads without starting another polling round.
-        // Preserve unknown-session terminals from the authoritative herdr snapshot.
+        let keys = self.reads.completed_keys();
+        self.refresh_forwarding()?;
+        if keys.is_empty() && !self.state.forwarding_resume_pending {
+            return Ok(());
+        }
         self.reads.scheduling = false;
-        let result = self.reconcile(self.last_snapshot.clone()).await;
+        let result = if self.state.forwarding_resume_pending
+            || keys.iter().any(|key| !self.agents.contains_key(key))
+        {
+            // Global checkpoints and ended-session reads still use authoritative
+            // identity/unknown-terminal handling, not a reduced live snapshot.
+            self.reconcile(self.last_snapshot.clone()).await
+        } else {
+            for key in keys {
+                let agent = self.agents[&key].clone();
+                if self.reconcile_agent(&key, &agent).await.is_ok() {
+                    let mapping = &self.state.mappings[&key];
+                    if mapping.prompt_queue.is_empty()
+                        || mapping.pending_prompt
+                        || mapping.queue_flight.is_some()
+                        || !agent.settled()
+                    {
+                        self.reads.finish(&key);
+                    }
+                }
+            }
+            self.process_prompt_queues().await;
+            self.check_submission_acceptances()
+        };
         self.reads.scheduling = true;
         result
     }
@@ -1497,8 +1628,8 @@ impl Bridge {
     }
 
     fn finish_queued_prompt(&mut self, key: &str, history: &output::SessionHistory) {
+        self.observe_submission_acceptances(key, &history.user_inputs);
         let mapping = self.state.mappings.get_mut(key).unwrap();
-        crate::activity::Submission::observe(&mut mapping.submissions, &history.user_inputs);
         if !mapping.submissions.is_empty() {
             return;
         }
@@ -1515,7 +1646,17 @@ impl Bridge {
     }
 
     async fn process_prompt_queues(&mut self) {
-        let keys: Vec<_> = self.agents.keys().cloned().collect();
+        let keys: Vec<_> = self
+            .agents
+            .keys()
+            .filter(|key| {
+                self.state
+                    .mappings
+                    .get(*key)
+                    .is_some_and(|mapping| !mapping.prompt_queue.is_empty())
+            })
+            .cloned()
+            .collect();
         for key in keys {
             if self.refresh_forwarding().is_err()
                 || !self.herdr_available
@@ -1583,51 +1724,150 @@ impl Bridge {
         }
     }
 
-    /// Recover an old installation's last own message without treating the incoming
-    /// /sync request (or another participant's message) as a new send reference.
-    async fn last_own_message_at(&self, group: &str, requested_at: u64) -> Result<Option<u64>> {
-        let mut before: Option<(u64, String)> = None;
-        let mut cursors = HashSet::new();
-        let mut latest = None;
-        loop {
-            let mut request = json!({"type":"timeline_list","account_id_hex":self.config.account_id_hex,"group_id_hex":group,"limit":50});
-            if let Some((at, id)) = &before {
-                request["before"] = json!({"recorded_at":at,"message_id_hex":id});
-            }
-            let page = self.marmot.marmot(request).await?;
-            ensure!(page["type"] == "timeline_page", "Invalid timeline response");
-            let rows = page["messages"]
-                .as_array()
-                .ok_or_else(|| anyhow::anyhow!("Missing timeline messages"))?;
-            let page_latest = rows
-                .iter()
-                .filter(|row| {
-                    row["sender"]["is_self"] == true
-                        && row["kind"] == 9
-                        && row["availability"] == "available"
+    pub(crate) fn native_reader(&self) -> crate::reads::Reader {
+        self.reads.reader()
+    }
+
+    fn history_request(
+        &self,
+        key: &str,
+        group: &str,
+        id: &str,
+        kind: crate::history::Kind,
+    ) -> crate::history::Request {
+        let targets = self
+            .state
+            .mappings
+            .iter()
+            .filter_map(|(mapping_key, mapping)| {
+                if matches!(kind, crate::history::Kind::Last(_)) && mapping_key != key {
+                    return None;
+                }
+                let target = mapping.group_id_hex.clone()?;
+                let agent = self
+                    .agents
+                    .get(mapping_key)
+                    .or(mapping.agent_record.as_ref())
+                    .filter(|agent| agent.key() == *mapping_key)?;
+                let session = agent
+                    .agent_session
+                    .clone()
+                    .filter(|session| output::supported(&session.agent))?;
+                Some(crate::history::Target {
+                    key: mapping_key.clone(),
+                    group: target,
+                    session,
                 })
-                .filter_map(|row| row["recorded_at"].as_u64())
-                .filter(|at| *at > 0 && *at <= requested_at)
-                .max();
-            latest = latest.max(page_latest);
-            if rows.is_empty() || page["has_more_before"] != true {
-                return Ok(latest);
-            }
-            let cursor = (
-                rows[0]["recorded_at"]
-                    .as_u64()
-                    .ok_or_else(|| anyhow::anyhow!("Invalid timeline time"))?,
-                rows[0]["message_id_hex"]
-                    .as_str()
-                    .ok_or_else(|| anyhow::anyhow!("Missing timeline message ID"))?
-                    .to_owned(),
-            );
-            ensure!(
-                cursors.insert(cursor.1.clone()),
-                "Timeline cursor did not advance"
-            );
-            before = Some(cursor);
+            })
+            .collect();
+        crate::history::Request {
+            key: key.into(),
+            group: group.into(),
+            id: id.into(),
+            kind,
+            requested_at: now(),
+            targets,
+            reference: self.state.last_confirmed_send_at,
+            groups: self
+                .state
+                .mappings
+                .values()
+                .filter_map(|m| m.group_id_hex.clone())
+                .collect(),
         }
+    }
+
+    fn queue_history(&mut self, request: crate::history::Request) -> Result<()> {
+        if self
+            .state
+            .history_requests
+            .iter()
+            .any(|old| old.key == request.key && old.id == request.id)
+        {
+            return Ok(());
+        }
+        ensure!(
+            self.state.history_requests.len() < 16,
+            "History request queue is full; retry later"
+        );
+        self.state.history_requests.push(request);
+        if let Err(error) = self.save() {
+            self.state.history_requests.pop();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub async fn process_history_requests(&mut self) -> Result<()> {
+        if self
+            .history_job
+            .as_ref()
+            .is_some_and(|job| job.is_finished())
+        {
+            let collection = self
+                .history_job
+                .take()
+                .unwrap()
+                .await
+                .map_err(|_| anyhow::anyhow!("History collection failed; request retained"))?;
+            let request = collection.request.clone();
+            let valid = self
+                .state
+                .mappings
+                .get(&request.key)
+                .is_some_and(|m| m.group_id_hex.as_deref() == Some(&request.group));
+            let seen = self
+                .state
+                .mappings
+                .get(&request.key)
+                .is_some_and(|m| m.seen_messages.contains(&request.id));
+            if valid && !seen {
+                match request.kind {
+                    crate::history::Kind::Recent(window) => {
+                        self.finish_chat_command(
+                            &request.key,
+                            &request.group,
+                            &request.id,
+                            Some(window),
+                            Some(collection),
+                        )
+                        .await?
+                    }
+                    crate::history::Kind::Last(count) => {
+                        self.finish_last_command(
+                            &request.key,
+                            &request.group,
+                            &request.id,
+                            count,
+                            Some(collection),
+                        )
+                        .await?
+                    }
+                }
+            }
+            let before = self.state.clone();
+            self.state
+                .history_requests
+                .retain(|old| old.key != request.key || old.id != request.id);
+            if let Err(error) = self.save() {
+                self.state = before;
+                return Err(error);
+            }
+        }
+        if self.history_job.is_none()
+            && let Some(request) = self.state.history_requests.first().cloned()
+        {
+            let reader = self.native_reader();
+            let config = self.config.clone();
+            let marmot = self.marmot.clone();
+            let notify = self.reads.notify.clone();
+            self.history_job = Some(tokio::spawn(async move {
+                let result = crate::history::collect(reader, config, marmot, request).await;
+                notify.notify_one();
+                result
+            }));
+        }
+        Ok(())
     }
 
     /// White Noise-only commands bypass agent input and the global phone-wake path.
@@ -1638,74 +1878,92 @@ impl Bridge {
         id: &str,
         recent_window: Option<u64>,
     ) -> Result<()> {
+        if self.reads.background
+            && let Some(window) = recent_window
+        {
+            return self.queue_history(self.history_request(
+                key,
+                group,
+                id,
+                crate::history::Kind::Recent(window),
+            ));
+        }
+        self.finish_chat_command(key, group, id, recent_window, None)
+            .await
+    }
+
+    async fn finish_chat_command(
+        &mut self,
+        key: &str,
+        group: &str,
+        id: &str,
+        recent_window: Option<u64>,
+        collection: Option<crate::history::Collection>,
+    ) -> Result<()> {
         use sha2::{Digest, Sha256};
         self.refresh_forwarding()?;
         let request = hex::encode(Sha256::digest(serde_json::to_vec(&(group, id))?));
         let mut replies = Vec::new();
         let mut unavailable = 0;
-        let requested_at = now();
+        let requested_at = collection
+            .as_ref()
+            .map_or_else(now, |c| c.request.requested_at);
         let mut reference = self.state.last_confirmed_send_at;
         if let Some(window) = recent_window {
-            if reference.is_none() {
-                let groups: HashSet<_> = self
-                    .state
-                    .mappings
-                    .values()
-                    .filter_map(|mapping| mapping.group_id_hex.clone())
-                    .collect();
-                for target in groups {
-                    match self.last_own_message_at(&target, requested_at).await {
-                        Ok(at) => reference = reference.max(at),
-                        Err(_) => unavailable += 1,
-                    }
+            let collection = match collection {
+                Some(c) => c,
+                None => {
+                    crate::history::collect(
+                        self.native_reader(),
+                        self.config.clone(),
+                        self.marmot.clone(),
+                        self.history_request(key, group, id, crate::history::Kind::Recent(window)),
+                    )
+                    .await
                 }
-            }
+            };
+            reference = reference.max(collection.reference);
+            unavailable += collection.unavailable;
             let cutoff = requested_at.saturating_sub(window);
-            let limit = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
-            let mut readers = tokio::task::JoinSet::new();
-            for (mapping_key, mapping) in &self.state.mappings {
-                let Some(target) = mapping.group_id_hex.clone() else {
+            for (target, result) in collection.histories {
+                if !self.state.mappings.get(&target.key).is_some_and(|m| {
+                    m.group_id_hex.as_ref() == Some(&target.group)
+                        && m.agent_record
+                            .as_ref()
+                            .and_then(|a| a.agent_session.as_ref())
+                            == Some(&target.session)
+                }) {
+                    unavailable += 1;
                     continue;
-                };
-                let Some(agent) = self
-                    .agents
-                    .get(mapping_key)
-                    .or(mapping.agent_record.as_ref())
-                    .filter(|agent| agent.key() == *mapping_key)
-                else {
-                    continue;
-                };
-                let Some(session) = agent
-                    .agent_session
-                    .clone()
-                    .filter(|session| output::supported(&session.agent))
-                else {
-                    continue;
-                };
-                let config = self.config.clone();
-                let limit = limit.clone();
-                readers.spawn(async move {
-                    let _permit = limit.acquire_owned().await?;
-                    Ok::<_, anyhow::Error>((target, output::read_history(&config, &session).await))
-                });
-            }
-            while let Some(result) = readers.join_next().await {
+                }
+                let target = target.group;
                 match result {
-                    Ok(Ok((target, Ok(mut history)))) => {
-                        history
+                    Ok(history) => {
+                        let recent: Vec<_> = history
                             .recent_messages
-                            .retain(|message| !self.state.source_known(&target, &message.key()));
+                            .iter()
+                            .filter(|message| !self.state.source_known(&target, &message.key()))
+                            .cloned()
+                            .collect();
                         if history
                             .activity_at
                             .is_some_and(|at| at <= now() && at >= cutoff)
-                            && let Some(excerpt) = history.catch_up()
+                            && let Some(excerpt) = output::SessionHistory::excerpt(&recent)
                         {
-                            let messages = history
-                                .recent_messages
+                            let messages = recent.iter().map(|message| message.key()).collect();
+                            let oldest = recent
                                 .iter()
-                                .map(|message| message.key())
-                                .collect();
-                            replies.push((target, excerpt, messages));
+                                .filter_map(|message| message.timestamp)
+                                .filter(|at| {
+                                    u64::try_from(*at)
+                                        .is_ok_and(|at| at >= cutoff && at <= requested_at)
+                                })
+                                .min()
+                                .unwrap_or_else(|| {
+                                    i64::try_from(history.activity_at.unwrap_or_default())
+                                        .unwrap_or(i64::MAX)
+                                });
+                            replies.push((oldest, target, excerpt, messages));
                         }
                     }
                     _ => unavailable += 1,
@@ -1718,13 +1976,18 @@ impl Bridge {
             self.state.last_confirmed_send_at = reference;
         }
         let count = replies.len();
-        for (target, text, messages) in replies {
+        replies.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        for (_, target, text, messages) in replies {
+            let start = self.state.outbox.len();
             self.state.enqueue_tracked(
                 &target,
                 &text,
                 Some(&format!("sync:{request}:{target}")),
                 messages,
             );
+            for item in &mut self.state.outbox[start..] {
+                item.recent = true;
+            }
         }
         let response = if recent_window.is_some() {
             let mut status = if count == 0 {
@@ -1743,7 +2006,7 @@ impl Bridge {
         } else {
             format!(
                 "# codr commands\n\n### General\n\n**`/help`**  \nShow commands\n\n**`/status`**  \nConnection, state, queue and unmute\n\n**`/last [count]`**  \nReplay the newest message in this chat without unmuting. Use /last4 or /last 4 for four; count 1–100.\n\n**`/recent [hours]`**  \nGet newest 3 messages per chat active in the past hour. Use /recent2 or /recent 2 for two hours.\n\n**`/update`**  \nCheck ngit for a stable bridge update; confirm before installing\n\n### Projects & Agents\n\n**`/new`**  \nSet up a project\n\n**`/agent`**  \nChoose agent (separate chat)\n\n**`/model`**  \nChoose model\n\n### Tasks\n\n**`/queue`**  \nView pending deliveries\n\n**`/cancel`**  \nInterrupt the current task\n\n### Sync\n\n**`/unmute`**  \nUnmute all chats and return to automatic sync\n\n**`/sync auto|on|off`**  \nSet persistent sync mode\nCurrent sync mode: {}\n\nCommands accept unambiguous prefixes (/n, /st, /sy). In the control chat the leading / is optional.",
-                forwarding::load(&self.config.state_path)?.mode.label()
+                self.forwarding.load(&self.config.state_path)?.mode.label()
             )
         };
         self.state
@@ -1762,6 +2025,25 @@ impl Bridge {
     }
 
     async fn last_command(&mut self, key: &str, group: &str, id: &str, count: usize) -> Result<()> {
+        if self.reads.background {
+            return self.queue_history(self.history_request(
+                key,
+                group,
+                id,
+                crate::history::Kind::Last(count),
+            ));
+        }
+        self.finish_last_command(key, group, id, count, None).await
+    }
+
+    async fn finish_last_command(
+        &mut self,
+        key: &str,
+        group: &str,
+        id: &str,
+        count: usize,
+        collection: Option<crate::history::Collection>,
+    ) -> Result<()> {
         let session = (!self.state.mappings[key].control)
             .then(|| {
                 self.agents
@@ -1773,7 +2055,22 @@ impl Bridge {
             .and_then(|agent| agent.agent_session.clone())
             .filter(|session| output::supported(&session.agent));
         let response = if let Some(session) = session {
-            match output::read_history(&self.config, &session).await {
+            let history = if let Some(collection) = collection {
+                collection
+                    .histories
+                    .into_iter()
+                    .find(|(target, _)| {
+                        target.key == key && target.group == group && target.session == session
+                    })
+                    .map(|(_, result)| result)
+                    .unwrap_or_else(|| Err(anyhow::anyhow!("Session binding changed")))
+            } else {
+                self.native_reader()
+                    .read(&self.config, &session)
+                    .await
+                    .map(|snapshot| snapshot.history)
+            };
+            match history {
                 Ok(history) => history
                     .last(count)
                     .unwrap_or_else(|| "No conversation messages yet.".into()),
@@ -1814,7 +2111,7 @@ impl Bridge {
                 .values()
                 .filter(|mapping| !mapping.control && mapping.group_id_hex.is_some())
                 .count();
-            let control = forwarding::load(&self.config.state_path)?;
+            let control = self.forwarding.load(&self.config.state_path)?;
             format!(
                 "codr control chat. {sessions} mapped session(s). Forwarding: {}. Use /new to start a project, /help for commands.",
                 control.mode.label()
@@ -2184,9 +2481,9 @@ impl Bridge {
                 }
             };
             let control = if let Some(mode) = mode {
-                forwarding::set_mode(&self.config.state_path, mode)?
+                std::sync::Arc::new(forwarding::set_mode(&self.config.state_path, mode)?)
             } else {
-                forwarding::load(&self.config.state_path)?
+                self.forwarding.load(&self.config.state_path)?
             };
             self.refresh_forwarding()?;
             return crate::launch::reply(
@@ -2225,11 +2522,32 @@ impl Bridge {
         }
         if !prepared
             && !crate::media::images(msg)
-            && output::permission::is_reply(text, self.state.mappings[&key].permission.is_some())
+            && output::permission::is_reply(
+                text,
+                self.state.mappings[&key].permission.is_some()
+                    || event["reply_to"]["message_id_hex"]
+                        .as_str()
+                        .is_some_and(|target| {
+                            !self.state.mappings[&key]
+                                .permission_card_deliveries
+                                .is_empty()
+                                || self.state.mappings[&key]
+                                    .permission_card_ids
+                                    .iter()
+                                    .any(|card| card == target)
+                        }),
+            )
         {
             ensure!(!queued, "Permission replies cannot be queued");
             return self
-                .reply_permission(&key, group, id, text, plain_command)
+                .reply_permission(
+                    &key,
+                    group,
+                    id,
+                    text,
+                    plain_command,
+                    event["reply_to"]["message_id_hex"].as_str(),
+                )
                 .await;
         }
         if plain_command
@@ -2654,6 +2972,9 @@ impl Bridge {
                 Some("Send a non-empty text message.".into())
             } else {
                 let before_submission = self.state.clone();
+                if let Some(history) = &acceptance_history {
+                    self.observe_submission_acceptances(&key, &history.user_inputs);
+                }
                 let mapping = self.state.mappings.get_mut(&key).unwrap();
                 let was_pending = mapping.pending_prompt;
                 let new_flight = immediate_prompt && mapping.queue_flight.is_none();
@@ -2667,12 +2988,6 @@ impl Bridge {
                     });
                 }
                 mapping.pending_prompt = true;
-                if let Some(history) = &acceptance_history {
-                    crate::activity::Submission::observe(
-                        &mut mapping.submissions,
-                        &history.user_inputs,
-                    );
-                }
                 if agent
                     .agent_session
                     .as_ref()
@@ -3026,10 +3341,12 @@ impl Bridge {
         mut permission: output::permission::Permission,
     ) -> Result<()> {
         self.state.mappings.get_mut(key).unwrap().decision = None;
-        if let Some(previous) = self.state.mappings[key].permission.as_ref()
-            && previous.request == permission.request
-        {
-            permission = previous.clone();
+        if let Some(previous) = self.state.mappings[key].permission.as_ref() {
+            if previous.request == permission.request {
+                permission = previous.clone();
+            } else {
+                permission.changed = previous.announced && !previous.submitted;
+            }
         }
         if self.state.mappings[key]
             .permission_attempts
@@ -3037,9 +3354,29 @@ impl Bridge {
         {
             permission.submitted = true;
         }
-        if !permission.announced && !permission.submitted {
+        if (!permission.announced || permission.card_delivery_id.is_none()) && !permission.submitted
+        {
+            let start = self.state.outbox.len();
             self.state.enqueue(group, &permission.text());
+            permission.card_delivery_id = self.state.outbox.get(start).map(|item| item.id.clone());
+            for item in &mut self.state.outbox[start..] {
+                item.permission_card = true;
+            }
+            self.state
+                .mappings
+                .get_mut(key)
+                .unwrap()
+                .permission_card_deliveries
+                .extend(
+                    self.state.outbox[start..]
+                        .iter()
+                        .map(|item| item.id.clone()),
+                );
             permission.announced = true;
+        }
+        if self.config.edit_responses && self.state.forwarding_enabled && !permission.submitted {
+            self.state
+                .update_response(key, group, "> Waiting for your permission...", false);
         }
         self.state.mappings.get_mut(key).unwrap().permission = Some(permission);
         self.save()
@@ -3069,14 +3406,18 @@ impl Bridge {
         id: &str,
         text: &str,
         typed: bool,
+        reply_target: Option<&str>,
     ) -> Result<()> {
         self.refresh_forwarding()?;
-        let Some((reply, code)) = output::permission::parse_reply(text).filter(|_| typed) else {
+        let parsed = output::permission::parse_reply(text)
+            .map(|(reply, code)| (reply, Some(code)))
+            .or_else(|| output::permission::parse_card_reply(text).map(|reply| (reply, None)));
+        let Some((reply, code)) = parsed.filter(|_| typed) else {
             return self.permission_notice(
                 key,
                 group,
                 id,
-                "Use typed /allow CODE or /reject CODE. Persistent rules stay terminal-only.",
+                "Send 1 to allow once or 2 to deny as a normal message. Persistent rules stay terminal-only.",
             );
         };
         let Some(permission) = self.state.mappings[key]
@@ -3091,12 +3432,19 @@ impl Bridge {
                 "No permission card is available. Check the terminal.",
             );
         };
-        if !permission.token().eq_ignore_ascii_case(code) {
+        let matches = match code {
+            Some(code) => permission.token().eq_ignore_ascii_case(code),
+            None => permission
+                .card_message_id
+                .as_deref()
+                .is_some_and(|card| reply_target.is_none_or(|target| card == target)),
+        };
+        if !matches {
             return self.permission_notice(
                 key,
                 group,
                 id,
-                "Permission code does not match. Use the current card.",
+                "The current permission card is not confirmed, or this reply refers to an old card. Wait for the current card, then send 1 or 2 as a normal message. No permission reply was sent.",
             );
         }
         if permission.submitted
@@ -3146,6 +3494,36 @@ impl Bridge {
         if herdr::get(&self.herdr, &agent).await?.agent_status != "blocked" {
             return self.permission_notice(key, group, id, "Permission is no longer waiting.");
         }
+        let confirms = text.trim().eq_ignore_ascii_case("confirm");
+        if confirms && !permission.confirming {
+            return self.permission_notice(
+                key,
+                group,
+                id,
+                "No approval is awaiting confirmation. Send 1 to allow once or 2 to deny.",
+            );
+        }
+        if permission.changed
+            && code.is_none()
+            && reply_target.is_none()
+            && matches!(reply, output::permission::Reply::Once)
+            && !confirms
+        {
+            let before = self.state.clone();
+            self.state
+                .mappings
+                .get_mut(key)
+                .unwrap()
+                .permission
+                .as_mut()
+                .unwrap()
+                .confirming = true;
+            if let Err(error) = self.permission_notice(key, group, id, "This permission request changed. Check the commands in the current card. Send confirm to allow them once, or 2 to deny.") {
+                self.state = before;
+                return Err(error);
+            }
+            return Ok(());
+        }
         // Durable intent precedes the only mutation. Unknown results must never auto-retry.
         let before = self.state.clone();
         let mapping = self.state.mappings.get_mut(key).unwrap();
@@ -3166,7 +3544,10 @@ impl Bridge {
         self.state.enqueue_manual(
             group,
             if result.is_ok() {
-                "Permission reply sent."
+                match reply {
+                    output::permission::Reply::Once => "Allowed once.",
+                    output::permission::Reply::Reject => "Denied.",
+                }
             } else {
                 "Permission reply not confirmed. Check the terminal; no automatic retry."
             },
@@ -3305,6 +3686,28 @@ impl Bridge {
                 "That question is no longer waiting. No answer was sent.",
             );
         }
+        let value = match &answer {
+            output::decision::Answer::Choice(choice) => decision.current_question().options
+                [choice - 1]
+                .label
+                .clone(),
+            output::decision::Answer::Custom(text) => text.clone(),
+        };
+        if decision.answers.len() + 1 < decision.questions.len() {
+            let before = self.state.clone();
+            let mapping = self.state.mappings.get_mut(key).unwrap();
+            let pending = mapping.decision.as_mut().unwrap();
+            pending.answers.push(value);
+            let next = pending.text();
+            mapping.seen_messages.push(id.into());
+            self.state
+                .enqueue_manual(group, &next, &format!("question-part:{group}:{id}"));
+            if let Err(error) = self.save() {
+                self.state = before;
+                return Err(error);
+            }
+            return Ok(true);
+        }
         let pending_prompt = self.state.mappings[key].pending_prompt;
         let before = self.state.clone();
         let mapping = self.state.mappings.get_mut(key).unwrap();
@@ -3318,21 +3721,17 @@ impl Bridge {
         let result = if let Some(form) = &decision.form_id {
             // V2 form option values equal their labels, as checked by from_forms.
             // Bind both choices and custom text to the verified request, not its UI.
-            let value = match &answer {
-                output::decision::Answer::Choice(choice) => {
-                    &decision.questions[0].options[choice - 1].label
-                }
-                output::decision::Answer::Custom(text) => text,
-            };
+            let values: serde_json::Map<String, Value> = decision
+                .answers
+                .iter()
+                .chain(std::iter::once(&value))
+                .enumerate()
+                .map(|(index, value)| (format!("q{index}"), json!(value)))
+                .collect();
             let path = format!("/api/session/{}/form/{form}/reply", session.value);
-            crate::catalogue::api(
-                &self.config,
-                "post",
-                &path,
-                Some(&json!({"answer":{"q0":value}})),
-            )
-            .await
-            .map(|_| ())
+            crate::catalogue::api(&self.config, "post", &path, Some(&json!({"answer":values})))
+                .await
+                .map(|_| ())
         } else {
             let output::decision::Answer::Choice(choice) = &answer else {
                 unreachable!("Custom answers require a native form");
@@ -3343,25 +3742,27 @@ impl Bridge {
             Ok(()) => {
                 self.refresh_forwarding()?;
                 if self.state.forwarding_enabled
-                    && let Some(turn) = snapshot.history.latest_turn
+                    && let Some(turn) = &snapshot.history.latest_turn
                 {
                     let mapping = self.state.mappings.get_mut(key).unwrap();
                     // Resume only this accepted answer's unfinished turn. Keep
                     // already completed replies suppressed, including this turn's
                     // earlier replies, without replaying another chat's history.
-                    for reply in snapshot.history.finals {
-                        if reply.turn.as_ref() == Some(&turn)
+                    for reply in &snapshot.history.finals {
+                        if reply.turn.as_ref() == Some(turn)
                             && !mapping.final_ids.contains(&reply.id)
                         {
-                            mapping.final_ids.push(reply.id);
+                            mapping.final_ids.push(reply.id.clone());
                         }
                     }
-                    mapping.muted_turns.retain(|muted| muted != &turn);
+                    mapping.muted_turns.retain(|muted| muted != turn);
                 }
-                let message = match answer {
+                let message = if decision.questions.len() > 1 {
+                    format!("Sent all {} answers.", decision.questions.len())
+                } else { match answer {
                     output::decision::Answer::Choice(choice) => format!("Sent choice {choice}: {}.", decision.questions[0].options[choice-1].label),
                     output::decision::Answer::Custom(_) => "Sent your custom answer to the current question.".into(),
-                };
+                }};
                 self.state.enqueue(group, &message);
             }
             Err(error) if error.downcast_ref::<crate::wire::NotSubmitted>().is_some() => {
@@ -3380,6 +3781,10 @@ impl Bridge {
     }
 
     pub async fn recover_inbound(&mut self) -> Result<()> {
+        if self.reads.background {
+            self.recovery.request();
+            return self.process_recovery().await;
+        }
         let groups: Vec<_> = self
             .state
             .mappings
@@ -3397,41 +3802,81 @@ impl Bridge {
     }
 
     async fn recover_group(&mut self, group: &str) -> Result<()> {
-        // Sender timestamps are not ingestion cursors. Rescan retained history and deduplicate
-        // by durable message ID so delayed relay deliveries cannot fall behind a watermark.
-        let mut before: Option<Value> = None;
-        let mut pages = Vec::new();
-        loop {
-            let mut req = json!({"type":"timeline_list","account_id_hex":self.config.account_id_hex,"group_id_hex":group,"limit":50});
-            if let Some(cursor) = &before {
-                req["before"] = cursor.clone();
-            }
-            let page = self.marmot.marmot(req).await?;
-            ensure!(page["type"] == "timeline_page", "Invalid timeline response");
-            let rows = page["messages"]
-                .as_array()
-                .ok_or_else(|| anyhow::anyhow!("Missing timeline messages"))?
-                .clone();
-            if rows.is_empty() {
-                break;
-            }
-            let cursor = json!({"recorded_at":rows[0]["recorded_at"], "message_id_hex":rows[0]["message_id_hex"]});
-            ensure!(
-                before.as_ref() != Some(&cursor),
-                "Timeline cursor did not advance"
-            );
-            before = Some(cursor);
-            pages.push(rows);
-            if page["has_more_before"] != true {
-                break;
+        let target = self
+            .recovery_groups()
+            .into_iter()
+            .find(|target| target.group == group)
+            .ok_or_else(|| anyhow::anyhow!("Group no longer mapped"))?;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let socket = self.marmot.clone();
+        let account = self.config.account_id_hex.clone();
+        let phone = self.phone.clone();
+        let worker = tokio::spawn(async move {
+            crate::recovery::stream_group(
+                &socket,
+                &account,
+                &phone,
+                &target,
+                &tx,
+                &tokio::sync::Notify::new(),
+            )
+            .await
+        });
+        while let Some(event) = rx.recv().await {
+            if let Err(error) = self.inbound(&event).await {
+                worker.abort();
+                return Err(error);
             }
         }
-        for rows in pages.into_iter().rev() {
-            for row in rows {
-                if row["availability"] == "available" && row["kind"] == 9 {
-                    self.inbound(&json!({"marmot_agent_control":PROTOCOL,"type":"inbound_message","account_id_hex":self.config.account_id_hex,"group_id_hex":group,"message":{"message_id_hex":row["message_id_hex"],"sender":row["sender"],"text":row["text"],"text_truncated":row["text_truncated"],"attachments_truncated":row["attachments_truncated"],"recorded_at":row["recorded_at"],"media":row["attachments"]}})).await?;
+        worker
+            .await
+            .map_err(|_| anyhow::anyhow!("Recovery collection failed"))?
+    }
+
+    fn recovery_groups(&self) -> Vec<crate::recovery::Group> {
+        self.state
+            .mappings
+            .values()
+            .filter_map(|mapping| {
+                let group = mapping.group_id_hex.clone()?;
+                let mut seen: HashSet<_> = mapping.seen_messages.iter().cloned().collect();
+                // Accepted media may still need richer references from recovery.
+                for prompt in &mapping.prompt_queue {
+                    if prompt.media.is_some() {
+                        seen.remove(&prompt.id);
+                    }
                 }
+                for event in &self.state.media_pending {
+                    if event["group_id_hex"] == group
+                        && let Some(id) = event["message"]["message_id_hex"].as_str()
+                    {
+                        seen.remove(id);
+                    }
+                }
+                Some(crate::recovery::Group { group, seen })
+            })
+            .collect()
+    }
+
+    pub async fn process_recovery(&mut self) -> Result<()> {
+        for _ in 0..8 {
+            let Some(event) = self.recovery.pop() else {
+                break;
+            };
+            if let Err(error) = self.inbound(&event).await {
+                self.recovery.failed();
+                return Err(error);
             }
+        }
+        self.recovery.finish().await;
+        if self.herdr_available && self.recovery.due() {
+            self.recovery.start(
+                self.marmot.clone(),
+                self.config.account_id_hex.clone(),
+                self.phone.clone(),
+                self.recovery_groups(),
+                self.reads.notify.clone(),
+            );
         }
         Ok(())
     }
@@ -3745,6 +4190,12 @@ impl Bridge {
             if self.process_media().await.is_err() {
                 recovery_due = true;
                 eprintln_throttled!("Prepared media input deferred; will reconcile history.");
+            }
+            if self.process_history_requests().await.is_err() {
+                eprintln_throttled!("Manual history remains pending; collection will retry.");
+            }
+            if self.process_recovery().await.is_err() {
+                eprintln_throttled!("Inbound recovery remains pending; retry is backed off.");
             }
             if self.check_submission_acceptances().is_err() {
                 eprintln_throttled!(

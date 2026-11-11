@@ -26,6 +26,41 @@ struct Job {
     task: JoinHandle<Result<output::SessionSnapshot>>,
 }
 
+/// Shared native reader and I/O budget for polling and explicit history reads.
+#[derive(Clone)]
+pub(crate) struct Reader {
+    limit: Arc<Semaphore>,
+    database: Arc<Mutex<output::opencode::Reader>>,
+    service: Arc<output::service::Reader>,
+}
+
+impl Reader {
+    pub async fn read(
+        &self,
+        config: &BridgeConfig,
+        session: &crate::herdr::Session,
+    ) -> Result<output::SessionSnapshot> {
+        let _permit = self.limit.acquire().await?;
+        self.validate(config, session).await
+    }
+
+    async fn validate(
+        &self,
+        config: &BridgeConfig,
+        session: &crate::herdr::Session,
+    ) -> Result<output::SessionSnapshot> {
+        if session.agent == "opencode" && config.opencode_service_file.is_some() {
+            anyhow::ensure!(
+                session.kind == "id",
+                "Unsupported native session reference kind"
+            );
+            self.service.read(config, &session.value).await
+        } else {
+            snapshot(config, session, self.database.clone()).await
+        }
+    }
+}
+
 /// One reader per session, with bounded parallel I/O and serial result application.
 pub(crate) struct Reads {
     pub background: bool,
@@ -37,6 +72,7 @@ pub(crate) struct Reads {
     ended: HashSet<String>,
     pub database: Arc<Mutex<output::opencode::Reader>>,
     service: Arc<output::service::Reader>,
+    completed: Arc<Mutex<HashSet<String>>>,
 }
 
 impl Default for Reads {
@@ -51,6 +87,7 @@ impl Default for Reads {
             ended: HashSet::new(),
             database: Arc::new(Mutex::new(output::opencode::Reader::default())),
             service: Arc::new(output::service::Reader::default()),
+            completed: Arc::default(),
         }
     }
 }
@@ -64,6 +101,31 @@ impl Drop for Reads {
 }
 
 impl Reads {
+    pub fn reader(&self) -> Reader {
+        Reader {
+            limit: self.limit.clone(),
+            database: self.database.clone(),
+            service: self.service.clone(),
+        }
+    }
+    pub fn completed_keys(&self) -> Vec<String> {
+        let mut completed = self.completed.lock().unwrap();
+        let keys: Vec<_> = completed.drain().collect();
+        let mut ready = Vec::new();
+        for key in keys {
+            if let Some(job) = self.jobs.get(&key) {
+                if job.task.is_finished() {
+                    ready.push(key);
+                } else {
+                    // Notification can race with the task returning its result.
+                    completed.insert(key);
+                    self.notify.notify_one();
+                }
+            }
+        }
+        ready
+    }
+
     pub fn retain(&mut self, keys: &HashSet<String>) {
         self.ready.retain(|key, _| keys.contains(key));
         // Let in-flight native readers finish before releasing their concurrency slot.
@@ -105,14 +167,9 @@ impl Reads {
         config: &BridgeConfig,
         session: &crate::herdr::Session,
     ) -> Result<output::SessionSnapshot> {
-        if session.agent == "opencode" && config.opencode_service_file.is_some() {
-            anyhow::ensure!(
-                session.kind == "id",
-                "Unsupported native session reference kind"
-            );
-            return self.service.read(config, &session.value).await;
-        }
-        snapshot(config, session, self.database.clone()).await
+        // Foreground validation is awaited by serial dispatch. Preserve its
+        // independent path so unrelated background jobs cannot queue controls.
+        self.reader().validate(config, session).await
     }
 
     pub async fn read(
@@ -170,28 +227,16 @@ impl Reads {
         if !self.scheduling {
             return Err(Pending.into());
         }
-        self.jobs.entry(key).or_insert_with(|| {
+        let reader = self.reader();
+        self.jobs.entry(key.clone()).or_insert_with(|| {
             let config = config.clone();
-            let limit = self.limit.clone();
             let notify = self.notify.clone();
-            let database = self.database.clone();
-            let service = self.service.clone();
+            let completed = self.completed.clone();
             Job {
                 context,
                 task: tokio::spawn(async move {
-                    let result = async {
-                        let _permit = limit.acquire_owned().await?;
-                        if session.agent == "opencode" && config.opencode_service_file.is_some() {
-                            anyhow::ensure!(
-                                session.kind == "id",
-                                "Unsupported native session reference kind"
-                            );
-                            service.read(&config, &session.value).await
-                        } else {
-                            snapshot(&config, &session, database).await
-                        }
-                    }
-                    .await;
+                    let result = reader.read(&config, &session).await;
+                    completed.lock().unwrap().insert(key);
                     notify.notify_one();
                     result
                 }),
@@ -214,4 +259,43 @@ pub(crate) async fn snapshot(
         return output::read_opencode_snapshot(config, session, database).await;
     }
     output::read_snapshot(config, session).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bech32::ToBase32;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn fresh_validation_does_not_queue_behind_background_capacity() {
+        let root = tempfile::tempdir().unwrap();
+        let reads = Reads::default();
+        let _busy = reads.limit.acquire_many(4).await.unwrap();
+        let config: BridgeConfig = serde_json::from_value(json!({
+            "phone_npub":bech32::encode("npub",[0x11u8;32].to_base32(),bech32::Variant::Bech32).unwrap(),
+            "account_id_hex":"aa".repeat(32), "herdr_socket":root.path().join("h.sock"),
+            "wn_agent_socket":root.path().join("w.sock"), "state_path":root.path().join("state.json"),
+            "opencode_service_file":root.path().join("absent-registration.json")
+        })).unwrap();
+        let session = crate::herdr::Session {
+            source: "fixture".into(),
+            agent: "opencode".into(),
+            kind: "id".into(),
+            value: "ses_fixture".into(),
+        };
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            reads.fresh(&config, &session),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "Fresh validation must reach its reader despite saturated background work"
+        );
+        assert!(
+            result.unwrap().is_err(),
+            "The synthetic registration is intentionally absent"
+        );
+    }
 }

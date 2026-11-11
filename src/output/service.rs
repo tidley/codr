@@ -1,6 +1,6 @@
 //! Non-owning local V2 reads. No CLI, health recovery, registration writes, or process signals.
 use super::{ExportV2, SessionSnapshot, decision, from_v2, history_from_data, permission, tasks};
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 use serde_json::Value;
 use std::{
@@ -29,6 +29,36 @@ type Sessions = HashMap<(PathBuf, String), Arc<tokio::sync::Mutex<Cache>>>;
 
 const HISTORY_LIMIT: usize = 128 * 1024 * 1024;
 const PAGE_SIZE: usize = 100;
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(super) struct ReadFailure(#[source] pub(super) anyhow::Error);
+
+#[cfg(test)]
+mod diagnostic_tests {
+    #[tokio::test]
+    async fn wrapped_service_timeouts_have_a_fixed_private_diagnostic() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let error = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_millis(10))
+            .build()
+            .unwrap()
+            .get(format!(
+                "http://{}/private-session",
+                listener.local_addr().unwrap()
+            ))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(error.is_timeout());
+        let wrapped: anyhow::Error = super::ReadFailure(anyhow::Error::new(error)).into();
+        assert_eq!(
+            crate::output::read_error_message(&wrapped),
+            "OpenCode local service read timed out; retry later"
+        );
+    }
+}
 
 #[derive(Deserialize)]
 struct Page {
@@ -69,6 +99,16 @@ impl Reader {
     }
 
     pub async fn read(
+        &self,
+        config: &crate::BridgeConfig,
+        session: &str,
+    ) -> Result<SessionSnapshot> {
+        self.read_inner(config, session)
+            .await
+            .map_err(|error| ReadFailure(error).into())
+    }
+
+    async fn read_inner(
         &self,
         config: &crate::BridgeConfig,
         session: &str,
@@ -192,7 +232,7 @@ impl Reader {
             });
             rebuilt = Some(messages);
             SessionSnapshot {
-                history: history_from_data(&export),
+                history: Arc::new(history_from_data(&export)),
                 tasks: tasks::from_data(&export),
                 ..Default::default()
             }
@@ -333,6 +373,33 @@ impl Reader {
     }
 
     async fn get(&self, registration: &Registration, path: &str, max: usize) -> Result<Vec<u8>> {
+        let result = self.get_once(registration, path, max).await;
+        let transient = result
+            .as_ref()
+            .err()
+            .and_then(|error| error.downcast_ref::<reqwest::Error>())
+            .is_some_and(|error| {
+                error.is_timeout()
+                    || error.is_connect()
+                    || error.is_request()
+                    || error.is_body()
+                    || error.is_decode()
+            });
+        if transient {
+            // GET only: discard the failed response and retry once. Never retry
+            // form submissions, HTTP rejections, invalid data, or size-limit failures.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            return self.get_once(registration, path, max).await;
+        }
+        result
+    }
+
+    async fn get_once(
+        &self,
+        registration: &Registration,
+        path: &str,
+        max: usize,
+    ) -> Result<Vec<u8>> {
         let mut request = self
             .client
             .get(format!("{}{path}", registration.url.trim_end_matches('/')));
@@ -342,7 +409,7 @@ impl Reader {
         let mut response = request
             .send()
             .await
-            .map_err(|_| anyhow::anyhow!("OpenCode read unavailable; retry later"))?;
+            .context("OpenCode read unavailable; retry later")?;
         ensure!(
             response.status().is_success(),
             "OpenCode read failed (HTTP {})",
@@ -358,7 +425,7 @@ impl Reader {
         while let Some(chunk) = response
             .chunk()
             .await
-            .map_err(|_| anyhow::anyhow!("OpenCode read interrupted; retry later"))?
+            .context("OpenCode read interrupted; retry later")?
         {
             ensure!(
                 bytes.len().saturating_add(chunk.len()) <= max,

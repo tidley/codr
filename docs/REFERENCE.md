@@ -28,7 +28,59 @@ The worker reads session transcripts in background jobs, with at most four reads
 
 The four-reader limit bounds background I/O, not chat subscriptions. The bridge listens for phone messages across all mapped chats.
 
+Read-completion wakes apply only completed sessions. Authoritative snapshots
+still handle discovery, unknown identities, group naming and ended sessions.
+Unchanged native history is shared in memory instead of copied for each read;
+questions and permission state are refreshed separately.
+
+Phone `/last` and `/recent` collection runs outside serial input dispatch. These
+commands share the worker's native reader cache and I/O budget with polling;
+desktop history also uses that reader. Up to sixteen phone history requests can
+wait durably across restart. Results are applied only to their recorded
+session/group bindings. A restart can repeat read-only collection but does not
+repeat a consumed command's reply. Catch-up ordering and five-second delivery
+spacing remain independent of live replies.
+
+Fresh phone prompt and decision validation keeps its independent read path, so
+unrelated queued history work cannot hold it behind the background reader budget.
+
+Inbound recovery reads timelines in a background job, retaining at most one
+payload page and eight queued events, plus cursor identities for cycle detection.
+Each pass seeks the oldest
+page again. If unseen owner input is present, it streams forward in page-sized
+batches; a full event channel stops further collection. A quiet scan needs no
+second traversal. Accepted media can still receive richer references.
+Cursor progress follows MDK's canonical message identity/epoch ordering, not
+wall-clock timestamp comparisons; timestamps can decrease across epochs.
+Failed recovery retries use a two-to-sixty-second backoff rather
+than retrying on each loop event. Full retained timelines are still traversed:
+sender timestamps cannot safely identify newly ingested older deliveries.
+
 This removes serial transcript exports from the main loop. **herdr** control requests, MDK delivery, and history recovery still await their own I/O. Parallel reads do not guarantee a fixed phone-delivery time.
+
+### Local state storage
+
+Codr keeps routing, pending work, delivery receipts and phone controls in its JSON
+state file. The embedded MDK runtime owns the separate encrypted messaging
+database. Codr does not store native agent transcripts in that database.
+
+The worker remembers the last successfully saved state and file metadata.
+An unchanged save compares that state before JSON encoding, then checks file
+metadata; it does not reread, rewrite or sync the state file. Changed state is
+saved immediately, without a batching delay: write
+a private temporary file, sync it, atomically replace the state file, then sync
+its directory. A changed destination, removed or modified file, or failed write
+prevents reuse of the saved observation. The worker keeps its existing exclusive
+state lock; editing the live state file from another process is not supported.
+
+Transcript and decision polling clocks stay in memory. Older state files still
+load, but new saves omit those two clocks; a restart can refresh history and
+decisions sooner. Durable reply IDs, permissions, submission intent, setup drafts,
+receipts and queues remain persistent. Forwarding controls are checked at the
+existing safety boundaries. The worker reuses parsed controls only while file
+identity and change metadata match, and reloads after a change, deletion or
+error. Locked control updates always read fresh data. No time-based cache hides
+an external mute, and wake receipts are not evicted to reduce file size.
 
 ### Start a workspace from your phone
 
@@ -107,6 +159,8 @@ opencode_db = "/home/your-user/.local/share/opencode/opencode.db"
 **codr** opens that database read-only and uses short SQLite read transactions. It does not change OpenCode tables, indexes, journal settings, or migrations. WAL mode lets OpenCode continue to write during a read.
 
 The first read loads the selected session once. Later reads use the indexed per-session event sequence and fetch only messages affected by new events. Updates to existing text, tasks, and questions are included. Unchanged sessions read no message or part bodies. Deletions remove cached content. A restart, replaced checkpoint, or event-log gap rebuilds the cache once. Durable reply IDs still prevent replay after a restart.
+
+The local HTTP reader retries a failed GET once after a 200 ms pause if the connection fails, times out, or drops during the response. It discards partial response bytes before the retry. HTTP rejections, invalid data and size-limit failures do not trigger this retry. A failed snapshot does not advance its cache checkpoint. The reader never retries form submissions or starts the OpenCode server. Diagnostics identify local-service failures separately from transcript or CLI failures.
 
 This reader supports the v1 `message`/`part` projections and durable message-event format verified with OpenCode 1.19.3. If required projection columns, the session's durable event log, or a supported message-event version are unavailable, **codr** logs the compatibility change and uses CLI export for that session. This also applies when OpenCode upgrades while the bridge is running. The configured `opencode_bin` must export the same mapped sessions. CLI exports support OpenCode 1.x and 2.x, but full exports cost more than incremental database reads.
 
@@ -192,6 +246,8 @@ Control replies wait until the host clock passes the latest owner input's whole-
 `/help` and `/recent` do not prompt agents, answer questions, create groups, or change sync mode. They work while muted or **herdr** is disconnected. Recently ended mapped conversations can participate in catch-up. The command chat receives a count of queued conversations and unavailable readers; a queued send does not prove phone receipt. Retrying the same inbound event does not resend the catch-up. A new `/recent` request skips unchanged source messages already confirmed sent or queued by the bridge, including previous catch-ups and ordinary assistant forwarding.
 
 The cutoff defaults to one hour before the `/recent` request and is fixed for the whole batch. For example, `/recent` at 16:00 selects chats active since 15:00; `/recent4` or `/recent 4` selects chats active since 12:00. The number is a positive whole number of hours, not a message count. Zero, negative, fractional, extra or overflowing arguments receive usage guidance without prompting an agent. The last confirmed outgoing-message clock is retained for delivery accounting, but does not extend this activity window.
+
+Catch-up conversations send oldest-first, using the oldest dated message in each excerpt within the requested window (or the conversation's activity date if none is dated). Each conversation's continuation messages stay together. After its final continuation is confirmed, the next conversation waits five seconds. Failed sends retain their place; the queue and pause survive restart. Live replies and other command replies do not wait for this catch-up pause.
 
 `/last` reads only the current chat's saved native conversation, including You and
 Agent text, not tool output or command acknowledgements. It sends available
@@ -357,6 +413,8 @@ Decision cards and answers do not require editable progress.
 
 OpenCode V2 exports omit running questions. The bridge reads live session forms through the configured reader. For a question with a native form ID, numbered and labelled choices use the authenticated form reply API, as custom answers do. The bridge sends the selected option value, not the number as custom text. No terminal screen match or keystrokes are needed. Completed forms disappear from this read and cannot be replayed as pending questions.
 
+Native V2 forms with up to eight single-choice questions show one part at a time, labelled `Question 1 of 2`, for example. Reply with a number or exact option label, or custom text when that part allows it. Each answer is saved before the next part appears and survives restart. Nothing is posted to OpenCode until the final answer submits all fields together. The bridge rechecks the whole form on every reply; a replaced or changed form discards the previous form's saved answers. Question codes are specific to the current part, so an old part's coded reply cannot answer a later part. These forms support 1–9 options per question. Multi-select fields still require the terminal.
+
 The bridge checks the session and exact pending question before a reply. Legacy questions without a native form ID also need an exact visible-question check before a terminal number shortcut. If an unanswered question is replaced, the new card requires its short code, for example `qabc123 1`. Duplicate deliveries and uncertain submissions are not sent again automatically.
 
 For supported OpenCode V2 questions that allow custom input, type a complete text answer directly, such as `v6.6.6`, or use `/answer TEXT`. The bridge sends it to the freshly checked native form through the authenticated API, not as a prompt or arbitrary terminal keys. A combined reply such as `1 v6.6.6` remains literal custom text. If the question changed, prefix the text with its current question code. Custom replies are limited to 4000 UTF-8 bytes; an answer beginning with `/` must use `/answer TEXT` so commands keep their meaning. Prepared media is not automatically submitted as custom text. Submission intent is saved before the API call, and an uncertain outcome is never automatically retried.
@@ -370,9 +428,13 @@ not resume a muted turn. Permission controls keep their separate no-unmute rule.
 
 Once the bridge has observed that the agent is no longer blocked, ordinary text such as `Retry ngit` starts a new prompt rather than answering a retained custom question. Numbers, option labels, question codes and `/answer TEXT` still count as explicit answer attempts and cannot turn into new prompts for an expired question. If a question stops waiting during a reply, the bridge keeps the fail-closed check and does not send that reply as a new prompt.
 
-Legacy shortcut routing was verified against OpenCode 1.18.35's single-choice question UI with 1–9 listed options. The gallery uses OpenCode 1.19.3, but does not verify live decision routing on that version. Custom text entry for legacy forms or questions that do not expose a native custom field, multi-select/multi-question dialogs, and decisions in other backends still require the terminal. Unsupported OpenCode blockers show a short notice instead of forwarding unrelated tool output.
+Legacy shortcut routing was verified against OpenCode 1.18.35's single-choice question UI with 1–9 listed options. The gallery uses OpenCode 1.19.3, but does not verify live decision routing on that version. Custom text entry for legacy forms or questions that do not expose a native custom field, multi-select fields, legacy multi-question dialogs, and decisions in other backends still require the terminal. Unsupported OpenCode blockers show a short notice instead of forwarding unrelated tool output.
 
-OpenCode V2 tool permissions can show a separate permission card. The configured phone owner can reply with `/allow CODE` for **Allow once**, or `/reject CODE`. Use the code from that card in the same chat. **Always allow** remains terminal-only. The bridge checks the session and the exact pending request before sending an API reply; it never sends terminal keys or changes persistent permission rules. Replies bypass the task queue and do not resume muted forwarding. An uncertain reply is not retried, including after restart; check the terminal instead. Multiple pending permissions, oversized requests, unsafe display text, and unavailable permission APIs require the terminal.
+OpenCode V2 tool permissions show a separate permission card. Send a normal message containing **1** for **Allow once** or **2** for **Deny**. No card selection or quoted reply is needed. You can also send the action label. The choice applies only to the current confirmed card in that chat. The bridge checks the session and exact pending request before sending an API reply. If an unanswered request changes, allowing its replacement needs an extra confirmation: check the new commands, then send `confirm` when asked. A confirmation for a request that changed again cannot approve the replacement. **Always allow** remains terminal-only. The bridge never sends terminal keys or changes persistent permission rules. Replies bypass the task queue and do not resume muted forwarding. An uncertain reply is not retried, including after restart. Check the terminal instead. Multiple pending permissions, oversized requests, unsafe display text, and unavailable permission APIs require the terminal.
+
+Phone permission cards retain the scrolling command block. Empty metadata and duplicate command details are omitted. Other request details remain visible. No approval code is displayed or needs to be typed. Older coded replies remain supported for compatibility. If you use a client that supports quoted replies, an explicit reply to an old permission card is rejected. Saved card links, pending confirmations and unconfirmed submissions survive restart.
+
+With editable progress enabled, the status says `Waiting for your permission...`. A confirmed reply says `Allowed once.` or `Denied.` This confirms the permission reply, not command execution or task completion.
 
 **herdr** 0.9.1 cannot make the final identity check and terminal input atomic. Avoid answering the same question simultaneously from the terminal and phone. After an uncertain answer, inspect the terminal before using `clear-prompt` and sending a new reply.
 
