@@ -8,6 +8,12 @@ The bridge uses one dedicated MDK identity across all mapped groups. Setup keeps
 
 ## Behaviour
 
+In combined mode, an embedded messaging worker exit stops Codr with a failure
+status after saving bridge state and joining the worker. The installed service
+supervisor can then restart it under its existing retry policy. Normal termination
+remains graceful. This detects worker exit, not a hung worker or relay health;
+persistent startup errors still require investigation.
+
 - New sessions create groups and invite the configured phone `npub`.
 - Group names pair the **herdr** tab label and workspace: `<tab name> (<workspace>)`, for example `review (Acme)`. Fresh sessions launched from an existing chat add the selected agent only when another live chat has the same tab/workspace title, such as `review (Acme - codex)` or `review (Acme - claude)`. The original chat keeps its title. A unique project does not need an agent suffix, and automatic or explicit renaming removes it once the duplicate ends. Without a workspace label, a duplicate fresh chat uses `review (codex)`; ordinary chats keep only `<tab name>`. Suffix intent survives restarts and pane moves, but the visible suffix depends on current live duplicates. Workspace and agent details also appear in the group description. Repository names and agent-generated conversation topics do not determine the chat name.
 - A phone message prompts only the agent mapped to that group.
@@ -43,6 +49,24 @@ spacing remain independent of live replies.
 
 Fresh phone prompt and decision validation keeps its independent read path, so
 unrelated queued history work cannot hold it behind the background reader budget.
+
+### Serial phone controls
+
+Send two to eight slash controls in one complete text message, for example
+`/recent /unmute` or `/sync off /last 3`. Separate commands with spaces or newlines.
+Supported controls are `/help`, `/status`, `/queue`, `/last [1-100]`,
+`/recent [hours]`, `/sync [auto|on|off]` and `/unmute`. Existing unambiguous
+prefixes and compact history counts work too. Ordinary prompts and absolute path
+arguments do not become command sequences.
+
+Codr validates the entire sequence before dispatching any control. It then runs
+the existing handlers left-to-right with the normal owner and replay checks.
+History collection remains in the background: the next control does not wait for
+history delivery. Replies can therefore arrive in a different order. A runtime
+error stops dispatch; completed controls stay applied, and a retry skips them.
+This is not an atomic transaction. Pending history and completed-control receipts
+survive restart. Launches, updates, cancellations and decision answers must be
+sent separately. Attachments and truncated text cannot dispatch a sequence.
 
 Inbound recovery reads timelines in a background job, retaining at most one
 payload page and eight queued events, plus cursor identities for cycle detection.
@@ -262,6 +286,19 @@ unavailable history receives a short notice. Use complete standalone text withou
 attachments or truncation; zero, fractional, extra or out-of-range counts receive
 usage guidance. At most the newest 100 conversation messages are retained for
 replay, while `/recent` continues to use its existing three-message excerpt.
+
+Wide top-level Markdown tables become labelled rows in outgoing phone messages.
+The first field becomes a row heading. Other fields use labelled bullets, with
+the original inline Markdown and links. A table is wide when it has four or more
+columns, or its estimated visible column width exceeds 80 display cells. Link
+destinations and Markdown delimiters do not count towards this estimate. Small
+tables, tables inside lists or quotes, and existing code blocks stay unchanged.
+Reference-style links in converted messages become self-contained inline links,
+so their targets remain available after transport chunking.
+This also applies to `/last` and `/recent`. Native history, source identities and
+already queued payloads do not change. Transport chunks prefer field boundaries
+for converted messages. A single field above the 30,000-byte message limit still
+needs splitting and can lose rich-text continuity at that boundary.
 
 Each excerpt message has a **You** or **Agent** label followed by its source date
 and time, for example `2026-10-28 12:13:14 UTC`. OpenCode uses its message creation

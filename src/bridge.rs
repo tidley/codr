@@ -2362,6 +2362,44 @@ impl Bridge {
                 .as_array()
                 .is_none_or(|items| items.is_empty())
             && msg["media"].as_array().is_none_or(|items| items.is_empty());
+        if plain_command
+            && !queued
+            && let Some(sequence) = crate::commands::sequence(raw_text)
+        {
+            let commands = match sequence {
+                Ok(commands) => commands,
+                Err(message) => {
+                    let before = self.state.clone();
+                    if let Err(error) = crate::launch::reply(self, &key, group, id, message) {
+                        self.state = before;
+                        return Err(error);
+                    }
+                    return Ok(());
+                }
+            };
+            for (index, command) in commands.into_iter().enumerate() {
+                let mut child = event.clone();
+                child["message"]["message_id_hex"] = json!(format!("{id}:command:{index}"));
+                child["message"]["text"] = json!(command);
+                let before = self.state.clone();
+                if let Err(error) = Box::pin(self.route_inbound(&child, false, false)).await {
+                    self.state = before;
+                    return Err(error);
+                }
+            }
+            let before = self.state.clone();
+            self.state
+                .mappings
+                .get_mut(&key)
+                .unwrap()
+                .seen_messages
+                .push(id.into());
+            if let Err(error) = self.save() {
+                self.state = before;
+                return Err(error);
+            }
+            return Ok(());
+        }
         let normalized = if plain_command && !queued {
             crate::commands::normalize(raw_text, control, menu_open)
         } else {

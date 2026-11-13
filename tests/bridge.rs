@@ -892,6 +892,205 @@ async fn cancel_interrupts_only_the_current_verified_session_once_without_cleari
 }
 
 #[tokio::test]
+async fn serial_controls_dispatch_in_order_and_survive_replay() {
+    let root = tempfile::tempdir().unwrap();
+    let config = config(root.path());
+    let observed = agent();
+    let mut bridge = mapped_bridge(config.clone(), &observed);
+    let mut event = inbound(HEX, "serial-sync");
+    event["message"]["text"] = json!("/sync off /sync on /queue");
+    bridge.inbound(&event).await.unwrap();
+    assert_eq!(
+        herdr_white_noise_bridge::forwarding::load(&config.state_path)
+            .unwrap()
+            .mode,
+        herdr_white_noise_bridge::forwarding::Mode::On
+    );
+    assert_eq!(bridge.state.outbox.len(), 3);
+    assert!(
+        bridge.state.mappings[&observed.key()]
+            .seen_messages
+            .contains(&"serial-sync".into())
+    );
+    drop(bridge);
+    let mut bridge = Bridge::open(config.clone()).unwrap();
+    herdr_white_noise_bridge::forwarding::set_mode(
+        &config.state_path,
+        herdr_white_noise_bridge::forwarding::Mode::Off,
+    )
+    .unwrap();
+    bridge.inbound(&event).await.unwrap();
+    assert_eq!(bridge.state.outbox.len(), 3);
+    assert_eq!(
+        herdr_white_noise_bridge::forwarding::load(&config.state_path)
+            .unwrap()
+            .mode,
+        herdr_white_noise_bridge::forwarding::Mode::Off
+    );
+}
+
+#[tokio::test]
+async fn serial_controls_history_then_unmute_is_nonblocking_and_durable() {
+    let root = tempfile::tempdir().unwrap();
+    let config = config(root.path());
+    let observed = agent();
+    let mut bridge = mapped_bridge(config.clone(), &observed);
+    bridge.poll_sessions(vec![observed.clone()]).await.unwrap();
+    // No native reader or herdr socket exists: dispatch must only queue collection.
+    let mut event = inbound(HEX, "serial-recent");
+    event["message"]["text"] = json!("/recent /unmute");
+    tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        bridge.inbound(&event),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let saved = BridgeState::load(&config.state_path).unwrap();
+    assert_eq!(saved.history_requests.len(), 1);
+    assert!(
+        saved.mappings[&observed.key()]
+            .seen_messages
+            .contains(&"serial-recent".into())
+    );
+    assert!(
+        saved
+            .outbox
+            .iter()
+            .any(|item| item.text.contains("No prompt was sent"))
+    );
+    drop(bridge);
+    let mut bridge = Bridge::open(config).unwrap();
+    bridge.inbound(&event).await.unwrap();
+    assert_eq!(bridge.state.history_requests.len(), 1);
+    assert_eq!(bridge.state.outbox.len(), saved.outbox.len());
+}
+
+#[tokio::test]
+async fn serial_controls_retry_only_unfinished_commands_after_restart() {
+    let root = tempfile::tempdir().unwrap();
+    let config = config(root.path());
+    let observed = agent();
+    let mut bridge = mapped_bridge(config.clone(), &observed);
+    bridge.poll_sessions(vec![observed.clone()]).await.unwrap();
+    for index in 0..16 {
+        let mut event = inbound(HEX, &format!("fill-{index}"));
+        event["message"]["text"] = json!("/last");
+        bridge.inbound(&event).await.unwrap();
+    }
+    let mut event = inbound(HEX, "serial-full");
+    event["message"]["text"] = json!("/queue /last /sync on");
+    assert!(bridge.inbound(&event).await.is_err());
+    assert_eq!(bridge.state.outbox.len(), 1);
+    assert!(
+        !bridge.state.mappings[&observed.key()]
+            .seen_messages
+            .contains(&"serial-full".into())
+    );
+    assert_eq!(
+        herdr_white_noise_bridge::forwarding::load(&config.state_path)
+            .unwrap()
+            .mode,
+        herdr_white_noise_bridge::forwarding::Mode::Auto
+    );
+    drop(bridge);
+    let mut bridge = Bridge::open(config).unwrap();
+    bridge.poll_sessions(vec![observed]).await.unwrap();
+    bridge.state.history_requests.clear();
+    bridge.inbound(&event).await.unwrap();
+    assert_eq!(
+        bridge.state.outbox.len(),
+        2,
+        "completed /queue must not repeat"
+    );
+    assert_eq!(bridge.state.history_requests.len(), 1);
+}
+
+#[tokio::test]
+async fn serial_controls_failed_save_keeps_receipts_retryable() {
+    for (text, replies) in [("/queue /sync off", 2), ("/queue /last 0", 1)] {
+        let root = tempfile::tempdir().unwrap();
+        let config = config(root.path());
+        let observed = agent();
+        let mut bridge = mapped_bridge(config.clone(), &observed);
+        std::fs::remove_file(&config.state_path).unwrap();
+        std::fs::create_dir(&config.state_path).unwrap();
+        let mut event = inbound(HEX, "serial-save");
+        event["message"]["text"] = json!(text);
+        assert!(bridge.inbound(&event).await.is_err());
+        assert!(bridge.state.outbox.is_empty());
+        assert!(
+            bridge.state.mappings[&observed.key()]
+                .seen_messages
+                .is_empty()
+        );
+        std::fs::remove_dir(&config.state_path).unwrap();
+        bridge.inbound(&event).await.unwrap();
+        assert_eq!(bridge.state.outbox.len(), replies);
+        assert!(
+            BridgeState::load(&config.state_path).unwrap().mappings[&observed.key()]
+                .seen_messages
+                .contains(&"serial-save".into())
+        );
+    }
+}
+
+#[tokio::test]
+async fn serial_controls_validate_before_effects_and_require_owner_plain_text() {
+    for (index, text) in [
+        "/sync off /recent 0",
+        "/sync off /update",
+        "/sync off /allow",
+        "/sync off /new",
+        "/sync off /help /unknown",
+        "/sync off /last 101",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let root = tempfile::tempdir().unwrap();
+        let config = config(root.path());
+        let mut bridge = mapped_bridge(config.clone(), &agent());
+        let mut event = inbound(HEX, &format!("invalid-{index}"));
+        event["message"]["text"] = json!(text);
+        bridge.inbound(&event).await.unwrap();
+        assert_eq!(
+            herdr_white_noise_bridge::forwarding::load(&config.state_path)
+                .unwrap()
+                .mode,
+            herdr_white_noise_bridge::forwarding::Mode::Auto
+        );
+        assert_eq!(bridge.state.outbox.len(), 1);
+        assert!(bridge.state.outbox[0].text.contains("No commands were run"));
+    }
+    for field in [
+        "sender",
+        "text_truncated",
+        "attachments_truncated",
+        "media",
+        "attachments",
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let config = config(root.path());
+        let mut bridge = mapped_bridge(config.clone(), &agent());
+        let mut event = inbound(HEX, "not-plain-owner");
+        event["message"]["text"] = json!("/sync off /sync on");
+        event["message"][field] = match field {
+            "sender" => json!({"account_id_hex": "foreign", "is_self": false}),
+            "media" | "attachments" => json!([{}]),
+            _ => json!(true),
+        };
+        bridge.inbound(&event).await.unwrap();
+        assert_eq!(
+            herdr_white_noise_bridge::forwarding::load(&config.state_path)
+                .unwrap()
+                .mode,
+            herdr_white_noise_bridge::forwarding::Mode::Auto
+        );
+    }
+}
+
+#[tokio::test]
 async fn sync_modes_persist_ignore_automatic_changes_and_unmute_restores_automatic_mode() {
     use herdr_white_noise_bridge::forwarding;
     let root = tempfile::tempdir().unwrap();

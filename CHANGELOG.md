@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.12.0] - In development
+
+Changes planned for the next minor release. Not yet published.
+
+### Fixed
+
+- Stop the combined service if its embedded messaging worker exits or panics,
+  including during startup, so the existing service supervisor can restart it.
+  Do not remain apparently healthy with phone messaging offline. Preserve durable
+  bridge state and normal graceful shutdown.
+
+### Changed
+
+- Accept serial phone controls such as `/recent /unmute` in one message. Validate
+  the full sequence before dispatch, run controls left-to-right, and retain
+  completed-command receipts across retries and restarts. Launches, updates and
+  permission answers still require separate messages.
+- Display wide outgoing Markdown tables as labelled rows in phone chats. Keep
+  inline formatting and links instead of squeezing columns or using code blocks.
+  Small tables and existing code blocks stay unchanged. Apply the same display
+  rule to automatic replies, `/last` and `/recent` without changing native history
+  or delivery receipts.
+
 ## [0.11.2] - 2026-11-11
 
 See the [release notes](docs/releases/0.11.2.md) for upgrade limits, measured

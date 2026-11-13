@@ -11,6 +11,7 @@ use tokio::sync::oneshot;
 
 pub struct EmbeddedMessaging {
     stop: Option<oneshot::Sender<()>>,
+    finished: oneshot::Receiver<()>,
     worker: Option<thread::JoinHandle<Result<()>>>,
 }
 
@@ -57,10 +58,13 @@ impl EmbeddedMessaging {
             .collect();
         settings.media_allowed_roots = vec![spool];
         let (stop, stopped) = oneshot::channel();
+        let (finished, completion) = oneshot::channel();
         // MDK startup and synchronous storage work cannot occupy bridge executor threads.
         let worker = thread::Builder::new()
             .name("codr-messaging".into())
             .spawn(move || {
+                // Dropping this sender wakes supervision on error, success or panic.
+                let _finished = finished;
                 let runtime = tokio::runtime::Builder::new_multi_thread()
                     .worker_threads(2)
                     .enable_all()
@@ -71,7 +75,7 @@ impl EmbeddedMessaging {
                     }));
                 if let Err(error) = result {
                     eprintln!(
-                        "Embedded messaging unavailable: {}. Desktop service remains running.",
+                        "Embedded messaging unavailable: {}. Combined service will stop for supervisor recovery.",
                         error.privacy_safe_code()
                     );
                     anyhow::bail!("Embedded messaging stopped");
@@ -80,8 +84,17 @@ impl EmbeddedMessaging {
             })?;
         Ok(Self {
             stop: Some(stop),
+            finished: completion,
             worker: Some(worker),
         })
+    }
+
+    /// Cancellation-safe: the main loop can also be waiting for a stop signal.
+    pub async fn wait_for_exit(&mut self) -> Result<()> {
+        let _ = (&mut self.finished).await;
+        anyhow::bail!(
+            "Embedded messaging worker exited; stopping combined service for supervisor recovery"
+        )
     }
 
     pub async fn shutdown(mut self) -> Result<()> {
@@ -105,5 +118,40 @@ impl Drop for EmbeddedMessaging {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancelled_completion_wait_still_observes_worker_panic() {
+        let (stop, _stopped) = oneshot::channel();
+        let (done, finished) = oneshot::channel();
+        let (go, proceed) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || -> Result<()> {
+            let _done = done;
+            proceed.recv().unwrap();
+            panic!("synthetic messaging worker panic");
+        });
+        let mut messaging = EmbeddedMessaging {
+            stop: Some(stop),
+            finished,
+            worker: Some(worker),
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), messaging.wait_for_exit())
+                .await
+                .is_err()
+        );
+        go.send(()).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), messaging.wait_for_exit())
+                .await
+                .unwrap()
+                .is_err()
+        );
+        assert!(messaging.shutdown().await.is_err());
     }
 }

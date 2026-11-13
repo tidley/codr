@@ -57,9 +57,108 @@ pub(crate) fn normalize(text: &str, control: bool, menu_open: bool) -> Normalize
     }
 }
 
+/// Only explicit slash controls form sequences; never split ordinary agent text.
+pub(crate) fn sequence(text: &str) -> Option<Result<Vec<String>, &'static str>> {
+    let words: Vec<_> = text.split_whitespace().collect();
+    let first = *words.first()?;
+    let is_command = |word: &str| {
+        if !word.starts_with('/') {
+            return false;
+        }
+        match normalize(word, false, false) {
+            Normalized::Ambiguous(_) => true,
+            Normalized::Text(value) => value
+                .split_whitespace()
+                .next()
+                .and_then(|name| name.strip_prefix('/'))
+                .is_some_and(|name| COMMANDS.contains(&name)),
+        }
+    };
+    // An absolute path is an argument, not evidence of a second command.
+    if !is_command(first) || !words.iter().skip(1).any(|word| is_command(word)) {
+        return None;
+    }
+    Some((|| {
+        let invalid = "Use two to eight slash controls: /help, /status, /queue, /last [1-100], /recent [hours], /sync [auto|on|off], /unmute. Send launches, updates and answers separately. No commands were run.";
+        let mut commands = Vec::new();
+        let mut start = 0;
+        while start < words.len() {
+            let end = (start + 1..words.len())
+                .find(|&i| words[i].starts_with('/'))
+                .unwrap_or(words.len());
+            let Normalized::Text(command) = normalize(&words[start..end].join(" "), false, false)
+            else {
+                return Err(invalid);
+            };
+            let args: Vec<_> = command.split_whitespace().collect();
+            let valid = match args.as_slice() {
+                ["/help" | "/status" | "/queue" | "/unmute" | "/last" | "/recent" | "/sync"] => {
+                    true
+                }
+                ["/sync", mode] => ["auto", "on", "off"]
+                    .iter()
+                    .any(|value| mode.eq_ignore_ascii_case(value)),
+                [name @ ("/last" | "/recent"), number]
+                    if number.bytes().all(|byte| byte.is_ascii_digit()) =>
+                {
+                    number.parse::<u64>().ok().is_some_and(|value| {
+                        value > 0
+                            && if *name == "/last" {
+                                value <= 100
+                            } else {
+                                value.checked_mul(3600).is_some()
+                            }
+                    })
+                }
+                _ => false,
+            };
+            if !valid || commands.len() == 8 {
+                return Err(invalid);
+            }
+            commands.push(command);
+            start = end;
+        }
+        Ok(commands)
+    })())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Normalized, normalize};
+
+    #[test]
+    fn serial_controls_validate_the_whole_sequence() {
+        assert_eq!(
+            super::sequence("/recent /unmute").unwrap().unwrap(),
+            vec!["/recent", "/unmute"]
+        );
+        assert_eq!(
+            super::sequence(" /LAST4\n/sy OFF /h ").unwrap().unwrap(),
+            vec!["/last 4", "/sync OFF", "/help"]
+        );
+        for value in [
+            "/recent 0 /unmute",
+            "/last 101 /help",
+            "/sync later /status",
+            "/recent /new",
+            "/allow /status",
+            "/recent /u",
+            "/status extra /help",
+            "/help /help /help /help /help /help /help /help /help",
+        ] {
+            assert!(super::sequence(value).unwrap().is_err(), "{value}");
+        }
+        for value in [
+            "ordinary /recent /unmute",
+            "/tmp/a /tmp/b",
+            "/recent",
+            "please /help",
+            "/new /tmp/a",
+            "/recent /tmp/a",
+        ] {
+            assert!(super::sequence(value).is_none(), "{value}");
+        }
+    }
 
     fn text(value: &str, control: bool, menu_open: bool) -> String {
         match normalize(value, control, menu_open) {
