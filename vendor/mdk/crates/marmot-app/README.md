@@ -5,9 +5,16 @@ session storage, the Nostr MLS peeler, the Nostr transport adapter, and relay-ba
 result as `MarmotApp` / `MarmotAppRuntime`. It sits below presentation layers (`wn`, the UniFFI and C bindings) and above
 the generic account, session, and engine crates. Read this if you are building a host app or binding on top of MDK.
 
+The default-off `dev-device-groups` capability permits the adopted device roster independently of policy-test timing.
+The app still requires runtime intent; a dev `wn`/`wnd` build supplies it. Ordinary release builds keep it off.
+An account that holds or is joining a device group opens only with both: otherwise its session fails with
+`AppError::ExperimentalDeviceGroupsRequired` before anything of it is read, sent or subscribed (mdk#3012).
+See [dev device linking](../cli/README.md#device-linking-dev-builds).
+
 ## Contents
 
 - [Runtime overview](#runtime-overview)
+- [Remote signer accounts](#remote-signer-accounts)
 - [SOCKS5 routing](#socks5-routing)
 - [Local storage](#local-storage)
 - [Account bootstrap and KeyPackages](#account-bootstrap-and-keypackages)
@@ -15,6 +22,7 @@ the generic account, session, and engine crates. Read this if you are building a
 - [Groups and invitations](#groups-and-invitations)
 - [Conversations](#conversations)
 - [Encrypted media endpoints](#encrypted-media-endpoints)
+- [Custom emoji sets](#custom-emoji-sets)
 - [Application-owned group state](#application-owned-group-state)
 - [Explicit full-history repair](#explicit-full-history-repair)
 - [History may be incomplete notices](#history-may-be-incomplete-notices)
@@ -32,6 +40,12 @@ The opt-in native startup recorder distinguishes task dispatch, account/key look
 and the shared agent stream watch manager. The relay plane also owns shared directory discovery fetches for relay lists,
 profiles, follow lists, and KeyPackages, including endpoint safety and in-flight coalescing. The daemon path is
 runtime-owned subscriptions plus typed events; explicit catch-up remains available for repair and tests.
+
+Account workers start authenticated rejoin for durably and natively `Unrecoverable` copies without
+restarting healthy peers or requiring a host Repair command. The existing Repair action can rearm an eligible
+parked episode; restarting alone does not reset its budget. Usable forks retain explicit replacement consent.
+See the [automatic rejoin contract](../../docs/marmot-architecture/invitation-recovery.md#automatic-rejoin-of-an-unrecoverable-copy)
+for device authorization, durable retries and the limits of history recovery.
 
 The runtime exposes account status, group listing/showing, message listing, and snapshot-plus-live subscription APIs,
 so CLI, TUI, and native surfaces never open the databases directly.
@@ -53,9 +67,10 @@ MLS confirmation are complete, even if a secondary relay still has a later repli
 keeps the original relay event and retry deadline. Unmet required acknowledgements and pending MLS confirmation keep
 their publication barrier.
 
-A new same-account durable admission also lets the managed worker yield a scheduled secondary retry that is already
-waiting on a relay. This applies only after required acknowledgements and MLS confirmation are complete. Unfinished
-attempts remain conservatively recorded as possibly exposed and retry their exact saved bytes after backoff. The
+A queued direct send (plain text, draft, or app event) or a new same-account durable admission lets the managed worker
+yield a scheduled secondary retry that is already waiting on a relay. Direct commands retain FIFO order. This applies
+only after required acknowledgements and MLS confirmation are complete. Unfinished attempts remain conservatively
+recorded as possibly exposed and retry their exact saved bytes after backoff. The
 worker finishes its current local effects before servicing the new send; required publication and confirmation work
 is not cancelled. After a yielded pass, one durable submission receives service ahead of overdue secondary retry
 passes once the finite backlog of deferred and buffered worker commands has drained. Earlier blocked commands keep
@@ -83,14 +98,50 @@ sample. These measurements do not include host rendering or every subsequent eng
   stay usable through account-scoped commands.
 - Signed-out, missing-signer, and onboarding-gated accounts remain ineligible even after a reset.
 
+**Relay settings.** `account_relay_liveness` reads configured relay URLs with the account's socket status,
+last attempt time, and available connection-error category. `subscribe_relay_liveness` supplies an initial snapshot
+and event-driven replacement lists; `RuntimeRelayLivenessSubscription::close` stops only the observer.
+`reconnect_relay` requires a running managed account and checks configured membership and dial safety. Its worker
+serializes reconnect with configuration reconciliation. The response wait is capped at sixteen minutes to allow
+queued long-running commands; after dispatch, the dial wait is capped at five seconds.
+Existing roles and ownership remain unchanged. Managed workers
+retire newly dialed manual connections when their configured membership ends, independently of UI observers.
+Configuration-cache errors are reported and retried on worker maintenance ticks without blocking receive startup.
+Reconciliation is rearmed on transport activation, including in-place startup retries.
+These session-local rows do not establish message delivery.
+See the [binding contract](../marmot-uniffi/README.md#relay-liveness) for state and privacy semantics.
+
 **Shutdown.** Hosts whose process can be suspended must call `MarmotAppRuntime::shutdown_and_close`, which closes every
 database and releases file locks; `shutdown` alone does not. See
 [local artifact safety](../../docs/marmot-architecture/overview/local-artifact-safety.md). A projection update
 reaches live subscriptions only after the write behind it has committed, so an update a host received that way is
 still stored after `shutdown_and_close`.
 
-For where the code lives (`src/runtime/`, `src/client/`, `src/media/`, and so on; the user directory is the [`nostr-directory`](../nostr-directory) crate) see
+For where the code lives (`src/runtime/`, `src/client/`, `src/media/`, and so on; the user directory is the [`nostr-directory`](../nostr-directory) crate
+and the diagnostics exporters are the [`marmot-observability`](../marmot-observability) crate) see
 [`AGENTS.md`](AGENTS.md).
+
+## Remote signer accounts
+
+The runtime owns NIP-46 sessions for `bunker://` and client-initiated
+`nostrconnect://` pairing. Each account has an independent transport and
+communication key. Permission approval precedes connection, and stored sessions
+restore before account workers without host signer callbacks. Sign-out and wipe
+erase the communication key; terminal storage close preserves it for restart.
+Native login/register adoption is runtime-owned once admitted: dropping its future
+stops waiting, not adoption. First await successful session `connect`; `nip46_login`
+accepts only an already-verified `Ready` session and never silently connects.
+Pairing is separately caller-owned and cancellable, with no account mutation while unbound.
+Reconnect never resumes an adoption retired by an earlier disconnect.
+Rollback still cleans its binding without cancelling a newer generation.
+Account deletion excludes session resume until credential erasure and removal finish;
+a queued resume reports the removed account, leaving a fresh pairing free to log in.
+Explicit session cancellation, disconnect, or logout interrupts adoption; shutdown
+interrupts and settles owned adoption before returning. Failed completed-account
+rebind restores prior local signer state and activation, but does not retract
+already-published KeyPackages. Host callback/NIP-55 login behavior is unchanged.
+See [external signer accounts](../../docs/external-signer-accounts.md#nip-46-sessions)
+for pairing, permission versions, recovery, cancellation, and credential storage.
 
 ## SOCKS5 routing
 
@@ -110,7 +161,7 @@ including invalid configuration. Later environment changes, including clearing t
 or unblock an invalid policy. Restart the process to apply a different configuration.
 
 The policy covers relay publishing, account receive/history pools, directory relay clients (including completion-aware
-reads), C NIP-46 signer sessions, and the shared HTTP clients for media, Open Ranking, and collectors (including audit
+reads), shared NIP-46 signer sessions, and the shared HTTP clients for media, Open Ranking, and collectors (including audit
 uploads). Completion-aware reads retain pre-admission wire-event counts under the proxy transport. Relay hostnames are
 resolved by the proxy. HTTP clients still resolve and validate destinations locally, then send the pinned IP through
 SOCKS5 while retaining the original HTTP Host header and TLS identity. The proxy is an explicitly trusted egress.
@@ -150,6 +201,14 @@ version.
 kind `0` profile, and an initial last-resort Marmot kind `30443` KeyPackage from a default relay set. Account setup
 requires acknowledgements from its operational relays.
 
+Interactive sign-in keeps a notice before initial KeyPackage publication: signing
+in alone does not restore existing chats or messages. The historical `SingleDevice`
+step and acknowledgment APIs retain their names and consent rules, but current
+findings no longer declare all multi-device use unsupported. See the shared
+[notice copy and advisory discovery limits](../marmot-uniffi/README.md#single-device-notice).
+Hosts adopt that presentation through localization; MDK owns the pause, discovery
+and publication gate.
+
 - KeyPackages are published to (and fetched from) the account's NIP-65 relays; there is no dedicated KeyPackage relay
   list.
 - Generated account setup can supply public indexers for copies of the relay lists and kind `0` metadata. Indexers are
@@ -159,10 +218,18 @@ requires acknowledgements from its operational relays.
 - Import flows can check whether those lists already exist before writing local account state. The same status API can
   fetch relay-list events from supplied bootstrap relays and store discovered user relay/KeyPackage data for
   deterministic CLI/TUI development.
+- A KeyPackage publish or rotation never replaces lists the identity already published. When the cached lists are
+  incomplete (an identity imported offline, or a kind `10002` with read relays only), it first reads the published
+  lists from the app's relays and the outboxes they advertise, and adopts what it finds. It publishes the app's relays
+  only for a list that read proved absent. A read that could not finish fails with `DirectoryLookupIncomplete`, and a
+  published list with no usable relay fails with `MissingRelayLists`; neither publishes anything. An open generated
+  setup still owns its lists.
 
 **Publication.** KeyPackage publication keeps a stable replaceable `d` tag per account and tracks the decoded
 KeyPackage ref separately. Normal publish reuses only a cached current-profile last-resort package; explicit rotate, a
-legacy cache entry, or a lifetime-policy rejection creates a new current-profile package under the same slot.
+legacy cache entry, or a lifetime-policy rejection creates a new current-profile package under the same slot. The
+session runtime refreshes the slot at least weekly, after a consumed Welcome and when supported capabilities change;
+see [marmot-session](../marmot-session/README.md#this-devices-keypackage-slot).
 
 **Inventory.** `account_key_package_records` / `account_key_packages` expose one current relay event per addressable
 slot in the validated fetch window. `account_key_package_relay_events` returns that window's current and superseded
@@ -238,12 +305,77 @@ membership, provider response, profile hydration, and network completion, withou
 
 ## Groups and invitations
 
+### Start a direct conversation
+
+```rust
+pub async fn start_direct_conversation(
+    &self,
+    account_ref: &str,
+    peer_account_id: &str,
+) -> Result<GroupId, AppError>
+```
+
+`MarmotAppRuntime::start_direct_conversation` accepts a hex or npub peer identity. The account worker serializes the
+existing deterministic direct-conversation lookup with creation. If no reusable conversation exists, it creates an unnamed
+group with the creator and peer as admins in the same founding state and Welcome. Reusing a group preserves its roles
+without an admin-policy update. Generic creation remains separate and does not infer direct-chat intent from a name or roster.
+
+The returned opaque MLS group id confirms canonical local state, not Welcome delivery. Retained Welcome delivery continues
+independently. Cancellation after command admission detaches the caller while the worker completes creation and retains
+delivery work. Retry after cancellation, response loss, or projection failure recovers and reuses the canonical engine group,
+even when the chat-list projection is missing. If a matching canonical group is eligible for reuse but cannot hydrate, retry
+returns an error rather than creating another group. Removed and disbanded copies do not block a fresh start. Concurrent
+starts on the same account return one local group. Simultaneous starts by different accounts can create two groups, each
+with both accounts as founding admins.
+
+There is no immutable cross-client DM provenance, so MDK cannot prove legacy groups eligible for automatic admin repair.
+Legacy and generic groups retain their authoritative roles, including unnamed two-member groups. Clients using generic
+creator-only creation remain interoperable: recipients accept the founding admin set through the Welcome, but cannot
+self-promote if they are not admins. Those clients must adopt the explicit start operation to create symmetric direct chats.
+
+**Experimental shared invitation decisions.** With device groups enabled, updated clients share Accept/Decline for
+one authenticated admission generation and its automatic sibling Adds (mdk#2628 D96). A separate external Add batch
+or admission fork can prompt again; older unidentified invites stay local-only. Higher version wins, with decline
+winning an equal version. Acceptance preserves membership, block/rejoin checks and explicit archive intent. Decline
+records durable work for this matching local leaf's ordinary Leave; a later accept never cancels an already-requested
+Leave or joins a device. `published = 0` with `CompletionUnknown` reports pending work, not completed departure by
+all devices. An explicit user Leave, including declining an invitation, also records Decline for the current identified
+admission before departure publication when this device trusts a device group. Archive, local deletion, sign-out and removal never create that
+choice. Unknown admissions, absent device-group trust and a held maximum decision version keep ordinary leaf Leave
+independent; a maximum skips a new choice rather than preventing departure.
+
+A known decline for the current admission also holds new automatic sibling Adds, even before ordinary Leave can be
+requested. Private KeyPackage requests follow the ordinary stock rules. A decline does not reach a copy this device
+already deleted locally. A later winning accept can resume an existing opted-in
+flow; it creates no Add or join obligation. Other generations and new founding admissions stay independent, and
+already admitted or signed traffic follows its ordinary settlement rules.
+
+This uses kind475 plus versioned sibling Welcomes, with no new host command or capability negotiation. Custom
+experimental senders and receivers must update together before using invitation sync; V1 Welcomes and their retries
+are not retrofitted. Released builds still cannot enable device groups. Hosts continue to render MDK's invitation
+and membership projections and must not infer broader account-wide departure across unrelated generations.
+
 `AppCreateGroupOptions::initial_admins` names invited account references to grant admin in the founding group state.
 The creator remains an admin. Omitting this option preserves creator-only admin authority.
 
 **Creating and inviting.** Group creation and invites take pubkeys at the action boundary. The app canonicalizes and
 deduplicates the requested roster and fetches current KeyPackages in bounded multi-author relay batches before building
 the MLS add.
+
+Create and invite return `GroupMemberResult<T>`: an optional operation result and ordered `member_outcomes`, one per
+canonical account. Each selected account reports its device count; selection does not imply Welcome delivery or joining.
+Unavailable accounts carry typed package, inbox-route, or incomplete-lookup outcomes and are omitted from the one MLS
+operation. If a nonempty roster has no eligible account, `operation` is `None` and no group or commit is created.
+An explicitly empty create still creates a creator-only group.
+
+Invalid input, self-inclusion, invalid admin intent, and authorization failures remain whole-operation errors.
+Empty invitations and invitations that add no device remain errors, even when another requested account is unavailable.
+Storage failures propagate instead of being classified as unavailable recipients. Initial admins must belong to the
+requested roster, but only selected accounts receive their requested role.
+`AppCreateGroupOptions::member_resolution` defaults to `Partial`; `Atomic` rejects the entire roster on its first
+recipient failure. `invite_members_with_initial_admins` takes the same policy explicitly. `start_direct_conversation`
+and stable agent-control v2 creation/invitation use atomic resolution, preserving their existing failure behavior.
+Simulator app/process membership actions also use atomic resolution before mutating their tracked groups.
 
 - Cached packages are useful for discovery, but cannot authorize an invitation or substitute for a failed relay lookup.
   This also applies to another account on the same installation: its local package record is not an invitation
@@ -275,9 +407,38 @@ the recipient retains the private package, or that every relay disclosed all rep
 in signed MLS app data, and project the decoded `nostr_group_id` plus relay list into group subscriptions and publish
 targets.
 
+**Leaving.** An admin account's Leave, including declining a pending invitation that made it an admin, is refused with
+`AdminCannotSelfRemove` before anything is written or sent; the host demotes it first (`self_demote_admin`) and then
+leaves, and a last admin first makes another member an admin. `requires_self_demote_before_leave` says so. With
+experimental device groups on (`MarmotApp::admin_leave_steps_down`), User Leave instead records the leave and lets the
+engine step this account down when another active administrator account remains, then request its own leaf's SelfRemove;
+the call returns before the step-down is published. The last active administrator account is refused on all its devices
+before a choice or departure is published (mdk#3014 keeps that automatic step-down off elsewhere). Queued work is
+pending, not completed departure; native Leave owns its retry. Sign-out never records a shared Decline; in a chat its
+account administers with another account it steps the account down and then leaves (mdk#2818, below). The coarse
+chat-list Leave action only opens this authoritative flow. A recorded Decline remains if a later eligibility check
+refuses departure. Without a trusted device group there is no new shared departure obligation. Already admitted native
+work follows its ordinary retry rules.
+
 **Welcomes.** Incoming welcomes are joined automatically at the MLS/session layer, then projected as pending local
 chats. Clients render accept/decline UI from the group record: accept clears `pending_confirmation`; decline publishes a
 leave, clears the pending flag, and archives the local projection so normal chat lists hide it.
+
+For outbound Welcomes, canonical group creation or a confirmed Add can succeed while delivery fails. Subscribe to
+`WelcomeDeliveryPending` and read `pending_welcome_deliveries` for the retained repair handles. Their optional
+`size_class` explains an all-target size refusal on the observed attempt, without relay details or an assumed relay
+limit. A legacy Welcome can have earlier exposure hidden by a crash or expired bookkeeping: neither a present class
+nor Unknown proves delivery or non-delivery. This also applies to a Welcome `EventTooLarge` error; keep native retry
+work and confirmed state. A specific diagnosis may become Unknown after a coarse legacy retry, while the same delivery
+debt and membership remain. Notices remain once per process/Welcome; use the query or an explicit retry's error for
+later causes. Diagnosis storage is best effort and never owns retries, adds another member, or rolls back the Add.
+
+**Members are accounts.** An account with several devices holds one MLS leaf per device in a group. Every member
+projection groups leaves by account: member records, rosters, member-id pages and conversation snapshots list each
+account once with its `device_count`, and `member_count`, admin counts and direct-chat detection count accounts. A chat
+between two accounts stays direct, and takes its title and avatar from the other account, whatever devices either
+person uses. Membership rows follow the engine's account-level changes: a second device joining, or one of several
+leaving, makes no row; an account's first device joining or last device leaving does.
 
 **Committed group activity.** Commands and maintenance retain native cleanup and commit activity before subscription
 work can suspend. Manual and scheduled convergence retain subscriber deltas through route refresh, checkpoints,
@@ -287,6 +448,16 @@ event journal.
 
 ## Conversations
 
+- **Timeline search.** `timeline_messages_with_query` and `subscribe_timeline_messages` accept `TimelineMessageQuery`.
+  The query combines literal Unicode-lowercased substring search, sender, inclusive `since`, exclusive `until`, and
+  `TimelineAttachmentType` filters before the page limit. Time bounds use `timeline_at`. Attachment types are `Any`
+  (the default), `Image`, `Video`, `Audio`, `File`, and `Attachment` (any attachment).
+  Group queries retain canonical chat order unless `search_wall_clock` is true. With that flag, searches order by
+  `(timeline_at, message_id_hex, group_id_hex)`; account-wide search cursors also require `cursor_group_id`.
+  Default account-wide queries and windows retain timestamp/message-id ordering and cursors.
+  Subscription windows retain filters and ordering through paging and live refreshes, use each
+  edge row's group for cursors, and preserve a scrolled-back window's inclusive upper bound. Filtered and explicit
+  wall-clock windows refresh from storage instead of applying unfiltered projection deltas.
 - **Drafts.** Rust app/runtime draft commands expose selected metadata, conditional save/clear, keyed attachment bytes,
   and revision-bound sends. Post-commit invalidations let conversation owners reload the selected composer; durable
   outbox acceptance clears only the submitted revision. See the
@@ -301,6 +472,22 @@ event journal.
   failures keep timed retries; account teardown and subscription drop close the handle. It never marks read or loads
   attachment bytes. UniFFI and C expose the same handle. See the
   [live conversation contract](../../docs/marmot-architecture/further-context/conversation-live-window-plan.md).
+
+`MarmotAppRuntime::submit_media_attachments` admits previously uploaded references
+with an optional `reply_to_message_id` before its client-token argument. A target
+adds `e` and `q` reply tags to the same kind-9 message as every attachment and the
+optional caption. `None` sends ordinary media. The method validates the target
+as exactly 32 bytes of hexadecimal and persists it in lowercase without reading,
+consuming, or changing the composer draft.
+
+`upload_media_with_client_token` and `upload_media_files_with_client_token`
+capture the reply from their request's `message_tags` when `send` is true, as
+White Noise Linux does before its upload worker starts. Either `e` or `q` may
+name the target; multiple references must agree, ignoring hexadecimal case.
+Reply references with missing, malformed, or conflicting targets fail before
+any PUT. Both wrappers retain the lowercase target through upload and durable
+admission without consulting the composer. With `send` false, their existing
+upload-only behavior is unchanged.
 
 ## Encrypted media endpoints
 
@@ -319,6 +506,50 @@ does not rewrite existing group state. An active group admin can migrate an exis
 Encrypted group images differ: no endpoint is stored in group state, so upload and fetch both resolve against the
 deployment's `group_image_endpoint`. Clients configured with different values therefore look for group images in
 different places; re-setting the group image republishes it to the current endpoint.
+
+## Custom emoji sets
+
+`MarmotApp` reads NIP-51 emoji sets (kind 30030) so a host can offer opt-in custom emoji. Every network step is a
+separate call the host makes after a user action:
+
+| Call | Network | What it reaches |
+| --- | --- | --- |
+| `sync_emoji_sets`, `fetch_emoji_set`, `user_emoji_list` | Relays, text only | The sticker discovery relays (account relays), plus up to 8 relay hints from a pasted `naddr` |
+| `fetch_emoji_set_asset`, `fetch_emoji_set_cover` | One image host | The host the set's author chose for that emoji or the cover; nothing is stored |
+| `install_emoji_set` | Every image host in the set | Downloads each emoji once and stores the bytes |
+| `emoji_sets`, `emoji_set`, `installed_custom_emoji`, `read_installed_custom_emoji`, `uninstall_emoji_set` | None | Local storage only, read on the blocking pool |
+
+Sync never fetches an image. Image fetches reveal the user's IP address to the image host, so hosts disclose them
+before calling. Each image fetch takes the `event_id_hex` of the set version the user was shown and fails with
+`EmojiSetChanged`, before any request, when a sync or fetch has stored another version since: a newer version can
+name other hosts, and the user must see those before revealing their address to them. Install does not fetch the set
+text either; with nothing stored it fails with `EmojiSetNotFound`. They use the hardened Blossom fetch: HTTPS on public hosts only, with loopback, private, link-local,
+unspecified and IPv4-mapped addresses refused before connecting and again after every redirect.
+
+Installing pins one set version (its event id) and stores each emoji's bytes and SHA-256 in the account database. A
+later change to the set's URLs or images reaches nothing until the user reinstalls; reads check the stored hash.
+Install is all-or-nothing. An `EmojiSetInstallControl` passed with it reports progress (entries finished of entries to
+try, bytes received) and cancels: no new download starts, those in flight are dropped and nothing is stored, so a
+cancelled reinstall keeps the previous snapshot. Runtime shutdown and storage close cancel running installs the same
+way. The final write is atomic and not interruptible.
+`user_emoji_list` reads the account's kind-10030 list for suggestions; MDK never publishes or edits it. Installed
+emoji carry no URL: to use one in a chat, upload its bytes as an encrypted attachment, so the set's image URL and
+address never reach a group.
+
+Limits:
+
+| Limit | Value |
+| --- | --- |
+| Sets per discovery sync | 60 newest, at most 16 versions of one address per fetch |
+| Emoji per set | 500 (later entries skipped as over the cap) |
+| Shortcode | 1–64 bytes of ASCII letters, digits, `-` and `_` (the chat custom-emoji rule) |
+| Image | 4 MiB, 4096 px per side, 200 frames; PNG/APNG, GIF, WebP or JPEG, decided by the bytes. A response typed as a non-image (such as `text/html`) is refused; any `image/*` type, right or wrong, is not checked against them |
+| Installed sets | 50 |
+| Stored bytes | 32 MiB per set, 128 MiB in all |
+
+Invalid, duplicate, failed and over-cap entries are dropped and reported in `skipped`; a set fails only when no entry
+is usable. Shortcode collisions between installed sets are flagged on each `installed_custom_emoji` row and left to
+the host.
 
 ## Application-owned group state
 
@@ -387,6 +618,281 @@ comparison runs off the worker; mutations, subsequent repair requests, and reads
 order. Send fairness remains #1947 work. All automatic history triggers use the same owner, job and durable pacing;
 bounded investigation can leave unresolved debt parked for new evidence or explicit repair.
 
+## Linked devices
+
+While device groups are enabled, creating a chat includes linked siblings from the start when this device holds compatible
+private KeyPackages for them. This applies even with "Add to all my chats" off, which covers older chats. Missing private
+KeyPackages never delay creation or fall back to public slots; the missing device needs a later Add or invite. Sibling
+Welcomes travel privately through the device group, independently of the other accounts' Welcome deliveries.
+
+`MarmotAppRuntime::linked_devices(account_ref)` lists this account's own devices as `LinkedDevice`s, from the roster of
+the device group this device trusts (mdk#2628): this device first (`is_this_device`), then by `linked_at`. Each carries
+its KeyPackage slot (`slot_id_hex`, the handle device actions take), label, client and platform, who linked it, its
+`LinkedDeviceStatus` and its settings. It is empty until this device trusts a device group, or while explicit
+device-group capability and runtime intent are absent. The device group's own events never reach hosts; `MarmotAppEvent::LinkedDevicesChanged`
+says to re-read. It also fires once each time the account's worker opens or reconnects, so it may fire with no visible
+change.
+
+Each device writes its own `client` and `platform`: `MarmotAppConfig::key_package_client_name` and
+`MarmotAppConfig::device_platform` (a short name such as `iOS`), trimmed, and empty when blank or over 64 bytes. It
+writes them with its next KeyPackage announcement in the device group.
+
+`MarmotAppRuntime::rename_linked_device(account_ref, slot_id_hex, label)` renames any of the account's devices, this one
+included: one roster commit in the device group, through the same roster write path as slot announcements, that changes
+only that entry's label and rename id. The label is at most 64 bytes of UTF-8; empty clears it. While the device group
+has an earlier change of this device's in flight, the rename is refused as `DeviceGroupRefused("device_group_busy")`
+with nothing sent, since a commit then could build on a roster that is about to change; retry later. A rename whose
+commit loses a fork is made again on a later maintenance pass, unless another user edit of that device won; that one
+stands. Show the label the next list returns after `LinkedDevicesChanged`, not the one the user typed.
+
+`MarmotAppRuntime::update_linked_device_settings(account_ref, slot_id_hex, add_to_all_chats, bring_history, keep_while_inactive)`
+changes any linked device's supplied settings, this device included. Each setting is optional: omitted values come
+from the current roster on the account worker, so changing one toggle does not restore another from a stale screen.
+A patch that still matches after earlier-edit recovery sends no new edit. Enabling **Add to all my chats** permits
+eligible direct post-link Adds while that flow is still adding, and gap filling under its conditions; turning it off
+does not leave joined chats. The approving device's direct post-link pass sends no gap-fill claim (kind 458). With
+three or more devices, it can race another sibling's gap filling and cause extra Add attempts, private-KeyPackage
+consumption, or Commits and convergence passes; selected-parent presence checks and ordinary branch selection still
+apply. **Bring chat history** applies to future sibling Adds and transfers still owed; enabling
+it does not backfill chats already joined or recreate a transfer discarded while it was off. **Keep while inactive**
+stops automatic removal of an `Inactive` device; it does not stop the mark, explicit removal or sign-out. The devices
+mark and remove inactive siblings themselves; see the [shared linked-devices contract](../marmot-uniffi/README.md#linked-devices).
+
+On the editing device, new automatic Adds and history transfers wait for a differing local setting intention to
+settle. Existing history debt keeps its original expiry; once ready, a history setting that is off discards that debt.
+This does not recall deliveries already handed off or change what another device sends before it learns the edit.
+
+A rename and a settings change share one recovery record. Before accepting another edit of that device, the runtime
+tries the existing recovery of an earlier lost edit and re-reads the roster. Retry `device_group_busy` only while it
+remains unsettled. A successful no-op never leaves an opposite lost intention to apply later. A competing user edit
+of that device wins as a whole, even if it changed a different toggle. Refresh the displayed label and flags on
+`LinkedDevicesChanged`. These commands remain behind the device-group development gate. Custom clients writing post-link settings must adopt
+this user-edit marker rule before using the feature; earlier draft writers must update first.
+
+When another of the account's devices removes this one, the account stops on this device once it reads the removal, and
+nothing more is sent from it. `MarmotAppEvent::DeviceUnlinked` fires once, after the account is signed out; from then on
+`ManagedAccount::unlinked` and `signed_out` stay set, and signing in, logging in, importing its key or starting
+onboarding for it fails with `AccountHomeError::AccountUnlinked`. Stop showing its local history; reads still return it,
+as for any signed-out account. `sign_out_and_wipe` wipes the account without leaving its chats or deleting its slot,
+which the other devices did; signing in again is then a new link.
+
+`sign_out_and_wipe` signs out through the account's other devices when this device has a linked device that is not
+signing out too. It records in the device group that it is leaving, which can take about 30 seconds to settle, then
+leaves only the chats no other device can take it out of, deletes its slot and wipes; the other devices then remove it
+from the device group and from the rest. `WipeOutcome::groups_left_to_siblings` counts the chats it left to them. When
+it can't ask them in time, it tries to leave every chat itself, reporting any it can't in `group_leave_failures`, and
+sets `siblings_not_reached`: tell the user its other devices couldn't be asked, and that they may still list it until
+the user removes it from one of them. The other devices show it as `LinkedDeviceStatus::Leaving` until they remove it. A
+device removed while it signs out finishes signing out and is not unlinked. Signing out targets this device only; it
+does not submit an account-wide Leave decision. An active admin's SelfRemove is refused, so in a chat its account
+administers with another account, where none of the account's other devices has a leaf, it steps the account down first
+and then leaves, as an admin's Leave does (mdk#2818). One wait of about 30 seconds covers all such chats, and each
+counts in `groups_left` only once this device sees the commit that removes it. Otherwise `group_leave_failures` reports
+it: its step-down was not accepted in time, the account is off the admin list but the removal was not seen in time (it
+stays a member), or the account became the chat's last admin. A blocked leave ends that chat's wait; the sign-out does
+not wait for a branch change that could unblock it. A chat this device was already leaving gets nothing new and joins
+the same wait. This device keeps its leaf, and the sign-out reports the chat, where the account is the chat's last
+admin, where another of the account's devices stays in it (a step-down takes the admin rights from every device), and
+once its device group removed it during the sign-out. An eligible sibling can still remove this device while the account
+remains an admin.
+
+Sibling assistance requires a trusted device group with another Active or Inactive device and this device's own
+roster entry already carrying its tag signature key. It applies only to chats that support same-account device
+removal and have the required tagged leaves. `groups_left_to_siblings` records a handoff, not confirmation that removal
+completed. Outside admin chats, `groups_left` counts successful local leave calls, not confirmed membership removal. The call still attempts
+local account deletion when remote departure fails: show the chats in `group_leave_failures` and check
+`local_cleanup.completed` separately. Completed local cleanup does not prove this device left every chat.
+
+An account that cannot run a worker here (signed out, lacking its registered external signer, or excluded by
+onboarding's worker gate) signs out on its own immediately. Unfinished onboarding that runs setup traffic but still
+refuses ordinary commands also signs out on its own immediately. Temporary worker-start failures and unreadable
+onboarding state retry within the same deadline. Runtime shutdown ends the sibling wait promptly and reports `siblings_not_reached`; any remaining cleanup failure is reported separately.
+
+### Chat history from another device
+
+A device linked with "Bring chat history" receives each chat's history from the device that added it (mdk#2628 4.2).
+Each sibling-imported `TimelineMessageRecord` names its source in `imported_from` (`HistoryImportSource`: the device's
+slot and its roster name now). Draw "Imported from <device>" for that source, and say "another device" for an empty
+name: a device with no name, one no longer linked, or before this device first read the roster. Names are resolved
+when rows are read, so a rename shows after `LinkedDevicesChanged`. The additive `history_import_provenance` field
+identifies either `Device(slot)` or `Backup(source)` in core timeline pages, incremental projections and conversation
+windows. Live rows have no provenance. The legacy `imported_from` field remains sibling-only: its absence alone does
+not distinguish live history from a backup. A backup is "restored from backup", never an unnamed device; its public
+archive identity proves neither its writer nor historical authorship. The UniFFI and C timeline/conversation DTOs
+carry the same typed provenance; their legacy sibling field stays unchanged.
+
+`MarmotAppRuntime::chat_history_imports(account_ref)` lists each held chat whose history is `Receiving` (a delivery
+waits to be imported; `retrying` once an attempt to get its bundle failed) or `Imported` (the latest import's source and time).
+It shows facts only: a chat with nothing to bring sends nothing, so no chat waits for one, and a delivery that expired
+after a week leaves nothing. A delivery for a chat this device does not hold yet appears once it joins.
+`MarmotAppEvent::ChatHistoryImportsChanged` fires whenever that answer changes, as rows are pruned or a source device
+is renamed too, and once each time the account's worker opens or reconnects. Everything here is empty and silent unless
+`dev_device_groups` is on.
+
+### Recovery words
+
+An account's backups are sealed to a recovery key that 12 recovery words derive, separate from the nsec (mdk#2628).
+`MarmotAppRuntime::begin_recovery_words(account_ref)` makes new words as `RecoveryWords`: show the 12 `words` once,
+then ask for the words at `confirm_positions` (1-based) and pass them, in order, to `confirm_recovery_words`. MDK holds
+the words in memory only and forgets them once their change went out or after `cancel_recovery_words`; a restart
+starts over with new words. Confirming keeps only the key's public half: in the device group's roster, or on this
+device while it has no device group, until the device group it founds carries it. A device that joins a device group
+instead leaves the group's backups as they are and forgets the key it kept. The first device to turn backups on writes
+them, and new words from any device keep that writer. A mismatch (`recovery_words_mismatch`), a busy device group
+(`device_group_busy`) or any other error keeps the words for another try; trying again commits nothing if the roster
+already holds their key. `turn_off_backups` turns backups off for every device of the account by clearing the writer
+and the key; backups already written stay until deleted, and turning backups on again takes new words. Both are
+refused as `device_group_busy` while the device group can't take the change, including while a change of this
+device's is still in flight. `backup_settings` says whether backups are on and whether this device writes them, as the
+device group's roster holds them now. Two devices changing backups at once can drop one change: MDK commits it again
+only while what it changed still stands, and otherwise it stays lost. Read `backup_settings` each time backup settings
+are shown, rather than showing what the user chose, so the user sees a lost change and can make it again. The selected
+writer writes bounded backup passes during maintenance; only an accepted pointer publication counts as a backup.
+Report `set_runtime_backup_background_conditions(wifi, charging)` once per runtime, before workers exist and
+when either fact changes. Background writer work requires both facts. Same-runtime worker restarts retain the report;
+a new runtime starts closed. Already admitted passes finish and settle after false, while later work waits.
+The account-shaped `set_backup_background_conditions` remains a compatibility wrapper: it validates an active,
+signable, fully onboarded account before updating the same runtime-wide facts, without starting a worker.
+External-signing accounts may report before the host registers its signer; signed worker work still requires that signer.
+
+An OS background task can await `run_due_backup_pass(account_ref)`. It joins a pass already running, or tries existing
+due/writer/backoff/media-credit admission once. The admission wait includes other queued work and startup catch-up.
+`NotStarted` means none was admitted; `FinishedAttempt` means the
+pass and serialized settlement attempt ended, including credit release. It does not prove successful pointer publication,
+force a backup, wait for future due work or establish global idle state. Cancelling that caller detaches its wait;
+worker stop/replacement returns `TransportClosed`. Once queued, this caller's wait has no additional timeout; the host
+bounds its OS execution opportunity. Manual restore and
+supported lower-level `AppClient` APIs remain independent.
+
+Backup setup and manual restore require `dev_device_groups` (off by default) and a build with experimental
+device-group support; unsupported setup/restore returns `DeviceGroupRefused("roster_unsupported")`.
+The runtime-wide fact report remains local, and the due-pass wait returns `NotStarted` when device groups are disabled.
+
+### Manual backup history restore
+
+The Rust runtime accepts words for one on-demand operation with
+`begin_backup_restore(account_ref, BackupRestoreWords::new(words))`. Move the owned input into MDK and clear any
+copies the caller retains; the Rust input guard has redacted Debug output and zeroizes its owned phrase. This is
+best-effort erasure of owned buffers, not a guarantee about upstream parser/hash scratch or compiler/register copies. Restore
+uses those words independently of the account's current recovery key and never changes that key or enables backups.
+It considers every listed archive, one bounded unexpired blob at a time through the existing media lane. A valid
+pointer from an incomplete relay view can recover history with a Partial result; a missing pointer in that view is
+Unavailable. Only fully completed discovery covering at least one requested relay can prune cached private catalog metadata.
+
+Restore imports only into ordinary chats whose selected MLS tree currently contains this device's own leaf. It checks
+before content fetch and again when the worker applies the result; another device's membership is insufficient.
+A known current chat is loaded on demand without loading unrelated chats; an unreadable held candidate is skipped
+and leaves a Partial result. An
+unknown chat gets only private availability metadata in the encrypted account database, without a transcript, MLS
+group, routing, membership or KeyPackage. After a real later join, the restore watch wakes and
+`backup_history_availability(account_ref, group_id)` can say that history may be available and identify the public key
+of the words needed. No automatic join, re-add, history-absence proof or full account disaster recovery is performed.
+Archived read positions, pins, mutes, archive choices and invitation decisions are not applied.
+
+`begin_backup_restore` returns a status with an opaque operation handle; a second active job is refused as
+`backup_restore_busy`. Read `backup_restore_status` or use `watch_backup_restore` for aggregate progress. Complete
+means the eligible work from that pointer settled, not that all past history was found; Partial keeps successful
+imports when a blob fails or membership disappears. Existing live rows win, imported rows create no unread counts,
+and the shared history validator handles retained content and attachment keys. Core row provenance identifies the
+actual backup source; `history_import_provenance` also queries an exact held event when needed.
+
+`cancel_backup_restore(account_ref, operation)` names the job so an old action cannot cancel a newer one. Cancellation
+and worker shutdown drop the operation's words, entropy and archive keys and stop active work; valid committed history
+stays. Already-running bounded crypto work may finish off the worker; it owns no database lease, cannot apply a
+cancelled result, and drops its keys with that work. Closing a watch only stops observing. No secret-backed job or
+cursor is persisted or resumed: a later explicit
+attempt supplies words again. Core Rust operation handles and methods are available here; complete UniFFI/C controls,
+provenance DTOs and operation-token codecs remain separate work. Restore uses the same experimental device-group gate
+as the writer.
+
+### Overdue KeyPackage refresh
+
+While this device trusts a device group, each KeyPackage it publishes is first announced in its own roster entry there,
+so a device group that can't take that Commit holds the refresh back.
+`MarmotAppRuntime::key_package_refresh_overdue(account_ref)` is true once a refresh is owed, the KeyPackage it would
+publish is still unannounced, and the slot's newest publication by this device is a week old, or there is none. Inviters stop treating the device as fresh at 30
+days, so tell the user. A routine refresh announces and publishes in one maintenance pass and never shows; one that is
+announced but failing at the relays doesn't count. The client recomputes the answer after each maintenance pass, and
+`MarmotAppEvent::KeyPackageRefreshOverdueChanged` says to re-read. Like `LinkedDevicesChanged`, it also fires once each
+time the account's worker opens or reconnects. It is false, and the event silent, without explicit device-group
+capability and runtime intent.
+
+## Unrecognized sign-ins
+
+`MarmotAppRuntime::unrecognized_sign_ins(account_ref)` lists sign-ins of this account that this device does not
+recognize as `UnrecognizedSignIn`s (mdk#2628), the earliest to appear first. Each is a fresh, valid KeyPackage of the
+account in a slot that neither this device nor the roster of its device group knows. One that is
+`before_this_device` was found by this device's first check: ask whether the user still has it. Any other is new: ask
+whether it was them. The account checks its slots at open, every six hours, and soon after one of its KeyPackages
+arrives live; `check_sign_ins` checks now. `answer_sign_in` takes a `SignInResponse`: `NotNow` keeps one listed
+without a prompt, `Reject` records it as rejected in the device group's roster, and `Dismiss` ends a prompt another
+device answered first. Linking one is device pairing's. `MarmotAppEvent::UnrecognizedSignInsChanged` says to re-read,
+and also fires once each time the account's worker opens or reconnects. All of it is empty and silent without explicit
+device-group capability and runtime intent.
+
+`start_fresh` is the answer when the user no longer has the devices the first check found: every sign-in from before
+this device is answered Not now, now and when one is listed later, and nothing is rejected, so one of them can still
+link this device. It is refused before the first check and once this device trusts a device group. `started_fresh`
+says whether it did so and still has no device group, so the app can say that only chats it is invited to from now on
+are here.
+
+`UnrecognizedSignIn::previously_linked_here` is optional local context for a retained link missing from the
+currently trusted, settled roster; false means no affirmative context, and the flag neither authenticates the current
+publication nor proves permanent loss.
+
+## Compromise warning
+
+`MarmotAppRuntime::compromise_warning(account_ref)` lists the account's open compromise warning on this device as
+`CompromiseWarningItem`s (mdk#2628), the earliest gathered first; it is empty when no warning is open. Each item means
+someone holding the account's signing key published where the account's devices did not: a sign-in answered This
+wasn't me (`RejectedSignIn`), on this device or another, or a KeyPackage this device found in its own slot that it did
+not make (`ForeignOwnSlotKeyPackage`), which warns on this device only and which it has replaced. The warning gathers
+this device's rejections and those in its device group's roster; rejections
+already in the first roster this device trusts count as seen, and a rejected sign-in leaves once its slot is linked as
+a device. `dismiss_compromise_warning` marks everything it gathers as seen, on this device only; a rejection that
+branch selection drops and restores stays seen. `CompromiseWarningReason` gains reasons in later releases; show one the
+host does not know as a generic one. `MarmotAppEvent::CompromiseWarningChanged` says to re-read, and also fires once
+each time the account's worker opens. All of it is empty and silent without explicit device-group capability and
+runtime intent.
+
+## Linking a new device
+
+Device linking (mdk#2628) runs through the account runtime. It requires the `unreleased-device-pairing` feature,
+explicit device-group build capability (`dev-device-groups`, or policy-test builds), and the per-client
+`dev_device_groups` runtime intent; every call is refused otherwise. Each call returns a `DeviceLinkSnapshot`: the new device's own
+link (`new_device`) and the prompts for sign-ins this device can link (`prompts`).
+
+- On the new device, `start_device_link` asks a device already signed in to link this one. Its state goes from
+  `WaitingForAnswer` to `Comparing`, with seven emoji and their English descriptions for screen readers, then
+  `WaitingForOtherDevice` after `confirm_device_link_match`, `Joining`, and `Linked`. `cancel_device_link` requests cancellation; see the [cancellation contract](../marmot-uniffi/API-REFERENCE.md#marmotcancel_device_link) for limits.
+- On a device already signed in, a prompt shows the same code once that device checked the new device's KeyPackage.
+  `link_device` takes the prompt id, the new device's label and its two settings, both on by default.
+  `decline_device_link` is Not now. The prompt stays `Linking` until the new device's first change in the device
+  group arrives, which the new device makes as soon as it joins; with none within an hour, this device removes it
+  again and both sides show `LinkFailed`. A prompt also says when the sign-in can't be linked, when the account has
+  20 devices, when several sign-ins compete, and who added the device on another device.
+- For explicit local repair, `reset_device_group_for_repair` follows the [shared reset contract](../marmot-uniffi/README.md#explicit-local-device-group-reset-before-fresh-pairing)
+  before fresh pairing: it preserves ordinary data but discards this copy's device-group continuity, may refuse while
+  busy, and does not guarantee fresh admission. Offer it when the snapshot's `device_group_stalled` is set: this device
+  can no longer catch up with its device group.
+- `device_link_snapshot` returns current linking and move progress. `MarmotAppEvent::DeviceLinkChanged` says to re-read. It
+  also fires once each time the account's worker opens or reconnects. Unconfirmed comparisons end because their
+  secrets are memory-only; admitted move bookkeeping resumes from storage.
+
+Starting that same linking flow while this device already trusts a device group moves only this device. The snapshot's
+`moves` distinguishes WaitingForWelcome, Joining and Made: the old trust remains until the destination's first selected
+own change is present. A pre-Made failure forgets only the destination. The move preserves ordinary chat membership,
+local small-state values and their versions; old admitted group-pinned traffic can settle before old local storage is
+forgotten. There is no cross-device-group delivery guarantee or immediate quiet deadline. An unrecoverable destination
+before Made retains old trust and ordinary repair; it can stay pending indefinitely and need manual local recovery.
+Corrupt or unreadable local move facts can fail progress/status reads and need manual recovery or reset/relink; no
+automatic unlinked state or notification is promised, and old trust is never reconstructed.
+
+Move views carry local recognition hints for old siblings and destination rejection collisions.
+`dismiss_device_group_move_sibling` dismisses only one hint. `LinkedDeviceStatus::Moved` distinguishes old-roster
+cleanup from removing a device from its chats. Recognition hints apply only on the mover: old siblings may ask “Was this
+you?” after cleanup, and the user can dismiss that prompt. See the [host move guidance](../marmot-uniffi/README.md#moving-this-device-to-another-device-group).
+
 ## History may be incomplete notices
 
 Recovery parks an obligation after its fixed budget of fruitless attempts instead of retrying forever.
@@ -401,13 +907,30 @@ account-wide ones (loss, incremental and explicit history) appear only in the li
 `MarmotAppEvent::HistoryNoticesChanged` announces any change, and a group whose own notices changed also gets
 `GroupStateUpdated`.
 
+`MarmotAppRuntime::account_recovery_status(account_ref)` reads the account's recovery as one `AccountRecoveryStatus`:
+the groups whose history is still being fetched, whether the inbox's is, and every notice as `history_notices` lists
+them. Re-read it on `MarmotAppEvent::RecoveryStatusChanged`; the recovery runner supplies the catching-up fields.
+Current epoch-gap exhaustion emits `EpochGap`. Other cause labels preserve compatibility; keep exhaustive matches.
+`HistoryNoticeCause::UnprovenHistory` is no longer emitted: what the coverage ledger parks (a relay that refused or
+could not prove a route's history, or history the retention window passed before anything proved it) is no evidence
+that messages are missing, so it raises no notice. The recovery runner probes a broken relay quietly, an hour after it
+breaks and then on an interval doubling to a day.
+
+A rejoin emits one `HistoryNoticeCause::BeforeRejoin` per new copy of the group. A replacement Welcome (the copy's
+install epoch moved and its join epoch was reset) makes the recovery runner retire what the group's routes owed or
+parked below the new copy's standing floor, never as coverage. A restart raises no second notice, and dismissing it
+retires nothing further. Retired spans stay in the relay re-check; loss inside them reopens them and explicit repair
+re-arms them.
+
 `dismiss_history_notice(account_ref, notice_id)` runs on the account worker. After the user accepts that the history may
-be incomplete, it durably retires exactly that occurrence as its own outcome (`state = 2`), never as coverage. A retired
-loss keeps its evidence as a watermark, so a delayed duplicate cannot rearm it, and releases the transport-cursor fence
-once no loss obligation remains pending, without counting a recovery success. It returns false for a stale id. New
-evidence re-arms recovery under a new revision, so the notice disappears and a later parking is a new notice with a new
-id. New loss, a higher missing epoch, each startup's incremental comparison, or a new explicit repair reopens retired
-demand as fresh debt. A malformed id is `AppError::Hex`.
+be incomplete, it durably retires exactly the shown occurrence (a parked obligation or a rejoin), never as coverage or a
+recovery success. Loss import, not dismissal, releases the delivery-loss fence; unchanged loss evidence is not imported
+again. It returns false for a stale id, including any `UnprovenHistory` notice id an older build showed, which changes
+nothing. A malformed id is `AppError::Hex`. A higher missing epoch starts a new epoch-gap occurrence.
+
+A relay the recovery runner gave up on raises no notice and needs no dismissal: its unit probes again on its own an hour
+after it parks, doubling to a day, under the same park (mdk#3308). New loss over a parked span earns a probe at once.
+Explicit full-history repair re-arms every unit.
 
 ## User blocking
 
@@ -491,13 +1014,18 @@ See [moderation reports](../../docs/marmot-architecture/moderation-reports.md) f
 ## Audit v5 Welcome evidence
 
 Opt-in audit recording writes v5 files (see [`marmot-forensics`](../marmot-forensics/README.md)); historical v4 files
-keep their separate legacy whole-file upload path. With audit logging enabled, the app records v5 Welcome evidence from
+stay local until retention expires them. With audit logging enabled, the app records v5 Welcome evidence from
 real founding, publication, receipt, peel, join and checkpoint boundaries. The
 [Welcome probe notes](tests/audit-v5-welcome-probe.md) describe those boundaries and the unit tests that exercise them:
 
 ```sh
 cargo test -p marmot-app --lib audit_v5_probe -- --nocapture --test-threads=1
 ```
+
+Local forensic files expire automatically 30 days after their last write, including files that have not been
+uploaded. Daily rotation keeps roughly 30 days of history with up to one extra day. Cleanup runs on exclusive app
+open and hourly across every account and failed-wipe remnant, even with recording or uploads disabled. Legacy files
+age out without rewriting their contents. The separate key-reveal security log is excluded.
 
 ## Run the tests
 

@@ -1,20 +1,18 @@
 use crate::RuntimePerformanceOperation as RuntimeOp;
-use crate::app_telemetry::runtime::Outcome as TelemetryOutcome;
+use marmot_observability::Outcome as TelemetryOutcome;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use cgka_traits::GroupId;
 use cgka_traits::MARMOT_APP_EVENT_KIND_POLL;
-use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_CHAT;
+use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_REACTION};
 use cgka_traits::ingest::IngestOutcome;
 use cgka_traits::transport::TransportEnvelope;
 use storage_sqlite::{
     TransportReconciliationItem, TransportReconciliationRoute, clamp_to_max_future_skew,
 };
 use tokio::time::timeout;
-use transport_nostr_adapter::NostrReconciliationItem as AdapterReconciliationItem;
 
-use crate::app_telemetry::{AppPerformanceOperation, SyncFailureStage};
 use crate::groups::{
     EventGroupProjection, decode_received_event, event_group_id, fail_if_publish_failed,
     observe_event,
@@ -22,31 +20,21 @@ use crate::groups::{
 use crate::media::media_imeta_tags_are_valid;
 use crate::notifications;
 use crate::{
-    AccountState, AppError, AppMessageProjection, AppPerformanceTelemetry, ClassifiedSyncFailure,
-    SDK_DRAIN_WAIT, SDK_FIRST_SYNC_WAIT, SelfMembership, SyncFailure, SyncSummary,
+    AccountState, AppError, AppMessageProjection, ClassifiedSyncFailure, SDK_DRAIN_WAIT,
+    SDK_FIRST_SYNC_WAIT, SelfMembership, SyncFailure, SyncSummary,
     TRANSPORT_CURSOR_MAX_FUTURE_SKEW, unix_now_seconds,
 };
-use marmot_forensics::{
-    AuditEventContext, EpochBackfillActivationOutcome, EpochBackfillExecutionSeam,
-    EpochStallBackfillTrigger,
-};
+use marmot_forensics::ForensicRecorder as _;
+use marmot_observability::PerformanceRecorder;
+use marmot_observability::{AppPerformanceOperation, SyncFailureStage};
 
-#[cfg(test)]
-use marmot_forensics::EpochBackfillCompletionKind;
-
-use super::audit::EpochBackfillTerminalAudit;
-use super::epoch_stall::BackfillDecision;
-use super::recovery::{AttemptGrant, ExplicitRecoveryPermit};
 use super::{AppClient, InventoryWrite};
 use crate::config::CursorPersistence;
 
-pub(super) mod comparison_job;
 #[cfg(test)]
 mod native_comparison_tests;
 mod native_ingress;
-pub(crate) use comparison_job::{ComparisonAdmission, ComparisonExecution, ComparisonNetworkJob};
-#[cfg(test)]
-pub(crate) use comparison_job::{MAX_COMPARISON_ADMISSION_PER_TURN, TestComparisonActivityWitness};
+pub(crate) use native_ingress::MAX_NATIVE_ADMISSION_PER_TURN;
 
 /// The worker consumes committed output; direct clients retain full summaries.
 pub(crate) struct CommittedSyncProgress<'a> {
@@ -60,12 +48,6 @@ impl CommittedSyncProgress<'_> {
         let (live_error, history_error) = client.advance_visible_join(&summary).await;
         (self.post_join_errors)(live_error, history_error);
     }
-}
-
-pub(crate) enum PendingRecoverySelection {
-    NotPending,
-    Deferred,
-    Grant(Box<AttemptGrant>),
 }
 
 /// How much recovery work a sync may do beyond draining live input.
@@ -89,175 +71,19 @@ pub(crate) enum SyncMode {
 /// account worker indefinitely and the next sync can resume from a smaller
 /// difference.
 pub(super) const TRANSPORT_RECONCILIATION_QUANTUM: Duration = Duration::from_secs(10);
-/// The network job owns up to four concurrent routes under the account-wide
-/// cutoff and refills slots as routes finish.
-/// The durable cursor starts the next pass after the rotation prefix the last
-/// pass covered, so it must hold at least two routes: see
-/// [`order_reconciliation_pass`].
-pub(super) const TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS: usize = 4;
+
+/// How often a catch-up drain publishes A, the account's read state: reads
+/// during a long drain see the state after a recent delivery, not each one
+/// (mdk#3273 decision 2).
+const DRAIN_READ_STATE_PUBLISH_INTERVAL: Duration = Duration::from_millis(250);
 
 // ponytail: EOSE crosses a separate router task; retain a short quiet window
 // until delivery and EOSE can share an ordered receive lane.
 const EOSE_QUIET_WAIT: Duration = Duration::from_millis(100);
 
-type OwnedComparisonResult = Result<
-    Option<(
-        transport_nostr_adapter::NostrReconciliationSummary,
-        Vec<transport_nostr_adapter::NostrRelayEvent>,
-    )>,
-    cgka_traits::TransportAdapterError,
->;
-
-#[cfg(test)]
-pub(crate) type TestComparisonResult = OwnedComparisonResult;
-
-/// Scripted comparison results. The network task takes one where it would
-/// have called the adapter: the next queued result, so a route the pass never
-/// reaches leaves its result queued, or an answer computed for the route.
-#[cfg(test)]
-#[derive(Clone)]
-pub(crate) enum ScriptedComparisons {
-    Queue(std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<TestComparisonResult>>>),
-    ByRoute(
-        std::sync::Arc<dyn Fn(&TransportReconciliationRoute) -> TestComparisonResult + Send + Sync>,
-    ),
-    /// An answer that arrives only after its own delay.
-    Timed(std::sync::Arc<TimedComparison>),
-}
-
-#[cfg(test)]
-type TimedComparison =
-    dyn Fn(&TransportReconciliationRoute) -> (Option<Duration>, TestComparisonResult) + Send + Sync;
-
-#[cfg(test)]
-impl ScriptedComparisons {
-    /// Answer every compared route, whenever the job compares it.
-    pub(crate) fn by_route(
-        answer: impl Fn(&TransportReconciliationRoute) -> TestComparisonResult + Send + Sync + 'static,
-    ) -> Self {
-        Self::ByRoute(std::sync::Arc::new(answer))
-    }
-
-    /// Answer each compared route after the delay the script chose for it.
-    pub(crate) fn timed(
-        answer: impl Fn(&TransportReconciliationRoute) -> (Option<Duration>, TestComparisonResult)
-        + Send
-        + Sync
-        + 'static,
-    ) -> Self {
-        Self::Timed(std::sync::Arc::new(answer))
-    }
-
-    /// A timed script's answer and its own delay, decided when the route
-    /// starts. Other scripts answer only once the delay has passed.
-    pub(crate) fn timed_answer(
-        &self,
-        route: &TransportReconciliationRoute,
-    ) -> Option<(Option<Duration>, TestComparisonResult)> {
-        match self {
-            Self::Timed(answer) => Some(answer(route)),
-            Self::Queue(_) | Self::ByRoute(_) => None,
-        }
-    }
-
-    pub(crate) fn answer(&self, route: &TransportReconciliationRoute) -> TestComparisonResult {
-        match self {
-            Self::Queue(queue) => queue
-                .lock()
-                .unwrap()
-                .pop_front()
-                .expect("one scripted result per selected comparison route"),
-            Self::ByRoute(answer) => answer(route),
-            Self::Timed(answer) => answer(route).1,
-        }
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        match self {
-            Self::Queue(queue) => queue.lock().unwrap().len(),
-            Self::ByRoute(_) | Self::Timed(_) => 0,
-        }
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-}
-
-#[cfg(test)]
-impl FromIterator<TestComparisonResult> for ScriptedComparisons {
-    fn from_iter<T: IntoIterator<Item = TestComparisonResult>>(iter: T) -> Self {
-        Self::Queue(std::sync::Arc::new(std::sync::Mutex::new(
-            iter.into_iter().collect(),
-        )))
-    }
-}
-
-#[cfg(test)]
-impl<const N: usize> From<[TestComparisonResult; N]> for ScriptedComparisons {
-    fn from(results: [TestComparisonResult; N]) -> Self {
-        results.into_iter().collect()
-    }
-}
-
-/// Explicit repair budget. Waiting for a process credit may take up to one
-/// budget; the job then gets a whole one of its own. The comparison pass gets
-/// its first five sixths (50 s of 60 s): a route still comparing then times
-/// out and the routes that finished come back. The last sixth is reserved for
-/// admitting and checkpointing what they fetched; admission stops at a turn
-/// boundary once the job's whole budget is spent. Both fit well inside the
-/// long worker RPC deadline.
+/// Explicit repair budget: the bound of the one repair pass the account's
+/// recovery runner serves for it, well inside the long worker RPC deadline.
 const FULL_HISTORY_REPAIR_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// The share of the repair budget reserved for admission, as a divisor.
-const FULL_HISTORY_ADMISSION_RESERVE_DIVISOR: u32 = 6;
-
-/// How often an explicit caller's in-place job checks for cancellation while
-/// its network task runs.
-const RECOVERY_JOB_CANCEL_POLL: Duration = Duration::from_millis(50);
-
-pub(crate) struct FullHistoryRepairControl<'a> {
-    started: Instant,
-    timeout: Duration,
-    cancelled: &'a (dyn Fn() -> bool + Sync),
-}
-
-impl FullHistoryRepairControl<'_> {
-    pub(crate) fn stopped(&self) -> Option<crate::FullHistoryRepairIncompleteReason> {
-        if (self.cancelled)() {
-            Some(crate::FullHistoryRepairIncompleteReason::Cancelled)
-        } else if self.started.elapsed() >= self.timeout {
-            Some(crate::FullHistoryRepairIncompleteReason::Deadline)
-        } else {
-            None
-        }
-    }
-
-    /// Only the caller's cancellation discards a pass in flight.
-    pub(crate) fn cancelled(&self) -> bool {
-        (self.cancelled)()
-    }
-
-    /// When the comparison pass must end, leaving the admission reserve.
-    pub(crate) fn network_deadline(&self) -> tokio::time::Instant {
-        tokio::time::Instant::from_std(self.started) + self.network_budget()
-    }
-
-    fn network_budget(&self) -> Duration {
-        self.timeout - self.timeout / FULL_HISTORY_ADMISSION_RESERVE_DIVISOR
-    }
-
-    /// This control's budget, restarted once the job holds its credit: the
-    /// credit wait is bounded by the caller's own budget, and the pass that
-    /// follows gets a whole one.
-    fn for_job(&self) -> Self {
-        FullHistoryRepairControl {
-            started: Instant::now(),
-            timeout: self.timeout,
-            cancelled: self.cancelled,
-        }
-    }
-}
 
 // One ingest or convergence pass can release several previously retained events.
 // Their durable identities belong to the events, not to the triggering envelope.
@@ -273,6 +99,17 @@ fn event_source_message_id_hex(event: &cgka_traits::engine::GroupEvent, fallback
     }
 }
 
+/// The MLS leaf that sent a received application message, when the engine
+/// recorded it.
+fn event_sender_leaf(event: &cgka_traits::engine::GroupEvent) -> Option<u32> {
+    match event {
+        cgka_traits::engine::GroupEvent::MessageReceived {
+            sender_leaf_index, ..
+        } => *sender_leaf_index,
+        _ => None,
+    }
+}
+
 fn event_encrypted_media_secret(
     event: &cgka_traits::engine::GroupEvent,
 ) -> Option<&cgka_traits::EncryptedMediaSecret> {
@@ -285,143 +122,10 @@ fn event_encrypted_media_secret(
     }
 }
 
-#[derive(Clone)]
-pub(super) enum TransportReconciliationWork {
-    Inbox(Vec<cgka_traits::TransportEndpoint>),
-    Group(cgka_traits::TransportGroupSubscription),
-}
-
-impl TransportReconciliationWork {
-    pub(super) fn route(&self) -> Option<TransportReconciliationRoute> {
-        match self {
-            Self::Inbox(_) => Some(TransportReconciliationRoute::Inbox),
-            Self::Group(group) => <[u8; 32]>::try_from(group.transport_group_id.as_slice())
-                .ok()
-                .map(TransportReconciliationRoute::Group),
-        }
-    }
-
-    /// The relays this work compares.
-    pub(super) fn endpoints(&self) -> &[cgka_traits::TransportEndpoint] {
-        match self {
-            Self::Inbox(endpoints) => endpoints,
-            Self::Group(group) => &group.endpoints,
-        }
-    }
-
-    /// Whether this route carries history for one of `groups`. The local inbox
-    /// carries welcomes, never a group's own epoch history.
-    fn repairs_group_in(&self, groups: &HashSet<cgka_traits::GroupId>) -> bool {
-        match self {
-            Self::Inbox(_) => false,
-            Self::Group(group) => groups.contains(&group.group_id),
-        }
-    }
-}
-
-fn nostr_reconciliation_item(item: TransportReconciliationItem) -> AdapterReconciliationItem {
-    AdapterReconciliationItem {
-        event_id: item.event_id,
-        created_at: item.created_at,
-    }
-}
-
-fn reconciliation_start_after_cursor(
-    routes: &[TransportReconciliationRoute],
-    cursor: Option<&TransportReconciliationRoute>,
-) -> usize {
-    cursor
-        .and_then(|cursor| routes.iter().position(|route| route > cursor))
-        .unwrap_or(0)
-}
-
-/// Pick the routes one reconciliation pass reconciles, in the order it
-/// reconciles them, and report how far the account-wide rotation may advance.
-///
-/// The account-wide rotation resumes after the durable cursor so no route is
-/// starved. The groups `repairing` names are what an armed epoch-gap intent is
-/// missing history for, so they take the front of the pass but never all of it;
-/// the rotation fills the remaining budget.
-///
-/// Priority is a view on one pass; the cursor is durable fairness state over
-/// the whole route set, so it advances along the rotated sequence and not along
-/// the priority order. The returned route is the end of the longest prefix of
-/// that rotated sequence this pass covers: every route up to it is scheduled,
-/// so claiming it never claims a route the pass skipped, and because the first
-/// rotated route is always scheduled the claim always moves forward. That is
-/// what keeps an armed set wider than the pass from pinning the rotation on its
-/// own leading routes for as long as it stays armed.
-///
-/// The first rotated route is scheduled for every `max_routes` of 2 or more:
-/// the armed prefix never fills the starting batch, so the rotation keeps the
-/// slot its own leading route needs. A one-route pass has no armed slot at all, and
-/// then an armed leading route is simply not covered and not claimed.
-fn order_reconciliation_pass(
-    work: &mut Vec<TransportReconciliationWork>,
-    cursor: Option<&TransportReconciliationRoute>,
-    repairing: &HashSet<cgka_traits::GroupId>,
-    max_routes: usize,
-) -> Option<TransportReconciliationRoute> {
-    work.sort_unstable_by_key(TransportReconciliationWork::route);
-    let route_keys = work
-        .iter()
-        .filter_map(TransportReconciliationWork::route)
-        .collect::<Vec<_>>();
-    let start = reconciliation_start_after_cursor(&route_keys, cursor);
-    if start > 0 {
-        work.rotate_left(start);
-    }
-    // Re-read the keys after the rotation: this is the order the pass's
-    // fairness is measured in, before priority reorders anything.
-    let rotation = work
-        .iter()
-        .filter_map(TransportReconciliationWork::route)
-        .collect::<Vec<_>>();
-    let (mut armed, rest): (Vec<_>, Vec<_>) = work
-        .drain(..)
-        .partition(|item| item.repairs_group_in(repairing));
-    // Leave the starting batch's rotation one slot, including explicit passes
-    // whose frozen inventory is larger than the concurrent network batch.
-    // Their tail may never start before the cutoff and must not be claimed.
-    let starting_cap = max_routes.min(TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS);
-    let armed_prefix = armed.len().min(starting_cap.saturating_sub(1));
-    work.extend(armed.drain(..armed_prefix));
-    work.extend(rest);
-    if max_routes > starting_cap {
-        work.extend(armed);
-    }
-    work.truncate(max_routes);
-
-    // Only the initial bounded batch is guaranteed to start. The durable
-    // claim remains pre-I/O, independent of which requests later finish.
-    let scheduled = work
-        .iter()
-        .take(starting_cap)
-        .filter_map(TransportReconciliationWork::route)
-        .collect::<Vec<_>>();
-    rotation
-        .into_iter()
-        .take_while(|route| scheduled.contains(route))
-        .last()
-}
-
 fn transport_reconciliation_record(
-    account_id: &cgka_traits::MemberId,
     delivery: &cgka_traits::TransportDelivery,
 ) -> Option<(TransportReconciliationRoute, TransportReconciliationItem)> {
-    let route = match &delivery.message.envelope {
-        TransportEnvelope::Welcome { recipient } if recipient == account_id => {
-            TransportReconciliationRoute::Inbox
-        }
-        TransportEnvelope::GroupMessage { transport_group_id }
-            if delivery.group_id_hint.is_some() =>
-        {
-            TransportReconciliationRoute::Group(
-                <[u8; 32]>::try_from(transport_group_id.as_slice()).ok()?,
-            )
-        }
-        _ => return None,
-    };
+    let route = crate::reconciliation_route(transport_nostr::DeliveryRoute::of(delivery)?);
     let event_id = <[u8; 32]>::try_from(delivery.message.id.as_slice()).ok()?;
     Some((
         route,
@@ -432,53 +136,20 @@ fn transport_reconciliation_record(
     ))
 }
 
-#[cfg(test)]
-struct EpochBackfillReplayOutcome {
-    duration_ms: u64,
-    activation_outcome: EpochBackfillActivationOutcome,
-    error_kind: Option<String>,
-    completion_kind: Option<EpochBackfillCompletionKind>,
-    counts: DrainCounts,
-}
-
-/// Result of asking the account owner to service pending recovery demand.
+/// Result of a recovery seam (`AppClient::refresh_pending_recovery`).
 ///
 /// `Deferred` is intentionally distinct from `NotPending`: existing demand
-/// may be waiting for cooldown, local capacity, a process credit, or
-/// acquisition capability, so the worker may still return success while
+/// waits for the recovery runner, so the worker still returns success while
 /// retaining the deferred recovery intent and its audit trail.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EpochBackfillRunOutcome {
     NotPending,
     Deferred,
-    /// Every obligation the job selected is satisfied.
-    Completed(SyncSummary),
-    /// The job ran and admitted whatever it fetched, but some selected debt
-    /// stays pending. The summary is real and must still be published.
-    Incomplete(SyncSummary),
-}
-
-/// The audit and loss guard of one already-reserved recovery job, opened when
-/// the job begins and closed through one terminal path.
-pub(crate) struct RecoveryExecutionState {
-    overflow: Option<transport_nostr::AccountDeliveryOverflow>,
-    overflow_guard: Option<super::recovery::RecoveryLossAttemptGuard>,
-    audit_groups: Vec<([u8; 16], GroupId, u64)>,
-    context: AuditEventContext,
-    started: Instant,
-    counts: DrainCounts,
-    activation: EpochBackfillActivationOutcome,
-    /// How the pass stopped when it ended without settling: cancelled, cut
-    /// at its deadline, or superseded by a grant change. `None` once it
-    /// settled or failed.
-    interruption: Option<marmot_forensics::RecoveryPassOutcome>,
-    /// What settlement saw, for the `recovery_attempt_finished` row.
-    tally: super::audit_recovery::RecoveryPassTally,
 }
 
 /// The public outcome of an explicit full-history repair that did not
 /// qualify. Everything the repair admitted stays in the partial summary.
-fn incomplete_full_history_repair(
+pub(crate) fn incomplete_full_history_repair(
     summary: SyncSummary,
     reason: crate::FullHistoryRepairIncompleteReason,
     delivery_loss_pending: bool,
@@ -498,60 +169,6 @@ fn incomplete_full_history_repair(
         SyncFailureStage::RelayReceive,
     )
 }
-
-/// Build the per-group terminal audit rows for one backfill execution.
-///
-/// `epochs_after` is a *reading*, not a fact about the group: a group whose
-/// record could not be read is simply absent from the map, exactly like a group
-/// that was never armed. Carrying the after-epoch as an `Option` all the way to
-/// the row is what keeps the two apart — the alternative, defaulting it to the
-/// before-epoch, makes a failed read indistinguishable from a replay that
-/// recovered nothing and lets the row assert an observation nobody took.
-///
-/// Free-standing so the row content is testable without a live client; the
-/// caller owns the recorder.
-#[cfg(test)]
-fn epoch_backfill_terminal_rows(
-    pending: &[storage_sqlite::StoredEpochBackfillIntent],
-    retry_ordinal: u64,
-    epochs_before: &HashMap<cgka_traits::GroupId, u64>,
-    epochs_after: &HashMap<cgka_traits::GroupId, u64>,
-    outcome: &EpochBackfillReplayOutcome,
-) -> Vec<(cgka_traits::GroupId, EpochBackfillTerminalAudit)> {
-    pending
-        .iter()
-        .map(|group| {
-            let group_id = cgka_traits::GroupId::new(
-                hex::decode(&group.group_id_hex).expect("valid fixture group"),
-            );
-            // The before-read has its own bail-out in
-            // `begin_epoch_backfill_execution`, so an absent entry here can only
-            // be the armed stalled epoch this intent was created from.
-            let local_epoch_before = epochs_before
-                .get(&group_id)
-                .copied()
-                .unwrap_or(group.stalled_epoch);
-            (
-                group_id.clone(),
-                EpochBackfillTerminalAudit {
-                    retry_ordinal,
-                    duration_ms: outcome.duration_ms,
-                    activation_outcome: outcome.activation_outcome,
-                    error_kind: outcome.error_kind.clone(),
-                    completion_kind: outcome.completion_kind,
-                    deliveries: outcome.counts.deliveries,
-                    skipped: outcome.counts.skipped,
-                    refused: outcome.counts.refused,
-                    local_epoch_before,
-                    local_epoch_after: epochs_after.get(&group_id).copied(),
-                },
-            )
-        })
-        .collect()
-}
-
-/// One obligation a settled pass reassessed, for its audit row.
-type Reassessed = super::audit_recovery::ReassessedObligation;
 
 /// The cursor a commit chose, from [`AppClient::seal_transport_cursor`].
 #[derive(Clone, Copy, Debug)]
@@ -593,11 +210,11 @@ struct DeliveryIngest {
     inventory_record: Option<InventoryRecord>,
 }
 
-type InventoryRecord = (TransportReconciliationRoute, TransportReconciliationItem);
+pub(crate) type InventoryRecord = (TransportReconciliationRoute, TransportReconciliationItem);
 
 #[derive(Default)]
 struct InventoryBatch {
-    items: [Option<InventoryRecord>; comparison_job::MAX_COMPARISON_ADMISSION_PER_TURN],
+    items: [Option<InventoryRecord>; MAX_NATIVE_ADMISSION_PER_TURN],
     len: usize,
 }
 
@@ -643,33 +260,6 @@ pub(crate) enum RecoveredDelivery {
         unpersisted: bool,
         refused_group: Option<cgka_traits::GroupId>,
     },
-}
-
-/// One compared route: its settlement outcome, and whether the comparison
-/// certifies it. A route is certified only when every required endpoint
-/// finished the comparison without truncation and every missing event it
-/// found was handed to admission. Best-effort endpoints only fetch.
-#[derive(Clone, PartialEq, Eq)]
-pub(crate) struct RouteComparison {
-    pub(crate) route: TransportReconciliationRoute,
-    pub(crate) outcome: storage_sqlite::RecoveryComparisonOutcome,
-    pub(crate) certified: bool,
-    /// Events the comparison durably admitted. Any is progress, even while
-    /// an unsupported required relay withholds the certificate.
-    pub(crate) fetched: usize,
-    /// Every required relay answered: it finished the comparison, or the
-    /// backend cannot compare the route. A pass that answered and neither
-    /// certified nor admitted anything is quiet. A failed or timed-out relay,
-    /// or a route this pass skipped, did not answer.
-    pub(crate) answered: bool,
-    /// Local unadmitted work still needs acquisition, even if every relay
-    /// answered. Invalid events and unknown remote coverage do not set this.
-    retry_admission: bool,
-    /// Queried relays that answered, including incomplete comparisons.
-    pub(crate) reached_endpoints: Vec<String>,
-    /// What the route's relays returned, for the attempt's audit row only.
-    /// Settlement never reads it.
-    pub(crate) acquisition: super::audit_recovery::RouteAcquisition,
 }
 
 /// What one drain loop saw on the wire.
@@ -747,7 +337,7 @@ impl StagedSyncError {
 /// Durable membership and push state are independently reconciled on reopen.
 #[derive(Clone)]
 pub(crate) struct PendingAppliedEffects {
-    effects: marmot_account::AccountDeviceEffects,
+    effects: marmot_session::AccountDeviceEffects,
     received_at: u64,
     source_message_id_hex: String,
     source_delivery_id: Option<cgka_traits::MessageId>,
@@ -791,18 +381,10 @@ const RETAINED_PROJECTION_STALL_WARNING_FAILURES: u32 = 4;
 /// engine's however the session and account layers wrapped it.
 fn unknown_group_id(error: &AppError) -> Option<GroupId> {
     use cgka_traits::error::EngineError;
-    let engine = match error {
-        AppError::UnknownGroup(group_id_hex) => {
-            return hex::decode(group_id_hex).ok().map(GroupId::new);
-        }
-        AppError::Account(marmot_account::AccountError::Engine(engine))
-        | AppError::Account(marmot_account::AccountError::Session(
-            cgka_session::SessionError::Engine(engine),
-        ))
-        | AppError::Session(cgka_session::SessionError::Engine(engine)) => engine,
-        _ => return None,
-    };
-    match engine {
+    if let AppError::UnknownGroup(group_id_hex) = error {
+        return hex::decode(group_id_hex).ok().map(GroupId::new);
+    }
+    match error.as_engine_error()? {
         EngineError::UnknownGroup(group_id) => Some(group_id.clone()),
         _ => None,
     }
@@ -817,6 +399,7 @@ fn defer_event_projection(
     deferred_groups: &[GroupId],
     projected: bool,
     summary: &mut SyncSummary,
+    host_may_see_group: impl Fn(&GroupId) -> bool,
 ) -> bool {
     if projected
         || !event_group_id(event).is_some_and(|group_id| deferred_groups.contains(group_id))
@@ -827,8 +410,9 @@ fn defer_event_projection(
         event,
         cgka_traits::engine::GroupEvent::MessageReceived { .. }
             | cgka_traits::engine::GroupEvent::GroupJoined { .. }
-    ) {
-        summary.events.push(event.clone());
+    ) && event_group_id(event).is_some_and(host_may_see_group)
+    {
+        summary.events.push(crate::groups::host_group_event(event));
     }
     true
 }
@@ -841,24 +425,21 @@ struct EventProjectionProgress {
     terminal_cleanup: Option<Option<storage_sqlite::TimelineProjectionUpdate>>,
 }
 
+/// Which retained sends [`AppClient::wake_retained_sends`] wakes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RetainedSendWake {
+    /// Every retryable target, as for a host connectivity edge.
+    All,
+    /// Only sends still below their required acknowledgements, the ones a
+    /// user sees as unsent, and sends still awaiting MLS confirmation.
+    BelowQuorum,
+}
+
 impl AppClient {
-    /// Persist a host connectivity-restored edge into every exact fanout whose
-    /// prior attempt was proven unavailable, then schedule its group for an
-    /// immediate worker pass. Ambiguous fanouts keep their original clocks.
+    /// Persist a host connectivity-restored edge into every exact fanout with a
+    /// retryable target, then schedule its group for an immediate worker pass.
     pub(crate) fn note_connectivity_restored(&mut self) -> Result<usize, AppError> {
-        let mut woken_targets = 0;
-        for mut fanout in self.runtime.session().outbound_fanouts()? {
-            let woken = fanout.wake_retryable_unavailable_targets();
-            if woken == 0 {
-                continue;
-            }
-            let group_id = fanout.group_id().cloned();
-            self.runtime.session().put_outbound_fanout(&fanout)?;
-            if let Some(group_id) = group_id {
-                self.pending_convergence_groups.insert(group_id);
-            }
-            woken_targets += woken;
-        }
+        let woken_targets = self.wake_retained_sends(RetainedSendWake::All)?;
         self.app.product_analytics.observe(
             crate::ProductFamily::Connectivity,
             "reconnect",
@@ -873,8 +454,101 @@ impl AppClient {
         Ok(woken_targets)
     }
 
+    /// Clear the retry clock of every retryable target of a retained send, then
+    /// schedule its group for an immediate worker pass. Attempt counts stay, so
+    /// a retry that fails again resumes its backoff. Possibly-exposed targets
+    /// wake too: their retry resends the same signed event, which a relay that
+    /// already holds it acknowledges as a duplicate. Leaving them on the
+    /// ambiguity clock held a reconnecting device's queued sends for up to an
+    /// hour (mdk#2762).
+    ///
+    /// A group the session opened only seeded hides its fanouts until it is
+    /// hydrated, so each group that holds one is hydrated first. Otherwise a
+    /// wake soon after a cold start would skip exactly the sends a previous
+    /// process left behind. A group that fails to hydrate moves to quarantine
+    /// and keeps its fanouts frozen, as at open.
+    ///
+    /// [`RetainedSendWake::BelowQuorum`] leaves sends that met their required
+    /// acknowledgements, and await no MLS confirmation, to the secondary
+    /// replication schedule.
+    pub(crate) fn wake_retained_sends(
+        &mut self,
+        scope: RetainedSendWake,
+    ) -> Result<usize, AppError> {
+        let unhydrated = self.runtime.unhydrated_group_ids();
+        if !unhydrated.is_empty() {
+            for group_id in self.runtime.outbound_fanout_group_ids()? {
+                if unhydrated.contains(&group_id)
+                    && let Err(error) = self.runtime.ensure_group_hydrated(&group_id)
+                {
+                    tracing::warn!(
+                        target: "marmot_app::sync",
+                        method = "wake_retained_sends",
+                        error_kind = AppError::from(error).privacy_safe_kind(),
+                        "group with retained sends could not hydrate for the wake",
+                    );
+                }
+            }
+        }
+        let mut woken_targets = 0;
+        for mut fanout in self.runtime.outbound_fanouts()? {
+            // A send that met quorum but still awaits MLS confirmation remains
+            // a group barrier, so its clock must not hold the group either.
+            if scope == RetainedSendWake::BelowQuorum
+                && fanout.outcome().accepted_targets >= fanout.request().required_acks.max(1)
+                && !matches!(fanout.mls_state(), cgka_traits::FanoutMlsState::Pending(_))
+            {
+                continue;
+            }
+            let woken = fanout.wake_targets_for_restored_connectivity();
+            if woken == 0 {
+                continue;
+            }
+            let group_id = fanout.group_id().cloned();
+            self.runtime.put_outbound_fanout(&fanout)?;
+            if let Some(group_id) = group_id {
+                self.pending_convergence_groups.insert(group_id);
+            }
+            woken_targets += woken;
+        }
+        Ok(woken_targets)
+    }
+
     pub(crate) fn take_pending_convergence_groups(&mut self) -> Vec<cgka_traits::GroupId> {
         self.pending_convergence_groups.drain().collect()
+    }
+
+    /// Whether this group's convergence pass parked after repeated failures
+    /// (mdk#2684).
+    pub(crate) fn convergence_pass_parked(
+        &self,
+        group_id: &cgka_traits::GroupId,
+    ) -> Result<bool, AppError> {
+        Ok(self.runtime.convergence_pass_parked(group_id)?)
+    }
+
+    /// Record whether `group_id`'s convergence pass is parked, owing hosts a
+    /// group-state notice when that changed since they last heard (mdk#2684).
+    /// Every entry point that can spend the budget re-reads the schedule, so
+    /// the notice does not depend on which one parked it. A group hosts may
+    /// not see owes them nothing.
+    pub(crate) fn note_convergence_park(&mut self, group_id: &cgka_traits::GroupId, parked: bool) {
+        if !self.host_may_see_group(group_id) {
+            return;
+        }
+        let changed = if parked {
+            self.announced_convergence_parks.insert(group_id.clone())
+        } else {
+            self.announced_convergence_parks.remove(group_id)
+        };
+        if changed {
+            self.pending_convergence_park_notices
+                .insert(group_id.clone());
+        }
+    }
+
+    pub(crate) fn take_convergence_park_notices(&mut self) -> Vec<cgka_traits::GroupId> {
+        self.pending_convergence_park_notices.drain().collect()
     }
 
     /// Engine-derived convergence scheduling state for one group.
@@ -892,6 +566,8 @@ impl AppClient {
             return Ok(ConvergenceScheduleState::Idle);
         }
         let convergence_delay = self.runtime.prepare_convergence_cutoff_delay_ms(group_id)?;
+        let parked = self.runtime.convergence_pass_parked(group_id)?;
+        self.note_convergence_park(group_id, parked);
         match convergence_delay {
             Some(0) => Ok(ConvergenceScheduleState::Ready),
             Some(remaining_ms) => {
@@ -906,7 +582,30 @@ impl AppClient {
                 }
             }
             None => {
-                if self.runtime.has_pending_convergence_inputs(group_id)? {
+                if parked {
+                    // A parked pass waits for new input or an explicit retry
+                    // and gates every other arm below (mdk#2684). Waking it
+                    // would only re-read the park; already-staged
+                    // publications keep their own retry wake.
+                    return Ok(if self.runtime.has_pending_outbound_fanouts(group_id)? {
+                        ConvergenceScheduleState::PendingOutbound {
+                            retry_after_ms: self
+                                .runtime
+                                .outbound_fanout_retry_delay_ms(group_id)?,
+                        }
+                    } else {
+                        ConvergenceScheduleState::Idle
+                    });
+                }
+                // A removed or disbanded copy never converges again, so a rival
+                // its removal left unresolved stays pending for good; waking
+                // the copy for it would do nothing.
+                if self.runtime.has_pending_convergence_inputs(group_id)?
+                    && !self
+                        .runtime
+                        .group_record(group_id)
+                        .is_ok_and(|group| group.is_terminal())
+                {
                     Ok(ConvergenceScheduleState::PendingUnopenable)
                 } else if self.runtime.has_queued_outbound_intents(group_id)?
                     && !self
@@ -935,12 +634,15 @@ impl AppClient {
                         .is_some_and(|request| {
                             request.status == cgka_traits::DisbandRequestStatus::Pending
                         }))
+                    || self.runtime.leave_redrive_owed(group_id)?
                 {
                     // Acceptance stores a separate durable request, not a queued
                     // outbound intent or convergence input. Keep its wakeup so
                     // the next advance can prepare the closing commit. Existing
                     // convergence and frozen publications retain their precedence;
-                    // an unrecoverable group stays paused.
+                    // an unrecoverable group stays paused. A leave request that
+                    // owes its step-down or SelfRemove is the same kind of
+                    // durable request (mdk#3014).
                     Ok(ConvergenceScheduleState::PendingOutbound {
                         retry_after_ms: None,
                     })
@@ -974,126 +676,10 @@ impl AppClient {
     /// account worker can arm their group timers.
     pub(crate) fn remember_pending_convergence_groups(
         &mut self,
-        effects: &marmot_account::AccountDeviceEffects,
+        effects: &marmot_session::AccountDeviceEffects,
     ) {
         self.pending_convergence_groups
             .extend(effects.pending_convergence.iter().cloned());
-    }
-
-    /// Feed one effects batch's epoch-gap recovery evidence to the stall
-    /// detector: a resource refusal arms a replay, and an epoch passage or a
-    /// convergence reorg reports the activity that can end an unrecovered run.
-    ///
-    /// Both directions matter, and only this seam carries the second one. A
-    /// delivery reports the epoch it was *read* at, which is where the device
-    /// already sits; the epochs a fold, a confirmed publish, or a maintenance
-    /// tick's own evolution carried it *through* are read at by nothing, so
-    /// without the engine's own `EpochChanged` the detector cannot tell a device
-    /// that recovered from one that is still stuck (see
-    /// [`EpochStallDetector::observe_epoch_passage`](super::epoch_stall::EpochStallDetector::observe_epoch_passage)).
-    /// Of the three emitting sites only a convergence reorg spans more than one
-    /// epoch; publish-confirm and peer-commit ingest are always adjacent, which
-    /// is the case the passage rule is tuned for.
-    ///
-    /// Events are consumed in engine order, so a passage later in the same batch
-    /// supersedes an arm an earlier refusal just made: the durable
-    /// `epoch_stall_backfill_armed` row still records that the replay was armed,
-    /// while the detector's run counter starts over. That split is intended — the
-    /// arm happened and stays on the forensic record, and the run is what the
-    /// later evidence contradicts.
-    pub(crate) fn observe_recovery_evidence(
-        &mut self,
-        effects: &marmot_account::AccountDeviceEffects,
-    ) {
-        if self.app.cursor_persistence() != CursorPersistence::Advance {
-            return;
-        }
-        for event in &effects.events {
-            use cgka_traits::engine::GroupEvent;
-            let transition = match event {
-                GroupEvent::GroupStateInvalidated { .. } => Some(("invalidation", "performed")),
-                GroupEvent::GroupStateRevalidated { .. } => Some(("revalidation", "success")),
-                GroupEvent::GroupUnrecoverable { .. } => Some(("unrecoverable", "failure")),
-                GroupEvent::PendingCommitRecovered { .. } => Some(("pending_commit", "success")),
-                GroupEvent::GroupHydrationRecovered { .. } => Some(("hydration", "success")),
-                _ => None,
-            };
-            if let Some((operation, outcome)) = transition {
-                self.app.product_analytics.observe(
-                    crate::ProductFamily::Recovery,
-                    operation,
-                    outcome,
-                    crate::ProductUnit::Transition,
-                    None,
-                );
-            }
-            match event {
-                cgka_traits::engine::GroupEvent::EpochChanged { group_id, from, to } => {
-                    self.epoch_stall.observe_epoch_passage(group_id, *from, *to);
-                }
-                cgka_traits::engine::GroupEvent::TransportObjectResourceRefused {
-                    group_id,
-                    ..
-                } => {
-                    let Ok(record) = self.runtime.group_record(group_id) else {
-                        continue;
-                    };
-                    // A terminal copy has no servable history, so arming here
-                    // could only mint a durable intent and a forensic row for
-                    // work that is never coming.
-                    if record.is_terminal() {
-                        continue;
-                    }
-                    // Recording the recovery intent before the recovery job
-                    // acquires any history, and recording an
-                    // escalation this arm raises, are both the shared decision
-                    // handler's job: a resource-refusal arm counts toward the
-                    // same unrecovered run as a deferred-delivery arm, and the
-                    // detector raises the run's escalation only once, at
-                    // whichever path happens to arm third.
-                    let decision = self.epoch_stall.observe_resource_refusal(
-                        group_id.clone(),
-                        record.epoch,
-                        epoch_stall_now_ms(),
-                    );
-                    self.apply_backfill_decision(
-                        group_id,
-                        record.epoch.0,
-                        decision,
-                        EpochStallBackfillTrigger::ResourceRefusal,
-                    );
-                }
-                // A convergence reorg is the third kind of recovery evidence,
-                // and the only one that never moves an epoch. Branch selection
-                // superseded an authenticated commit this device had applied;
-                // when the two branches carry the same epoch number the engine
-                // emits no `EpochChanged` for it at all, so without this arm a
-                // device that just crossed a fork resolution is indistinguishable
-                // from one that saw nothing.
-                //
-                // Matching the withdrawal rather than its `CommitRolledBack`
-                // twin is not a choice about which is better evidence: the
-                // engine pushes the pair back to back, once per rolled-back
-                // commit, with nothing fallible between them, so the two arms
-                // would decide identically and the second would only re-decide
-                // what the first already did.
-                cgka_traits::engine::GroupEvent::GroupStateInvalidated {
-                    group_id,
-                    reason:
-                        cgka_traits::engine::GroupStateInvalidationReason::SupersededByBranchSelection,
-                    ..
-                } => {
-                    // Deliberately not fed the carried `epoch`: that is the
-                    // source epoch of the fork the superseded commit lost, which
-                    // sits *behind* where this device is now. The detector's
-                    // observed epoch only ever moves forward, and handing it a
-                    // backward position would walk the per-epoch suppression
-                    // back with it.
-                    self.epoch_stall.observe_convergence_reorg(group_id);
-                }
-                _ => {}
-            }
-        }
     }
 
     /// Apply the publish gate to `effects`, observing the same batch's
@@ -1119,7 +705,7 @@ impl AppClient {
     /// automatically after temporary transport loss.
     pub(crate) async fn observe_recovery_evidence_then_fail_if_publish_failed(
         &mut self,
-        effects: &marmot_account::AccountDeviceEffects,
+        effects: &marmot_session::AccountDeviceEffects,
     ) -> Result<(), AppError> {
         // Foreground send preflight can settle unrelated retained commits.
         // Their membership decisions are already canonical even if the
@@ -1140,7 +726,7 @@ impl AppClient {
     /// and reuse route refresh and subscriber buffering from the full observer.
     pub(crate) async fn observe_native_membership_effects(
         &mut self,
-        effects: &marmot_account::AccountDeviceEffects,
+        effects: &marmot_session::AccountDeviceEffects,
     ) -> Result<(), AppError> {
         let queued = self.pending_applied_effects.len();
         self.retain_effect_projection(effects, "", unix_now_seconds(), false);
@@ -1153,6 +739,9 @@ impl AppClient {
         // Queue the activity suffix behind native cleanup, before either phase
         // can suspend. Cancellation must not leave it owned by the command.
         self.queue_own_group_system_projection_updates(effects);
+        // Member adds reach this boundary only as activity, never through the
+        // shared projection seam, so queue their push-token shares here.
+        self.queue_push_registration_shares_for_member_adds(&effects.events);
         let routes_dirty = self.retry_applied_effect_projections_buffered().await?;
         let routes_changed = self.refresh_group_routes()?.routing_changed;
         if routes_dirty || routes_changed {
@@ -1165,7 +754,7 @@ impl AppClient {
     /// failures retain a retry edge without changing the command's publish result.
     async fn observe_native_membership_effects_best_effort(
         &mut self,
-        effects: &marmot_account::AccountDeviceEffects,
+        effects: &marmot_session::AccountDeviceEffects,
     ) {
         if let Err(error) = self.observe_native_membership_effects(effects).await {
             self.pending_runtime_group_subscription_refresh = true;
@@ -1182,7 +771,7 @@ impl AppClient {
     /// withdrawal events. Project the full batch before returning that failure.
     async fn observe_failed_publish_effects_best_effort(
         &mut self,
-        effects: &marmot_account::AccountDeviceEffects,
+        effects: &marmot_session::AccountDeviceEffects,
     ) {
         let result = self
             .observe_send_applied_effects(effects)
@@ -1200,8 +789,9 @@ impl AppClient {
     }
 
     pub(crate) async fn sync_runtime_groups(&mut self) -> Result<(), AppError> {
-        let rebuild_since = self.subscription_rebuild_since()?;
         self.pending_runtime_group_subscription_refresh = true;
+        self.prepare_runner_ownership().await?;
+        let rebuild_since = self.subscription_rebuild_since();
         let result = self.sync_runtime_groups_since(rebuild_since).await;
         if result.is_ok() {
             self.pending_runtime_group_subscription_refresh = false;
@@ -1264,40 +854,13 @@ impl AppClient {
         Ok(())
     }
 
-    pub(crate) fn subscription_rebuild_since(
-        &self,
-    ) -> Result<Option<cgka_traits::transport::Timestamp>, AppError> {
-        let since = self
-            .relay_plane
-            .subscription_rebuild_since(self.checkpointed_transport_timestamp);
-        let storage = self.app.account_storage(&self.state.label)?;
-        for demand in storage
-            .app_storage()
-            .pending_recovery_demands()?
-            .into_iter()
-            .filter(|demand| demand.cause == storage_sqlite::RecoveryCause::SubscriptionReplay)
-        {
-            let scopes = storage
-                .app_storage()
-                .recovery_scope_snapshots(demand.ticket.id)?
-                .into_iter()
-                .filter(|scope| !scope.replay_admitted)
-                .collect::<Vec<_>>();
-            if scopes
-                .iter()
-                .any(|scope| scope.plan.since_seconds.is_none())
-            {
-                return Ok(None);
-            }
-            if let Some(floor) = scopes
-                .iter()
-                .filter_map(|scope| scope.plan.since_seconds)
-                .min()
-            {
-                return Ok(since.map(|since| cgka_traits::transport::Timestamp(since.0.min(floor))));
-            }
-        }
-        Ok(since)
+    /// The floor every rebuilt REQ asks from: the transport cursor less the
+    /// rebuild lookback, as the relay plane reads it. History an earlier
+    /// owner still owed below it converts to the runner's debt before any
+    /// subscription goes out, so it never lowers another route's REQ (#2793).
+    pub(crate) fn subscription_rebuild_since(&self) -> Option<cgka_traits::transport::Timestamp> {
+        self.relay_plane
+            .subscription_rebuild_since(self.checkpointed_transport_timestamp)
     }
 
     pub(crate) fn delivery_loss_blocks_cursor(&self) -> bool {
@@ -1396,196 +959,52 @@ impl AppClient {
         &mut self,
         overflow: transport_nostr::AccountDeliveryOverflow,
     ) -> Result<(), AppError> {
-        // The router's process-local fence already froze cursor advancement at
-        // the omission. Re-observe the same token here so the queued signal is
-        // also an idempotent storage boundary before recovery starts.
-        let storage = self.app.account_storage(&self.state.label)?;
-        let app = storage.app_storage();
-        self.synchronize_recovery_loss(&app)?;
+        self.delivery_overflow_recovery_pending = true;
+        self.delivery_overflow_recovery_marker_token = Some(overflow.marker_token);
+        let app = self.app.account_storage(&self.state.label)?.app_storage();
         if overflow.dropped > 0 {
-            let marked = app.mark_account_delivery_recovery_observed(
+            let routes = self.adapter.delivery_loss_routes(&overflow).map(|routes| {
+                routes
+                    .into_iter()
+                    .map(|(route, earliest)| (crate::reconciliation_route(route), earliest))
+                    .collect::<Vec<_>>()
+            });
+            app.record_account_recovery_loss_routed(
                 &self.state.label,
+                storage_sqlite::RecoveryLossCause::Queue,
                 overflow.marker_token,
                 overflow.dropped,
+                unix_now_seconds(),
                 overflow.earliest_dropped,
+                routes.as_deref(),
             )?;
-            self.record_recovery_loss_imports(marked.into_iter().collect());
         }
         if overflow.notification_losses > 0 {
-            // The lag's REQ floors bound the loss from below. Each lag mints a
-            // fresh token, so a lower floor always imports as new loss with a
-            // new obligation revision rather than rewriting a frozen goal.
-            app.record_account_recovery_loss_bounded(
+            let routes = self
+                .adapter
+                .notification_loss_routes(&overflow)
+                .map(|routes| {
+                    routes
+                        .into_iter()
+                        .map(|(route, since)| (crate::reconciliation_route(route), since))
+                        .collect::<Vec<_>>()
+                });
+            app.record_account_recovery_loss_routed(
                 &self.state.label,
                 storage_sqlite::RecoveryLossCause::NotificationConsumer,
                 overflow.notification_token,
                 0,
                 unix_now_seconds(),
                 overflow.notification_floor,
+                routes.as_deref(),
             )?;
-            self.synchronize_recovery_loss(&app)?;
+        }
+        self.synchronize_recovery_loss(&app)?;
+        if overflow.notification_losses > 0 {
             self.adapter.notification_loss_persisted(overflow);
         }
-        // A late observation of loss the user already retired rearms nothing.
-        // Release its fence as the dismissal would have, never as coverage.
-        if self.release_retired_delivery_loss(Some(overflow))? {
-            tracing::debug!(
-                target: "marmot_app::relay_plane",
-                method = "observe_delivery_overflow",
-                "observed delivery loss was already retired; cursor fence released",
-            );
-            return Ok(());
-        }
-        self.delivery_overflow_recovery_pending = true;
-        self.delivery_overflow_recovery_marker_token = Some(overflow.marker_token);
-        tracing::warn!(
-            target: "marmot_app::relay_plane",
-            method = "observe_delivery_overflow",
-            queue_depth = overflow.queue_depth,
-            dropped = overflow.dropped,
-            dropped_bounded = overflow.earliest_dropped.is_some(),
-            notification_losses = overflow.notification_losses,
-            notification_bounded = overflow.notification_floor.is_some(),
-            elapsed_ms = overflow.elapsed_ms,
-            "account delivery loss requires comparison recovery",
-        );
+        self.finish_runner_loss_import()?;
         Ok(())
-    }
-
-    /// Freeze the bounded comparison pass before the grant reaches network I/O.
-    /// Receipt synchronization and any inventory compaction happen here; a
-    /// compaction that invalidates the reservation makes plan installation fail
-    /// conservatively, without executing a stale snapshot.
-    /// `every_route` lifts the per-pass route cap for an explicit repair,
-    /// whose single pass must reach every route inside its own budget.
-    pub(super) fn freeze_recovery_inventory(
-        &mut self,
-        goals: &mut [([u8; 16], Vec<storage_sqlite::RecoveryScopePlan>)],
-        uncompared: &HashSet<([u8; 16], u64)>,
-        every_route: bool,
-    ) -> Result<super::recovery::FrozenRecoveryPass, AppError> {
-        let storage = self.app.account_storage(&self.state.label)?;
-        let mut work = Vec::new();
-        // Certified scopes keep their coverage; passes rotate to the rest.
-        for scope in goals.iter().flat_map(|(id, scopes)| {
-            scopes
-                .iter()
-                .filter(move |scope| !uncompared.contains(&(*id, scope.scope_id)))
-        }) {
-            if scope.admitted_endpoints.is_empty() {
-                continue;
-            }
-            let endpoints = scope
-                .admitted_endpoints
-                .iter()
-                .cloned()
-                .map(cgka_traits::TransportEndpoint)
-                .collect();
-            let candidate = match (scope.route_kind, &scope.group_id, scope.transport_group_id) {
-                (0, _, _) => TransportReconciliationWork::Inbox(endpoints),
-                (1, Some(group), Some(route)) => {
-                    TransportReconciliationWork::Group(cgka_traits::TransportGroupSubscription {
-                        group_id: cgka_traits::GroupId::new(group.clone()),
-                        transport_group_id: route.to_vec(),
-                        endpoints,
-                        retained_since: None,
-                    })
-                }
-                _ => continue,
-            };
-            if !work
-                .iter()
-                .any(|existing: &TransportReconciliationWork| existing.route() == candidate.route())
-            {
-                work.push(candidate);
-            }
-        }
-        let cursor = storage
-            .app_storage()
-            .transport_reconciliation_route_cursor()?;
-        let rotation_claim = order_reconciliation_pass(
-            &mut work,
-            cursor.as_ref(),
-            &self.armed_epoch_backfill_groups(),
-            if every_route {
-                usize::MAX
-            } else {
-                TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS
-            },
-        );
-        let receipts = self.transport_receipts()?;
-        let mut frozen = Vec::new();
-        let mut excluded = Vec::new();
-        for work in work {
-            let route = work.route().expect("validated recovery route");
-            let matches = |scope: &storage_sqlite::RecoveryScopePlan| match route {
-                TransportReconciliationRoute::Inbox => scope.route_kind == 0,
-                TransportReconciliationRoute::Group(id) => {
-                    scope.route_kind == 1 && scope.transport_group_id == Some(id)
-                }
-            };
-            let until = goals
-                .iter()
-                .flat_map(|(id, scopes)| {
-                    scopes
-                        .iter()
-                        .filter(move |scope| !uncompared.contains(&(*id, scope.scope_id)))
-                })
-                .filter(|scope| matches(scope))
-                .map(|scope| scope.until_seconds)
-                .max()
-                .unwrap_or_default();
-            let mut required = goals
-                .iter()
-                .flat_map(|(id, scopes)| {
-                    scopes
-                        .iter()
-                        .filter(move |scope| !uncompared.contains(&(*id, scope.scope_id)))
-                })
-                .filter(|scope| matches(scope))
-                .flat_map(|scope| scope.required_endpoints.iter().cloned())
-                .collect::<Vec<_>>();
-            required.sort();
-            required.dedup();
-            let inventory = receipts.inventory(&route, until)?;
-            for scope in goals
-                .iter_mut()
-                .flat_map(|(id, scopes)| {
-                    scopes
-                        .iter_mut()
-                        .filter(move |scope| !uncompared.contains(&(*id, scope.scope_id)))
-                })
-                .filter(|scope| matches(scope))
-            {
-                // This describes the local comparison floor, never a claim that
-                // older debt was served or permission to narrow its goal.
-                scope.inventory_floor.get_or_insert(inventory.since);
-            }
-            if inventory.since <= until {
-                frozen.push(super::recovery::FrozenRecoveryInventory {
-                    work,
-                    route,
-                    required,
-                    since: inventory.since,
-                    until,
-                    items: inventory
-                        .items
-                        .into_iter()
-                        .filter(|item| item.created_at <= until)
-                        .map(nostr_reconciliation_item)
-                        .collect(),
-                });
-            } else {
-                // This route was inspected, not merely left for rotation.
-                // Its old goal is below the account's retained inventory.
-                excluded.push(route);
-            }
-        }
-        Ok(super::recovery::FrozenRecoveryPass {
-            inventory: frozen,
-            rotation_claim,
-            excluded_routes: excluded,
-        })
     }
 
     /// One-shot native effects must keep their engine-owning client until projected.
@@ -1661,13 +1080,53 @@ impl AppClient {
         Ok(self.has_pending_runtime_group_subscription_refresh())
     }
 
+    pub(crate) async fn sync_relay_liveness(
+        &self,
+    ) -> Result<Vec<cgka_traits::TransportEndpoint>, AppError> {
+        let configured = self.app.relay_liveness_config(&self.state.label)?;
+        let client = self
+            .relay_plane
+            .account_history_relay_client(self.adapter.account_id())
+            .await
+            .ok_or_else(|| {
+                cgka_traits::TransportAdapterError::AccountNotActive(
+                    self.adapter.account_id().clone(),
+                )
+            })?;
+        client.sync_liveness_config(&configured).await?;
+        Ok(configured)
+    }
+
+    pub(crate) async fn reconnect_relay(
+        &self,
+        canonical_url: String,
+    ) -> Result<crate::RelayLiveness, AppError> {
+        let configured = self.sync_relay_liveness().await?;
+        if configured
+            .binary_search_by(|endpoint| endpoint.as_str().cmp(canonical_url.as_str()))
+            .is_err()
+        {
+            return Err(cgka_traits::TransportAdapterError::Subscription(
+                "relay is not configured for this account".into(),
+            )
+            .into());
+        }
+        self.relay_plane
+            .reconnect_relay(
+                self.adapter.account_id(),
+                cgka_traits::TransportEndpoint(canonical_url),
+            )
+            .await
+            .map_err(AppError::from)
+    }
+
     pub(crate) async fn prepare_transport(&mut self) -> Result<(), AppError> {
         self.prepare_transport_with_telemetry(None).await
     }
 
     pub(crate) async fn prepare_transport_with_telemetry(
         &mut self,
-        telemetry: Option<&AppPerformanceTelemetry>,
+        telemetry: Option<&PerformanceRecorder>,
     ) -> Result<(), AppError> {
         self.prepare_transport_for_sync(telemetry)
             .await
@@ -1676,10 +1135,13 @@ impl AppClient {
 
     async fn prepare_transport_for_sync(
         &mut self,
-        telemetry: Option<&AppPerformanceTelemetry>,
+        telemetry: Option<&PerformanceRecorder>,
     ) -> Result<(), (SyncFailureStage, AppError)> {
         // Failed/cancelled activation must retain a retry intent for scheduled work.
         self.pending_runtime_group_subscription_refresh = true;
+        self.prepare_runner_ownership()
+            .await
+            .map_err(|error| (SyncFailureStage::TransportActivation, error))?;
         // Before any subscription goes out: auth-gated relays (NIP-42)
         // withhold gift-wrapped welcomes from unauthenticated subscribers.
         let activation_started = Instant::now();
@@ -1690,9 +1152,7 @@ impl AppClient {
             .set_transport_signer(self.adapter.account_id(), self.transport_signer.clone())
             .await
             .map_err(|error| (SyncFailureStage::TransportActivation, error.into()))?;
-        let rebuild_since = self
-            .subscription_rebuild_since()
-            .map_err(|error| (SyncFailureStage::TransportActivation, error))?;
+        let rebuild_since = self.subscription_rebuild_since();
         let activation = self.runtime.activate_transport(rebuild_since).await;
         if let Some(telemetry) = telemetry {
             telemetry.record(
@@ -1725,6 +1185,7 @@ impl AppClient {
     /// This compatibility entry point preserves the original [`AppError`]
     /// contract. Call [`Self::sync_with_partial_progress`] when the caller must
     /// report the durably applied prefix of a failed catch-up pass.
+    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     pub async fn sync(&mut self) -> Result<SyncSummary, AppError> {
         match self.sync_inner(None, SyncMode::Explicit).await {
             Ok(summary) => Ok(summary),
@@ -1755,7 +1216,7 @@ impl AppClient {
 
     pub(crate) async fn sync_with_stage_telemetry(
         &mut self,
-        telemetry: Option<&AppPerformanceTelemetry>,
+        telemetry: Option<&PerformanceRecorder>,
         mode: SyncMode,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
         match self.sync_inner(telemetry, mode).await {
@@ -1792,7 +1253,7 @@ impl AppClient {
     /// maintenance, only drains: the worker's own job serves its debt.
     async fn sync_inner(
         &mut self,
-        telemetry: Option<&AppPerformanceTelemetry>,
+        telemetry: Option<&PerformanceRecorder>,
         mode: SyncMode,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
         let routing_changed = self.refresh_sync_routes().map_err(|error| {
@@ -1818,38 +1279,42 @@ impl AppClient {
         // Network cooldown never withholds already queued input or engine
         // events. Receiving existing subscriptions is not a new acquisition.
         let mut summary = self.sync_sdk_relay(None).await?;
-        use crate::runtime::account_worker::recovery_credits;
         let state_persist = |summary: SyncSummary, error| {
             ClassifiedSyncFailure::at_stage(summary, error, SyncFailureStage::StatePersist)
         };
-        // A sync with no recovery debt, or no relay recovery may contact,
-        // takes no credit: it would only hold one of the process's two, and
-        // the account with it, for a grant it cannot select.
-        let wants_job =
-            self.app.cursor_persistence() == CursorPersistence::Advance && (explicit || startup);
-        if wants_job && let Err(error) = self.request_sync_comparison(telemetry, explicit) {
+        // A startup or explicit sync, with some relay recovery may contact,
+        // flushes recovery observations. The recovery runner owns the fetch
+        // (mdk#2660 phase 4).
+        if self.app.cursor_persistence() == CursorPersistence::Advance
+            && (explicit || startup)
+            && self.recovery_endpoints_admitted()
+            && let Err(error) = self.refresh_account_recovery().await
+        {
             return Err(state_persist(summary, error));
         }
-        let pending = match self.recovery_pending() {
-            Ok(pending) => pending && self.recovery_endpoints_admitted(),
-            Err(error) => return Err(state_persist(summary, error)),
-        };
-        let credit = if !wants_job || !pending {
-            None
-        } else if explicit {
+        // A directly owned client also runs its recovery runner in place for
+        // one pass (mdk#2660).
+        if explicit && self.has_in_place_recovery_runner() {
+            summary = self.run_in_place_recovery_pass(summary).await?;
+        }
+        self.finish_prepared_sync_summary(summary).await
+    }
+
+    /// The in-place runner's pass after an explicit sync, behind `summary`.
+    /// Boxed like the pass itself, so its awaits add nothing to every sync's
+    /// stack.
+    fn run_in_place_recovery_pass(
+        &mut self,
+        mut summary: SyncSummary,
+    ) -> futures::future::BoxFuture<'_, Result<SyncSummary, ClassifiedSyncFailure>> {
+        Box::pin(async move {
             self.pending_applied_sync_summary
                 .merge(std::mem::take(&mut summary));
-            let credit = recovery_credits::acquire_recovery_credit(&self.recovery_credits).await;
-            self.prepend_pending_applied_summary(&mut summary);
-            Some(credit)
-        } else {
-            recovery_credits::try_acquire_recovery_credit(&self.recovery_credits)
-        };
-        let grant = if credit.is_some() {
-            // Input that arrived while the credit was pending is ingested
-            // before the inventory freezes, so the job does not fetch it again.
-            self.pending_applied_sync_summary
-                .merge(std::mem::take(&mut summary));
+            self.run_recovery_runner_pass().await;
+            // The pass's admission can lift a group's live fence, and the
+            // adapter then hands over the frames it was holding. A directly
+            // owned client has no worker to read them, so this sync does: a
+            // one-shot client would otherwise close with them unread.
             let drained = self.sync_sdk_relay(None).await;
             self.prepend_pending_applied_summary(&mut summary);
             match drained {
@@ -1860,40 +1325,11 @@ impl AppClient {
                     return Err(failure);
                 }
             }
-            match self.select_sync_grant(telemetry, explicit).await {
-                Ok(grant) => grant,
-                Err(error) => return Err(state_persist(summary, error)),
-            }
-        } else {
-            None
-        };
-        if let (Some(grant), Some(credit)) = (grant, credit) {
-            self.pending_applied_sync_summary
-                .merge(std::mem::take(&mut summary));
-            let recovered = self.run_recovery_job(grant, credit, None).await;
-            self.prepend_pending_applied_summary(&mut summary);
-            match recovered {
-                Ok(
-                    EpochBackfillRunOutcome::Completed(recovered)
-                    | EpochBackfillRunOutcome::Incomplete(recovered),
-                ) => summary.merge(recovered),
-                Ok(EpochBackfillRunOutcome::Deferred | EpochBackfillRunOutcome::NotPending) => {}
-                Err(error) => {
-                    summary.merge(std::mem::take(&mut self.pending_failed_sync_summary));
-                    return Err(ClassifiedSyncFailure::at_stage(
-                        summary,
-                        error,
-                        SyncFailureStage::Unknown,
-                    ));
-                }
-            }
-            // A route the job's admission changed is subscribed before this
-            // returns: a directly owned client has no worker to refresh it.
             if self.pending_runtime_group_subscription_refresh {
                 summary = self.refresh_live_group_subscriptions(summary).await?;
             }
-        }
-        self.finish_prepared_sync_summary(summary).await
+            Ok(summary)
+        })
     }
 
     /// Bring the live group subscriptions up to the current routes. Nothing
@@ -1933,57 +1369,10 @@ impl AppClient {
         Ok(refresh.routing_changed)
     }
 
-    /// Record a startup or explicit comparison request, then select one grant.
-    /// Without a process credit nothing is selected: the durable demand waits
-    /// for the worker's next recovery job instead of spending a reservation.
-    pub(crate) async fn prepare_sync_grant(
-        &mut self,
-        telemetry: Option<&AppPerformanceTelemetry>,
-        explicit: bool,
-        credit_available: bool,
-    ) -> Result<Option<AttemptGrant>, AppError> {
-        self.request_sync_comparison(telemetry, explicit)?;
-        if !credit_available {
-            return Ok(None);
-        }
-        self.select_sync_grant(telemetry, explicit).await
-    }
-
-    /// Record a startup or explicit caller's comparison request.
-    fn request_sync_comparison(
-        &mut self,
-        telemetry: Option<&AppPerformanceTelemetry>,
-        explicit: bool,
-    ) -> Result<(), AppError> {
-        if self.app.cursor_persistence() == CursorPersistence::Advance
-            && (explicit || (telemetry.is_some() && !self.comparison_startup_requested))
-        {
-            self.request_bounded_comparison()?;
-            if !explicit {
-                self.comparison_startup_requested = true;
-            }
-        }
-        Ok(())
-    }
-
-    /// Select the grant a sync's job runs, under the credit it holds.
-    async fn select_sync_grant(
-        &mut self,
-        telemetry: Option<&AppPerformanceTelemetry>,
-        explicit: bool,
-    ) -> Result<Option<AttemptGrant>, AppError> {
-        let mut caller = ExplicitRecoveryPermit::default();
-        self.authorize_account_recovery(
-            explicit.then_some(&mut caller),
-            if explicit {
-                EpochBackfillExecutionSeam::ExplicitCatchUp
-            } else if telemetry.is_some() {
-                EpochBackfillExecutionSeam::Startup
-            } else {
-                EpochBackfillExecutionSeam::Maintenance
-            },
-        )
-        .await
+    /// Flush recovery observations before the worker's first sync (see
+    /// [`Self::refresh_account_recovery`]).
+    pub(crate) async fn prepare_startup_recovery(&mut self) -> Result<(), AppError> {
+        self.refresh_account_recovery().await
     }
 
     /// Install the session's live subscriptions, floored at the cursor. This
@@ -1991,7 +1380,7 @@ impl AppClient {
     /// without touching these subscriptions.
     pub(crate) async fn activate_live_transport(
         &mut self,
-        telemetry: Option<&AppPerformanceTelemetry>,
+        telemetry: Option<&PerformanceRecorder>,
     ) -> Result<(), ClassifiedSyncFailure> {
         if self.app.cursor_persistence() == CursorPersistence::Frozen {
             self.adapter.require_fresh_activation().await;
@@ -2001,13 +1390,7 @@ impl AppClient {
             .map_err(|(stage, error)| {
                 ClassifiedSyncFailure::at_stage(SyncSummary::default(), error, stage)
             })?;
-        let since = self.subscription_rebuild_since().map_err(|error| {
-            ClassifiedSyncFailure::at_stage(
-                SyncSummary::default(),
-                error,
-                SyncFailureStage::TransportActivation,
-            )
-        })?;
+        let since = self.subscription_rebuild_since();
         self.record_subscription_rebuild(since.map(|timestamp| timestamp.0))
             .await;
         Ok(())
@@ -2105,7 +1488,7 @@ impl AppClient {
     /// so the projection is exercisable against a given batch of effects.
     pub(crate) async fn observe_drained_session_events(
         &mut self,
-        effects: &marmot_account::AccountDeviceEffects,
+        effects: &marmot_session::AccountDeviceEffects,
     ) -> Result<SyncSummary, AppError> {
         self.retain_effect_projection(effects, "", unix_now_seconds(), true);
         let mut summary = self.take_pending_applied_sync_summary();
@@ -2129,7 +1512,7 @@ impl AppClient {
     /// publication bookkeeping. Keep its successful prefix available on failure.
     fn project_drained_effects(
         &mut self,
-        effects: &marmot_account::AccountDeviceEffects,
+        effects: &marmot_session::AccountDeviceEffects,
         source_received_at: u64,
         summary: &mut SyncSummary,
         progress: &mut EffectProjectionProgress,
@@ -2161,6 +1544,7 @@ impl AppClient {
                 &progress.deferred_groups,
                 event_progress.projected,
                 summary,
+                |group_id| self.host_may_see_group(group_id),
             ) {
                 event_progress.completed = true;
                 continue;
@@ -2224,6 +1608,7 @@ impl AppClient {
                     self.app.allow_loopback_blob_endpoints(),
                 ) && let Err(error) = self.project_received_message(
                     message,
+                    event_sender_leaf(event),
                     event_encrypted_media_secret(event),
                     group_metadata.as_ref(),
                     &mut event_summary,
@@ -2234,6 +1619,17 @@ impl AppClient {
                         projection_started.elapsed(),
                     );
                     return Err(error);
+                }
+                match event {
+                    cgka_traits::engine::GroupEvent::GroupJoined {
+                        group_id,
+                        via_welcome,
+                        ..
+                    } => self.note_invitation_admission(group_id, Some(via_welcome))?,
+                    cgka_traits::engine::GroupEvent::GroupCreated { group_id } => {
+                        self.note_invitation_admission(group_id, None)?
+                    }
+                    _ => {}
                 }
                 let updated_group =
                     event_group_id(event).and_then(|group_id| self.state_group_record(group_id));
@@ -2363,7 +1759,7 @@ impl AppClient {
     /// `pending_applied_sync_summary`. The caller persists state afterwards.
     pub(crate) async fn observe_send_applied_effects(
         &mut self,
-        effects: &marmot_account::AccountDeviceEffects,
+        effects: &marmot_session::AccountDeviceEffects,
     ) -> Result<(), AppError> {
         self.retain_applied_effects(effects);
         self.flush_send_applied_effects().await
@@ -2382,14 +1778,14 @@ impl AppClient {
     /// Retain drained native events until every app storage projection succeeds.
     pub(crate) fn retain_applied_effects(
         &mut self,
-        effects: &marmot_account::AccountDeviceEffects,
+        effects: &marmot_session::AccountDeviceEffects,
     ) {
         self.retain_effect_projection(effects, "", unix_now_seconds(), false);
     }
 
     fn retain_effect_projection(
         &mut self,
-        effects: &marmot_account::AccountDeviceEffects,
+        effects: &marmot_session::AccountDeviceEffects,
         source_message_id_hex: &str,
         received_at: u64,
         drained: bool,
@@ -2397,13 +1793,16 @@ impl AppClient {
         self.observe_recovery_evidence(effects);
         self.remember_pending_convergence_groups(effects);
         self.remember_published_reports(effects);
+        self.note_device_group_sent_ids(effects);
+        self.note_device_group_removal(effects);
         self.note_superseded_intent_reports(effects);
+        self.settle_accepted_push_announces(effects);
         self.enqueue_effect_projection(effects, source_message_id_hex, received_at, drained);
     }
 
     fn enqueue_effect_projection(
         &mut self,
-        effects: &marmot_account::AccountDeviceEffects,
+        effects: &marmot_session::AccountDeviceEffects,
         source_message_id_hex: &str,
         received_at: u64,
         drained: bool,
@@ -2438,7 +1837,7 @@ impl AppClient {
         received_at: u64,
         cursor: usize,
     ) {
-        let effects = marmot_account::AccountDeviceEffects {
+        let effects = marmot_session::AccountDeviceEffects {
             events: events.to_vec(),
             ..Default::default()
         };
@@ -2465,6 +1864,7 @@ impl AppClient {
         pending: &mut PendingAppliedEffects,
     ) -> Result<(), AppError> {
         if !pending.bookkeeping_started {
+            self.settle_sibling_welcome_carriers(&pending.effects)?;
             self.transport_receipts()?;
             self.observe_recovery_health(&pending.effects)?;
             // This helper transfers unfinished source finalization back to its
@@ -2491,6 +1891,7 @@ impl AppClient {
             .get(pending.failed_message_cursor)
         {
             if pending.failed_message_update.is_none() {
+                self.history_delivery_failed(&failed.app_event_id)?;
                 pending.failed_message_update = Some(
                     self.app
                         .account_storage(&self.state.label)?
@@ -2618,6 +2019,19 @@ impl AppClient {
                     return Err(error);
                 }
             };
+            for event in &projected_effects.events {
+                use cgka_traits::engine::GroupEvent;
+                if matches!(
+                    event,
+                    GroupEvent::GroupJoined { .. }
+                        | GroupEvent::LocalGroupCopyTerminated { .. }
+                        | GroupEvent::LocalGroupCopyRestored { .. }
+                        | GroupEvent::GroupHydrationRecovered { .. }
+                        | GroupEvent::GroupUnrecoverable { .. }
+                ) {
+                    self.backup_restore.availability_changed = true;
+                }
+            }
             // Only post-engine-success batches own this pin. Projection has
             // settled; release before any checkpoint can seal a newer cursor.
             if let Some(id) = &pending.source_delivery_id {
@@ -2859,6 +2273,7 @@ impl AppClient {
         self.event_group_projection(group_id, group_metadata).ok()
     }
 
+    #[cfg_attr(not(feature = "test-support"), allow(dead_code))]
     pub async fn next_event(&mut self) -> Result<SyncSummary, AppError> {
         loop {
             let mut native_changes = self.adapter.replay_changes().await;
@@ -2909,15 +2324,13 @@ impl AppClient {
                 // The loss is durable and fences the cursor. A directly owned
                 // client has no worker, so its recovery job runs here.
                 transport_nostr::AccountDeliveryReceive::Overflow(_) => {
-                    match self
-                        .run_pending_epoch_backfill(EpochBackfillExecutionSeam::Receive)
-                        .await?
-                    {
-                        EpochBackfillRunOutcome::Completed(summary)
-                        | EpochBackfillRunOutcome::Incomplete(summary) => summary,
-                        EpochBackfillRunOutcome::Deferred | EpochBackfillRunOutcome::NotPending => {
-                            SyncSummary::default()
-                        }
+                    self.refresh_pending_recovery().await?;
+                    // Its recovery runner runs one pass here (mdk#2660).
+                    if self.has_in_place_recovery_runner() {
+                        self.run_recovery_runner_pass().await;
+                        self.take_pending_applied_sync_summary()
+                    } else {
+                        SyncSummary::default()
                     }
                 }
             };
@@ -2969,9 +2382,9 @@ impl AppClient {
                     return Ok(transport_nostr::AccountDeliveryReceive::Overflow(loss));
                 }
             }
-            // Spilled rows that became queue loss are already durable and
-            // fence the cursor. Report them as an overflow, so every caller
-            // starts the same recovery it runs for a router omission.
+            // Spilled rows that became queue loss are already ledger debt.
+            // Report them as an overflow, so every caller starts the same
+            // recovery it runs for a router omission.
             if self.delivery_spill.take_recorded_loss() {
                 return Ok(transport_nostr::AccountDeliveryReceive::Overflow(
                     transport_nostr::AccountDeliveryOverflow {
@@ -3052,36 +2465,6 @@ impl AppClient {
             })
     }
 
-    /// Startup's off-worker comparison may receive a delivery before its
-    /// immutable network request completes. Keep the applied prefix visible
-    /// on a later checkpoint failure, just as the inline startup drain did.
-    pub(crate) async fn ingest_received_delivery_with_partial(
-        &mut self,
-        delivery: cgka_traits::TransportDelivery,
-    ) -> Result<SyncSummary, ClassifiedSyncFailure> {
-        let drain_started = std::time::Instant::now();
-        let cursor_before_secs = self.state.last_transport_timestamp;
-        match self.ingest_received_delivery_inner(delivery).await {
-            Ok(summary) => Ok(summary),
-            Err((summary, ingested, routes_dirty, error, stage)) => {
-                let counts = DrainCounts {
-                    deliveries: u64::from(ingested),
-                    ..DrainCounts::default()
-                };
-                Err(self
-                    .finish_failed_sync_drain(
-                        summary,
-                        routes_dirty,
-                        counts,
-                        StagedSyncError::new(error, stage),
-                        drain_started,
-                        cursor_before_secs,
-                    )
-                    .await)
-            }
-        }
-    }
-
     async fn ingest_received_delivery_inner(
         &mut self,
         delivery: cgka_traits::TransportDelivery,
@@ -3109,9 +2492,7 @@ impl AppClient {
                     self.record_durable_transport_reconciliation_delivery(delivery);
                     None
                 }
-                InventoryWrite::NativeTurn => {
-                    transport_reconciliation_record(self.adapter.account_id(), delivery)
-                }
+                InventoryWrite::NativeTurn => transport_reconciliation_record(delivery),
             };
             self.adapter.release_account_delivery(&delivery.message.id);
             return Ok((
@@ -3291,23 +2672,6 @@ impl AppClient {
         }
     }
 
-    /// Whether this seam must leave a pending intent alone for now.
-    ///
-    /// Pacing skips automatic attempts outright rather than queueing them:
-    /// the intent is already durable and the next seam past the cooldown runs
-    /// it. Caller-directed catch-up is exempt: a person asking for a repair is
-    /// not a loop.
-    #[cfg(test)]
-    pub(crate) fn epoch_backfill_retry_is_paced(&self, seam: EpochBackfillExecutionSeam) -> bool {
-        if matches!(seam, EpochBackfillExecutionSeam::ExplicitCatchUp) {
-            return false;
-        }
-        !self
-            .recovery_owner
-            .test_retry_remaining(&self.app.account_storage(&self.state.label).unwrap())
-            .is_zero()
-    }
-
     /// Drain the transport for an ordinary floored sync: ingest what is waiting
     /// and return as soon as the relays go quiet. A loss control record ends
     /// the drain once its loss is durable; recovery settles it by comparison.
@@ -3333,6 +2697,7 @@ impl AppClient {
         // before/after so an analyzer can compare the persisted floor against
         // the ingested `created_at`s.
         let drain_started = std::time::Instant::now();
+        let mut drain_published_at = drain_started;
         let cursor_before_secs = self.state.last_transport_timestamp;
         let mut routes_dirty = false;
         let overflowed = loop {
@@ -3357,6 +2722,14 @@ impl AppClient {
                         .await);
                 }
             };
+            // A drain turn: every delivery so far is ingested and projected
+            // and the next wait has not begun. Publish A here, at most once
+            // per bound, so reads follow a long catch-up without the
+            // per-delivery path paying for it (mdk#3273).
+            if drain_published_at.elapsed() >= DRAIN_READ_STATE_PUBLISH_INTERVAL {
+                self.publish_read_state();
+                drain_published_at = std::time::Instant::now();
+            }
             let committed = self.take_pending_applied_sync_summary();
             if let Some(on_progress) = on_progress {
                 // Native admission already checkpointed these frames. Keep
@@ -3364,6 +2737,11 @@ impl AppClient {
                 on_progress.publish(self, committed).await;
             } else {
                 self.pending_native_sync_summary.merge(committed);
+            }
+            // An unlinked account receives nothing more; the drain ends as a
+            // quiet relay ends it (mdk#2628 D67).
+            if self.device_unlinked {
+                break false;
             }
             let wait = if first_wait {
                 SDK_FIRST_SYNC_WAIT
@@ -3378,12 +2756,11 @@ impl AppClient {
                 loop {
                     match timeout(EOSE_QUIET_WAIT, self.adapter.receive_account_delivery()).await {
                         Ok(result) => return result,
-                        // Settled, not complete: a relay that refused a REQ for
-                        // good will never report EOSE, so waiting longer brings
-                        // nothing. Ending the drain early ends it exactly as a
-                        // timeout would, checkpoint included; live promotion
-                        // and activation reuse still require EOSE.
-                        Err(_) if self.adapter.account_subscription_eose().await.settled() => {
+                        // Current input, not complete-query coverage: a full
+                        // delegated reply has ended too. Refused REQs bring no
+                        // further input. Ending the wait changes no checkpoint
+                        // or cursor-qualification guard.
+                        Err(_) if self.adapter.account_subscription_input().await.settled => {
                             return Ok(None);
                         }
                         Err(_) => {}
@@ -3802,13 +3179,44 @@ impl AppClient {
         }
     }
 
+    /// Record the inventory rows one recovery-runner admission command
+    /// deferred, in one transaction, before the runner's settle lets any
+    /// staged copy go. Only events still held on routes still standing are
+    /// recorded (`record_held_reconciliation_items`): an event released in
+    /// between is unseen, so settle keeps its staged copy and admits it
+    /// again. A crash before this leaves the staged copies, which are
+    /// admitted again as held. A failed write leaves rows absent, never
+    /// wrong, as a failed immediate write does: a later reconciliation
+    /// fetches those events again.
+    pub(crate) fn record_deferred_reconciliation_items(&self, records: &[InventoryRecord]) {
+        if records.is_empty() {
+            return;
+        }
+        let recorded = self
+            .app
+            .account_storage(&self.state.label)
+            .and_then(|storage| {
+                storage
+                    .app_storage()
+                    .record_held_reconciliation_items(
+                        records.iter().map(|(route, item)| (route, item)),
+                    )
+                    .map_err(AppError::from)
+            });
+        if recorded.is_err() {
+            tracing::warn!(
+                target: "marmot_app::relay_plane",
+                method = "record_deferred_reconciliation_items",
+                "could not persist transport reconciliation items"
+            );
+        }
+    }
+
     fn record_durable_transport_reconciliation_delivery(
         &self,
         delivery: &cgka_traits::TransportDelivery,
     ) {
-        if let Some((route, item)) =
-            transport_reconciliation_record(self.adapter.account_id(), delivery)
-        {
+        if let Some((route, item)) = transport_reconciliation_record(delivery) {
             // Own relay echoes and seen-index hits are skipped precisely because
             // the event is already durable. Recording them here closes the
             // migration/echo seam without replaying them through the engine.
@@ -3837,13 +3245,12 @@ impl AppClient {
         let outer_transport_at = delivery.message.timestamp.0;
         let source_received_at = delivery.received_at.0;
         let group_id_hint = delivery.group_id_hint.clone();
-        let reconciliation_record =
-            transport_reconciliation_record(client.adapter.account_id(), delivery);
-        let welcome = matches!(
+        let reconciliation_record = transport_reconciliation_record(delivery);
+        let inbox = matches!(
             &delivery.message.envelope,
             TransportEnvelope::Welcome { .. }
         );
-        let probe_receive = if welcome && (client.audit_v5_enabled() || cfg!(test)) {
+        let probe_receive = if inbox && (client.audit_v5_enabled() || cfg!(test)) {
             client
                 .audit_v5_probe
                 .as_mut()
@@ -3851,16 +3258,15 @@ impl AppClient {
         } else {
             None
         };
-        client.flush_live_v5_events();
         // Hold the same account policy lock through admission and projection, so a
         // block cannot commit between authenticating the inviter and creating state.
         let policy_lock = client.app.block_update_lock(&client.state.label).await;
-        let _welcome_policy_guard = if welcome {
+        let _welcome_policy_guard = if inbox {
             Some(policy_lock.lock().await)
         } else {
             None
         };
-        if welcome {
+        if inbox {
             let storage = client
                 .app
                 .account_storage(&client.state.label)?
@@ -3873,60 +3279,39 @@ impl AppClient {
                     inventory_record: None,
                 });
             }
-            // Dismissals remain authoritative after unblock. With no current
-            // blocks the normal ingress peeler is sufficient.
-            if storage.has_blocked_users()? {
-                let account = client.app.account_home().account(&client.state.label)?;
-                let peeler = transport_nostr_peeler::NostrMlsPeeler::new().with_welcome_signer_arc(
-                    client
-                        .app
-                        .account_signer_for_summary(&account)?
-                        .as_nostr_signer(),
-                );
-                // The seal's authenticated sender is authoritative, never the outer gift-wrap key.
-                // A peel failure proceeds to normal admission, which rejects invalid envelopes.
-                if let Ok(peeled) =
-                    cgka_traits::peeler::TransportPeeler::peel_welcome(&peeler, &delivery.message)
-                        .await
-                    && let Some(sender) = peeled.sender
-                    && storage.is_user_blocked(&hex::encode(sender.as_slice()))?
-                {
-                    storage.dismiss_blocked_welcome(&source_message_id_hex)?;
-                    return Ok(DeliveryIngest {
-                        routes_dirty: false,
-                        must_stay_fetchable: false,
-                        refused_group: None,
-                        inventory_record: None,
-                    });
-                }
-            }
+            // Dismissals stay authoritative after unblock. The installed app
+            // peeler checks inviter policy after its one authenticated decode.
         }
-        let rejoin_offers_before = if welcome {
+        let rejoin_offers_before = if inbox {
             Some(client.rejoin_offer_snapshot()?)
         } else {
             None
         };
-        let observation = client.app.product_analytics.begin(
-            if welcome {
+        let observation = client.app.product_analytics.operation(
+            if inbox {
                 crate::ProductFamily::Welcome
             } else {
                 crate::ProductFamily::MessageProcessing
             },
-            if welcome { "process" } else { "receive" },
+            if inbox { "process" } else { "receive" },
             crate::ProductUnit::Attempt,
         );
         let telemetry = client.runtime_telemetry.clone();
         let ingest_observation = telemetry.as_ref().map(|t| t.observe(RuntimeOp::Ingest));
-        if let (Some(slot), Some(receive)) = (&client.audit_v5_peel_slot, probe_receive.clone()) {
-            slot.lock().unwrap().arm(&delivery.message, receive);
+        if let Some(slot) = &client.audit_v5_peel_slot {
+            let mut slot = slot.lock().unwrap();
+            let _ = slot.take();
+            if let Some(receive) = probe_receive.clone() {
+                slot.arm(&delivery.message, receive);
+            }
         }
         let ingest = client
             .runtime
             .ingest_delivery_with_observer(delivery, |phase, duration, success| {
                 if let Some(telemetry) = &telemetry {
                     let operation = match phase {
-                        marmot_account::AccountIngestPhase::Engine => RuntimeOp::IngestEngine,
-                        marmot_account::AccountIngestPhase::EffectPublication => {
+                        marmot_session::AccountIngestPhase::Engine => RuntimeOp::IngestEngine,
+                        marmot_session::AccountIngestPhase::EffectPublication => {
                             RuntimeOp::IngestEffectPublish
                         }
                     };
@@ -3942,13 +3327,18 @@ impl AppClient {
                 }
             })
             .await;
-        if let (Some(probe), Some(slot)) = (&mut client.audit_v5_probe, &client.audit_v5_peel_slot)
-            && let Some(completion) = slot.lock().unwrap().take()
-        {
-            probe.unwrapped(completion);
-        }
+        let private_control = if let Some(slot) = &client.audit_v5_peel_slot {
+            let (private_control, completion) = slot.lock().unwrap().take();
+            if let (Some(probe), Some(completion)) = (&mut client.audit_v5_probe, completion) {
+                probe.unwrapped(completion);
+            }
+            private_control
+        } else {
+            false
+        };
         if let (Some(probe), Some(receive), Ok(effects)) =
             (&mut client.audit_v5_probe, probe_receive, &ingest)
+            && !private_control
             && matches!(effects.outcome, IngestOutcome::Processed)
         {
             // The event is journaled in the join transaction. Only this
@@ -3972,7 +3362,7 @@ impl AppClient {
                 && let Ok(group) = client.runtime.group_record(group_id)
             {
                 let initial_join = probe.joined(receive.clone(), &group);
-                if initial_join && client.runtime.session().audit_v5_enabled() {
+                if initial_join && client.audit.records_v5() {
                     let admins = client.runtime.admin_pubkeys(group_id).ok();
                     probe.baseline(
                         &group,
@@ -3992,26 +3382,52 @@ impl AppClient {
             });
         }
         if let Some(observation) = observation {
-            observation.finish(match &ingest {
+            let outcome = match &ingest {
+                _ if private_control => None,
                 Ok(effects) => match &effects.outcome {
-                    IngestOutcome::Processed => "success",
+                    IngestOutcome::Processed => Some("success"),
+                    // Authenticated control is neither an invitation metric nor
+                    // a reason to export a control-specific discriminator.
+                    IngestOutcome::GroupRecovery { .. } => None,
+                    // Another device's Welcome delivery is one more copy of
+                    // the account's invitation here, not a rejected Welcome.
                     IngestOutcome::Ignored {
                         category:
                             cgka_traits::InputRejectionCategory::Duplicate
-                            | cgka_traits::InputRejectionCategory::OwnEcho,
-                    } => "duplicate",
+                            | cgka_traits::InputRejectionCategory::OwnEcho
+                            | cgka_traits::InputRejectionCategory::NotAddressedToThisDevice,
+                    } => Some("duplicate"),
                     IngestOutcome::Buffered { .. }
                     | IngestOutcome::TransportDeferred { .. }
-                    | IngestOutcome::LocalState { .. } => "deferred",
-                    IngestOutcome::ResourceRefused { .. } => "capacity",
+                    | IngestOutcome::LocalState { .. } => Some("deferred"),
+                    IngestOutcome::ResourceRefused { .. } => Some("capacity"),
                     IngestOutcome::Ignored { .. }
                     | IngestOutcome::Stale { .. }
-                    | IngestOutcome::Rejected { .. } => "rejected",
+                    | IngestOutcome::Rejected { .. } => Some("rejected"),
                 },
-                Err(_) => "failure",
-            });
+                Err(_) => Some("failure"),
+            };
+            if let Some(outcome) = outcome {
+                observation.finish(outcome);
+            } else {
+                observation.discard();
+            }
         }
         let effects = ingest?;
+        // A Welcome delivery naming another KeyPackage of this account is a
+        // reason to look for a new sign-in (mdk#2628 3.2): bring the check
+        // forward, as a live KeyPackage of the account does.
+        if matches!(
+            effects.outcome,
+            IngestOutcome::Ignored {
+                category: cgka_traits::InputRejectionCategory::NotAddressedToThisDevice,
+            }
+        ) {
+            client
+                .app
+                .sign_in_nudges
+                .nudge(&hex::encode(client.runtime.self_id().as_slice()));
+        }
         let queued = client.pending_applied_effects.len();
         client.retain_effect_projection(
             &effects.effects,
@@ -4072,39 +3488,11 @@ impl AppClient {
                 .expect("accepted delivery batch")
                 .source_delivery_id = Some(source_message_id.clone());
         }
-        if !must_stay_fetchable && let Some((route, item)) = &reconciliation_record {
-            if !defer_inventory {
-                client.record_reconciliation_items(std::iter::once((route, item)));
-            }
-            if matches!(
-                effects.outcome,
-                IngestOutcome::Processed
-                    | IngestOutcome::Buffered { .. }
-                    | IngestOutcome::TransportDeferred { .. }
-                    | IngestOutcome::LocalState { .. }
-            ) {
-                let progress =
-                    client
-                        .app
-                        .account_storage(&client.state.label)
-                        .and_then(|storage| {
-                            client
-                                .recovery_owner
-                                .observe_scoped_admission(
-                                    &storage.app_storage(),
-                                    route,
-                                    item.created_at,
-                                    Instant::now(),
-                                )
-                                .map_err(AppError::from)
-                        });
-                if progress.is_err() {
-                    // Retained input remains valid; a failed retry reset merely
-                    // preserves conservative pacing and never authorizes early I/O.
-                    tracing::warn!(target: "marmot_app::recovery", method = "observe_scoped_admission",
-                        "could not checkpoint recovery admission progress");
-                }
-            }
+        if !must_stay_fetchable
+            && !defer_inventory
+            && let Some((route, item)) = &reconciliation_record
+        {
+            client.record_reconciliation_items(std::iter::once((route, item)));
         }
         let refused_group = match &effects.outcome {
             IngestOutcome::ResourceRefused { group_id, .. } => Some(group_id.clone()),
@@ -4194,378 +3582,6 @@ impl AppClient {
                 None
             },
         })
-    }
-
-    /// Feed an unavailable group delivery to the epoch-stall detector.
-    /// Transport-deferred input arms a backfill after the stalled-epoch
-    /// threshold; resource refusal arms it immediately because it directly
-    /// proves the fetched history was not fully retained. A deferral whose
-    /// engine-reported lineage is fork-side arms on the same threshold and
-    /// carries its own trigger — see
-    /// [`backfill_trigger_for`](super::epoch_stall::backfill_trigger_for) for
-    /// why the label moves and the decision does not. Repeated arming that
-    /// never recovers the group escalates onto the next successful sync summary,
-    /// the seam every worker surface already publishes. Only observed under
-    /// `CursorPersistence::Advance`: a `Frozen` wake-collection pass must not
-    /// own recovery. Its deferrals still reach the detector, but not on the
-    /// main app's next sync, where they arrive as duplicates: the next
-    /// `Advance` open rebuilds them from the retained rows instead
-    /// ([`Self::seed_epoch_stall_from_deferred_rows`]).
-    fn detect_epoch_stall(
-        &mut self,
-        group_id_hint: Option<cgka_traits::GroupId>,
-        message_id_hex: &str,
-        outcome: &IngestOutcome,
-        transport_at: cgka_traits::transport::Timestamp,
-    ) {
-        if self.app.cursor_persistence() != CursorPersistence::Advance {
-            return;
-        }
-        let Some(group_id) = group_id_hint else {
-            return;
-        };
-        // A group we cannot resolve (unknown or quarantined) has its own recovery
-        // surface; do not track it here.
-        let Ok(record) = self.runtime.group_record(&group_id) else {
-            return;
-        };
-        // A terminal copy has no servable history, so arming here could only
-        // mint a durable intent and a forensic row for work that is never
-        // coming. Defense in depth: a removed copy classifies
-        // `LocalState { Removed }` and a disbanded one
-        // `Ignored { UnknownGroup }`, so both already reach the `Skip` arm
-        // below.
-        if record.is_terminal() {
-            return;
-        }
-        // A contested fork is eligible local work, not proof of a missing
-        // transport object. Independent existing loss/gap obligations survive.
-        if crate::client::epoch_stall::backfill_trigger_for(outcome)
-            == EpochStallBackfillTrigger::ContestedForkDeferral
-        {
-            self.epoch_stall
-                .observe_group_epoch(&group_id, record.epoch);
-            self.pending_convergence_groups.insert(group_id);
-            return;
-        }
-        let now_ms = epoch_stall_now_ms();
-        let decision = match outcome {
-            // Traffic older than this copy's Welcome is expected after a join,
-            // and after a re-add it is most of what the relay serves: the
-            // absent stretch was sealed under epochs this copy never entered
-            // and never will. Unopenable, but not evidence this device is
-            // behind — and a backfill armed from it could only re-fetch more of
-            // the same. Land the epoch like every other non-evidence outcome
-            // below and stop there. Soft by design: an application message
-            // carries its sender's compose time, so a message drained from the
-            // offline outbox can look old while being live. Dropping one piece
-            // of evidence costs nothing, because every other undecryptable
-            // message this device receives still arms.
-            IngestOutcome::TransportDeferred { .. }
-                if record.transport_message_predates_local_copy(transport_at) =>
-            {
-                self.epoch_stall
-                    .observe_group_epoch(&group_id, record.epoch);
-                BackfillDecision::Skip
-            }
-            IngestOutcome::TransportDeferred { .. } => self.epoch_stall.observe_undecryptable(
-                group_id.clone(),
-                message_id_hex.to_owned(),
-                record.epoch,
-                now_ms,
-            ),
-            IngestOutcome::ResourceRefused { .. } => {
-                self.epoch_stall
-                    .observe_resource_refusal(group_id.clone(), record.epoch, now_ms)
-            }
-            // Any other outcome carries no stall evidence, but it does tell the
-            // detector where this device now sits. This is a landing position
-            // only: the epochs a folded commit carried the device *through* reach
-            // the detector as an `EpochChanged` passage, from this same delivery's
-            // effects in `observe_recovery_evidence`. The landing report stays
-            // because it is the fallback for movement no passage covers — an
-            // engine seam that advances a group without emitting `EpochChanged`,
-            // or a batch this delivery never sees — and because two landings at
-            // different epochs can end a run on their own. Where both fire they
-            // agree, since observing an epoch already recorded is a no-op.
-            _ => {
-                self.epoch_stall
-                    .observe_group_epoch(&group_id, record.epoch);
-                BackfillDecision::Skip
-            }
-        };
-        self.apply_backfill_decision(
-            &group_id,
-            record.epoch.0,
-            decision,
-            crate::client::epoch_stall::backfill_trigger_for(outcome),
-        );
-    }
-
-    /// Rebuild undecryptable-traffic evidence from durable deferred rows.
-    ///
-    /// [`Self::detect_epoch_stall`] counts only deferrals this process ingests
-    /// in `Advance` mode. A `Frozen` wake (an iOS notification extension) still
-    /// retains each undecryptable object as a `PeelDeferred` row, but when the
-    /// main app next syncs those objects arrive as duplicates, so live
-    /// detection never sees them. A device woken mostly by notifications then
-    /// arms only when one app session happens to see enough live traffic
-    /// (mdk#2257). This feeds the rows retained at each group's current epoch
-    /// through the same detector and filters instead, for groups the detector
-    /// has not already signalled at that epoch. It changes no durable state
-    /// unless the detector arms.
-    pub(crate) fn seed_epoch_stall_from_deferred_rows(&mut self) {
-        if self.app.cursor_persistence() != CursorPersistence::Advance {
-            return;
-        }
-        let limit = self.epoch_stall.threshold();
-        let groups = self
-            .state
-            .groups
-            .iter()
-            .filter_map(|group| hex::decode(&group.group_id_hex).ok())
-            .map(GroupId::new)
-            .collect::<Vec<_>>();
-        for group_id in groups {
-            let Ok(evidence) = self.runtime.deferred_stall_evidence(&group_id, limit) else {
-                continue;
-            };
-            // Retained rows supply only the first arm. Once this group has
-            // signalled at the evidence epoch, here or in the durable state
-            // restored before hydration, rows replayed on every later open are
-            // not fresh traffic and must not pace re-arms or end the run.
-            if evidence.rows.is_empty()
-                || self.epoch_stall.has_signalled_at(&group_id, evidence.epoch)
-            {
-                continue;
-            }
-            let outcome = IngestOutcome::TransportDeferred {
-                group_id: group_id.clone(),
-                lineage: evidence.lineage,
-            };
-            for row in evidence.rows {
-                self.detect_epoch_stall(
-                    Some(group_id.clone()),
-                    &hex::encode(row.message_id.as_slice()),
-                    &outcome,
-                    row.transport_timestamp,
-                );
-            }
-        }
-    }
-
-    /// Apply an epoch-stall backfill decision: arm the replay, and record an
-    /// escalation the detector raises.
-    ///
-    /// Every site that takes a [`BackfillDecision`] must route it through here.
-    /// Callers guard `record.is_terminal()` before deciding — both already hold
-    /// the group record, so re-reading it per arm here would buy nothing.
-    /// The detector latches `escalated` when it raises
-    /// [`BackfillDecision::ArmAndEscalate`], so it raises that decision exactly
-    /// once per unrecovered run. That makes reporting exactly-once by
-    /// construction rather than by caller discipline: the escalation lands in
-    /// `pending_epoch_stall_escalations` instead of on whatever [`SyncSummary`]
-    /// the calling pass is building, so a later `?` on that pass cannot drop it
-    /// — it rides out on the next seam that returns `Ok` (see
-    /// [`Self::drain_epoch_stall_escalations`]).
-    pub(crate) fn apply_backfill_decision(
-        &mut self,
-        group_id: &cgka_traits::GroupId,
-        stalled_epoch: u64,
-        decision: BackfillDecision,
-        trigger: EpochStallBackfillTrigger,
-    ) {
-        if decision == BackfillDecision::Reassess {
-            self.pending_convergence_groups.insert(group_id.clone());
-            self.persist_epoch_stall_evidence([group_id]);
-        }
-        if decision.arms_backfill() {
-            let demand_ticket = |client: &Self| {
-                client
-                    .app
-                    .account_storage(&client.state.label)
-                    .ok()
-                    .and_then(|storage| storage.app_storage().pending_recovery_demands().ok())
-                    .and_then(|demands| {
-                        demands.into_iter().find(|demand| {
-                            demand.cause == storage_sqlite::RecoveryCause::EpochGap
-                                && demand.group_id.as_deref() == Some(group_id.as_slice())
-                        })
-                    })
-                    .map(|demand| demand.ticket)
-            };
-            let before = demand_ticket(self);
-            let buffered_before = self.pending_recovery_arm_writes.get(group_id).copied();
-            let durable_intent = storage_sqlite::StoredEpochBackfillIntent {
-                group_id_hex: hex::encode(group_id.as_slice()),
-                stalled_epoch,
-            };
-            let result = self.app.arm_epoch_backfill_intents(
-                &self.state.label,
-                std::slice::from_ref(&durable_intent),
-            );
-            match result {
-                Ok(()) => {
-                    self.pending_recovery_arm_writes.remove(group_id);
-                }
-                Err(error) => {
-                    self.pending_recovery_arm_writes
-                        .entry(group_id.clone())
-                        .and_modify(|epoch| *epoch = (*epoch).max(stalled_epoch))
-                        .or_insert(stalled_epoch);
-                    tracing::warn!(target: "marmot_app::epoch_stall", method = "apply_backfill_decision",
-                        error_kind = error.privacy_safe_kind(), "recovery demand persistence will be retried before acquisition");
-                }
-            }
-            let after = demand_ticket(self);
-            if before != after
-                || buffered_before != self.pending_recovery_arm_writes.get(group_id).copied()
-            {
-                let context = AuditEventContext {
-                    operation_id: Some(hex::encode(
-                        after
-                            .map(|ticket| ticket.id)
-                            .unwrap_or_else(rand::random::<[u8; 16]>),
-                    )),
-                    ..AuditEventContext::default()
-                };
-                self.record_epoch_stall_backfill_armed(group_id, stalled_epoch, trigger, &context);
-            }
-            // The arm mark is what paces the next one, so it has to outlive the
-            // process: a device wedged for six hours must not buy a re-arm by
-            // being force-killed.
-            self.persist_epoch_stall_evidence(std::slice::from_ref(group_id));
-        }
-        if trigger == EpochStallBackfillTrigger::ResourceRefusal {
-            let pressure = self
-                .app
-                .account_storage(&self.state.label)
-                .and_then(|storage| {
-                    Ok(storage.app_storage().record_recovery_capacity_pressure(
-                        group_id.as_slice(),
-                        stalled_epoch,
-                        self.recovery_owner.logical_now_ms(Instant::now())?,
-                    )?)
-                });
-            if pressure.is_ok() {
-                self.pending_recovery_capacity_writes.remove(group_id);
-            }
-            if let Err(error) = pressure {
-                self.pending_recovery_capacity_writes
-                    .insert(group_id.clone(), stalled_epoch);
-                tracing::warn!(target: "marmot_app::recovery", method = "record_recovery_capacity_pressure",
-                    error_kind=error.privacy_safe_kind(), "admission pressure remains pending persistence");
-            }
-        }
-        if let BackfillDecision::ArmAndEscalate { arms } = decision {
-            // The replay is armed above regardless: escalating reports that
-            // replay alone is not repairing this group, it does not replace the
-            // attempt (see EPOCH_STALL_ESCALATION_ARM_THRESHOLD for why
-            // reporting is all this decision does).
-            self.report_epoch_stall_escalation(
-                group_id,
-                stalled_epoch,
-                arms,
-                self.epoch_stall.escalation_arm_threshold(),
-                "apply_backfill_decision",
-            );
-        }
-    }
-
-    /// Report that repeated full-history replay is not recovering a group.
-    ///
-    /// Two rules reach here and the report they produce is deliberately the
-    /// same shape, because the claim is the same one: this many armed
-    /// full-history replays did not return this group to the tip. An arm run
-    /// across moving epochs counts arms
-    /// ([`EPOCH_STALL_ESCALATION_ARM_THRESHOLD`]); a group frozen at one epoch
-    /// counts the relay-confirmed fruitless completions those arms produced
-    /// ([`EPOCH_STALL_FRUITLESS_COMPLETION_THRESHOLD`]). The detector latches
-    /// `escalated` for the run either way, so a run reports once.
-    pub(super) fn report_epoch_stall_escalation(
-        &mut self,
-        group_id: &cgka_traits::GroupId,
-        stalled_epoch: u64,
-        arms: u32,
-        decided_by_threshold: u32,
-        method: &'static str,
-    ) {
-        // The threshold logged is the one that actually decided, which is not
-        // always the arm-run threshold the audit row carries: `method` names the
-        // rule and this names the count it reached.
-        tracing::warn!(
-            target: "marmot_app::epoch_stall",
-            method = method,
-            arms,
-            decided_by_threshold,
-            "epoch-gap backfill armed repeatedly without recovering a group; escalating"
-        );
-        self.record_epoch_stall_backfill_escalated(group_id, stalled_epoch, arms);
-        self.pending_epoch_stall_escalations
-            .push(crate::EpochStallEscalation {
-                group_id: group_id.clone(),
-                stalled_epoch,
-                arms,
-            });
-    }
-
-    /// Merge durable arms into their existing retry owners. Counters describe
-    /// account-wide replay attempts, so new groups get a fresh queued intent
-    /// instead of inheriting another run's EOSE failures or resetting that run.
-    ///
-    /// Ends by dropping terminal groups. On a hydrated open that is also how a
-    /// row for a group no owner holds is retired: this admits it, and the drop
-    /// clears it. Before hydration every record reads non-terminal, so the row
-    /// survives to the next pass.
-    pub(crate) fn restore_persisted_epoch_backfill_intents(
-        &mut self,
-        _intents: Vec<storage_sqlite::StoredEpochBackfillIntent>,
-    ) {
-        // Demand is already authoritative in SQL. Hydration does not rebuild
-        // an independent execution queue or reset retry cost.
-        self.drop_settled_epoch_backfill_intents();
-    }
-
-    /// Write the detector's frozen-epoch evidence for `groups` to durable
-    /// storage.
-    ///
-    /// Best-effort like the durable arm marker beside it: losing a row costs
-    /// the affected group one more paced attempt after a restart, which is the
-    /// same cost the pre-persistence behavior paid every time. Failing the
-    /// replay over it would trade a delayed report for a lost one.
-    pub(crate) fn persist_epoch_stall_evidence<'groups>(
-        &mut self,
-        groups: impl IntoIterator<Item = &'groups cgka_traits::GroupId>,
-    ) {
-        let evidence = groups
-            .into_iter()
-            .filter_map(|group_id| {
-                let evidence = self.epoch_stall.wedge_evidence(group_id)?;
-                Some(storage_sqlite::StoredEpochStallEvidence {
-                    group_id_hex: hex::encode(group_id.as_slice()),
-                    stalled_epoch: evidence.stalled_epoch,
-                    fruitless_completions: evidence.fruitless_completions,
-                    fruitless_reported: evidence.fruitless_reported,
-                    last_arm_at_ms: evidence.last_arm_at_ms,
-                })
-            })
-            .collect::<Vec<_>>();
-        match self.app.record_epoch_stall_evidence(
-            &self.state.label,
-            &evidence,
-            self.epoch_stall.fruitless_completion_threshold(),
-        ) {
-            Ok(changed) => {
-                for group_id in changed {
-                    self.mark_recovery_status_changed(&group_id);
-                }
-            }
-            Err(error) => {
-                tracing::warn!(target: "marmot_app::epoch_stall", method = "persist_epoch_stall_evidence",
-                    error_kind = error.privacy_safe_kind(),
-                    "recovery evidence and warning remain pending persistence");
-            }
-        }
     }
 
     /// Reconcile branch-selection tombstones against the engine's own commit
@@ -4775,964 +3791,6 @@ impl AppClient {
         }
     }
 
-    /// Rebuild the frozen-epoch evidence a previous process gathered.
-    pub(crate) fn restore_persisted_epoch_stall_evidence(
-        &mut self,
-        evidence: Vec<storage_sqlite::StoredEpochStallEvidence>,
-    ) {
-        let mut malformed = 0_u64;
-        let restored = evidence
-            .into_iter()
-            .filter_map(|entry| {
-                let Ok(group_id) = hex::decode(&entry.group_id_hex) else {
-                    malformed = malformed.saturating_add(1);
-                    return None;
-                };
-                Some((
-                    cgka_traits::GroupId::new(group_id),
-                    super::epoch_stall::EpochStallEvidence {
-                        stalled_epoch: entry.stalled_epoch,
-                        fruitless_completions: entry.fruitless_completions,
-                        fruitless_reported: entry.fruitless_reported,
-                        last_arm_at_ms: entry.last_arm_at_ms,
-                    },
-                ))
-            })
-            .collect::<Vec<_>>();
-        if malformed > 0 {
-            tracing::warn!(
-                target: "marmot_app::epoch_stall",
-                method = "restore_persisted_epoch_stall_evidence",
-                malformed,
-                "ignored malformed durable frozen-epoch recovery evidence"
-            );
-        }
-        self.epoch_stall.restore_wedge_evidence(restored);
-    }
-
-    #[cfg(test)]
-    fn persist_epoch_backfill_intent(
-        &self,
-        pending: &[storage_sqlite::StoredEpochBackfillIntent],
-    ) -> Result<(), AppError> {
-        self.app
-            .arm_epoch_backfill_intents(&self.state.label, pending)
-    }
-
-    /// End the failed recovery run for a group this device is terminal in:
-    /// retire its durable recovery-health rows, drop the in-memory run, and
-    /// mark the group's recovery status dirty when the durable clear changed
-    /// something.
-    ///
-    /// The same pair an authenticated rejoin runs, in the same order: durable
-    /// first, so a failed clear leaves nothing changed for the next pass to
-    /// retry rather than a run memory forgot and storage still remembers.
-    ///
-    /// Dropping the intent alone leaves the run behind to accumulate
-    /// fruitless-completion evidence, and nothing else retires that evidence
-    /// row while the group row is kept.
-    ///
-    /// Returns whether the durable rows are gone. Best-effort either way — the
-    /// warn is in here so both callers share it — but a caller holding
-    /// something that would strand the evidence row on failure has to be able
-    /// to see it, which is what
-    /// [`Self::drop_settled_epoch_backfill_intents`] does with the intent row.
-    fn retire_terminal_group_recovery(&mut self, group_id: &cgka_traits::GroupId) -> bool {
-        #[cfg(test)]
-        if std::mem::take(&mut self.fail_next_terminal_recovery_retire) {
-            tracing::warn!(
-                target: "marmot_app::epoch_stall",
-                method = "retire_terminal_group_recovery",
-                error_kind = "injected_terminal_retire_failure",
-                "terminal recovery run kept its durable rows and will be retired on a later pass"
-            );
-            return false;
-        }
-        match self
-            .app
-            .account_storage(&self.state.label)
-            .and_then(|storage| {
-                Ok(storage
-                    .app_storage()
-                    .retire_terminal_group_recovery(group_id)?)
-            }) {
-            Ok(changed) => {
-                self.epoch_stall.clear_recovered_group(group_id);
-                if changed {
-                    self.mark_recovery_status_changed(group_id);
-                }
-                true
-            }
-            Err(error) => {
-                tracing::warn!(
-                    target: "marmot_app::epoch_stall",
-                    method = "retire_terminal_group_recovery",
-                    error_kind = error.privacy_safe_kind(),
-                    "terminal recovery run kept its durable rows and will be retired on a later pass"
-                );
-                false
-            }
-        }
-    }
-
-    /// Drop every armed epoch-gap intent for a group this device is terminal in
-    /// (removed, or the group disbanded), clear its durable marker, and retire
-    /// its recovery run.
-    ///
-    /// Such an intent is unservable. `refresh_group_routes` / `refresh_routing`
-    /// have already pruned the group's routes, and the replay is account-wide
-    /// rather than intent-scoped, so no replay can ever fetch that group's
-    /// history. Keeping the intent only spends the one account-wide replay
-    /// budget and gathers wedge evidence about a group we left. The host's
-    /// recovery warning is already terminality-gated
-    /// (`GroupRecoveryStatus::automatic_recovery_failed`); what leaked was the
-    /// `EpochStallEscalated` event, its forensic escalation row, and a durable
-    /// evidence row nothing else retires while the group row is kept.
-    ///
-    /// [`super::group_is_terminal`] reads the engine record, so a deferred open
-    /// answers `false` for everything before hydration. That makes the
-    /// restore-time call an early-out only; the guarantee is the call at the top
-    /// of [`Self::run_pending_epoch_backfill`], which runs after hydration.
-    ///
-    /// Terminal retirement applies to every epoch of the group. Ordinary
-    /// completion instead uses the owner's exact obligation revision and scope
-    /// tokens, so stale attempts cannot retire newer demand.
-    ///
-    /// An epoch gap also completes on its own evidence: once the group's local
-    /// epoch moves past the stalled one, that exact gap no longer applies. A
-    /// later stall arms a new gap at its own epoch.
-    fn drop_settled_epoch_backfill_intents(&mut self) {
-        let intents = match self
-            .app
-            .account_storage(&self.state.label)
-            .and_then(|storage| Ok(storage.app_storage().pending_epoch_backfill_intents()?))
-        {
-            Ok(intents) => intents,
-            Err(error) => {
-                tracing::warn!(target: "marmot_app::epoch_stall", method = "drop_settled_epoch_backfill_intents",
-                    error_kind=error.privacy_safe_kind(), "could not inspect settled recovery demand");
-                return;
-            }
-        };
-        let resolved = intents
-            .iter()
-            .filter(|intent| {
-                hex::decode(&intent.group_id_hex)
-                    .ok()
-                    .and_then(|group| self.local_epoch_for_group(&cgka_traits::GroupId::new(group)))
-                    .is_some_and(|epoch| epoch > intent.stalled_epoch)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if !resolved.is_empty()
-            && let Err(error) = self
-                .app
-                .account_storage(&self.state.label)
-                .and_then(|storage| {
-                    Ok(storage
-                        .app_storage()
-                        .clear_epoch_backfill_intents(&resolved)?)
-                })
-        {
-            tracing::warn!(target: "marmot_app::epoch_stall", method = "drop_settled_epoch_backfill_intents",
-                error_kind=error.privacy_safe_kind(), "could not retire resolved epoch-gap demand");
-        }
-        let mut terminal = self
-            .pending_recovery_arm_writes
-            .keys()
-            .cloned()
-            .collect::<HashSet<_>>();
-        terminal.extend(self.pending_recovery_capacity_writes.keys().cloned());
-        terminal.extend(intents.into_iter().filter_map(|intent| {
-            hex::decode(intent.group_id_hex)
-                .ok()
-                .map(cgka_traits::GroupId::new)
-        }));
-        terminal.retain(|group| super::group_is_terminal(&self.runtime, group));
-        for group in terminal {
-            if self.retire_terminal_group_recovery(&group) {
-                self.pending_recovery_arm_writes.remove(&group);
-                self.pending_recovery_capacity_writes.remove(&group);
-            }
-        }
-    }
-
-    /// Move every recorded escalation onto the summary a seam is about to
-    /// return.
-    ///
-    /// Call this as the LAST step before `Ok(summary)`, at every outermost seam
-    /// — the ones whose `Ok` is handed to a caller rather than followed by more
-    /// fallible work. Partial-progress sync also calls it on `Err`, moving the
-    /// one-shot decision into `SyncFailure::partial_summary` before a managed
-    /// worker can discard and rebuild the client. The compatibility `sync()`
-    /// path leaves it stashed on failure because its `AppError` contract has no
-    /// partial-summary channel. Moving (not copying) keeps delivery exactly
-    /// once across either path.
-    ///
-    /// One nested case needs care: [`Self::drain_pending_session_events`] drains
-    /// while nested inside `sync_inner`, so its escalations leave the stash and
-    /// ride `summary` from the merge onwards. Nothing fallible may be inserted
-    /// between that merge and `sync_inner`'s `Ok` — past the merge they sit on a
-    /// local summary again, and a `?` would take them down with the pass. (Which
-    /// also makes `sync_inner`'s own call belt-and-braces rather than
-    /// load-bearing: the nested drain has already emptied the stash.)
-    ///
-    /// A run is still forgotten when a caller discards the client outright; the
-    /// [`super::epoch_stall`] module header covers that case and what
-    /// re-escalating then costs.
-    pub(crate) fn drain_epoch_stall_escalations(&mut self, summary: &mut SyncSummary) {
-        summary
-            .epoch_stall_escalations
-            .append(&mut self.pending_epoch_stall_escalations);
-    }
-
-    /// Whether an epoch-gap backfill is armed and awaiting its replay. Read by
-    /// the account worker to schedule a forensic audit-tracker upload for the
-    /// just-recorded `epoch_stall_backfill_armed` row without poking the field.
-    pub(crate) fn has_pending_epoch_backfill(&self) -> bool {
-        !self.pending_recovery_arm_writes.is_empty()
-            || !self.pending_recovery_capacity_writes.is_empty()
-            || self
-                .app
-                .account_storage(&self.state.label)
-                .and_then(|storage| {
-                    Ok(!storage
-                        .app_storage()
-                        .pending_epoch_backfill_intents()?
-                        .is_empty())
-                })
-                .unwrap_or(true)
-    }
-
-    /// Current group-scoped debt, including obligations held by a live grant.
-    /// This inspection does not authorize acquisition or infer completion.
-    fn armed_epoch_backfill_groups(&self) -> HashSet<cgka_traits::GroupId> {
-        self.app
-            .account_storage(&self.state.label)
-            .and_then(|storage| Ok(storage.app_storage().pending_epoch_backfill_intents()?))
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|intent| {
-                hex::decode(intent.group_id_hex)
-                    .ok()
-                    .map(cgka_traits::GroupId::new)
-            })
-            .collect()
-    }
-
-    /// Read a group's current local epoch, or `None` when it cannot be read.
-    ///
-    /// `None` is deliberately not a claim about the group: it covers a group
-    /// that is gone as well as a storage backend that was busy or closed.
-    /// Callers must treat it as "unobserved", never as "unchanged". The read
-    /// error itself has no audit field to land in, so name its privacy-safe
-    /// kind here — that is the difference between chasing a deleted group and
-    /// chasing lock contention.
-    pub(crate) fn local_epoch_for_group(&self, group_id: &cgka_traits::GroupId) -> Option<u64> {
-        match self.runtime.group_record(group_id) {
-            Ok(record) => Some(record.epoch.0),
-            Err(error) => {
-                tracing::warn!(
-                    target: "marmot_app::epoch_stall",
-                    method = "local_epoch_for_group",
-                    error_kind = AppError::from(error).privacy_safe_kind(),
-                    "local group epoch could not be read; treating it as unobserved"
-                );
-                None
-            }
-        }
-    }
-
-    /// Select and run one recovery job in place, waiting for a process
-    /// credit: the recovery seam of a directly owned client, which has no
-    /// worker to run the job for it.
-    pub(crate) async fn run_pending_epoch_backfill(
-        &mut self,
-        seam: EpochBackfillExecutionSeam,
-    ) -> Result<EpochBackfillRunOutcome, AppError> {
-        if !self.recovery_pending()? {
-            return Ok(EpochBackfillRunOutcome::NotPending);
-        }
-        let credit = crate::runtime::account_worker::recovery_credits::acquire_recovery_credit(
-            &self.recovery_credits,
-        )
-        .await;
-        match self.select_pending_epoch_backfill(seam).await? {
-            PendingRecoverySelection::NotPending => Ok(EpochBackfillRunOutcome::NotPending),
-            PendingRecoverySelection::Deferred => Ok(EpochBackfillRunOutcome::Deferred),
-            PendingRecoverySelection::Grant(grant) => {
-                self.run_recovery_job(*grant, credit, None).await
-            }
-        }
-    }
-
-    /// Select one grant for the recovery job. Every caller runs the exact
-    /// frozen grant it selected; nothing spends a second reservation.
-    pub(crate) async fn select_pending_epoch_backfill(
-        &mut self,
-        seam: EpochBackfillExecutionSeam,
-    ) -> Result<PendingRecoverySelection, AppError> {
-        self.drop_settled_epoch_backfill_intents();
-        if !self.recovery_pending()? {
-            return Ok(PendingRecoverySelection::NotPending);
-        }
-        let mut explicit = ExplicitRecoveryPermit::default();
-        let permit = (seam == EpochBackfillExecutionSeam::ExplicitCatchUp).then_some(&mut explicit);
-        let Some(grant) = self.authorize_account_recovery(permit, seam).await? else {
-            return Ok(PendingRecoverySelection::Deferred);
-        };
-        #[cfg(test)]
-        if let Some(witness) = &self.test_recovery_selection_witness {
-            witness.lock().unwrap().push(super::TestRecoverySelection {
-                seam,
-                attempt_serial: grant.reservation.attempt_serial,
-                comparison_revision: grant.comparison_revision,
-                obligation_count: grant.fence.obligations.len(),
-            });
-        }
-        Ok(PendingRecoverySelection::Grant(Box::new(grant)))
-    }
-
-    // Shares the classified failure payload with the job's terminal path.
-    #[allow(clippy::result_large_err)]
-    fn begin_recovery_execution(
-        &mut self,
-        grant: &AttemptGrant,
-    ) -> Result<RecoveryExecutionState, ClassifiedSyncFailure> {
-        let Some(plan) = grant.plan() else {
-            return Err(ClassifiedSyncFailure::at_stage(
-                SyncSummary::default(),
-                cgka_traits::storage::StorageError::Serialization(
-                    "recovery grant has no frozen plan".into(),
-                )
-                .into(),
-                SyncFailureStage::StatePersist,
-            ));
-        };
-        let overflow = self
-            .delivery_overflow_recovery_marker_token
-            .filter(|_| self.delivery_overflow_recovery_pending)
-            .map(|token| self.adapter.start_delivery_overflow_recovery(token));
-        let overflow_guard =
-            overflow.map(|_| super::recovery::RecoveryLossAttemptGuard::new(self.adapter.clone()));
-        let audit_groups = plan
-            .iter()
-            .filter(|obligation| obligation.cause == storage_sqlite::RecoveryCause::EpochGap)
-            .filter_map(|obligation| {
-                obligation.group_id.as_ref().and_then(|group| {
-                    self.local_epoch_for_group(group)
-                        .map(|epoch| (obligation.id, group.clone(), epoch))
-                })
-            })
-            .collect::<Vec<_>>();
-        let context = AuditEventContext {
-            operation_id: Some(format!("recovery-{}", grant.reservation.attempt_serial)),
-            ..AuditEventContext::default()
-        };
-        let started = Instant::now();
-        self.record_recovery_attempt_started(grant, &context);
-        if !audit_groups.is_empty() {
-            self.record_epoch_stall_backfill_started(
-                grant.seam,
-                grant.reservation.ordinal.saturating_sub(1),
-                &context,
-            );
-        }
-        Ok(RecoveryExecutionState {
-            overflow,
-            overflow_guard,
-            audit_groups,
-            context,
-            started,
-            counts: DrainCounts::default(),
-            activation: EpochBackfillActivationOutcome::Failed,
-            interruption: None,
-            tally: Default::default(),
-        })
-    }
-
-    // Preserve the job's classified partial summary and audit terminal.
-    #[allow(clippy::result_large_err)]
-    fn finish_recovery_execution(
-        &mut self,
-        grant: &AttemptGrant,
-        mut execution: RecoveryExecutionState,
-        result: Result<SyncSummary, ClassifiedSyncFailure>,
-    ) -> Result<SyncSummary, ClassifiedSyncFailure> {
-        // The pass itself is over; what follows settles loss and the cursor,
-        // which have their own rows.
-        self.record_recovery_attempt_finished(
-            grant,
-            &execution.context,
-            u64::try_from(execution.started.elapsed().as_millis()).unwrap_or(u64::MAX),
-            super::audit_recovery::pass_outcome(
-                result.is_err(),
-                execution.interruption,
-                &execution.tally,
-                execution
-                    .counts
-                    .deliveries
-                    .saturating_sub(execution.counts.unpersisted),
-            ),
-            result
-                .as_ref()
-                .err()
-                .map(|failure| failure.source.privacy_safe_kind()),
-            &execution.counts,
-            &execution.tally,
-        );
-        if result.is_err() {
-            self.abandon_loss_completion().map_err(|error| {
-                ClassifiedSyncFailure::at_stage(
-                    result
-                        .as_ref()
-                        .err()
-                        .map(|failure| failure.partial_summary.clone())
-                        .unwrap_or_default(),
-                    error,
-                    SyncFailureStage::StatePersist,
-                )
-            })?;
-        }
-        for (id, group, before) in execution.audit_groups {
-            let after = self.local_epoch_for_group(&group);
-            let revision = grant
-                .fence
-                .obligations
-                .iter()
-                .find(|(selected, _)| *selected == id)
-                .map(|(_, revision)| *revision)
-                .unwrap_or(0);
-            let qualified = self
-                .app
-                .account_storage(&self.state.label)
-                .and_then(|storage| {
-                    Ok(storage
-                        .app_storage()
-                        .recovery_obligation_is_satisfied(id, revision)?)
-                })
-                .unwrap_or(false);
-            self.record_epoch_stall_backfill_terminal(
-                &group,
-                qualified && after.is_some(),
-                EpochBackfillTerminalAudit {
-                    retry_ordinal: grant.reservation.ordinal.saturating_sub(1),
-                    duration_ms: execution.started.elapsed().as_millis() as u64,
-                    activation_outcome: execution.activation,
-                    completion_kind: None,
-                    error_kind: (!qualified).then(|| {
-                        result
-                            .as_ref()
-                            .err()
-                            .map(|failure| failure.source.privacy_safe_kind().to_owned())
-                            .unwrap_or_else(|| "history_coverage_unproven".into())
-                    }),
-                    deliveries: execution.counts.deliveries,
-                    skipped: execution.counts.skipped,
-                    refused: execution.counts.refused,
-                    local_epoch_before: before,
-                    local_epoch_after: after,
-                },
-                &execution.context,
-            );
-        }
-        // Qualification/plane acknowledgment is separate from ending the
-        // transient acquisition. No EOSE-only outcome may clear the loss guard.
-        if let Some(attempt) = execution.overflow {
-            let finished = if result.is_ok() {
-                self.finish_qualified_recovery_loss(grant, attempt)
-                    .map_err(|error| {
-                        ClassifiedSyncFailure::at_stage(
-                            result.as_ref().ok().cloned().unwrap_or_default(),
-                            error,
-                            SyncFailureStage::StatePersist,
-                        )
-                    })?
-            } else {
-                false
-            };
-            if !finished {
-                self.adapter.fail_delivery_overflow_recovery();
-            } else if !self.delivery_loss_blocks_cursor() {
-                // Every drained prefix was persisted while the loss fence held
-                // the old cursor. Promote the admitted candidate only after the
-                // exact live acknowledgment and durable evidence reclamation.
-                let sealed = self.seal_transport_cursor();
-                if let Err(error) =
-                    self.save_state_with_pending_local_group_deletion_frontier_clears()
-                {
-                    self.abandon_transport_cursor(sealed);
-                    return Err(ClassifiedSyncFailure::at_stage(
-                        result.as_ref().ok().cloned().unwrap_or_default(),
-                        error,
-                        SyncFailureStage::StatePersist,
-                    ));
-                }
-                self.settle_transport_cursor(
-                    sealed,
-                    marmot_forensics::TransportCursorTrigger::LossSettled,
-                );
-            }
-        }
-        if let Some(guard) = execution.overflow_guard.as_mut() {
-            guard.disarm();
-        }
-        result
-    }
-
-    /// Settle a finished comparison: the comparison slot's route outcomes,
-    /// then every selected obligation's checkpoint, with the existing revision
-    /// fences. Old attempts still cannot clear newer demand.
-    async fn settle_recovery_grant(
-        &mut self,
-        grant: &AttemptGrant,
-        counts: &mut DrainCounts,
-        tally: &mut super::audit_recovery::RecoveryPassTally,
-        comparison_outcomes: Vec<RouteComparison>,
-        mut summary: SyncSummary,
-    ) -> Result<SyncSummary, ClassifiedSyncFailure> {
-        tally.observe_routes(&comparison_outcomes);
-        self.synchronize_native_replay().await.map_err(|error| {
-            ClassifiedSyncFailure::at_stage(summary.clone(), error, SyncFailureStage::StatePersist)
-        })?;
-        let local = self.drain_pending_session_events().await.map_err(|error| {
-            ClassifiedSyncFailure::at_stage(summary.clone(), error, SyncFailureStage::Unknown)
-        })?;
-        summary.merge(local);
-        let storage = self
-            .app
-            .account_storage(&self.state.label)
-            .map_err(|error| {
-                ClassifiedSyncFailure::at_stage(
-                    summary.clone(),
-                    error,
-                    SyncFailureStage::StatePersist,
-                )
-            })?;
-        let app = storage.app_storage();
-        let checkpoint = (|| -> Result<Vec<Reassessed>, AppError> {
-            self.synchronize_recovery_loss(&app)?;
-            drop(self.transport_receipts()?);
-            self.observe_recovery_route_policy()?;
-            // An uncertified endpoint's outcome stays Unknown, distinct from
-            // Unsupported; eligibility also depends on the cause.
-            let outcome = storage_sqlite::RecoveryScopeOutcome::Unknown;
-            if let (Some(revision), Some(plan)) =
-                (grant.comparison_revision, &grant.comparison_plan)
-            {
-                use storage_sqlite::RecoveryComparisonOutcome as Comparison;
-                let route_results = comparison_outcomes
-                    .iter()
-                    .map(|compared| {
-                        let route = match &compared.route {
-                            TransportReconciliationRoute::Inbox => None,
-                            TransportReconciliationRoute::Group(id) => Some(id),
-                        };
-                        (route, compared)
-                    })
-                    .collect::<HashMap<_, _>>();
-                let mut outcomes = plan
-                    .routes
-                    .iter()
-                    .map(|scope| {
-                        let route = if scope.route_kind == 0 {
-                            None
-                        } else {
-                            Some(
-                                scope
-                                    .transport_group_id
-                                    .as_ref()
-                                    .expect("frozen comparison route"),
-                            )
-                        };
-                        // Unknown remote coverage is serviced once the relays
-                        // answer. Locally unadmitted work must retain acquisition
-                        // retries even after its obligation's quiet streak parks.
-                        let observed = route_results.get(&route).map_or(
-                            Comparison::TransientFailure,
-                            |compared| {
-                                if compared.answered
-                                    && !compared.retry_admission
-                                    && compared.outcome == Comparison::TransientFailure
-                                {
-                                    Comparison::ServicedUnknown
-                                } else {
-                                    compared.outcome
-                                }
-                            },
-                        );
-                        (scope.scope_id, observed)
-                    })
-                    .collect::<Vec<_>>();
-                let unsupported = (!outcomes.is_empty()
-                    && outcomes.iter().all(|(_, o)| *o == Comparison::Unsupported))
-                .then_some(self.adapter.recovery_comparison_capability_key());
-                if unsupported.is_none() {
-                    // Capability blocking is backend-wide, never inferred for
-                    // an unstarted suffix. The selected unsupported scopes were
-                    // serviced without coverage; their audit facts stay intact.
-                    for (_, outcome) in &mut outcomes {
-                        if *outcome == Comparison::Unsupported {
-                            *outcome = Comparison::ServicedUnknown;
-                        }
-                    }
-                }
-                app.settle_recovery_comparison(
-                    revision,
-                    grant.reservation.attempt_serial,
-                    &outcomes,
-                    unsupported,
-                )?;
-            }
-            let mut progressed_any = false;
-            let mut explicit_window_certified = false;
-            let mut reassessed = Vec::new();
-            for obligation in grant.plan().expect("validated executor grant") {
-                if obligation.cause == storage_sqlite::RecoveryCause::SubscriptionReplay {
-                    let stored = app.recovery_scope_snapshots(obligation.id)?;
-                    let checkpoints = obligation
-                        .scopes
-                        .iter()
-                        .map(|scope| storage_sqlite::RecoveryScopeCheckpoint {
-                            token: scope.token.clone(),
-                            endpoints: Vec::new(),
-                            retained_known_event: false,
-                            replay_admitted: stored.iter().any(|old| {
-                                old.plan.scope_id == scope.goal.scope_id && old.replay_admitted
-                            }),
-                        })
-                        .collect::<Vec<_>>();
-                    let progress = obligation
-                        .scopes
-                        .iter()
-                        .filter(|scope| {
-                            !stored.iter().any(|old| {
-                                old.plan.scope_id == scope.goal.scope_id && old.replay_admitted
-                            })
-                        })
-                        .map(|scope| {
-                            (
-                                scope.goal.scope_id,
-                                storage_sqlite::RecoveryPassProgress::Unserved,
-                            )
-                        })
-                        .collect::<Vec<_>>();
-                    app.checkpoint_recovery_comparison(
-                        &grant.fence,
-                        grant.reservation.attempt_serial,
-                        obligation.id,
-                        &checkpoints,
-                        storage_sqlite::RecoveryEligibility::Retry,
-                        &progress,
-                    )?;
-                    reassessed.push(super::audit_recovery::ReassessedObligation {
-                        id: obligation.id,
-                        progress: (!progress.is_empty())
-                            .then_some(marmot_forensics::RecoveryScopeProgress::Unserved),
-                        scopes_certified: 0,
-                        comparison_owned: false,
-                        closed_below_window: false,
-                    });
-                    continue;
-                }
-                // A selected group can lack any executable route even though
-                // another obligation made the account ready. Preserve that
-                // debt until capability/policy changes instead of probing it
-                // forever on unrelated account readiness.
-                let unroutable = obligation
-                    .scopes
-                    .iter()
-                    .all(|scope| scope.goal.admitted_endpoints.is_empty());
-                // Cold-start history has no evidence but comparison. When no
-                // compared route had a comparison backend, wait for a
-                // capability change instead of spending passes on it.
-                let mut compared = obligation.scopes.iter().filter_map(|scope| {
-                    let route = match (scope.goal.route_kind, scope.goal.transport_group_id) {
-                        (0, _) => TransportReconciliationRoute::Inbox,
-                        (1, Some(id)) => TransportReconciliationRoute::Group(id),
-                        _ => return None,
-                    };
-                    comparison_outcomes.iter().find(|c| c.route == route)
-                });
-                let unsupported = obligation.cause
-                    == storage_sqlite::RecoveryCause::IncrementalHistory
-                    && compared.clone().next().is_some()
-                    && compared.all(|c| {
-                        c.outcome == storage_sqlite::RecoveryComparisonOutcome::Unsupported
-                    });
-                let outcome = if unsupported {
-                    storage_sqlite::RecoveryScopeOutcome::Unsupported
-                } else if !unroutable {
-                    outcome
-                } else if obligation
-                    .scopes
-                    .iter()
-                    .all(|scope| scope.goal.route_kind == 2)
-                {
-                    storage_sqlite::RecoveryScopeOutcome::Unsupported
-                } else {
-                    storage_sqlite::RecoveryScopeOutcome::Excluded
-                };
-                let refused = obligation
-                    .group_id
-                    .as_ref()
-                    .map_or(counts.refused > 0, |group| {
-                        counts.refused_groups.contains(group)
-                    });
-                // A maintenance boundary is its own REQ's end of stored events,
-                // and known-event demand completes once its exact event is
-                // retained. Every other cause, explicit repair included,
-                // completes on comparison certificates over the
-                // retained-inventory window.
-                let comparison_owned = !matches!(
-                    obligation.cause,
-                    storage_sqlite::RecoveryCause::Maintenance
-                        | storage_sqlite::RecoveryCause::KnownEvent
-                );
-                let mut certified = false;
-                let mut fetched = false;
-                // Audit only: scopes certified for this goal after the pass,
-                // and this obligation's own pass progress.
-                let mut scopes_certified = 0_u64;
-                let mut obligation_progress = None;
-                let mut closed_below_window = false;
-                let mut checkpoints = Vec::with_capacity(obligation.scopes.len());
-                // Each compared scope's own pass: quiet only when its required
-                // relays answered and it neither certified nor admitted anything.
-                let mut progress = Vec::with_capacity(obligation.scopes.len());
-                for scope in &obligation.scopes {
-                    let route = match (scope.goal.route_kind, scope.goal.transport_group_id) {
-                        (0, _) => Some(TransportReconciliationRoute::Inbox),
-                        (1, Some(id)) => Some(TransportReconciliationRoute::Group(id)),
-                        _ => None,
-                    };
-                    let compared = route
-                        .as_ref()
-                        .and_then(|route| comparison_outcomes.iter().find(|c| &c.route == route));
-                    fetched |= compared.is_some_and(|compared| compared.fetched > 0);
-                    // Explicit history has no lower bound, so a comparison
-                    // that certified the retained window searched all it can.
-                    // The scope keeps that fact for its goal, off the quiet
-                    // streak; it is never coverage.
-                    let window_searched = obligation.cause
-                        == storage_sqlite::RecoveryCause::ExplicitHistory
-                        && !refused
-                        && compared.is_some_and(|compared| compared.certified)
-                        && route.as_ref().is_some_and(|route| {
-                            grant.inventory.iter().any(|window| {
-                                &window.route == route && scope.goal.until_seconds <= window.until
-                            })
-                        });
-                    // A scope this pass did not compare, or already certified
-                    // for this goal, keeps the certificates it has.
-                    let kept_certificate = grant
-                        .certified_scopes
-                        .contains(&(obligation.id, scope.goal.scope_id));
-                    if comparison_owned
-                        && !unroutable
-                        && scope.goal.known_event_id.is_none()
-                        && (compared.is_none() || kept_certificate)
-                    {
-                        scopes_certified += u64::from(kept_certificate);
-                        continue;
-                    }
-                    // A comparison proves only the window it compared. A goal
-                    // that reaches below the retained-inventory floor, or has
-                    // no lower bound, keeps its debt. Cold-start and
-                    // incremental history is that window: its floor, raised by
-                    // retention or compaction, is the goal's lower bound.
-                    // Explicit history has no lower bound, so it never
-                    // certifies; a certified window only names what is left.
-                    let window_bounded =
-                        obligation.cause == storage_sqlite::RecoveryCause::IncrementalHistory;
-                    let covers_goal = route.as_ref().is_some_and(|route| {
-                        grant.inventory.iter().any(|window| {
-                            &window.route == route
-                                && (window_bounded
-                                    || scope
-                                        .goal
-                                        .since_seconds
-                                        .is_some_and(|since| since >= window.since))
-                                && scope.goal.until_seconds <= window.until
-                                // A route certificate says nothing about a
-                                // required relay absent from this network pass.
-                                // A comparison pass queries the incremental
-                                // debt's relays; when that debt was not rebuilt
-                                // with this grant, another obligation's scope on
-                                // the same route can require a relay it lacks.
-                                && scope.goal.required_endpoints.iter().all(|endpoint| {
-                                    window.work.endpoints().iter().any(|queried| {
-                                        transport_nostr::same_relay(queried.as_str(), endpoint)
-                                    })
-                                })
-                        })
-                    });
-                    let scope_certified = comparison_owned
-                        && !refused
-                        && covers_goal
-                        && compared.is_some_and(|compared| compared.certified);
-                    certified |= scope_certified;
-                    scopes_certified += u64::from(scope_certified);
-                    let scope_progress = if window_searched {
-                        storage_sqlite::RecoveryPassProgress::WindowCertified
-                    } else if scope_certified
-                        || compared.is_some_and(|compared| compared.fetched > 0)
-                    {
-                        storage_sqlite::RecoveryPassProgress::Progressed
-                    } else if !refused
-                        && compared.is_some_and(|compared| {
-                            compared.answered
-                                && compared.outcome
-                                    != storage_sqlite::RecoveryComparisonOutcome::Unsupported
-                        })
-                    {
-                        storage_sqlite::RecoveryPassProgress::Quiet
-                    } else {
-                        storage_sqlite::RecoveryPassProgress::Unserved
-                    };
-                    if compared.is_some() {
-                        tally.observe_progress(scope_progress);
-                        obligation_progress = Some(super::audit_recovery::merge_progress(
-                            obligation_progress,
-                            scope_progress,
-                        ));
-                        if scope_progress != storage_sqlite::RecoveryPassProgress::Unserved
-                            || compared.is_some_and(|compared| {
-                                scope.goal.required_endpoints.iter().any(|required| {
-                                    compared.reached_endpoints.iter().any(|reached| {
-                                        transport_nostr::same_relay(required, reached)
-                                    })
-                                })
-                            })
-                        {
-                            progress.push((scope.goal.scope_id, scope_progress));
-                        }
-                    }
-                    let retained_known_event = match (&route, scope.goal.known_event_id) {
-                        (Some(route), Some(event)) => app.retained_recovery_event(
-                            route,
-                            &event,
-                            scope.goal.since_seconds,
-                            scope.goal.until_seconds,
-                        )?,
-                        _ => false,
-                    };
-                    let endpoints = scope
-                        .goal
-                        .required_endpoints
-                        .iter()
-                        .map(|endpoint| {
-                            let admitted = scope.goal.admitted_endpoints.contains(endpoint);
-                            storage_sqlite::RecoveryEndpointCheckpoint {
-                                endpoint: endpoint.clone(),
-                                outcome: match (admitted, scope_certified) {
-                                    (false, _) => storage_sqlite::RecoveryScopeOutcome::Excluded,
-                                    (true, true) => storage_sqlite::RecoveryScopeOutcome::Covered,
-                                    (true, false) => outcome,
-                                },
-                                exhaustive: admitted && scope_certified,
-                                admission_complete: admitted && scope_certified,
-                                first_boundary: false,
-                            }
-                        })
-                        .collect();
-                    // Synthetic tests supply independent finite-inventory
-                    // certificates; a refused admission cannot be promoted by
-                    // this fixture.
-                    #[cfg(test)]
-                    let endpoints = if counts.refused == 0 {
-                        self.test_recovery_evidence
-                            .map_or(endpoints, |evidence| evidence(&scope.goal))
-                    } else {
-                        endpoints
-                    };
-                    checkpoints.push(storage_sqlite::RecoveryScopeCheckpoint {
-                        token: scope.token.clone(),
-                        retained_known_event,
-                        replay_admitted: false,
-                        endpoints,
-                    });
-                }
-                progressed_any |= certified || fetched;
-                let eligibility = super::recovery::eligibility_after_comparison(outcome, refused);
-                if comparison_owned {
-                    app.checkpoint_recovery_comparison(
-                        &grant.fence,
-                        grant.reservation.attempt_serial,
-                        obligation.id,
-                        &checkpoints,
-                        eligibility,
-                        &progress,
-                    )?;
-                    // Once every scope of an explicit request has had its
-                    // window certified, on this pass or an earlier slice,
-                    // nothing is left that any pass can search: close it
-                    // instead of letting it park into a notice. A scope never
-                    // compared, such as one with no admitted relay, keeps it
-                    // open.
-                    // The close is revision-checked, so a stale attempt that
-                    // wrote nothing cannot close a newer request.
-                    if obligation.cause == storage_sqlite::RecoveryCause::ExplicitHistory {
-                        let scopes = app.recovery_scope_snapshots(obligation.id)?;
-                        if !scopes.is_empty() && scopes.iter().all(|scope| scope.window_certified) {
-                            explicit_window_certified = true;
-                            if let Some((_, revision)) = grant
-                                .fence
-                                .obligations
-                                .iter()
-                                .find(|(id, _)| *id == obligation.id)
-                            {
-                                closed_below_window = app.close_explicit_history_request(
-                                    storage_sqlite::RecoveryDemandTicket {
-                                        id: obligation.id,
-                                        revision: *revision,
-                                    },
-                                )?;
-                            }
-                        }
-                    }
-                } else {
-                    app.checkpoint_recovery_obligation(
-                        &grant.fence,
-                        grant.reservation.attempt_serial,
-                        obligation.id,
-                        &checkpoints,
-                        eligibility,
-                    )?;
-                }
-                reassessed.push(super::audit_recovery::ReassessedObligation {
-                    id: obligation.id,
-                    progress: obligation_progress,
-                    scopes_certified,
-                    comparison_owned,
-                    closed_below_window,
-                });
-            }
-            self.explicit_history_window_certified = explicit_window_certified;
-            if progressed_any {
-                // New coverage or newly fetched history is progress: the next
-                // pass runs at the base delay and the parking streak restarts.
-                self.recovery_owner
-                    .observe_certified_progress(&app, grant)?;
-            }
-            Ok(reassessed)
-        })();
-        let reassessed = checkpoint.map_err(|error| {
-            ClassifiedSyncFailure::at_stage(summary.clone(), error, SyncFailureStage::StatePersist)
-        })?;
-        self.record_recovery_reassessments(
-            &app,
-            grant,
-            &AuditEventContext {
-                operation_id: Some(format!("recovery-{}", grant.reservation.attempt_serial)),
-                ..AuditEventContext::default()
-            },
-            reassessed,
-        );
-        self.drain_epoch_stall_escalations(&mut summary);
-        Ok(summary)
-    }
-
     /// Explicit account-wide repair for a host that has independent evidence
     /// its incremental cursor may be incomplete (for example, a long-offline
     /// participant that has no new traffic capable of arming epoch-stall
@@ -5742,176 +3800,42 @@ impl AppClient {
     pub(crate) async fn repair_full_history(
         &mut self,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
-        self.repair_full_history_cancellable(&|| false).await
+        self.repair_full_history_cancellable(&|| false, None).await
     }
 
+    /// Explicit repair. It runs through the account's runner, `spawned` for a
+    /// worker account (mdk#2660 phase 4).
     pub(crate) async fn repair_full_history_cancellable(
         &mut self,
         cancelled: &(dyn Fn() -> bool + Sync),
+        spawned: Option<&mut super::history_recovery::recovery_runner::host::SpawnedRunner>,
     ) -> Result<SyncSummary, ClassifiedSyncFailure> {
-        self.repair_full_history_with_control(&FullHistoryRepairControl {
-            started: Instant::now(),
-            timeout: FULL_HISTORY_REPAIR_TIMEOUT,
-            cancelled,
-        })
-        .await
-    }
-
-    /// Run the one recovery job for an explicit caller: every route of the
-    /// grant is compared in one pass inside the repair budget, the job is
-    /// awaited here, and the repair succeeds only when its explicit history
-    /// obligation is certified. It never activates or replays subscriptions.
-    async fn repair_full_history_with_control(
-        &mut self,
-        control: &FullHistoryRepairControl<'_>,
-    ) -> Result<SyncSummary, ClassifiedSyncFailure> {
-        let state_persist = |summary: SyncSummary, error: AppError| {
-            ClassifiedSyncFailure::at_stage(summary, error, SyncFailureStage::StatePersist)
-        };
-        if let Some(reason) = control.stopped() {
-            return Err(incomplete_full_history_repair(
-                SyncSummary::default(),
-                reason,
-                self.delivery_loss_blocks_cursor(),
-            ));
+        if !cancelled() {
+            // Explicit Repair authorizes a fresh finite rejoin episode before
+            // handing history acquisition to the account's runner.
+            self.retry_parked_rejoins().map_err(|error| {
+                ClassifiedSyncFailure::at_stage(
+                    SyncSummary::default(),
+                    error,
+                    SyncFailureStage::StatePersist,
+                )
+            })?;
         }
-        if self
-            .refresh_sync_routes()
-            .map_err(|error| state_persist(SyncSummary::default(), error))?
-        {
-            // The live subscriptions follow the route change later; recovery
-            // compares the refreshed routes without touching them.
-            self.pending_runtime_group_subscription_refresh = true;
+        if self.repairs_through_runner(spawned.as_deref()) {
+            return self
+                .repair_full_history_through_runner(cancelled, FULL_HISTORY_REPAIR_TIMEOUT, spawned)
+                .await;
         }
-        let storage = self
-            .app
-            .account_storage(&self.state.label)
-            .map_err(|error| state_persist(SyncSummary::default(), error))?;
-        let app = storage.app_storage();
-        let operation = rand::random::<[u8; 16]>();
-        let (ticket, transition) = app
-            .request_recovery_observed(
-                storage_sqlite::RecoveryRequest::ExplicitHistory {
-                    operation_id: &operation,
-                },
-                unix_now_seconds().saturating_mul(1000),
-            )
-            .map_err(|error| state_persist(SyncSummary::default(), error.into()))?;
-        self.record_recovery_request(
-            storage_sqlite::RecoveryCause::ExplicitHistory,
-            ticket,
-            transition,
-        );
-        let mut waiter = super::recovery::RecoveryCallerGuard::new(storage.clone(), ticket);
-        // An explicit caller waits for its process credit, but never past its
-        // own cancellation or budget.
-        let credit = {
-            use crate::runtime::account_worker::recovery_credits;
-            let pool = self.recovery_credits.clone();
-            let acquire = recovery_credits::acquire_recovery_credit(&pool);
-            tokio::pin!(acquire);
-            loop {
-                if let Some(reason) = control.stopped() {
-                    waiter
-                        .detach()
-                        .map_err(|error| state_persist(SyncSummary::default(), error.into()))?;
-                    return Err(incomplete_full_history_repair(
-                        SyncSummary::default(),
-                        reason,
-                        self.delivery_loss_blocks_cursor(),
-                    ));
-                }
-                tokio::select! {
-                    credit = &mut acquire => break credit,
-                    () = tokio::time::sleep(RECOVERY_JOB_CANCEL_POLL) => {}
-                }
-            }
-        };
-        let mut caller = ExplicitRecoveryPermit::full_history();
-        let grant = self
-            .authorize_account_recovery(
-                Some(&mut caller),
-                EpochBackfillExecutionSeam::ExplicitCatchUp,
-            )
-            .await
-            .map_err(|error| state_persist(SyncSummary::default(), error))?;
-        self.explicit_history_window_certified = false;
-        self.recovery_job_network_cut = false;
-        self.recovery_job_admission_expired = false;
-        let job = control.for_job();
-        let result = match grant {
-            Some(grant) => self.run_recovery_job(grant, credit, Some(&job)).await,
-            None => Ok(EpochBackfillRunOutcome::Deferred),
-        };
-        let summary = match &result {
-            Ok(
-                EpochBackfillRunOutcome::Completed(summary)
-                | EpochBackfillRunOutcome::Incomplete(summary),
-            ) => summary.clone(),
-            _ => SyncSummary::default(),
-        };
-        let qualified = app
-            .recovery_obligation_is_satisfied(ticket.id, ticket.revision)
-            .map_err(|error| state_persist(summary.clone(), error.into()))?;
-        // The certified window wins over the clock: a pass that finished,
-        // however late, is judged on its routes. Only cancellation, admission
-        // cut at the whole budget, or a network cutoff that left the window
-        // uncertified reports otherwise.
-        let reason = {
-            use crate::FullHistoryRepairIncompleteReason as Reason;
-            if job.cancelled() {
-                Reason::Cancelled
-            } else if self.recovery_job_admission_expired {
-                Reason::Deadline
-            } else if self.explicit_history_window_certified {
-                Reason::BelowRetentionWindow
-            } else if self.recovery_job_network_cut {
-                Reason::Deadline
+        // Without a runner to serve it, nothing can prove the repair.
+        Err(incomplete_full_history_repair(
+            SyncSummary::default(),
+            if cancelled() {
+                crate::FullHistoryRepairIncompleteReason::Cancelled
             } else {
-                Reason::CoverageUnproven
-            }
-        };
-        if result.is_ok()
-            && !qualified
-            && reason == crate::FullHistoryRepairIncompleteReason::BelowRetentionWindow
-        {
-            // The pass finished with every route's window certified. What is
-            // left lies below the window, where no pass can search, so the
-            // request closes: it would otherwise only park into a notice. It
-            // is recorded as neither coverage nor a dismissal.
-            let closed = app
-                .close_explicit_history_request(ticket)
-                .map_err(|error| state_persist(summary.clone(), error.into()))?;
-            // Settlement usually closed it already and recorded that verdict;
-            // record only a close this seam made.
-            if closed {
-                self.record_need_changed(
-                    None,
-                    marmot_forensics::RecoveryObligationCause::ExplicitHistory,
-                    marmot_forensics::RecoveryNeedChange::ClosedBelowWindow,
-                    ticket,
-                    None,
-                    None,
-                    None,
-                );
-            }
-        }
-        waiter
-            .detach()
-            .map_err(|error| state_persist(summary.clone(), error.into()))?;
-        match result {
-            Ok(_) if qualified => Ok(summary),
-            Ok(_) => Err(incomplete_full_history_repair(
-                summary,
-                reason,
-                self.delivery_loss_blocks_cursor(),
-            )),
-            Err(error) => Err(ClassifiedSyncFailure::at_stage(
-                std::mem::take(&mut self.pending_failed_sync_summary),
-                error,
-                SyncFailureStage::Unknown,
-            )),
-        }
+                crate::FullHistoryRepairIncompleteReason::CoverageUnproven
+            },
+            self.delivery_loss_blocks_cursor(),
+        ))
     }
 
     #[cfg(test)]
@@ -5960,8 +3884,8 @@ impl AppClient {
         let buffered = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let progress_updates = buffered.clone();
         let observe = std::sync::Arc::new(
-            move |session: &cgka_session::AccountDeviceSession,
-                  published: &marmot_account::PublishedApplicationMessage| {
+            move |view: marmot_session::GroupAuthorityView<'_>,
+                  published: &marmot_session::PublishedApplicationMessage| {
                 // UPDATE-only finalization cannot create absent rows or clear an
                 // invalidation. Revival requires the live-group check in the final
                 // effects handler and intentionally waits for that handler.
@@ -5981,7 +3905,7 @@ impl AppClient {
                         // may have no SQL delta but still owes a fresh checkpoint.
                         crate::runtime::publish_conversation_captures_from_session(
                             &conversation_captures,
-                            session,
+                            view,
                             &app,
                             &label,
                             &published.group_id,
@@ -6037,12 +3961,6 @@ impl AppClient {
         let mut summary = self
             .finish_scheduled_convergence_effects(group_id, &effects)
             .await?;
-        // This seam follows an actual engine evaluation. Projection-only
-        // replays of an effects batch must not allocate observation identities.
-        if let Err(error) = self.observe_qualified_local_stagnation(group_id) {
-            tracing::warn!(target: "marmot_app::recovery", method = "observe_qualified_local_stagnation",
-                error_kind=error.privacy_safe_kind(), "qualified local observation remains uncounted");
-        }
         self.drain_epoch_stall_escalations(&mut summary);
         Ok(summary)
     }
@@ -6051,7 +3969,7 @@ impl AppClient {
     pub(crate) async fn finish_scheduled_convergence_effects(
         &mut self,
         group_id: &cgka_traits::GroupId,
-        effects: &marmot_account::AccountDeviceEffects,
+        effects: &marmot_session::AccountDeviceEffects,
     ) -> Result<SyncSummary, AppError> {
         let result = self
             .observe_scheduled_convergence_effects(group_id, effects)
@@ -6069,7 +3987,7 @@ impl AppClient {
     pub(crate) async fn observe_scheduled_convergence_effects(
         &mut self,
         group_id: &cgka_traits::GroupId,
-        effects: &marmot_account::AccountDeviceEffects,
+        effects: &marmot_session::AccountDeviceEffects,
     ) -> Result<(), AppError> {
         for published in &effects.published_app_messages {
             self.pending_resumed_message_notifications
@@ -6186,7 +4104,7 @@ impl AppClient {
             .map(|((group, _), _)| group.clone())
             .collect::<HashSet<_>>();
         for group in groups {
-            let fanouts = match self.runtime.session().outbound_fanouts_for_group(&group) {
+            let fanouts = match self.runtime.outbound_fanouts_for_group(&group) {
                 Ok(fanouts) => fanouts,
                 Err(error) => {
                     self.pending_runtime_group_subscription_refresh = true;
@@ -6213,7 +4131,7 @@ impl AppClient {
     /// classified against this same authority, independent of batch order.
     fn local_group_deletion_frontiers_at_batch_start(
         &self,
-        effects: &marmot_account::AccountDeviceEffects,
+        effects: &marmot_session::AccountDeviceEffects,
     ) -> Result<HashMap<String, u64>, AppError> {
         let storage = self.app.account_storage(&self.state.label)?;
         let mut frontiers = HashMap::new();
@@ -6315,6 +4233,7 @@ impl AppClient {
     fn project_received_message(
         &mut self,
         message: crate::ReceivedMessage,
+        sender_leaf: Option<u32>,
         carried_media_secret: Option<&cgka_traits::EncryptedMediaSecret>,
         group_metadata: Option<&cgka_traits::Group>,
         summary: &mut SyncSummary,
@@ -6327,31 +4246,50 @@ impl AppClient {
                 })
                 .and_then(|profile| {
                     self.runtime
-                        .session()
                         .canonical_group_membership(&message.group_id)
                         .map_err(AppError::from)
                         .map(|membership| (profile, membership.member_leaves))
                 })
                 .and_then(|(profile, active_leaves)| {
-                    self.app.ingest_push_gossip_message(
-                        &self.state.label,
-                        &message,
-                        &active_leaves,
-                        profile,
-                    )
+                    self.app
+                        .ingest_push_gossip_message(
+                            &self.state.label,
+                            &message,
+                            &active_leaves,
+                            profile,
+                        )
+                        .map(|action| (action, active_leaves))
                 });
-            if let Err(err) = ingest_result {
-                tracing::warn!(
-                    target: "marmot_app::notifications",
-                    method = "project_received_message",
-                    error_kind = err.privacy_safe_kind(),
-                    "ignoring malformed push token gossip",
-                );
+            match ingest_result {
+                // What an announce asks for is worked out after its own
+                // entries are applied, and ranked over the leaves they were
+                // applied against.
+                Ok((_, active_leaves))
+                    if message.kind == notifications::MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE =>
+                {
+                    self.note_received_push_repair_ask(&message, sender_leaf, &active_leaves);
+                }
+                Ok((action, _)) => {
+                    self.note_push_repair_cover(&message.group_id, message.source_epoch, &action);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        target: "marmot_app::notifications",
+                        method = "project_received_message",
+                        error_kind = err.privacy_safe_kind(),
+                        "ignoring malformed push token gossip",
+                    );
+                }
             }
             return Ok(());
         }
-        let retains_encrypted_media = message.kind == MARMOT_APP_EVENT_KIND_CHAT
-            && media_imeta_tags_are_valid(&message.tags, self.app.allow_loopback_blob_endpoints());
+        let retains_encrypted_media = matches!(
+            message.kind,
+            MARMOT_APP_EVENT_KIND_CHAT | MARMOT_APP_EVENT_KIND_REACTION
+        ) && media_imeta_tags_are_valid(
+            &message.tags,
+            self.app.allow_loopback_blob_endpoints(),
+        );
         if let Err(error) = self
             .app
             .directory()
@@ -6381,28 +4319,68 @@ impl AppClient {
             origin_commit_id: None,
             moderation_grant,
         };
-        let projection_update = self.app.record_account_app_event_at(
-            &self.state.label,
-            &message_projection,
-            message.received_at,
-        )?;
-        if retains_encrypted_media
-            && self
-                .remember_received_encrypted_media_secret(
+        // The engine's retained-anchor read can require a separate database
+        // savepoint. Resolve it before taking the app write transaction, then
+        // commit the available key together with its source slots.
+        let source_media_secret = if retains_encrypted_media {
+            match carried_media_secret {
+                Some(secret) => Some(cgka_traits::SecretBytes::new(secret.as_bytes().to_vec())),
+                None => match self
+                    .exportable_encrypted_media_secret(&message.group_id, message.source_epoch)
+                {
+                    Ok(secret) => secret,
+                    Err(error)
+                        if matches!(&error, AppError::Storage(_))
+                            || matches!(
+                                error.as_engine_error(),
+                                Some(cgka_traits::EngineError::Storage(_))
+                            ) =>
+                    {
+                        return Err(error);
+                    }
+                    Err(_) => {
+                        // Late/legacy events can outlive their retained source
+                        // exporter. Preserve that content and any existing
+                        // cached material when historic keys are unavailable.
+                        tracing::warn!(
+                            target: "marmot_app::media",
+                            method = "project_received_message",
+                            error_code = "encrypted_media_secret_cache_skipped",
+                            "source media key unavailable for a legacy received message",
+                        );
+                        None
+                    }
+                },
+            }
+        } else {
+            None
+        };
+        let projection_update = if let Some(secret) = source_media_secret {
+            // An acknowledged source must carry its available media key. A
+            // required-key failure rolls back the source and leaves its durable
+            // engine outbox event available after retry or restart.
+            let storage = self.app.account_storage(&self.state.label)?;
+            cgka_traits::StorageProvider::with_transaction(&storage, |_| {
+                let update = self.app.record_account_app_event_at(
+                    &self.state.label,
+                    &message_projection,
+                    message.received_at,
+                )?;
+                self.remember_received_encrypted_media_secret(
                     &message.group_id,
                     message.source_epoch,
                     &message.tags,
-                    carried_media_secret,
-                )
-                .is_err()
-        {
-            tracing::warn!(
-                target: "marmot_app::media",
-                method = "project_received_message",
-                error_code = "encrypted_media_secret_cache_skipped",
-                "failed to cache encrypted media source epoch secret",
-            );
-        }
+                    secret.as_slice(),
+                )?;
+                Ok::<_, AppError>(update)
+            })?
+        } else {
+            self.app.record_account_app_event_at(
+                &self.state.label,
+                &message_projection,
+                message.received_at,
+            )?
+        };
         summary.projection_updates.push(projection_update);
         self.prune_plaintext_retention_for_group(&message.group_id)?;
         Ok(())
@@ -6442,6 +4420,55 @@ impl AppClient {
         let pending_inputs = self.pending_seen_event_count;
         let pending_acks = self.pending_application_event_acks.len();
         let pending_frontiers = self.pending_local_group_deletion_frontier_clears.len();
+        // Nothing to persist: maintenance saves after every tick. Skipping the
+        // write also skips the chat-list stale mark and presentation wake,
+        // which would otherwise force a full chat-list rebuild and set off
+        // another attachment pass (mdk#2923).
+        let max_cursor =
+            unix_now_seconds().saturating_add(crate::TRANSPORT_CURSOR_MAX_FUTURE_SKEW.as_secs());
+        let storage = self.app.account_storage(&self.state.label);
+        let nothing_to_persist = changed_groups == 0
+            && pending_acks == 0
+            && pending_frontiers == 0
+            && created_group_id_hex.is_none()
+            && self.checkpointed_transport_timestamp == self.saved_transport_timestamp
+            // A cursor beyond the allowed future skew (the clock moved back)
+            // still needs the save that clamps it, whether this client saved
+            // it or another process did. Only a save that carries a cursor
+            // can clamp a stored one: with none, the save leaves it as is, so
+            // a stored future cursor alone does not force it.
+            && self.saved_transport_timestamp.is_none_or(|cursor| {
+                cursor <= max_cursor
+                    && storage
+                        .as_ref()
+                        .map_err(|_| ())
+                        .and_then(|storage| {
+                            storage
+                                .app_storage()
+                                .stored_transport_cursor(&self.state.label)
+                                .map_err(|_| ())
+                        })
+                        .is_ok_and(|stored| stored.is_none_or(|cursor| cursor <= max_cursor))
+            });
+        // Receipts synchronize once per save: released receipts can add seen
+        // events, and a retry of a failed synchronization could succeed and
+        // hide the failure. The save below reuses this result, so an error
+        // still fails the save and records its span.
+        let mut synchronized_seen_events = None;
+        if nothing_to_persist {
+            match self.transport_receipts() {
+                Ok(receipts) => {
+                    let seen_events = receipts.pending_seen_events();
+                    if seen_events.is_empty() {
+                        self.invalidate_chat_list_after_foreign_commit(storage.ok());
+                        self.flush_live_v5_events();
+                        return Ok(None);
+                    }
+                    synchronized_seen_events = Some(Ok(seen_events));
+                }
+                Err(error) => synchronized_seen_events = Some(Err(error)),
+            }
+        }
         let message_ref = (pending_acks == 1)
             .then(|| self.pending_application_event_acks.iter().next())
             .flatten()
@@ -6482,6 +4509,14 @@ impl AppClient {
         #[cfg(not(test))]
         let audit_fail_before_commit = false;
         let mut known_not_committed = audit_fail_before_commit;
+        // Taken before the save: a foreign commit during or after it stays
+        // visible to the next skip, at the cost of one extra rebuild. A read
+        // after the save could already include a commit the chat list
+        // rebuilt before (mdk#2923).
+        let pre_save_commit_version = storage
+            .as_ref()
+            .ok()
+            .and_then(|storage| storage.app_storage().foreign_commit_version().ok());
         let result = (|| {
             #[cfg(test)]
             if audit_fail_before_commit {
@@ -6489,8 +4524,11 @@ impl AppClient {
                     "injected v5 probe checkpoint failure".into(),
                 ));
             }
-            let seen_events = match self.transport_receipts() {
-                Ok(receipts) => receipts.pending_seen_events(),
+            let seen_events = match synchronized_seen_events.take().unwrap_or_else(|| {
+                self.transport_receipts()
+                    .map(|receipts| receipts.pending_seen_events())
+            }) {
+                Ok(seen_events) => seen_events,
                 Err(error) => {
                     // This failed before either projection save entry point.
                     // The checkpoint itself therefore did not commit.
@@ -6542,6 +4580,7 @@ impl AppClient {
                 )?;
                 None
             };
+            self.saved_transport_timestamp = self.checkpointed_transport_timestamp;
             self.pending_seen_event_count = 0;
             self.pending_group_projection_updates.clear();
             self.pending_local_group_deletion_frontier_clears.clear();
@@ -6550,6 +4589,24 @@ impl AppClient {
         })();
         if let Some(observation) = observation {
             observation.finish_app(&result);
+        }
+        #[cfg(test)]
+        if let Some(hook) = self.test_after_checkpoint_save.take() {
+            hook();
+        }
+        if result.is_ok() {
+            // A delta save marks the whole chat list stale, so it covers
+            // every foreign commit before it. A created-row save refreshes
+            // only its new row (the whole list only when other groups were
+            // dirty too), so it compares versions as a skip does: a foreign
+            // commit since the last checkpoint invalidates the list here.
+            if created_group_id_hex.is_some()
+                && (pre_save_commit_version.is_none()
+                    || self.observed_commit_version != pre_save_commit_version)
+            {
+                self.app.invalidate_chat_list_projection(&self.state.label);
+            }
+            self.observed_commit_version = pre_save_commit_version;
         }
         if let Some(probe) = &mut self.audit_v5_probe {
             probe.finish_checkpoint(audit_updates, result.is_ok(), audit_fail_before_commit);
@@ -6568,7 +4625,16 @@ impl AppClient {
             || pending_acks != 0
             || pending_frontiers != 0
             || created_group_id_hex.is_some();
-        if has_checkpoint_work && !welcome_only_checkpoint {
+        // A committed save of seen inputs alone changed nothing an analyzer
+        // follows. Every ignored relay replay ends in one, so recording it
+        // would add a row per replayed message (mdk#3300). A failed save keeps
+        // its row.
+        let inputs_only_checkpoint = result.is_ok()
+            && changed_groups == 0
+            && pending_acks == 0
+            && pending_frontiers == 0
+            && created_group_id_hex.is_none();
+        if has_checkpoint_work && !welcome_only_checkpoint && !inputs_only_checkpoint {
             self.record_v5_app_checkpoint(super::audit_v5_app_update::CheckpointObservation {
                 message_ref,
                 changed_groups,
@@ -6590,6 +4656,43 @@ impl AppClient {
             });
         }
         result
+    }
+
+    /// A skipped checkpoint still invalidates the chat list when another
+    /// connection committed since the last checkpoint: the save it replaces marked
+    /// the list stale, and that was how a change another runtime made, such
+    /// as archiving a chat, reached this runtime's warmed list. The first
+    /// skip after open, or after a failed read, has no version to compare
+    /// and invalidates too. Commits by this process's engine connection also
+    /// move the version, so this can invalidate more often than needed,
+    /// never less.
+    fn invalidate_chat_list_after_foreign_commit(
+        &mut self,
+        storage: Option<storage_sqlite::SqliteAccountStorage>,
+    ) {
+        let version =
+            storage.and_then(|storage| storage.app_storage().foreign_commit_version().ok());
+        // An unknown previous version, the first skip after open or after a
+        // failed read, cannot rule out a foreign commit before it, so it
+        // invalidates too: at most one extra rebuild per open.
+        let invalidate = version.is_none() || self.observed_commit_version != version;
+        if invalidate {
+            self.app.invalidate_chat_list_projection(&self.state.label);
+        }
+        self.observed_commit_version = version;
+        // Zero-duration counts: how often a skip still costs a chat-list
+        // rebuild tells whether something commits on idle ticks.
+        if let Some(telemetry) = self.runtime_telemetry.as_ref() {
+            telemetry.record_runtime(
+                if invalidate {
+                    RuntimeOp::ProjectionCheckpointSkippedInvalidated
+                } else {
+                    RuntimeOp::ProjectionCheckpointSkipped
+                },
+                std::time::Duration::ZERO,
+                TelemetryOutcome::Success,
+            );
+        }
     }
 
     /// Withdraw app rows when the engine actually discarded this device's queue.
@@ -6695,6 +4798,11 @@ impl AppClient {
                     leaves,
                     departed_members,
                 )?;
+                let leaves = leaves
+                    .iter()
+                    .map(|leaf| leaf.leaf_index)
+                    .collect::<Vec<_>>();
+                self.forget_push_repair_leaves(group_id, &leaves);
             }
             cgka_traits::engine::GroupEvent::LocalGroupCopyTerminated {
                 group_id,
@@ -6706,6 +4814,8 @@ impl AppClient {
                     .stored_group_self_membership(&self.state.label, &group_id_hex)?;
                 let membership = if *voluntary || existing == Some(SelfMembership::Left) {
                     SelfMembership::Left
+                } else if self.account_keeps_a_leaf(group_id)? {
+                    SelfMembership::DeviceRemoved
                 } else {
                     SelfMembership::Removed
                 };
@@ -6732,9 +4842,8 @@ impl AppClient {
                 if !self.has_local_group_deletion_frontier(group_id)?
                     && !self
                         .runtime
-                        .session()
                         .leave_in_progress(group_id)
-                        .map_err(cgka_session::SessionError::from)? =>
+                        .map_err(marmot_session::SessionError::from)? =>
             {
                 routes_dirty |= self.restore_canonical_self_membership(group_id)?;
             }
@@ -6757,11 +4866,25 @@ impl AppClient {
                 .app
                 .remove_stale_group_push_tokens(&self.state.label, &group_id_hex, &[]);
         }
+        if let Some(group_id) = super::push::member_add_group(event) {
+            self.queue_push_registration_share_after_member_added(group_id)?;
+        }
+        self.note_own_member_add(event);
         self.invalidate_terminal_pending_sends(event, summary, cleanup)?;
         if let Some(group_id) = self_arrival_group(event) {
             routes_dirty |= self.restore_joined_self_membership(group_id)?;
         }
         Ok(routes_dirty)
+    }
+
+    /// Whether this device's copy of the group is removed while the account
+    /// still has a leaf in it: a removal of this device alone, which is not a
+    /// removal of the account from the group (mdk#2628 D62). A removed copy
+    /// keeps the members the removal left.
+    pub(crate) fn account_keeps_a_leaf(&self, group_id: &GroupId) -> Result<bool, AppError> {
+        let record = self.runtime.group_record(group_id)?;
+        let self_id = self.runtime.self_id();
+        Ok(record.removed && record.members.iter().any(|member| member.id == self_id))
     }
 
     /// Restore departed projections from canonical local-device state, without a timeline invitation.
@@ -6771,23 +4894,21 @@ impl AppClient {
         group_id: &GroupId,
     ) -> Result<bool, AppError> {
         let group_id_hex = hex::encode(group_id.as_slice());
-        if !matches!(
-            self.app
-                .stored_group_self_membership(&self.state.label, &group_id_hex)?,
-            Some(SelfMembership::Left | SelfMembership::Removed)
-        ) || self.runtime.group_record(group_id)?.is_terminal()
+        if !self
+            .app
+            .stored_group_self_membership(&self.state.label, &group_id_hex)?
+            .is_some_and(SelfMembership::departed)
+            || self.runtime.group_record(group_id)?.is_terminal()
             || self.has_local_group_deletion_frontier(group_id)?
             || self
                 .runtime
-                .session()
                 .leave_in_progress(group_id)
-                .map_err(cgka_session::SessionError::from)?
+                .map_err(marmot_session::SessionError::from)?
         {
             return Ok(false);
         }
         if self
             .runtime
-            .session()
             .canonical_group_membership(group_id)?
             .local_leaf_active
         {
@@ -6801,11 +4922,10 @@ impl AppClient {
     /// Canonical restoration repairs membership while preserving local archive intent.
     fn restore_canonical_self_membership(&mut self, group_id: &GroupId) -> Result<bool, AppError> {
         let group_id_hex = hex::encode(group_id.as_slice());
-        let departed = matches!(
-            self.app
-                .stored_group_self_membership(&self.state.label, &group_id_hex)?,
-            Some(SelfMembership::Left | SelfMembership::Removed)
-        );
+        let departed = self
+            .app
+            .stored_group_self_membership(&self.state.label, &group_id_hex)?
+            .is_some_and(SelfMembership::departed);
         if !departed {
             return Ok(false);
         }
@@ -6858,7 +4978,9 @@ impl AppClient {
             group.self_membership = SelfMembership::Member;
         }
         self.mark_group_projection_dirty(group_id);
-        self.app.presentation_signals.wake();
+        // The durable restore already changed what the chat-list row shows:
+        // rebuild it on the next read instead of after the next save.
+        self.app.invalidate_chat_list_projection(&self.state.label);
     }
 
     fn display_names_for_events(
@@ -6894,7 +5016,7 @@ impl AppClient {
     #[cfg(test)]
     async fn observe_account_device_effects(
         &mut self,
-        effects: &marmot_account::AccountDeviceEffects,
+        effects: &marmot_session::AccountDeviceEffects,
         summary: &mut SyncSummary,
         source_message_id_hex: &str,
         source_received_at: u64,
@@ -6920,7 +5042,7 @@ impl AppClient {
 
     fn observe_account_device_effects_inner(
         &mut self,
-        effects: &marmot_account::AccountDeviceEffects,
+        effects: &marmot_session::AccountDeviceEffects,
         summary: &mut SyncSummary,
         source_message_id_hex: &str,
         source_received_at: u64,
@@ -6944,6 +5066,7 @@ impl AppClient {
                 &progress.deferred_groups,
                 event_progress.projected,
                 summary,
+                |group_id| self.host_may_see_group(group_id),
             ) {
                 event_progress.completed = true;
                 continue;
@@ -7032,10 +5155,22 @@ impl AppClient {
                 ) {
                     self.project_received_message(
                         message,
+                        event_sender_leaf(event),
                         event_encrypted_media_secret(event),
                         group_metadata.as_ref(),
                         &mut event_summary,
                     )?;
+                }
+                match event {
+                    cgka_traits::engine::GroupEvent::GroupJoined {
+                        group_id,
+                        via_welcome,
+                        ..
+                    } => self.note_invitation_admission(group_id, Some(via_welcome))?,
+                    cgka_traits::engine::GroupEvent::GroupCreated { group_id } => {
+                        self.note_invitation_admission(group_id, None)?
+                    }
+                    _ => {}
                 }
                 let updated_group =
                     event_group_id(event).and_then(|group_id| self.state_group_record(group_id));
@@ -7052,7 +5187,7 @@ impl AppClient {
                 );
                 if previous_group != updated_group
                     && let Some(probe) = &mut self.audit_v5_probe
-                    && (self.runtime.session().audit_v5_enabled() || cfg!(test))
+                    && (self.audit.records_v5() || cfg!(test))
                 {
                     probe.projected(event, marmot_forensics::v5::UpdateCause::WelcomeJoin);
                 }
@@ -7207,7 +5342,10 @@ fn self_arrival_group(event: &cgka_traits::engine::GroupEvent) -> Option<&GroupI
 #[cfg(test)]
 mod live_cursor_checkpoint_tests {
     use super::SyncSummary;
-    use crate::tests::{LiveCursorFixture, inject_epoch_gap_probe, run_composed_app_runtime_test};
+    use crate::tests::{
+        LiveCursorFixture, inject_epoch_gap_probe, run_composed_app_runtime_test,
+        run_composed_app_runtime_test_on_one_thread,
+    };
 
     /// Queue a newer delivery ahead of an older one, as relays replay stored
     /// history newest-first, and arm the older one's ingest to fail. Returns
@@ -7244,7 +5382,6 @@ mod live_cursor_checkpoint_tests {
             fixture
                 .client
                 .subscription_rebuild_since()
-                .unwrap()
                 .is_some_and(|since| since.0 <= failed.created_at),
             "the restart's subscriptions start at or below it"
         );
@@ -7400,37 +5537,6 @@ mod live_cursor_checkpoint_tests {
         });
     }
 
-    /// The startup receive checkpoints the applied prefix when a delivery
-    /// fails to ingest, as the drain does. The newer delivery's live
-    /// promotion already stopped at the queued older one, and the failure's
-    /// checkpoint must not pass the older one either.
-    #[test]
-    fn a_startup_receive_checkpoint_after_a_failed_older_ingest_still_covers_it() {
-        run_composed_app_runtime_test("startup-failed-older-ingest", || async {
-            let mut fixture = LiveCursorFixture::open().await;
-            let older = queue_newest_first_with_a_failing_older(&mut fixture).await;
-            for expect_failure in [false, true] {
-                let received = tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    fixture.client.receive_next_delivery(),
-                )
-                .await
-                .expect("a delivery is ready")
-                .unwrap();
-                let transport_nostr::AccountDeliveryReceive::Delivery(delivery) = received else {
-                    panic!("a live delivery must not produce a control record");
-                };
-                let result = fixture
-                    .client
-                    .ingest_received_delivery_with_partial(*delivery)
-                    .await;
-                assert_eq!(result.is_err(), expect_failure);
-                assert_eq!(fixture.persisted(), Some(older.created_at + 120));
-            }
-            a_stop_still_admits(fixture, older).await;
-        });
-    }
-
     /// A drain checkpoint a fence held reaches nothing of its own. The cursor
     /// it re-persists came from an earlier live promotion, so it must not
     /// become the settled floor, or the router would queue what only that
@@ -7439,6 +5545,7 @@ mod live_cursor_checkpoint_tests {
     fn a_fenced_drain_checkpoint_keeps_spilling_what_live_promotion_exposed() {
         run_composed_app_runtime_test("live-cursor-fenced-drain", || async {
             let mut fixture = LiveCursorFixture::open().await;
+            let (spill_gate, writing) = fixture.hold_spill_writes();
             let cursor_before = fixture.cursor_before;
             let promoting = fixture.probe(cursor_before + 4_000, "promoting");
             queue_in_order(&fixture, [promoting.clone()]).await;
@@ -7452,13 +5559,15 @@ mod live_cursor_checkpoint_tests {
             let second = fixture
                 .delivery(fixture.probe(cursor_before + 1_001, "second"))
                 .await;
-            // The spill writer has not run yet, so its hand-off fences the
-            // drain checkpoint that follows, which a later ingest would
-            // otherwise have moved past the live promotion.
+            // Hold the real spill write through the checkpoint. Even a writer
+            // scheduled immediately must leave its hand-off fencing the cursor.
             fixture
                 .app
                 .relay_plane
                 .route_account_delivery_for_test(first);
+            tokio::time::timeout(std::time::Duration::from_secs(5), writing.notified())
+                .await
+                .expect("the spill writer reaches its store gate");
             assert!(fixture.client.adapter.delivery_loss_blocks_cursor());
             fixture.client.state.last_transport_timestamp = Some(cursor_before + 5_000);
             fixture
@@ -7480,6 +5589,7 @@ mod live_cursor_checkpoint_tests {
                     .is_none(),
                 "a delivery only the live promotion exposed is still spilled"
             );
+            drop(spill_gate);
             tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 while fixture
                     .app
@@ -7503,56 +5613,62 @@ mod live_cursor_checkpoint_tests {
     /// would lose it, since the restart re-subscribes above it.
     #[test]
     fn a_delivery_arriving_during_a_drain_checkpoint_save_survives_a_stop() {
-        run_composed_app_runtime_test("drain-checkpoint-arrival-during-save", || async {
-            let mut fixture = LiveCursorFixture::open().await;
-            let cursor_before = fixture.cursor_before;
-            // A drained prefix: admitted without promoting, as a drain's
-            // ingests are until its checkpoint.
-            let drained = fixture
-                .delivery(fixture.probe(cursor_before + 4_000, "drained"))
-                .await;
-            fixture
-                .client
-                .admit_recovered_delivery(&drained, crate::client::sync::InventoryWrite::Immediate)
-                .await
-                .unwrap();
-            assert_eq!(
-                fixture.client.state.last_transport_timestamp,
-                Some(cursor_before + 4_000)
-            );
-            assert_eq!(fixture.persisted(), Some(cursor_before));
-
-            let late_at = cursor_before + 1_000;
-            let late = fixture.probe(late_at, "late");
-            let delivery = fixture.delivery(late.clone()).await;
-            fixture.land_during_seal(crate::client::CursorSeal::After, delivery);
-            fixture
-                .client
-                .checkpoint_sync_prefix(&mut SyncSummary::default(), false, 1)
-                .await
-                .unwrap_or_else(|_| panic!("the checkpoint saves"));
-
-            let persisted = fixture.persisted();
-            assert_eq!(persisted, Some(cursor_before + 4_000));
-            assert!(
-                fixture
-                    .app
-                    .relay_plane
-                    .subscription_rebuild_since(persisted)
-                    .is_some_and(|since| since.0 > late_at),
-                "the regression needs a restart floor above the late delivery"
-            );
-            assert!(
+        run_composed_app_runtime_test_on_one_thread(
+            "drain-checkpoint-arrival-during-save",
+            || async {
+                let mut fixture = LiveCursorFixture::open().await;
+                let cursor_before = fixture.cursor_before;
+                // A drained prefix: admitted without promoting, as a drain's
+                // ingests are until its checkpoint.
+                let drained = fixture
+                    .delivery(fixture.probe(cursor_before + 4_000, "drained"))
+                    .await;
                 fixture
                     .client
-                    .adapter
-                    .try_receive_account_delivery()
-                    .is_none(),
-                "the queue never holds a delivery below the checkpoint's floor"
-            );
-            fixture.wait_for_spilled(&late.id).await;
-            fixture.reopen_and_admit_spilled(&late.id).await;
-        });
+                    .admit_recovered_delivery(
+                        &drained,
+                        crate::client::sync::InventoryWrite::Immediate,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    fixture.client.state.last_transport_timestamp,
+                    Some(cursor_before + 4_000)
+                );
+                assert_eq!(fixture.persisted(), Some(cursor_before));
+
+                let late_at = cursor_before + 1_000;
+                let late = fixture.probe(late_at, "late");
+                let delivery = fixture.delivery(late.clone()).await;
+                fixture.land_during_seal(crate::client::CursorSeal::After, delivery);
+                fixture
+                    .client
+                    .checkpoint_sync_prefix(&mut SyncSummary::default(), false, 1)
+                    .await
+                    .unwrap_or_else(|_| panic!("the checkpoint saves"));
+
+                let persisted = fixture.persisted();
+                assert_eq!(persisted, Some(cursor_before + 4_000));
+                assert!(
+                    fixture
+                        .app
+                        .relay_plane
+                        .subscription_rebuild_since(persisted)
+                        .is_some_and(|since| since.0 > late_at),
+                    "the regression needs a restart floor above the late delivery"
+                );
+                assert!(
+                    fixture
+                        .client
+                        .adapter
+                        .try_receive_account_delivery()
+                        .is_none(),
+                    "the queue never holds a delivery below the checkpoint's floor"
+                );
+                fixture.wait_for_spilled(&late.id).await;
+                fixture.reopen_and_admit_spilled(&late.id).await;
+            },
+        );
     }
 
     /// Before its first cursor an account's restart relies on its
@@ -7562,7 +5678,7 @@ mod live_cursor_checkpoint_tests {
     /// admits it.
     #[test]
     fn an_older_arrival_during_an_accounts_first_checkpoint_survives_a_stop() {
-        run_composed_app_runtime_test("first-cursor-arrival-during-save", || async {
+        run_composed_app_runtime_test_on_one_thread("first-cursor-arrival-during-save", || async {
             let mut fixture = LiveCursorFixture::open_without_cursor().await;
             let cursor_before = fixture.cursor_before;
             let drained = fixture
@@ -7650,9 +5766,10 @@ mod runtime_group_subscription_refresh_tests {
     use std::sync::Arc;
 
     use super::{SyncCheckpointError, SyncSummary};
+    use crate::MarmotApp;
     use crate::tests::ScriptedPushRelayClient;
-    use crate::{AppPerformanceTelemetry, MarmotApp};
     use marmot_account::AccountHome;
+    use marmot_observability::PerformanceRecorder;
 
     /// A send can release a peer's route update without changing membership.
     /// Its retained observer must install that route and retry a failed rebuild.
@@ -7673,7 +5790,12 @@ mod runtime_group_subscription_refresh_tests {
             let app = MarmotApp::with_relay(dir.path(), "wss://old.example")
                 .with_test_relay_client(relay.clone());
             let mut client = app.client("alice").await.unwrap();
-            let group_id = client.create_group("retained routing", &[]).await.unwrap();
+            let group_id = client
+                .create_group("retained routing", &[])
+                .await
+                .unwrap()
+                .operation
+                .expect("eligible fixture members");
             let routes_before = client.routing.snapshot().group_routes;
             let subscriptions_before = relay.subscription_count();
             let next_route =
@@ -7737,6 +5859,7 @@ mod runtime_group_subscription_refresh_tests {
         let key = app
             .sqlcipher_key("alice", &keys, &path, crate::SqlcipherDatabaseKind::Session)
             .unwrap();
+        storage_sqlite::expect_uncounted_writes_for_test(&path);
         let connection = rusqlite::Connection::open(path).unwrap();
         storage_sqlite::open_hardened_sqlcipher(
             &connection,
@@ -7759,14 +5882,24 @@ mod runtime_group_subscription_refresh_tests {
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
-        let forgotten = client.create_group("forgotten", &[]).await.unwrap();
-        let kept = client.create_group("kept", &[]).await.unwrap();
+        let forgotten = client
+            .create_group("forgotten", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
+        let kept = client
+            .create_group("kept", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let kept_hex = hex::encode(kept.as_slice());
         let connection = projection_fault_connection(&app);
         connection.execute_batch(&format!("CREATE TRIGGER fail_kept_removal BEFORE UPDATE OF self_membership ON account_groups
             WHEN NEW.group_id_hex = '{kept_hex}' AND NEW.self_membership = 'removed'
             BEGIN SELECT RAISE(FAIL, 'injected kept removal failure'); END;")).unwrap();
-        let mixed = marmot_account::AccountDeviceEffects {
+        let mixed = marmot_session::AccountDeviceEffects {
             events: [forgotten.clone(), kept.clone()]
                 .into_iter()
                 .map(|group_id| GroupEvent::LocalGroupCopyTerminated {
@@ -7783,14 +5916,14 @@ mod runtime_group_subscription_refresh_tests {
                 .await
                 .is_err()
         );
-        let forgotten_only = marmot_account::AccountDeviceEffects {
+        let forgotten_only = marmot_session::AccountDeviceEffects {
             events: vec![GroupEvent::LocalGroupCopyRestored {
                 group_id: forgotten.clone(),
             }],
             ..Default::default()
         };
         client.retain_effect_projection(&forgotten_only, "forgotten-source", 112, true);
-        let welcome = marmot_account::AccountDeviceEffects {
+        let welcome = marmot_session::AccountDeviceEffects {
             events: vec![GroupEvent::GroupJoined {
                 group_id: kept.clone(),
                 via_welcome: cgka_traits::MessageId::new(vec![0x75; 32]),
@@ -7879,7 +6012,7 @@ mod runtime_group_subscription_refresh_tests {
                     .with_test_relay_client(relay.clone());
                 let mut client = app.client("alice").await.unwrap();
                 client.prepare_transport().await.unwrap();
-                let telemetry = AppPerformanceTelemetry::default();
+                let telemetry = PerformanceRecorder::default();
                 let group = client
                     .create_group_with_options_and_telemetry(
                         "retry",
@@ -7889,6 +6022,8 @@ mod runtime_group_subscription_refresh_tests {
                     )
                     .await
                     .unwrap()
+                    .operation
+                    .expect("eligible fixture members")
                     .group_id;
                 // Leave the second route pending so this observer must install it.
                 client
@@ -7899,7 +6034,9 @@ mod runtime_group_subscription_refresh_tests {
                         &telemetry,
                     )
                     .await
-                    .unwrap();
+                    .unwrap()
+                    .operation
+                    .expect("eligible fixture members");
                 let group_hex = hex::encode(group.as_slice());
                 for (id, retention) in [
                     ("published-before-tail", None),
@@ -7948,9 +6085,10 @@ mod runtime_group_subscription_refresh_tests {
                         origin_commit_id: Some(cgka_traits::MessageId::new(vec![0x76; 32])),
                     }
                 };
-                let effects = marmot_account::AccountDeviceEffects {
+                let effects = marmot_session::AccountDeviceEffects {
                     events: vec![event.clone()],
-                    published_app_messages: vec![marmot_account::PublishedApplicationMessage {
+                    published_app_messages: vec![marmot_session::PublishedApplicationMessage {
+                        publication_observation: None,
                         group_id: group.clone(),
                         app_event_id: "published-before-tail".into(),
                         message_id: cgka_traits::MessageId::new(vec![0x77; 32]),
@@ -8045,8 +6183,18 @@ mod runtime_group_subscription_refresh_tests {
             MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
         let mut client = app.client("alice").await.unwrap();
         client.prepare_transport().await.unwrap();
-        let group = client.create_group("rejoined", &[]).await.unwrap();
-        let blocked = client.create_group("blocked", &[]).await.unwrap();
+        let group = client
+            .create_group("rejoined", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
+        let blocked = client
+            .create_group("blocked", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let group_hex = hex::encode(group.as_slice());
         let blocked_hex = hex::encode(blocked.as_slice());
         let path = app.account_storage_path("alice");
@@ -8054,6 +6202,7 @@ mod runtime_group_subscription_refresh_tests {
         let key = app
             .sqlcipher_key("alice", &keys, &path, crate::SqlcipherDatabaseKind::Session)
             .unwrap();
+        storage_sqlite::expect_uncounted_writes_for_test(&path);
         let connection = rusqlite::Connection::open(path).unwrap();
         storage_sqlite::open_hardened_sqlcipher(
             &connection,
@@ -8064,7 +6213,7 @@ mod runtime_group_subscription_refresh_tests {
         connection.execute_batch(&format!("CREATE TRIGGER fail_second_termination BEFORE UPDATE OF self_membership ON account_groups
             WHEN NEW.group_id_hex = '{blocked_hex}' AND NEW.self_membership = 'removed'
             BEGIN SELECT RAISE(FAIL, 'injected second termination failure'); END;")).unwrap();
-        let effects = marmot_account::AccountDeviceEffects {
+        let effects = marmot_session::AccountDeviceEffects {
             events: vec![
                 GroupEvent::LocalGroupCopyTerminated {
                     group_id: group.clone(),
@@ -8081,7 +6230,7 @@ mod runtime_group_subscription_refresh_tests {
             .observe_recovery_evidence_then_fail_if_publish_failed(&effects)
             .await
             .unwrap();
-        let rejoin = marmot_account::AccountDeviceEffects {
+        let rejoin = marmot_session::AccountDeviceEffects {
             events: vec![GroupEvent::GroupJoined {
                 group_id: group.clone(),
                 via_welcome: cgka_traits::MessageId::new(vec![0x77; 32]),
@@ -8170,7 +6319,7 @@ mod runtime_group_subscription_refresh_tests {
             .with_test_relay_client(relay.clone());
         let mut client = app.client("alice").await.unwrap();
         client.prepare_transport().await.unwrap();
-        let telemetry = AppPerformanceTelemetry::default();
+        let telemetry = PerformanceRecorder::default();
         client
             .create_group_with_options_and_telemetry(
                 "catch-up retry intent",
@@ -8179,7 +6328,9 @@ mod runtime_group_subscription_refresh_tests {
                 &telemetry,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
 
         relay.fail_next_subscribe();
         let mut summary = SyncSummary::default();
@@ -8197,6 +6348,55 @@ mod runtime_group_subscription_refresh_tests {
                 .unwrap()
         );
         assert!(!client.has_pending_runtime_group_subscription_refresh());
+    }
+
+    /// A failed runner preparation keeps the worker's runner out only until a
+    /// preparation succeeds. The paced refresh retry prepares again; a group
+    /// subscription that still fails after it keeps that refresh armed, but
+    /// not the runner out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_runner_preparation_waits_only_for_the_next_preparation() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(relay.clone());
+        let mut client = app.client("alice").await.unwrap();
+        client.prepare_transport().await.unwrap();
+        client
+            .create_group_with_options_and_telemetry(
+                "runner preparation retry",
+                &[],
+                crate::AppCreateGroupOptions::default(),
+                &PerformanceRecorder::default(),
+            )
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
+        assert!(client.recovery_runner_due());
+
+        client.fail_next_runner_preparation = true;
+        assert!(client.spawn_recovery_runner().await.is_none());
+        assert!(client.has_pending_runtime_group_subscription_refresh());
+        assert!(
+            !client.recovery_runner_due(),
+            "a failed preparation keeps the runner out"
+        );
+
+        relay.fail_next_subscribe();
+        client
+            .retry_pending_runtime_group_subscription_refresh()
+            .await
+            .expect_err("the group subscription still fails after the preparation");
+        assert!(client.has_pending_runtime_group_subscription_refresh());
+        assert!(
+            client.recovery_runner_due(),
+            "the retry prepared ownership, so the worker starts its runner"
+        );
+        assert!(client.spawn_recovery_runner().await.is_some());
     }
 
     /// Secondary route failures preserve command success and primary publication
@@ -8226,7 +6426,7 @@ mod runtime_group_subscription_refresh_tests {
                 .with_test_relay_client(relay.clone());
             let mut client = app.client("alice").await.unwrap();
             client.prepare_transport().await.unwrap();
-            let telemetry = AppPerformanceTelemetry::default();
+            let telemetry = PerformanceRecorder::default();
             let created = client
                 .create_group_with_options_and_telemetry(
                     "command observation",
@@ -8235,7 +6435,9 @@ mod runtime_group_subscription_refresh_tests {
                     &telemetry,
                 )
                 .await
-                .unwrap();
+                .unwrap()
+                .operation
+                .expect("eligible fixture members");
             client
                 .create_group_with_options_and_telemetry(
                     "pending install",
@@ -8244,12 +6446,14 @@ mod runtime_group_subscription_refresh_tests {
                     &telemetry,
                 )
                 .await
-                .unwrap();
+                .unwrap()
+                .operation
+                .expect("eligible fixture members");
             let group = created.group_id;
             let group_hex = hex::encode(group.as_slice());
             // Explicit projection fixture: force the post-canonical observer's
             // rebuild, independently of the requested command's publication.
-            let mut effects = marmot_account::AccountDeviceEffects {
+            let mut effects = marmot_session::AccountDeviceEffects {
                 events: vec![GroupEvent::LocalGroupCopyTerminated {
                     group_id: group.clone(),
                     voluntary: true,
@@ -8269,7 +6473,8 @@ mod runtime_group_subscription_refresh_tests {
                     },
                     origin_commit_id: Some(cgka_traits::MessageId::new(vec![0x73; 32])),
                 });
-                effects.failures.push(marmot_account::PublishFailure {
+                effects.failures.push(marmot_session::PublishFailure {
+                    oversized: None,
                     message_id: cgka_traits::MessageId::new(vec![0x74; 32]),
                     reason: "primary publication failure".into(),
                 });
@@ -8365,7 +6570,7 @@ mod runtime_group_subscription_refresh_tests {
             .with_test_relay_client(relay.clone());
         let mut client = app.client("alice").await.unwrap();
         client.prepare_transport().await.unwrap();
-        let telemetry = AppPerformanceTelemetry::default();
+        let telemetry = PerformanceRecorder::default();
         // The managed-runtime create, which defers the relay-side subscription
         // install to a later refresh (the worker performs it after replying).
         // The second group is that outstanding install: the drained disband
@@ -8379,7 +6584,9 @@ mod runtime_group_subscription_refresh_tests {
                 &telemetry,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         client
             .create_group_with_options_and_telemetry(
                 "drained retry bystander",
@@ -8388,9 +6595,11 @@ mod runtime_group_subscription_refresh_tests {
                 &telemetry,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
 
-        let effects = marmot_account::AccountDeviceEffects {
+        let effects = marmot_session::AccountDeviceEffects {
             events: vec![cgka_traits::engine::GroupEvent::GroupStateChanged {
                 group_id: created.group_id,
                 epoch: cgka_traits::EpochId(2),
@@ -8572,81 +6781,145 @@ pub(crate) fn epoch_stall_now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::DrainCounts;
-    use super::{
-        EpochBackfillReplayOutcome, TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS,
-        TransportReconciliationWork, epoch_backfill_terminal_rows, incomplete_full_history_repair,
-        order_reconciliation_pass, reconciliation_start_after_cursor,
-        transport_reconciliation_record,
-    };
+    use super::{incomplete_full_history_repair, transport_reconciliation_record};
     use crate::tests::{
-        ScriptedPushRelayClient, armed_group_ids, bounded_epoch_backfill_config,
-        client_on_app_relay_plane, make_group_terminal,
+        ScriptedPushRelayClient, armed_group_ids, client_on_app_relay_plane, make_group_terminal,
     };
     use crate::{MarmotApp, SyncFailureStage, SyncSummary};
     use marmot_account::AccountHome;
-    use marmot_forensics::EpochBackfillActivationOutcome;
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Duration;
 
-    /// Contract fixture: provide exhaustive, durably admitted endpoint proof.
-    /// Scripted SDK EOSE is deliberately insufficient to produce this proof.
-    fn qualify_epoch_obligation(
-        storage: &storage_sqlite::SqliteAppStorage,
-        grant: &crate::client::recovery::AttemptGrant,
-        group: &cgka_traits::GroupId,
-    ) -> bool {
-        use storage_sqlite::{
-            RecoveryEligibility, RecoveryEndpointCheckpoint, RecoveryScopeCheckpoint,
-            RecoveryScopeOutcome,
-        };
-        let obligation = grant
-            .plan()
-            .unwrap()
-            .iter()
-            .find(|obligation| {
-                obligation.cause == storage_sqlite::RecoveryCause::EpochGap
-                    && obligation.group_id.as_ref() == Some(group)
-            })
+    /// #2151: the projection must preserve the source key carried by an
+    /// authenticated reaction after retention retired the previous cached key.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn received_reaction_preserves_its_carried_media_source_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let account = AccountHome::open(dir.path())
+            .create_account("alice")
             .unwrap();
-        let checkpoints = obligation
-            .scopes
-            .iter()
-            .map(|scope| RecoveryScopeCheckpoint {
-                token: scope.token.clone(),
-                retained_known_event: false,
-                replay_admitted: false,
-                endpoints: scope
-                    .goal
-                    .required_endpoints
-                    .iter()
-                    .map(|endpoint| RecoveryEndpointCheckpoint {
-                        endpoint: endpoint.clone(),
-                        outcome: RecoveryScopeOutcome::Covered,
-                        exhaustive: true,
-                        admission_complete: true,
-                        first_boundary: false,
-                    })
-                    .collect(),
-            })
-            .collect::<Vec<_>>();
-        storage
-            .checkpoint_recovery_obligation(
-                &grant.fence,
-                grant.reservation.attempt_serial,
-                obligation.id,
-                &checkpoints,
-                RecoveryEligibility::Retry,
-            )
+        let app = MarmotApp::with_relay(dir.path(), "wss://reaction-projection.example")
+            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let group = client
+            .create_group("reaction key", &[])
+            .await
             .unwrap()
+            .operation
+            .expect("eligible fixture members");
+        let (source, secret) = client.encrypted_media_secret(&group).unwrap();
+        let carried = cgka_traits::EncryptedMediaSecret::new(secret);
+        let reference = crate::MediaAttachmentReference {
+            locators: vec![crate::MediaLocator {
+                kind: "blossom-v1".into(),
+                value: "https://media.example/party".into(),
+            }],
+            ciphertext_sha256: "11".repeat(32),
+            plaintext_sha256: "22".repeat(32),
+            nonce_hex: "33".repeat(12),
+            file_name: "party.png".into(),
+            media_type: "image/png".into(),
+            version: "encrypted-media-v2".into(),
+            source_epoch: source,
+            source_epoch_identity: None,
+            dim: None,
+            thumbhash: None,
+        };
+        let storage = app.account_storage("alice").unwrap();
+        let group_hex = hex::encode(group.as_slice());
+        // Retention can retire the current epoch's cached key before another
+        // attachment arrives in that same epoch. Use the real storage sweep to
+        // reach that state rather than inventing a future source epoch.
+        storage
+            .app_storage()
+            .record_app_event_with_retention(
+                &storage_sqlite::StoredAppEvent {
+                    group_id_hex: group_hex.clone(),
+                    message_id_hex: "51".repeat(32),
+                    source_message_id_hex: Some("52".repeat(32)),
+                    source_epoch: Some(source),
+                    direction: "received".into(),
+                    sender: account.account_id_hex.clone(),
+                    plaintext: String::new(),
+                    kind: 9,
+                    tags: vec![reference.imeta_tag()],
+                    recorded_at: 1,
+                    received_at: 1,
+                    origin_commit_id: None,
+                    moderation_grant: false,
+                },
+                Some(cgka_traits::app_event::AppMessageRetentionDecision {
+                    retention_seconds: 1,
+                    expires_at: Some(2),
+                }),
+            )
+            .unwrap();
+        storage
+            .app_storage()
+            .secure_prune_expired_app_events(&group_hex, 2, &account.account_id_hex, &|_, _| false)
+            .unwrap();
+        assert!(
+            storage
+                .app_storage()
+                .encrypted_media_epoch_secret(
+                    &hex::encode(group.as_slice()),
+                    cgka_traits::app_components::GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+                    source
+                )
+                .unwrap()
+                .is_none()
+        );
+        client
+            .project_received_message(
+                crate::ReceivedMessage {
+                    authority: None,
+                    message_id_hex: "41".repeat(32),
+                    source_message_id_hex: "42".repeat(32),
+                    sender: account.account_id_hex,
+                    sender_display_name: None,
+                    group_id: group.clone(),
+                    source_epoch: source,
+                    retention: None,
+                    plaintext: ":party:".into(),
+                    kind: 7,
+                    tags: vec![
+                        vec!["e".into(), "43".repeat(32)],
+                        vec![
+                            "emoji".into(),
+                            "party".into(),
+                            "https://media.example/party".into(),
+                        ],
+                        reference.imeta_tag(),
+                    ],
+                    recorded_at: 1,
+                    received_at: 1,
+                },
+                None,
+                Some(&carried),
+                None,
+                &mut SyncSummary::default(),
+            )
+            .unwrap();
+        let remembered = storage
+            .app_storage()
+            .encrypted_media_epoch_secret(
+                &hex::encode(group.as_slice()),
+                cgka_traits::app_components::GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+                source,
+            )
+            .unwrap();
+        assert!(
+            remembered.as_deref() == Some(carried.as_bytes()),
+            "reaction-only media must retain the authenticated source key"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn contested_fork_and_capacity_facts_keep_independent_recovery_demand() {
-        use crate::client::epoch_stall::BackfillDecision;
+    async fn contested_fork_evidence_keeps_independent_recovery_demand() {
+        use crate::client::history_recovery::epoch_stall::BackfillDecision;
         use cgka_traits::ingest::{DeferralLineage, IngestOutcome};
-        use marmot_forensics::{EpochBackfillExecutionSeam, EpochStallBackfillTrigger};
+        use marmot_forensics::EpochStallBackfillTrigger;
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())
             .create_account("alice")
@@ -8654,11 +6927,16 @@ mod tests {
         let app = MarmotApp::with_relay_and_config(
             dir.path(),
             "wss://relay.example",
-            bounded_epoch_backfill_config().with_dev_epoch_backfill_retry_backoff_ms(15_000),
+            crate::MarmotAppConfig::white_noise(),
         )
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = client_on_app_relay_plane(&app, "alice").await;
-        let group = client.create_group("evidence policy", &[]).await.unwrap();
+        let group = client
+            .create_group("evidence policy", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let epoch = client.runtime.group_record(&group).unwrap().epoch.0;
         let storage = app.account_storage("alice").unwrap().app_storage();
         let fork = IngestOutcome::TransportDeferred {
@@ -8684,13 +6962,10 @@ mod tests {
             BackfillDecision::Arm,
             EpochStallBackfillTrigger::UndecryptableThreshold,
         );
-        let grant = client
-            .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
-            .await
-            .unwrap()
-            .unwrap();
-        let retry = storage.recovery_retry_state().unwrap();
-        drop(grant);
+        assert_eq!(
+            client.refresh_pending_recovery().await.unwrap(),
+            super::EpochBackfillRunOutcome::Deferred
+        );
         client.pending_convergence_groups.clear();
         client.detect_epoch_stall(
             Some(group.clone()),
@@ -8700,35 +6975,108 @@ mod tests {
         );
         assert!(client.pending_convergence_groups.contains(&group));
         assert_eq!(storage.pending_epoch_backfill_intents().unwrap().len(), 1);
-        assert_eq!(storage.recovery_retry_state().unwrap(), retry);
+    }
+
+    /// A resource refusal arms an ordinary epoch gap whose first runner visit
+    /// begins at once. Every later refusal at that epoch, skipped or paced into
+    /// a local reassessment, leaves the gap's demand and visit to the runner's
+    /// own schedule: no re-arm, no wait, no wake.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_resource_refusal_arms_one_ordinary_runner_visit() {
+        use cgka_traits::ingest::{InboundResourceLimit, IngestOutcome};
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay_and_config(
+            dir.path(),
+            "wss://relay.example",
+            crate::MarmotAppConfig::white_noise(),
+        )
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        let group = client
+            .create_group("refused", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
+        let storage = app.account_storage("alice").unwrap().app_storage();
+        let refused = IngestOutcome::ResourceRefused {
+            group_id: group.clone(),
+            resource: InboundResourceLimit::TransportDeferredCapacity,
+        };
+        let wake = client.routing.recovery_runner_wake();
+        let wakes = || *wake.borrow();
+        let gap = || {
+            let demand = storage
+                .pending_recovery_demands()
+                .unwrap()
+                .into_iter()
+                .find(|demand| demand.cause == storage_sqlite::RecoveryCause::EpochGap)
+                .expect("the refusal armed an epoch gap");
+            let visit = storage.recovery_epoch_gap_retry(demand.ticket).unwrap();
+            (demand.ticket, demand.eligibility, visit)
+        };
+        let before = wakes();
+        client.detect_epoch_stall(
+            Some(group.clone()),
+            "refused-0",
+            &refused,
+            cgka_traits::transport::Timestamp(crate::unix_now_seconds()),
+        );
+        let (ticket, eligibility, visit) = gap();
+        assert_eq!(eligibility, storage_sqlite::RecoveryEligibility::Ready);
+        assert!(
+            visit.is_some_and(|visit| visit.in_progress && visit.visits == 1),
+            "the refusal's arm begins the runner's first visit"
+        );
+        assert_eq!(wakes(), before + 1);
         assert!(
             client
-                .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
-                .await
-                .unwrap()
-                .is_none()
+                .history_recovery
+                .test_state()
+                .pending_recovery_arm_writes
+                .is_empty()
         );
 
-        // A paced local reassessment can coincide with actual refusal. The
-        // local-work decision must not discard the separate pressure fact.
-        client.apply_backfill_decision(
-            &group,
-            epoch,
-            BackfillDecision::Reassess,
-            EpochStallBackfillTrigger::ResourceRefusal,
-        );
-        let demand = storage
-            .pending_recovery_demands()
-            .unwrap()
-            .into_iter()
-            .find(|demand| demand.cause == storage_sqlite::RecoveryCause::EpochGap)
-            .unwrap();
-        assert_eq!(
-            demand.eligibility,
-            storage_sqlite::RecoveryEligibility::WaitingCapacity
-        );
-        assert_eq!(storage.recovery_retry_state().unwrap(), retry);
+        // The cap stays full, so every further message is refused too: first
+        // skipped, then paced into a local reassessment on every refusal.
+        let refuse = |client: &mut crate::AppClient, index| {
+            client.detect_epoch_stall(
+                Some(group.clone()),
+                &format!("refused-{index}"),
+                &refused,
+                cgka_traits::transport::Timestamp(crate::unix_now_seconds()),
+            );
+        };
+        for index in 1..10 {
+            refuse(&mut client, index);
+        }
+        client.pending_convergence_groups.clear();
+        client.history_recovery.test_state().epoch_stall =
+            std::mem::take(&mut client.history_recovery.test_state().epoch_stall)
+                .with_wedge_rearm_interval_ms(0);
+        for index in 10..20 {
+            refuse(&mut client, index);
+        }
         assert!(client.pending_convergence_groups.contains(&group));
+        let (after, eligibility, still) = gap();
+        assert!(after == ticket, "a repeated refusal never re-arms the gap");
+        assert_eq!(eligibility, storage_sqlite::RecoveryEligibility::Ready);
+        assert_eq!(still, visit, "the runner alone moves its visit on");
+        assert_eq!(
+            wakes(),
+            before + 1,
+            "repeated refusals never wake the runner"
+        );
+        assert!(
+            client
+                .history_recovery
+                .test_state()
+                .pending_recovery_arm_writes
+                .is_empty()
+        );
     }
 
     /// A commit or retry can release several retained messages in one effects batch.
@@ -8751,8 +7099,13 @@ mod tests {
         let app = MarmotApp::with_relay(dir.path(), "wss://batch-projection.example")
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
-        let group_id = client.create_group("batch projection", &[]).await.unwrap();
-        let mut effects = marmot_account::AccountDeviceEffects::default();
+        let group_id = client
+            .create_group("batch projection", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
+        let mut effects = marmot_session::AccountDeviceEffects::default();
         let mut sources = HashMap::new();
         for index in 0..3 {
             let payload = crate::messages::encode_inner_event(
@@ -8787,6 +7140,7 @@ mod tests {
                     group_id: group_id.clone(),
                     message_id: sent.reports[0].message_id.clone(),
                     sender: MemberId::new(hex::decode(&account.account_id_hex).unwrap()),
+                    sender_leaf_index: None,
                     epoch: client.runtime.group_record(&group_id).unwrap().epoch,
                     payload,
                     retention: None,
@@ -8944,7 +7298,12 @@ mod tests {
             let app = MarmotApp::with_relay(dir.path(), "wss://backfill.example")
                 .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
             let mut client = app.client("alice").await.unwrap();
-            let group = client.create_group("seen tail", &[]).await.unwrap();
+            let group = client
+                .create_group("seen tail", &[])
+                .await
+                .unwrap()
+                .operation
+                .expect("eligible fixture members");
             let storage = app.account_storage("alice").unwrap();
             let ids = (0..5)
                 .map(|i| MessageId::new(vec![i; 32]))
@@ -8982,8 +7341,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn released_backfill_restore_preserves_owned_retry_progress_and_merges_new_work() {
-        use marmot_forensics::EpochBackfillExecutionSeam;
+    async fn released_backfill_restore_keeps_buffered_demand_and_merges_new_work() {
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())
             .create_account("alice")
@@ -8991,20 +7349,34 @@ mod tests {
         let app = MarmotApp::with_relay_and_config(
             dir.path(),
             "wss://backfill.example",
-            bounded_epoch_backfill_config().with_dev_epoch_backfill_retry_backoff_ms(15_000),
+            crate::MarmotAppConfig::white_noise(),
         )
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = client_on_app_relay_plane(&app, "alice").await;
-        let first = client.create_group("first demand", &[]).await.unwrap();
-        let second = client.create_group("second demand", &[]).await.unwrap();
+        let first = client
+            .create_group("first demand", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
+        let second = client
+            .create_group("second demand", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let buffered = client
             .create_group("failed persistence", &[])
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let added = client
             .create_group("new durable demand", &[])
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let storage = app.account_storage("alice").unwrap().app_storage();
         let intent =
             |group: &cgka_traits::GroupId, epoch| storage_sqlite::StoredEpochBackfillIntent {
@@ -9014,14 +7386,9 @@ mod tests {
         storage
             .arm_epoch_backfill_intents(&[intent(&first, 5), intent(&second, 7)])
             .unwrap();
-        let grant = client
-            .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
-            .await
-            .unwrap()
-            .unwrap();
-        drop(grant);
-        let retry = storage.recovery_retry_state().unwrap();
         client
+            .history_recovery
+            .test_state()
             .pending_recovery_arm_writes
             .insert(buffered.clone(), 8);
         storage
@@ -9030,21 +7397,30 @@ mod tests {
         client.restore_persisted_epoch_backfill_intents(
             storage.pending_epoch_backfill_intents().unwrap(),
         );
-        assert_eq!(client.pending_recovery_arm_writes.get(&buffered), Some(&8));
-        assert_eq!(storage.recovery_retry_state().unwrap(), retry);
+        assert_eq!(
+            client
+                .history_recovery
+                .test_state()
+                .pending_recovery_arm_writes
+                .get(&buffered),
+            Some(&8)
+        );
         // Older observations cannot regress epochs; a new observation joins
-        // the existing row without resetting the account's paid retry cost.
+        // the existing row.
         storage
             .arm_epoch_backfill_intents(&[intent(&first, 4), intent(&second, 9), intent(&added, 2)])
             .unwrap();
+        assert_eq!(
+            client.refresh_pending_recovery().await.unwrap(),
+            super::EpochBackfillRunOutcome::Deferred
+        );
         assert!(
             client
-                .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
-                .await
-                .unwrap()
-                .is_none()
+                .history_recovery
+                .test_state()
+                .pending_recovery_arm_writes
+                .is_empty()
         );
-        assert!(client.pending_recovery_arm_writes.is_empty());
         let epochs = storage
             .pending_epoch_backfill_intents()
             .unwrap()
@@ -9060,7 +7436,6 @@ mod tests {
                 (hex::encode(added.as_slice()), 3),
             ])
         );
-        assert_eq!(storage.recovery_retry_state().unwrap(), retry);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9075,7 +7450,12 @@ mod tests {
         let app = MarmotApp::with_relay(dir.path(), "wss://backfill.example")
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
-        let group = client.create_group("reload failure", &[]).await.unwrap();
+        let group = client
+            .create_group("reload failure", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let storage = app.account_storage("alice").unwrap();
         let raw = MessageRecord {
             id: MessageId::new(vec![0xfd; 32]),
@@ -9097,7 +7477,12 @@ mod tests {
                 cgka_traits::storage::StorageError::Busy(_)
             ))
         ));
-        assert!(client.released_backfill_reload_pending);
+        assert!(
+            client
+                .history_recovery
+                .test_state()
+                .released_backfill_reload_pending
+        );
         assert!(!client.seen_events_index.contains(&id_hex));
         assert!(!client.state.seen_events.contains(&id_hex));
         assert!(
@@ -9128,7 +7513,12 @@ mod tests {
                 .is_empty()
         );
         assert!(client.has_pending_epoch_backfill());
-        assert!(!client.released_backfill_reload_pending);
+        assert!(
+            !client
+                .history_recovery
+                .test_state()
+                .released_backfill_reload_pending
+        );
         let pending = storage
             .app_storage()
             .pending_epoch_backfill_intents()
@@ -9149,148 +7539,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn older_backfill_completion_preserves_released_intent_across_reopen() {
-        use cgka_traits::storage::MessageStorage;
-        use cgka_traits::{EpochId, MessageId, MessageRecord, MessageState};
-        use marmot_forensics::EpochBackfillExecutionSeam;
-        for epoch_increment in [0, 1] {
-            let dir = tempfile::tempdir().unwrap();
-            AccountHome::open(dir.path())
-                .create_account("alice")
-                .unwrap();
-            let app = MarmotApp::with_relay_and_config(
-                dir.path(),
-                "wss://backfill.example",
-                bounded_epoch_backfill_config(),
-            )
-            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
-            let mut client = client_on_app_relay_plane(&app, "alice").await;
-            let group = client
-                .create_group("release during replay", &[])
-                .await
-                .unwrap();
-            let epoch = client.group_mls_state(&group).unwrap().epoch;
-            let storage = app.account_storage("alice").unwrap();
-            storage
-                .app_storage()
-                .arm_epoch_backfill_intents(&[storage_sqlite::StoredEpochBackfillIntent {
-                    group_id_hex: hex::encode(group.as_slice()),
-                    stalled_epoch: epoch,
-                }])
-                .unwrap();
-            let grant = client
-                .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
-                .await
-                .unwrap()
-                .unwrap();
-            let raw = MessageRecord {
-                id: MessageId::new(vec![0xfe; 32]),
-                group_id: group.clone(),
-                epoch: EpochId(epoch + epoch_increment),
-                state: MessageState::PeelDeferred,
-                payload: Vec::new(),
-                deferred_peel: None,
-            };
-            storage.put_message(&raw).unwrap();
-            storage.release_message_for_replay(&raw).unwrap();
-            client.reconcile_released_transport_receipts().unwrap();
-            assert!(
-                !qualify_epoch_obligation(&storage.app_storage(), &grant, &group),
-                "old qualified coverage cannot clear newly released input"
-            );
-            let retry = storage.app_storage().recovery_retry_state().unwrap();
-            drop(grant);
-            drop(client);
-            let mut reopened = client_on_app_relay_plane(&app, "alice").await;
-            let pending = storage
-                .app_storage()
-                .pending_epoch_backfill_intents()
-                .unwrap();
-            assert_eq!(pending.len(), 1);
-            assert_eq!(pending[0].stalled_epoch, epoch + epoch_increment);
-            assert_eq!(
-                storage
-                    .app_storage()
-                    .recovery_retry_state()
-                    .unwrap()
-                    .attempt_serial,
-                retry.attempt_serial
-            );
-            let mut permit = crate::client::recovery::ExplicitRecoveryPermit::default();
-            let next = reopened
-                .authorize_account_recovery(
-                    Some(&mut permit),
-                    EpochBackfillExecutionSeam::ExplicitCatchUp,
-                )
-                .await
-                .unwrap()
-                .unwrap();
-            assert!(qualify_epoch_obligation(
-                &storage.app_storage(),
-                &next,
-                &group
-            ));
-            assert!(
-                storage
-                    .app_storage()
-                    .pending_epoch_backfill_intents()
-                    .unwrap()
-                    .is_empty()
-            );
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn older_backfill_completion_still_clears_groups_without_new_work() {
-        use marmot_forensics::EpochBackfillExecutionSeam;
-        let dir = tempfile::tempdir().unwrap();
-        AccountHome::open(dir.path())
-            .create_account("alice")
-            .unwrap();
-        let app = MarmotApp::with_relay_and_config(
-            dir.path(),
-            "wss://backfill.example",
-            bounded_epoch_backfill_config(),
-        )
-        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
-        let mut client = client_on_app_relay_plane(&app, "alice").await;
-        let changed = client
-            .create_group("changed obligation", &[])
-            .await
-            .unwrap();
-        let finished = client
-            .create_group("compatible obligation", &[])
-            .await
-            .unwrap();
-        let storage = app.account_storage("alice").unwrap().app_storage();
-        let intent =
-            |group: &cgka_traits::GroupId, epoch| storage_sqlite::StoredEpochBackfillIntent {
-                group_id_hex: hex::encode(group.as_slice()),
-                stalled_epoch: epoch,
-            };
-        storage
-            .arm_epoch_backfill_intents(&[intent(&changed, 0), intent(&finished, 0)])
-            .unwrap();
-        let grant = client
-            .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
-            .await
-            .unwrap()
-            .unwrap();
-        storage
-            .arm_epoch_backfill_intents(&[intent(&changed, 1)])
-            .unwrap();
-        assert!(!qualify_epoch_obligation(&storage, &grant, &changed));
-        assert!(
-            qualify_epoch_obligation(&storage, &grant, &finished),
-            "an unrelated obligation revision cannot erase compatible proof"
-        );
-        let remaining = storage.pending_epoch_backfill_intents().unwrap();
-        assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].group_id_hex, hex::encode(changed.as_slice()));
-        assert_eq!(remaining[0].stalled_epoch, 1);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn terminal_group_backfill_intents_are_not_rearmed_on_restore() {
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())
@@ -9299,9 +7547,24 @@ mod tests {
         let app = MarmotApp::with_relay(dir.path(), "wss://backfill.example")
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
-        let live = client.create_group("still a member", &[]).await.unwrap();
-        let removed = client.create_group("removed device", &[]).await.unwrap();
-        let disbanded = client.create_group("disbanded group", &[]).await.unwrap();
+        let live = client
+            .create_group("still a member", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
+        let removed = client
+            .create_group("removed device", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
+        let disbanded = client
+            .create_group("disbanded group", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let storage = app.account_storage("alice").unwrap().app_storage();
 
         let mut armed = armed_backfill(&live, 4);
@@ -9327,14 +7590,10 @@ mod tests {
         );
     }
 
-    /// The mixed case, observed through the production entry point. Retry
-    /// pacing is the seam's own way of stopping short of a replay, so the drop
-    /// is visible without paying for one: the live group survives the pass and
-    /// is what the cooldown is still holding.
+    /// The mixed case, observed through the production recovery seam: the
+    /// live group survives the pass and stays owed to the recovery runner.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_backfill_run_drops_every_group_that_became_terminal() {
-        use marmot_forensics::EpochBackfillExecutionSeam;
-
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())
             .create_account("alice")
@@ -9342,9 +7601,24 @@ mod tests {
         let app = MarmotApp::with_relay(dir.path(), "wss://backfill.example")
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
-        let live = client.create_group("still a member", &[]).await.unwrap();
-        let departed = client.create_group("departed", &[]).await.unwrap();
-        let queued_departed = client.create_group("queued departed", &[]).await.unwrap();
+        let live = client
+            .create_group("still a member", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
+        let departed = client
+            .create_group("departed", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
+        let queued_departed = client
+            .create_group("queued departed", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let storage = app.account_storage("alice").unwrap().app_storage();
         let epoch = client.group_mls_state(&live).unwrap().epoch;
 
@@ -9353,34 +7627,19 @@ mod tests {
         let queued = armed_backfill(&queued_departed, epoch);
         client.persist_epoch_backfill_intent(&primary).unwrap();
         client.persist_epoch_backfill_intent(&queued).unwrap();
-        let grant = client
-            .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
-            .await
-            .unwrap()
-            .unwrap();
-        drop(grant);
-        let retry = storage.recovery_retry_state().unwrap();
 
         // Both groups turn terminal only after their intents were armed.
         make_group_terminal(&client, &departed, false);
         make_group_terminal(&client, &queued_departed, true);
 
-        assert!(matches!(
-            client
-                .run_pending_epoch_backfill(EpochBackfillExecutionSeam::Maintenance)
-                .await
-                .unwrap(),
-            crate::EpochBackfillRunOutcome::Deferred
-        ));
+        assert_eq!(
+            client.refresh_pending_recovery().await.unwrap(),
+            super::EpochBackfillRunOutcome::Deferred
+        );
         assert_eq!(
             armed_group_ids(&client),
             vec![live.clone()],
             "only the group this device is still a member of may stay armed"
-        );
-        assert_eq!(
-            storage.recovery_retry_state().unwrap(),
-            retry,
-            "terminal cleanup does not forgive the live group's retry cost"
         );
         assert_eq!(
             storage
@@ -9409,7 +7668,12 @@ mod tests {
         let app = MarmotApp::with_relay(dir.path(), "wss://backfill.example")
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
-        let departed = client.create_group("departed", &[]).await.unwrap();
+        let departed = client
+            .create_group("departed", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let storage = app.account_storage("alice").unwrap();
         let epoch = client.group_mls_state(&departed).unwrap().epoch;
         client
@@ -9442,59 +7706,11 @@ mod tests {
         );
     }
 
-    /// A wholly-terminal owner must stop reading as pending *before* the
-    /// account-wide cooldown gate, or it keeps `has_pending_epoch_backfill`
-    /// true for a whole backoff window — which is also what arms `next_event`
-    /// summaries and the forensic audit-upload schedule.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn wholly_terminal_intent_is_not_pending_under_retry_pacing() {
-        use marmot_forensics::EpochBackfillExecutionSeam;
-
-        let dir = tempfile::tempdir().unwrap();
-        AccountHome::open(dir.path())
-            .create_account("alice")
-            .unwrap();
-        let app = MarmotApp::with_relay(dir.path(), "wss://backfill.example")
-            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
-        let mut client = app.client("alice").await.unwrap();
-        let departed = client.create_group("departed", &[]).await.unwrap();
-        let epoch = client.group_mls_state(&departed).unwrap().epoch;
-        client
-            .persist_epoch_backfill_intent(&armed_backfill(&departed, epoch))
-            .unwrap();
-        let grant = client
-            .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
-            .await
-            .unwrap()
-            .unwrap();
-        drop(grant);
-        make_group_terminal(&client, &departed, false);
-
-        // Independent account-history demand may still be selected. Terminal
-        // retirement must remove this group's debt regardless of that outcome.
-        let _ = client
-            .run_pending_epoch_backfill(EpochBackfillExecutionSeam::Maintenance)
-            .await
-            .unwrap();
-        assert!(!client.has_pending_epoch_backfill());
-        assert!(!client.has_pending_epoch_backfill());
-        assert!(
-            app.account_storage("alice")
-                .unwrap()
-                .app_storage()
-                .pending_epoch_backfill_intents()
-                .unwrap()
-                .is_empty()
-        );
-    }
-
     /// The durable arm can sit at a later epoch than the in-memory intent
     /// holding it, so the clear must not key off the intent's epoch. Retiring
     /// the group's row retires it whatever epoch storage holds.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn terminal_group_row_clears_whatever_epoch_storage_holds() {
-        use marmot_forensics::EpochBackfillExecutionSeam;
-
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())
             .create_account("alice")
@@ -9502,13 +7718,20 @@ mod tests {
         let app = MarmotApp::with_relay(dir.path(), "wss://backfill.example")
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
-        let departed = client.create_group("departed", &[]).await.unwrap();
+        let departed = client
+            .create_group("departed", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let storage = app.account_storage("alice").unwrap().app_storage();
 
         client
             .persist_epoch_backfill_intent(&armed_backfill(&departed, 5))
             .unwrap();
         client
+            .history_recovery
+            .test_state()
             .pending_recovery_arm_writes
             .insert(departed.clone(), 5);
         // A later durable observation supersedes an older failed-write fact.
@@ -9521,12 +7744,7 @@ mod tests {
             .unwrap();
         make_group_terminal(&client, &departed, false);
 
-        // Independent account-history demand may still be selected. Terminal
-        // retirement must remove this group's debt regardless of that outcome.
-        let _ = client
-            .run_pending_epoch_backfill(EpochBackfillExecutionSeam::Maintenance)
-            .await
-            .unwrap();
+        client.refresh_pending_recovery().await.unwrap();
         assert!(!client.has_pending_epoch_backfill());
         assert!(
             storage.pending_epoch_backfill_intents().unwrap().is_empty(),
@@ -9540,7 +7758,7 @@ mod tests {
     /// row is retired by nothing else.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dropping_a_terminal_intent_also_retires_its_recovery_run() {
-        use marmot_forensics::{EpochBackfillExecutionSeam, EpochStallBackfillTrigger};
+        use marmot_forensics::EpochStallBackfillTrigger;
 
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())
@@ -9549,17 +7767,26 @@ mod tests {
         let app = MarmotApp::with_relay(dir.path(), "wss://backfill.example")
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
-        let departed = client.create_group("departed", &[]).await.unwrap();
+        let departed = client
+            .create_group("departed", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let storage = app.account_storage("alice").unwrap().app_storage();
         let epoch = client.group_mls_state(&departed).unwrap().epoch;
 
         // The detector opens the run; `apply_backfill_decision` only consumes
         // the decision it returns.
-        let decision = client.epoch_stall.observe_resource_refusal(
-            departed.clone(),
-            cgka_traits::EpochId(epoch),
-            crate::client::sync::epoch_stall_now_ms(),
-        );
+        let decision = client
+            .history_recovery
+            .test_state()
+            .epoch_stall
+            .observe_resource_refusal(
+                departed.clone(),
+                cgka_traits::EpochId(epoch),
+                crate::client::sync::epoch_stall_now_ms(),
+            );
         client.apply_backfill_decision(
             &departed,
             epoch,
@@ -9567,7 +7794,12 @@ mod tests {
             EpochStallBackfillTrigger::ResourceRefusal,
         );
         assert!(
-            client.epoch_stall.wedge_evidence(&departed).is_some(),
+            client
+                .history_recovery
+                .test_state()
+                .epoch_stall
+                .wedge_evidence(&departed)
+                .is_some(),
             "the arm must open a recovery run to retire"
         );
         assert_eq!(
@@ -9577,16 +7809,16 @@ mod tests {
         );
 
         make_group_terminal(&client, &departed, false);
-        // Independent account-history demand may still be selected. Terminal
-        // retirement must remove this group's debt regardless of that outcome.
-        let _ = client
-            .run_pending_epoch_backfill(EpochBackfillExecutionSeam::Maintenance)
-            .await
-            .unwrap();
+        client.refresh_pending_recovery().await.unwrap();
         assert!(!client.has_pending_epoch_backfill());
 
         assert!(
-            client.epoch_stall.wedge_evidence(&departed).is_none(),
+            client
+                .history_recovery
+                .test_state()
+                .epoch_stall
+                .wedge_evidence(&departed)
+                .is_none(),
             "the in-memory recovery run must be retired with the intent"
         );
         assert!(
@@ -9595,12 +7827,12 @@ mod tests {
         );
     }
 
-    /// A terminal transition during an authorized attempt invalidates its old
-    /// coverage and retires both demand and stall evidence, even without EOSE.
+    /// A terminal transition while the gap is owed retires both demand and
+    /// stall evidence, even without EOSE, and keeps what was admitted.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_replay_that_ends_terminal_escalates_nothing_and_leaves_no_evidence() {
-        use crate::client::epoch_stall::BackfillDecision;
-        use marmot_forensics::{EpochBackfillExecutionSeam, EpochStallBackfillTrigger};
+        use crate::client::history_recovery::epoch_stall::BackfillDecision;
+        use marmot_forensics::EpochStallBackfillTrigger;
         for (disbanded, admit_prefix) in
             [(false, false), (false, true), (true, false), (true, true)]
         {
@@ -9609,17 +7841,21 @@ mod tests {
             let (app, mut client, route) = crate::tests::undecryptable_probe_route(
                 &dir,
                 &relay,
-                bounded_epoch_backfill_config(),
+                crate::MarmotAppConfig::white_noise(),
             )
             .await;
             let group = route.group_id.clone();
             let epoch = client.group_mls_state(&group).unwrap().epoch;
             let storage = app.account_storage("alice").unwrap().app_storage();
-            let _ = client.epoch_stall.observe_resource_refusal(
-                group.clone(),
-                cgka_traits::EpochId(epoch),
-                super::epoch_stall_now_ms(),
-            );
+            let _ = client
+                .history_recovery
+                .test_state()
+                .epoch_stall
+                .observe_resource_refusal(
+                    group.clone(),
+                    cgka_traits::EpochId(epoch),
+                    super::epoch_stall_now_ms(),
+                );
             client.apply_backfill_decision(
                 &group,
                 epoch,
@@ -9627,11 +7863,6 @@ mod tests {
                 EpochStallBackfillTrigger::UndecryptableThreshold,
             );
             assert_eq!(storage.epoch_stall_evidence().unwrap().len(), 1);
-            let grant = client
-                .authorize_account_recovery(None, EpochBackfillExecutionSeam::Maintenance)
-                .await
-                .unwrap()
-                .unwrap();
             let admitted_id = if admit_prefix {
                 let delivery = route.probe(
                     crate::unix_now_seconds().saturating_sub(1),
@@ -9645,9 +7876,21 @@ mod tests {
             };
             make_group_terminal(&client, &group, disbanded);
             client.drop_settled_epoch_backfill_intents();
-            assert!(!qualify_epoch_obligation(&storage, &grant, &group));
-            assert!(client.pending_epoch_stall_escalations.is_empty());
-            assert!(client.epoch_stall.wedge_evidence(&group).is_none());
+            assert!(
+                client
+                    .history_recovery
+                    .test_state()
+                    .pending_epoch_stall_escalations
+                    .is_empty()
+            );
+            assert!(
+                client
+                    .history_recovery
+                    .test_state()
+                    .epoch_stall
+                    .wedge_evidence(&group)
+                    .is_none()
+            );
             assert!(storage.epoch_stall_evidence().unwrap().is_empty());
             assert!(storage.pending_epoch_backfill_intents().unwrap().is_empty());
             if let Some(id) = admitted_id {
@@ -9674,15 +7917,24 @@ mod tests {
         let app = MarmotApp::with_relay(dir.path(), "wss://backfill.example")
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
-        let departed = client.create_group("departed", &[]).await.unwrap();
+        let departed = client
+            .create_group("departed", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let storage = app.account_storage("alice").unwrap().app_storage();
         let epoch = client.group_mls_state(&departed).unwrap().epoch;
 
-        let decision = client.epoch_stall.observe_resource_refusal(
-            departed.clone(),
-            cgka_traits::EpochId(epoch),
-            crate::client::sync::epoch_stall_now_ms(),
-        );
+        let decision = client
+            .history_recovery
+            .test_state()
+            .epoch_stall
+            .observe_resource_refusal(
+                departed.clone(),
+                cgka_traits::EpochId(epoch),
+                crate::client::sync::epoch_stall_now_ms(),
+            );
         client.apply_backfill_decision(
             &departed,
             epoch,
@@ -9725,231 +7977,13 @@ mod tests {
             "the retried pass retires the durable evidence row"
         );
         assert!(
-            client.epoch_stall.wedge_evidence(&departed).is_none(),
+            client
+                .history_recovery
+                .test_state()
+                .epoch_stall
+                .wedge_evidence(&departed)
+                .is_none(),
             "the retried pass retires the in-memory run"
-        );
-    }
-
-    fn failed_replay_outcome() -> EpochBackfillReplayOutcome {
-        EpochBackfillReplayOutcome {
-            duration_ms: 1,
-            activation_outcome: EpochBackfillActivationOutcome::Succeeded,
-            error_kind: Some("backfill_drain_eose_timeout".to_string()),
-            completion_kind: None,
-            counts: DrainCounts::default(),
-        }
-    }
-
-    // "We looked and the group did not move" and "we could not look" are
-    // different facts and lead to different investigations. The after-read can
-    // fail on its own, so a row that reports `group_advanced: false` for an
-    // unread epoch asserts knowledge nobody has — which is what made the
-    // failed backfill rows untrustworthy in the field.
-    #[test]
-    fn an_unread_post_replay_epoch_is_reported_as_unobserved_not_as_no_advance() {
-        let group_id = cgka_traits::GroupId::new(vec![7u8; 16]);
-        let pending = armed_backfill(&group_id, 4);
-        let epochs_before = HashMap::from([(group_id.clone(), 4u64)]);
-        let epochs_after = HashMap::new();
-
-        let rows = epoch_backfill_terminal_rows(
-            &pending,
-            0,
-            &epochs_before,
-            &epochs_after,
-            &failed_replay_outcome(),
-        );
-
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].1.local_epoch_before, 4);
-        assert_eq!(rows[0].1.local_epoch_after, None);
-    }
-
-    // The observed case must keep saying exactly what it always said.
-    #[test]
-    fn an_observed_post_replay_epoch_still_reports_the_reading_it_took() {
-        let group_id = cgka_traits::GroupId::new(vec![7u8; 16]);
-        let pending = armed_backfill(&group_id, 4);
-        let epochs_before = HashMap::from([(group_id.clone(), 4u64)]);
-        let epochs_after = HashMap::from([(group_id.clone(), 4u64)]);
-
-        let rows = epoch_backfill_terminal_rows(
-            &pending,
-            0,
-            &epochs_before,
-            &epochs_after,
-            &failed_replay_outcome(),
-        );
-
-        assert_eq!(rows[0].1.local_epoch_after, Some(4));
-    }
-
-    /// A device wedged in more groups than one pass holds stays armed for as
-    /// long as it is wedged. Its routes must not take the whole pass, or the
-    /// durable cursor never advances and every other route — the local inbox
-    /// included — loses its by-id backstop for the duration.
-    #[test]
-    fn an_armed_intent_wider_than_the_pass_still_leaves_the_rotation_a_slot() {
-        let mut work = vec![TransportReconciliationWork::Inbox(Vec::new())];
-        work.extend((1..=6u8).map(|route| {
-            TransportReconciliationWork::Group(cgka_traits::TransportGroupSubscription {
-                group_id: cgka_traits::GroupId::new(vec![route; 16]),
-                transport_group_id: vec![route; 32],
-                endpoints: Vec::new(),
-                retained_since: None,
-            })
-        }));
-        let armed = (3..=6u8)
-            .map(|route| cgka_traits::GroupId::new(vec![route; 16]))
-            .collect::<std::collections::HashSet<_>>();
-
-        order_reconciliation_pass(
-            &mut work,
-            None,
-            &armed,
-            TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS,
-        );
-
-        let armed_routes = work
-            .iter()
-            .filter(|item| item.repairs_group_in(&armed))
-            .count();
-        assert_eq!(
-            armed_routes,
-            TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS - 1,
-            "the armed set must leave the rotation one slot"
-        );
-        assert!(
-            matches!(work.last(), Some(TransportReconciliationWork::Inbox(_))),
-            "the rotation keeps its slot, so the pass still advances the cursor"
-        );
-    }
-    /// Fairness under repetition. The pass caps how many armed routes it
-    /// takes, so a device armed for more groups than that cap must still reach
-    /// every armed route over successive passes. Production advances the
-    /// durable route cursor to the rotation progress the pass reports, so the
-    /// cursor a pass leaves behind is the one it returns.
-    #[test]
-    fn repeated_passes_reach_every_armed_route_beyond_the_pass_cap() {
-        let armed_ids = (3..=6u8)
-            .map(|route| cgka_traits::GroupId::new(vec![route; 16]))
-            .collect::<Vec<_>>();
-        let armed = armed_ids
-            .iter()
-            .cloned()
-            .collect::<std::collections::HashSet<_>>();
-        let mut cursor: Option<storage_sqlite::TransportReconciliationRoute> = None;
-        let mut reached = std::collections::HashSet::new();
-        let passes = 16usize;
-
-        for _ in 0..passes {
-            // Production rebuilds the work set from the routing snapshot every
-            // pass; only the durable cursor carries across passes.
-            let mut work = vec![TransportReconciliationWork::Inbox(Vec::new())];
-            work.extend((3..=6u8).map(|route| {
-                TransportReconciliationWork::Group(cgka_traits::TransportGroupSubscription {
-                    group_id: cgka_traits::GroupId::new(vec![route; 16]),
-                    transport_group_id: vec![route; 32],
-                    endpoints: Vec::new(),
-                    retained_since: None,
-                })
-            }));
-
-            let claim = order_reconciliation_pass(
-                &mut work,
-                cursor.as_ref(),
-                &armed,
-                TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS,
-            );
-
-            for item in &work {
-                if let TransportReconciliationWork::Group(group) = item {
-                    reached.insert(group.group_id.clone());
-                }
-            }
-            assert!(
-                claim.is_some(),
-                "a pass with routes must report rotation progress"
-            );
-            cursor = claim;
-        }
-
-        let starved = armed_ids
-            .iter()
-            .filter(|group_id| !reached.contains(*group_id))
-            .count();
-        assert_eq!(
-            starved, 0,
-            "every armed route must reconcile within {passes} passes, so the cap starves none"
-        );
-    }
-
-    /// The by-id pass an epoch-gap backfill runs ahead of its drain exists to
-    /// fetch history the account is missing. An armed intent names exactly the
-    /// groups that history belongs to, and the account-wide rotation lands on
-    /// them only by chance, so the pass takes them first and continues the
-    /// rotation over everything else.
-    #[test]
-    fn reconciliation_pass_takes_an_armed_backfill_route_ahead_of_the_rotation() {
-        let armed_group = cgka_traits::GroupId::new(vec![0xaa; 16]);
-        let mut work = vec![TransportReconciliationWork::Inbox(Vec::new())];
-        work.extend((1..=5u8).map(|route| {
-            TransportReconciliationWork::Group(cgka_traits::TransportGroupSubscription {
-                group_id: if route == 5 {
-                    armed_group.clone()
-                } else {
-                    cgka_traits::GroupId::new(vec![route; 16])
-                },
-                transport_group_id: vec![route; 32],
-                endpoints: Vec::new(),
-                retained_since: None,
-            })
-        }));
-
-        order_reconciliation_pass(
-            &mut work,
-            None,
-            &std::collections::HashSet::from([armed_group.clone()]),
-            TRANSPORT_RECONCILIATION_MAX_ROUTES_PER_PASS,
-        );
-
-        let selected = work
-            .iter()
-            .map(|item| match item {
-                TransportReconciliationWork::Inbox(_) => None,
-                TransportReconciliationWork::Group(group) => Some(group.group_id.clone()),
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            selected,
-            vec![
-                Some(armed_group),
-                None,
-                Some(cgka_traits::GroupId::new(vec![1; 16])),
-                Some(cgka_traits::GroupId::new(vec![2; 16])),
-            ],
-            "the armed route leads the pass and the rotation keeps the rest"
-        );
-    }
-
-    #[test]
-    fn reconciliation_cursor_rotates_past_a_slow_route_and_wraps() {
-        let routes = vec![
-            storage_sqlite::TransportReconciliationRoute::Inbox,
-            storage_sqlite::TransportReconciliationRoute::Group([0x01; 32]),
-            storage_sqlite::TransportReconciliationRoute::Group([0x02; 32]),
-        ];
-        assert_eq!(
-            reconciliation_start_after_cursor(&routes, Some(&routes[0])),
-            1
-        );
-        assert_eq!(
-            reconciliation_start_after_cursor(&routes, Some(&routes[1])),
-            2
-        );
-        assert_eq!(
-            reconciliation_start_after_cursor(&routes, Some(&routes[2])),
-            0
         );
     }
 
@@ -9981,7 +8015,7 @@ mod tests {
         };
 
         assert_eq!(
-            transport_reconciliation_record(&account, &delivery),
+            transport_reconciliation_record(&delivery),
             Some((
                 storage_sqlite::TransportReconciliationRoute::Group(route_id),
                 storage_sqlite::TransportReconciliationItem {
@@ -9991,7 +8025,7 @@ mod tests {
             ))
         );
         delivery.group_id_hint = None;
-        assert_eq!(transport_reconciliation_record(&account, &delivery), None);
+        assert_eq!(transport_reconciliation_record(&delivery), None);
     }
 
     // Pauses the clock, which needs the current-thread runtime.
@@ -10002,8 +8036,11 @@ mod tests {
             .create_account("alice")
             .unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
+        // The first drain runs before any relay has answered.
+        relay.hold_replies(Some(crate::tests::every_reply));
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(relay.clone());
+        relay.connect_relays(&["wss://relay.example"]).await;
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         client.sync_runtime_groups().await.unwrap();
         tokio::time::pause();
@@ -10011,13 +8048,7 @@ mod tests {
         client.sync_sdk_relay(None).await.unwrap();
         assert!(started.elapsed() >= crate::SDK_FIRST_SYNC_WAIT);
         assert!(started.elapsed() <= crate::SDK_FIRST_SYNC_WAIT + Duration::from_millis(1));
-        for subscription in relay.accepted_subscriptions() {
-            for endpoint in subscription.endpoints() {
-                app.relay_plane
-                    .handle_relay_eose_for_test(endpoint.clone(), subscription.subscription_id())
-                    .await;
-            }
-        }
+        relay.answer_held_replies().await;
         assert!(client.adapter.account_subscription_eose().await.complete());
         let started = tokio::time::Instant::now();
         client.sync_sdk_relay(None).await.unwrap();
@@ -10038,36 +8069,33 @@ mod tests {
             .create_account("alice")
             .unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
+        // One REQ is refused instead of answered.
+        relay.hold_replies(Some(crate::tests::every_reply));
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(relay.clone());
+        relay.connect_relays(&["wss://relay.example"]).await;
         let mut client = client_on_app_relay_plane(&app, "alice").await;
         client.sync_runtime_groups().await.unwrap();
         tokio::time::pause();
         client.sync_sdk_relay(None).await.unwrap();
         let subscriptions = relay.accepted_subscriptions();
-        let (refused, served) = subscriptions
-            .split_first()
+        let refused = subscriptions
+            .first()
             .expect("the account holds a subscription");
         for endpoint in refused.endpoints() {
-            app.relay_plane
-                .handle_relay_closed_for_test(
-                    endpoint.clone(),
-                    refused.subscription_id(),
-                    transport_nostr_adapter::SubscriptionRefusal {
-                        category: Some(cgka_traits::TransportEndpointRejectionCategory::Restricted),
-                        disposition:
-                            transport_nostr_adapter::SubscriptionRefusalDisposition::Dropped,
-                    },
+            relay
+                .close_subscription(
+                    endpoint,
+                    &refused.subscription_id(),
+                    "restricted: not served here",
                 )
                 .await;
         }
-        for subscription in served {
-            for endpoint in subscription.endpoints() {
-                app.relay_plane
-                    .handle_relay_eose_for_test(endpoint.clone(), subscription.subscription_id())
-                    .await;
-            }
-        }
+        // Every other relay answers.
+        let refused_id = refused.subscription_id();
+        relay
+            .release_held_replies(|subscription, _| subscription.subscription_id() != refused_id)
+            .await;
         let progress = client.adapter.account_subscription_eose().await;
         assert!(progress.settled());
         assert!(!progress.complete());
@@ -10134,6 +8162,40 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn repair_before_the_worker_seats_its_runner_is_coverage_unproven() {
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+        // The actual local-open stage precedes the worker's fallible runner
+        // preparation. It has no network or runner yet.
+        let mut client = app
+            .local_client_with_relay_plane("alice", &app.relay_plane, None)
+            .await
+            .unwrap();
+        for cancelled in [false, true] {
+            let error = client
+                .repair_full_history_cancellable(&|| cancelled, None)
+                .await
+                .unwrap_err();
+            let expected = if cancelled {
+                crate::FullHistoryRepairIncompleteReason::Cancelled
+            } else {
+                crate::FullHistoryRepairIncompleteReason::CoverageUnproven
+            };
+            assert!(matches!(
+                error.source,
+                crate::AppError::FullHistoryRepairIncomplete {
+                    reason,
+                    delivery_loss_pending: false,
+                } if reason == expected
+            ));
+            assert_eq!(error.partial_summary, SyncSummary::default());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn uncertified_full_history_repair_keeps_the_buffered_prefix() {
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())
@@ -10176,79 +8238,90 @@ mod tests {
 mod queued_outbound_schedule_tests;
 
 #[cfg(test)]
-mod full_history_tests;
-
-#[cfg(test)]
-mod selective_history_acquisition_tests;
-
-#[cfg(test)]
-mod retired_loss_observation_tests {
+mod routed_loss_observation_tests {
     use std::sync::Arc;
 
-    use crate::client::history_notices::park_recovery_for_test;
-    use crate::tests::{ScriptedPushRelayClient, client_on_app_relay_plane};
-    use transport_nostr::AccountDeliveryOverflow;
+    use storage_sqlite::{RecoveryLossCause, TransportReconciliationRoute};
 
-    /// A dismissal cannot release the plane while that generation still has
-    /// work in flight, such as a queued control record. The later observation
-    /// of the same, now retired, loss must release the fence rather than
-    /// re-raise it, while genuinely new loss still arms recovery.
+    use crate::client::history_recovery::recovery_coverage::scenario_tests::{
+        fixture, relay, routes,
+    };
+
+    /// Under an overflow storm the marker writer is usually mid-write when
+    /// the worker observes a generation, so the observation runs past the
+    /// durable count. It carries the router's routes, so the generation stays
+    /// routed: only the route that lost deliveries loses coverage, from the
+    /// earliest one dropped there, and the inbox keeps its live boundary.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_late_observation_of_retired_loss_releases_the_fence_without_rearming() {
-        let dir = tempfile::tempdir().unwrap();
-        crate::AccountHome::open(dir.path())
-            .create_account("alice")
-            .unwrap();
-        let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
-            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
-        let mut client = client_on_app_relay_plane(&app, "alice").await;
-        let storage = app.account_storage("alice").unwrap();
-        let app = storage.app_storage();
-        app.mark_account_delivery_recovery("alice", 42, 1).unwrap();
-        client.delivery_overflow_recovery_pending = true;
-        client.delivery_overflow_recovery_marker_token = Some(42);
-        client.adapter.start_delivery_overflow_recovery(42);
-        client.adapter.fail_delivery_overflow_recovery();
-        let loss = app
-            .pending_recovery_demands()
-            .unwrap()
+    async fn an_observation_past_the_durable_count_keeps_the_routers_routes() {
+        let mut fixture = fixture().await;
+        let app = fixture.storage.app_storage();
+        let group = routes(&fixture.client)
             .into_iter()
-            .find(|demand| demand.cause == storage_sqlite::RecoveryCause::QueueLoss)
-            .unwrap()
-            .ticket
-            .id;
-        park_recovery_for_test(&storage, loss);
-        let ticket = app.parked_recovery_obligations().unwrap()[0].ticket;
-        assert!(
-            app.retire_parked_recovery_obligation(ticket.id, ticket.revision, 1_000)
-                .unwrap()
-        );
-        assert!(client.delivery_loss_blocks_cursor());
-
-        let observed = client.adapter.pending_delivery_overflow().unwrap();
-        client.observe_delivery_overflow(observed).unwrap();
-        assert!(!client.delivery_overflow_recovery_pending);
-        assert!(client.adapter.pending_delivery_overflow().is_none());
-        assert!(!client.delivery_loss_blocks_cursor());
-        assert!(app.account_delivery_recovery("alice").unwrap().is_none());
-        assert!(client.history_notices().unwrap().is_empty());
-
-        client
-            .observe_delivery_overflow(AccountDeliveryOverflow {
-                generation: 9,
-                marker_token: 77,
-                dropped: 1,
-                ..Default::default()
-            })
+            .find(|route| matches!(route, TransportReconciliationRoute::Group(_)))
             .unwrap();
-        assert!(client.delivery_overflow_recovery_pending);
+        let TransportReconciliationRoute::Group(group_id) = group else {
+            unreachable!()
+        };
+        let inbox = TransportReconciliationRoute::Inbox;
+        let dropped_at = crate::unix_now_seconds() - 20;
+        for route in [&inbox, &group] {
+            assert!(
+                app.recovery_coverage_covers(route, &[relay()], dropped_at, dropped_at)
+                    .unwrap(),
+                "a live boundary covers each route"
+            );
+        }
+        let inbox_before = app.recovery_coverage_ranges(&inbox, &relay()).unwrap();
+
+        // No marker write ever lands, so the whole generation is past the
+        // durable count.
+        let relay_plane = fixture.client.app.relay_plane.clone();
+        let account = fixture.client.adapter.account_id().clone();
+        assert!(relay_plane.disable_account_delivery_spill_for_test(&account));
+        assert!(relay_plane.set_account_delivery_recovery_marker_for_test(
+            &account,
+            Arc::new(|_, _, _, _| {
+                Err(transport_nostr::AccountDeliveryRecoveryMarkerError::Retryable)
+            }),
+        ));
+        for index in 0..=transport_nostr::ACCOUNT_DELIVERY_BUFFER {
+            let delivery = fixture
+                .client
+                .adapter
+                .recovered_deliveries(transport_nostr_adapter::NostrRelayEvent {
+                    endpoint: cgka_traits::TransportEndpoint("wss://relay.example".into()),
+                    subscription_id: None,
+                    event: crate::tests::epoch_gap_probe(
+                        &hex::encode(group_id),
+                        dropped_at,
+                        &format!("storm-{index}"),
+                    ),
+                })
+                .await
+                .unwrap()
+                .pop()
+                .expect("the group route receives the probe");
+            relay_plane.route_account_delivery_for_test(delivery);
+        }
+        let observed = fixture.client.adapter.pending_delivery_overflow().unwrap();
+        assert!(observed.dropped > 0);
+        fixture.client.observe_delivery_overflow(observed).unwrap();
+
+        let reach = app
+            .recovery_loss_reach("alice", RecoveryLossCause::Queue)
+            .unwrap();
+        assert_eq!(reach.every_route_from, None, "the generation stays routed");
+        assert_eq!(reach.routes, [(group.clone(), dropped_at)].into());
         assert_eq!(
-            app.account_delivery_recovery("alice")
-                .unwrap()
-                .unwrap()
-                .marker_token,
-            77,
-            "new loss reopens the retired obligation as pending debt"
+            app.recovery_coverage_ranges(&inbox, &relay()).unwrap(),
+            inbox_before,
+            "the inbox lost nothing"
+        );
+        assert!(
+            !app.recovery_coverage_covers(&group, &[relay()], dropped_at, dropped_at)
+                .unwrap(),
+            "the group owes from its earliest drop"
         );
     }
 }

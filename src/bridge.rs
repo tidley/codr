@@ -1169,6 +1169,20 @@ impl Bridge {
         // Older bridge versions created these groups without a transcript watermark.
         // Seed their existing history once when enabling native reply support.
         self.seed_native_history(key, agent).await?;
+        let native_receipts: Vec<_> = self.state.mappings[key]
+            .submissions
+            .iter()
+            .filter_map(|submission| submission.native_message_id.clone())
+            .collect();
+        if let Some(session) = crate::prompt::native_session(&self.config, agent).map(str::to_owned)
+        {
+            for id in native_receipts {
+                if let Ok(Some(input)) = crate::prompt::accepted(&self.config, &session, &id).await
+                {
+                    self.observe_submission_acceptances(key, &[input]);
+                }
+            }
+        }
         if (self.config.auto_forwarding || !self.state.mappings[key].submissions.is_empty())
             && agent
                 .agent_session
@@ -1466,7 +1480,7 @@ impl Bridge {
             .submissions
             .iter()
             .any(|submission| submission.overdue(now()));
-        let notice = "Native acceptance is unconfirmed. Terminal input was attempted, but no matching native message was observed. No automatic retry will run. Inspect the agent before using local clear-prompt; new submissions in this chat are paused.";
+        let notice = "Native acceptance is unconfirmed. Prompt submission was attempted, but no matching native receipt was observed. No automatic retry will run. Inspect the agent before using local clear-prompt; new submissions in this chat are paused.";
         for receipt in warnings {
             self.state
                 .enqueue_manual(&group, notice, &format!("acceptance:{group}:{receipt}"));
@@ -1483,6 +1497,12 @@ impl Bridge {
 
     fn observe_submission_acceptances(&mut self, key: &str, inputs: &[crate::activity::UserInput]) {
         let mapping = self.state.mappings.get_mut(key).unwrap();
+        let native: Vec<_> = mapping
+            .submissions
+            .iter()
+            .filter(|submission| submission.native_message_id.is_some())
+            .map(|submission| submission.receipt.clone())
+            .collect();
         let warned: Vec<_> = mapping
             .submissions
             .iter()
@@ -1490,6 +1510,19 @@ impl Bridge {
             .map(|submission| submission.receipt.clone())
             .collect();
         crate::activity::Submission::observe(&mut mapping.submissions, inputs);
+        for receipt in native {
+            if !mapping
+                .submissions
+                .iter()
+                .any(|submission| submission.receipt == receipt)
+            {
+                if let Some(flight) = &mut mapping.queue_flight {
+                    flight.confirmed = true;
+                    mapping.completion_pending = true;
+                }
+                mapping.activity.confirm_phone(&receipt);
+            }
+        }
         let resolved: Vec<_> = warned
             .into_iter()
             .filter(|receipt| {
@@ -3031,14 +3064,19 @@ impl Bridge {
                     .as_ref()
                     .is_some_and(|session| output::supported(&session.agent))
                 {
-                    mapping.submissions.push(crate::activity::Submission::new(
+                    let mut submission = crate::activity::Submission::new(
                         id,
                         text,
                         acceptance_history
                             .as_ref()
                             .map(|history| history.user_inputs.as_slice()),
                         now(),
-                    ));
+                    );
+                    if crate::prompt::native_session(&self.config, &agent).is_some() {
+                        submission.native_message_id =
+                            Some(format!("msg_codr_{}", uuid::Uuid::new_v4().simple()));
+                    }
+                    mapping.submissions.push(submission);
                 }
                 if let Some(history) = phone_history {
                     mapping.activity.start_phone(id, text, &history.user_inputs);
@@ -3049,18 +3087,37 @@ impl Bridge {
                     self.state = before_consumption.unwrap_or(before_submission);
                     return Err(error);
                 }
-                match herdr::prompt(&self.herdr, &agent, text).await {
-                    Ok(response) if response["result"]["type"]=="agent_prompted" => {
+                let native_id = self.state.mappings[&key]
+                    .submissions
+                    .iter()
+                    .find(|submission| submission.receipt == id)
+                    .and_then(|submission| submission.native_message_id.clone());
+                let delivery = if let Some(native_id) = native_id {
+                    let session = crate::prompt::native_session(&self.config, &agent)
+                        .expect("Native receipt requires a configured OpenCode session");
+                    crate::prompt::send(&self.config, session, &native_id, text)
+                        .await
+                        .map(Some)
+                } else {
+                    match herdr::prompt(&self.herdr, &agent, text).await {
+                        Ok(response) if response["result"]["type"] == "agent_prompted" => Ok(None),
+                        Ok(_) => Err(anyhow::anyhow!(
+                            "Terminal prompt acknowledgement unconfirmed"
+                        )),
+                        Err(error) => Err(error),
+                    }
+                };
+                match delivery {
+                    Ok(accepted) => {
+                        if let Some(input) = accepted {
+                            self.observe_submission_acceptances(&key, &[input]);
+                        }
                         if new_flight {
-                            let mapping=self.state.mappings.get_mut(&key).unwrap();
-                            mapping.queue_flight.as_mut().unwrap().confirmed=true;
-                            mapping.completion_pending=true;
+                            let mapping = self.state.mappings.get_mut(&key).unwrap();
+                            mapping.queue_flight.as_mut().unwrap().confirmed = true;
+                            mapping.completion_pending = true;
                         }
                         if queued && !prepared {
-                            ensure!(
-                                response["result"]["type"] == "agent_prompted",
-                                "Queued prompt acknowledgement was not confirmed"
-                            );
                             let mapping = self.state.mappings.get_mut(&key).unwrap();
                             mapping.queue_flight.as_mut().unwrap().confirmed = true;
                             mapping.completion_pending = true;
@@ -3081,23 +3138,33 @@ impl Bridge {
                                     true,
                                 );
                             }
-                            if !was_pending || self.state.mappings[&key].response_id.is_none() {self.state.begin_response(&key, group);}
+                            if !was_pending || self.state.mappings[&key].response_id.is_none() {
+                                self.state.begin_response(&key, group);
+                            }
                             if !was_pending && !self.state.mappings[&key].submissions.is_empty() {
-                                self.state.update_response(&key, group, "> Request submitted...", false);
+                                self.state.update_response(
+                                    &key,
+                                    group,
+                                    "> Request submitted...",
+                                    false,
+                                );
                             }
                         }
                         None
                     }
-                    Ok(_) => Some("The prompt could not be confirmed. It will not be retried. Inspect the agent before submitting again.".into()),
                     Err(error) => {
                         if error.downcast_ref::<crate::wire::NotSubmitted>().is_some() {
                             let m = self.state.mappings.get_mut(&key).unwrap();
                             m.pending_prompt = was_pending;
-                            if new_flight {m.queue_flight=None;}
+                            if new_flight {
+                                m.queue_flight = None;
+                            }
                             m.activity.cancel_phone(id);
                             m.submissions.retain(|submission| submission.receipt != id);
                             if let Some(prompt) = queued_prompt {
-                                if !prepared {m.queue_flight = None;}
+                                if !prepared {
+                                    m.queue_flight = None;
+                                }
                                 m.prompt_queue.insert(queued_index, prompt);
                             } else {
                                 m.seen_messages.retain(|seen| seen != id);

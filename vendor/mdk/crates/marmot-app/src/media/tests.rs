@@ -6,7 +6,7 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use chacha20poly1305::aead::{Aead, AeadInPlace, KeyInit, Payload};
+use chacha20poly1305::aead::{AeadInPlace, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use url::Url;
 
@@ -37,29 +37,6 @@ fn media_upload_batch_enforces_the_same_aggregate_bound_as_the_connector() {
     assert!(validate_media_upload_batch_lengths([max_plaintext - 3, 3]).is_ok());
     assert!(validate_media_upload_batch_lengths([max_plaintext, 1]).is_err());
     assert!(validate_media_upload_batch_lengths([u64::MAX, 1]).is_err());
-}
-
-#[test]
-fn in_place_encryption_is_wire_identical_to_the_previous_allocating_api() {
-    let key = [0x11_u8; 32];
-    let nonce = [0x22_u8; 12];
-    let aad = b"encrypted-media compatibility";
-    let plaintext = b"same key nonce aad and plaintext";
-    let cipher = ChaCha20Poly1305::new_from_slice(&key).unwrap();
-    let expected = cipher
-        .encrypt(
-            Nonce::from_slice(&nonce),
-            Payload {
-                msg: plaintext,
-                aad,
-            },
-        )
-        .unwrap();
-    let mut actual = plaintext.to_vec();
-    cipher
-        .encrypt_in_place(Nonce::from_slice(&nonce), aad, &mut actual)
-        .unwrap();
-    assert_eq!(actual, expected);
 }
 
 fn valid_imeta_tag() -> Vec<String> {
@@ -435,6 +412,60 @@ async fn spawn_stalled_http_server() -> (String, tokio::task::JoinHandle<()>) {
         std::future::pending::<()>().await;
     });
     (url, server)
+}
+
+/// Observe a complete real HTTP request, then hold its response until released.
+async fn spawn_observed_http_response(
+    response: Vec<u8>,
+) -> (
+    String,
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (seen, request_seen) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let read = stream.read(&mut buffer).await.unwrap();
+            assert_ne!(
+                read, 0,
+                "client closed before sending complete HTTP headers"
+            );
+            request.extend_from_slice(&buffer[..read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        seen.send(()).unwrap();
+        if released.await.is_ok() {
+            stream.write_all(&response).await.unwrap();
+        }
+    });
+    (url, request_seen, release, server)
+}
+
+/// Poll real I/O without letting an idle paused runtime advance policy time.
+pub(crate) async fn drive_with_manual_time<F: std::future::Future>(future: F) -> F::Output {
+    let wall_started = Instant::now();
+    tokio::pin!(future);
+    loop {
+        if let std::task::Poll::Ready(output) = futures::poll!(future.as_mut()) {
+            return output;
+        }
+        assert!(
+            wall_started.elapsed() < Duration::from_secs(10),
+            "real I/O observations did not finish with virtual time held"
+        );
+        tokio::task::yield_now().await;
+    }
 }
 
 /// Stream a complete response in bounded intervals and count every accepted request.
@@ -953,13 +984,13 @@ async fn encrypted_media_download_records_network_integrity_and_crypto_phases() 
     )
     .await
     .expect("fixture upload should succeed");
-    let telemetry = crate::app_telemetry::AppPerformanceTelemetry::default();
+    let telemetry = marmot_observability::PerformanceRecorder::default();
     let transport =
         BlossomHttpTransport::for_test(true, Duration::from_secs(60), Duration::from_secs(1));
 
     download_encrypted_media_with_transport(
         upload.attachments[0].reference.clone(),
-        &secret,
+        MediaKey::EpochSecret(&secret),
         &endpoints,
         &allowed,
         &transport,
@@ -983,6 +1014,57 @@ async fn encrypted_media_download_records_network_integrity_and_crypto_phases() 
         assert_eq!(phase.failures, 0);
     }
     assert_eq!(snapshot.media_download_locator_failover.attempts, 0);
+}
+
+/// A device that imported a message holds the file's key, not its epoch's
+/// secret (mdk#2628 4.2a): that key alone opens the download, and a wrong one
+/// fails it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_imported_file_key_opens_the_download_without_the_epoch_secret() {
+    let (server, _received) = spawn_roundtrip_blob_server();
+    let endpoints = [blossom_endpoint(server)];
+    let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
+    let secret = media_secret();
+    let upload = upload_encrypted_media(
+        media_upload_request(None),
+        42,
+        &secret,
+        &signing_keys(),
+        operation_policy(EncryptedMediaVersion::V2, &endpoints, &allowed, true),
+        &BlossomHttpTransport::new(true),
+    )
+    .await
+    .expect("fixture upload should succeed");
+    let reference = upload.attachments[0].reference.clone();
+    let file_key = media_file_key_for_reference(&secret, &reference).unwrap();
+    let transport = BlossomHttpTransport::new(true);
+
+    let downloaded = download_encrypted_media_with_transport(
+        reference.clone(),
+        MediaKey::File(&file_key),
+        &endpoints,
+        &allowed,
+        &transport,
+        None,
+    )
+    .await
+    .expect("the file key opens the download");
+    assert_eq!(
+        downloaded.plaintext,
+        media_upload_request(None).attachments[0].plaintext
+    );
+
+    let wrong = [0x77; 32];
+    download_encrypted_media_with_transport(
+        reference,
+        MediaKey::File(&wrong),
+        &endpoints,
+        &allowed,
+        &transport,
+        None,
+    )
+    .await
+    .expect_err("a wrong file key fails the download");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1562,6 +1644,7 @@ fn loopback_reference() -> MediaAttachmentReference {
         media_type: "image/png".to_owned(),
         version: ENCRYPTED_MEDIA_VERSION.to_owned(),
         source_epoch: 0,
+        source_epoch_identity: None,
         dim: None,
         thumbhash: None,
     }
@@ -1577,7 +1660,12 @@ async fn download_prepare_stays_local() {
     let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(relay.clone());
     let mut client = app.client("alice").await.unwrap();
-    let group = client.create_group("media", &[]).await.unwrap();
+    let group = client
+        .create_group("media", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let mut reference = loopback_reference();
     reference.source_epoch = client.runtime.group_record(&group).unwrap().epoch.0;
     client
@@ -1607,6 +1695,7 @@ async fn download_prepare_stays_local() {
     let key = app
         .sqlcipher_key("alice", &keys, &path, crate::SqlcipherDatabaseKind::Session)
         .unwrap();
+    storage_sqlite::expect_uncounted_writes_for_test(&path);
     let connection = rusqlite::Connection::open(path).unwrap();
     storage_sqlite::open_hardened_sqlcipher(
         &connection,
@@ -1914,7 +2003,7 @@ fn blob_reference_for_servers(body: &[u8], servers: &[String]) -> MediaAttachmen
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn renewed_lease_keeps_pool() {
-    let (server_url, accepted, server) = spawn_keep_alive_http_server(b"hello", 2).await;
+    let (server_url, _accepted, server) = spawn_keep_alive_http_server(b"hello", 2).await;
     let transport = BlossomHttpTransport::for_test(true, Duration::ZERO, Duration::from_secs(1));
     let url = format!("{server_url}/{}.bin", valid_hash());
     for _ in 0..2 {
@@ -1926,12 +2015,12 @@ async fn renewed_lease_keeps_pool() {
         );
     }
     server.await.unwrap();
-    assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    assert_eq!(transport.pools_built(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn uploads_reuse_renewed_pool() {
-    let (url, accepted, server) = spawn_keep_alive_http_server(b"{}", 2).await;
+    let (url, _accepted, server) = spawn_keep_alive_http_server(b"{}", 2).await;
     let transport = BlossomHttpTransport::for_test(true, Duration::ZERO, Duration::from_secs(1));
     for _ in 0..2 {
         upload_blossom_blob(
@@ -1945,12 +2034,12 @@ async fn uploads_reuse_renewed_pool() {
         .unwrap();
     }
     server.await.unwrap();
-    assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    assert_eq!(transport.pools_built(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn repeated_same_origin_downloads_reuse_one_vetted_connection() {
-    let (server_url, accepted, server) = spawn_keep_alive_http_server(b"hello", 2).await;
+async fn repeated_same_origin_downloads_reuse_one_vetted_pool() {
+    let (server_url, _accepted, server) = spawn_keep_alive_http_server(b"hello", 2).await;
     let transport =
         BlossomHttpTransport::for_test(true, Duration::from_secs(60), Duration::from_secs(1));
     let url = format!("{server_url}/{}.bin", valid_hash());
@@ -1970,9 +2059,9 @@ async fn repeated_same_origin_downloads_reuse_one_vetted_connection() {
     server.await.unwrap();
 
     assert_eq!(
-        accepted.load(Ordering::SeqCst),
+        transport.pools_built(),
         1,
-        "compatible same-origin downloads should reuse the vetted connection"
+        "compatible same-origin downloads should reuse the vetted pool"
     );
 }
 
@@ -2084,14 +2173,17 @@ async fn stalled_first_locator_reaches_healthy_fallback_within_startup_bound() {
 }
 
 /// Stalled locators reserve time for the remaining fallback candidates.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(start_paused = true)]
 async fn locator_failover_shares_one_end_to_end_transfer_deadline() {
     const TRANSFER_DEADLINE: Duration = Duration::from_millis(130);
 
     let body = b"healthy ciphertext";
-    let (first_url, first_server) = spawn_stalled_http_server().await;
-    let (second_url, second_server) = spawn_stalled_http_server().await;
-    let healthy_url = spawn_http_response(http_ok_response(body));
+    let (first_url, first_seen, first_release, first_server) =
+        spawn_observed_http_response(http_ok_response(body)).await;
+    let (second_url, second_seen, second_release, second_server) =
+        spawn_observed_http_response(http_ok_response(body)).await;
+    let (healthy_url, healthy_seen, healthy_release, healthy_server) =
+        spawn_observed_http_response(http_ok_response(body)).await;
     let reference = blob_reference_for_servers(body, &[first_url, second_url, healthy_url]);
     let transport = BlossomHttpTransport::for_test_with_transfer_timeout(
         true,
@@ -2100,20 +2192,34 @@ async fn locator_failover_shares_one_end_to_end_transfer_deadline() {
         TRANSFER_DEADLINE,
     );
     let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
-    let started = Instant::now();
+    let started = tokio::time::Instant::now();
+    let download = fetch_encrypted_media_blob_with_transport(&reference, &[], &allowed, &transport);
+    let driver = async move {
+        first_seen.await.unwrap();
+        // The first startup allowance is 80 ms. One extra virtual millisecond
+        // covers timer tick rounding; real socket work advances no policy time.
+        tokio::time::advance(Duration::from_millis(81)).await;
+        second_seen.await.unwrap();
+        // Only 49 ms of the original budget remains. The second candidate must
+        // reserve half for the healthy locator, rather than start a fresh 130 ms.
+        tokio::time::advance(Duration::from_millis(25)).await;
+        healthy_seen.await.unwrap();
+        healthy_release.send(()).unwrap();
+        healthy_server.await.unwrap();
+    };
 
+    let (downloaded, ()) = drive_with_manual_time(async { tokio::join!(download, driver) }).await;
     let downloaded =
-        fetch_encrypted_media_blob_with_transport(&reference, &[], &allowed, &transport)
-            .await
-            .expect("stalled candidates must leave time for the healthy locator");
+        downloaded.expect("stalled candidates must leave time for the healthy locator");
     first_server.abort();
     second_server.abort();
+    drop((first_release, second_release));
 
     assert_eq!(downloaded, body);
-    let elapsed = started.elapsed();
-    assert!(
-        elapsed < Duration::from_secs(2),
-        "two stalled candidates must share the configured end-to-end deadline"
+    assert_eq!(
+        started.elapsed(),
+        Duration::from_millis(106),
+        "HTTP scheduling must not consume the original 130 ms policy budget"
     );
 }
 
@@ -2219,7 +2325,7 @@ async fn shared_deadline_timeout_records_the_active_later_locator_phase() {
         Duration::from_millis(80),
         Duration::from_millis(130),
     );
-    let telemetry = crate::app_telemetry::AppPerformanceTelemetry::default();
+    let telemetry = marmot_observability::PerformanceRecorder::default();
     let allowed = [BLOSSOM_LOCATOR_KIND_V1.to_owned()];
 
     let error = fetch_encrypted_media_blob_with_observer(
@@ -2424,7 +2530,7 @@ async fn oversized_content_length_does_not_record_body_transfer_timing() {
     let server = spawn_http_response(response.into_bytes());
     let url = format!("{server}/{}.bin", valid_hash());
     let transport = BlossomHttpTransport::new(true);
-    let telemetry = crate::app_telemetry::AppPerformanceTelemetry::default();
+    let telemetry = marmot_observability::PerformanceRecorder::default();
 
     let err = fetch_blossom_blob_with_observer(&url, &transport, Some(&telemetry))
         .await
@@ -2445,7 +2551,7 @@ async fn empty_response_records_first_byte_failure_without_body_transfer_timing(
     );
     let url = format!("{server}/{}.bin", valid_hash());
     let transport = BlossomHttpTransport::new(true);
-    let telemetry = crate::app_telemetry::AppPerformanceTelemetry::default();
+    let telemetry = marmot_observability::PerformanceRecorder::default();
 
     let body = fetch_blossom_blob_with_observer(&url, &transport, Some(&telemetry))
         .await
@@ -2973,7 +3079,7 @@ async fn decryption_failure_is_a_download_failure_not_a_reference_error() {
 
     let err = download_encrypted_media_with_transport(
         upload.attachments[0].reference.clone(),
-        &wrong_secret,
+        MediaKey::EpochSecret(&wrong_secret),
         &endpoints,
         &allowed,
         &transport,
@@ -3230,6 +3336,7 @@ pub(crate) fn attachment_worker_fixture_with_secret(
             media_type: mime.into(),
             version: EncryptedMediaVersion::V2.as_str().into(),
             source_epoch: 3,
+            source_epoch_identity: None,
             dim: None,
             thumbhash: None,
         },
@@ -3253,7 +3360,7 @@ async fn automatic_attachment_classifies_integrity_and_streaming_size_failures_w
         }];
         let result = download_encrypted_media_classified(
             reference,
-            &[7; 32],
+            MediaKey::EpochSecret(&[7; 32]),
             &[],
             &allowed,
             &BlossomHttpTransport::new(true).with_download_limit(cap),
@@ -3275,7 +3382,7 @@ async fn automatic_attachment_classifies_integrity_and_streaming_size_failures_w
     assert!(matches!(
         download_encrypted_media_classified(
             reference,
-            &[7; 32],
+            MediaKey::EpochSecret(&[7; 32]),
             &[],
             &allowed,
             &BlossomHttpTransport::new(true).with_download_limit(8),
@@ -3294,7 +3401,7 @@ async fn automatic_attachment_classifies_integrity_and_streaming_size_failures_w
         }];
         let result = download_encrypted_media_classified(
             reference,
-            &[if wrong_secret { 8 } else { 7 }; 32],
+            MediaKey::EpochSecret(&[if wrong_secret { 8 } else { 7 }; 32]),
             &[],
             &allowed,
             &BlossomHttpTransport::new(true),
@@ -3344,7 +3451,7 @@ async fn automatic_attachment_stops_only_when_every_locator_reports_the_blob_mis
             .collect();
         let result = download_encrypted_media_classified(
             reference,
-            &[7; 32],
+            MediaKey::EpochSecret(&[7; 32]),
             &[],
             &allowed,
             &BlossomHttpTransport::new(true),
@@ -3398,4 +3505,87 @@ async fn file_upload_idle_watchdog_allows_setup_then_rejects_a_stalled_body() {
         watchdog.await.unwrap(),
         AppError::MediaUploadTimedOut
     ));
+}
+
+/// Sticker-sized fetches share the media transfer bound: a body that keeps
+/// progressing after candidate startup must not be cut off by that shorter
+/// startup bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn limited_fetch_survives_a_body_that_outlasts_candidate_startup() {
+    let body = Arc::new(vec![7_u8; 64 * 1024]);
+    let (url, _requests, server) =
+        spawn_progressing_http_server(body.clone(), Duration::from_millis(900)).await;
+    let transport = BlossomHttpTransport::for_test_with_transfer_timeout(
+        true,
+        Duration::from_secs(60),
+        Duration::from_millis(200),
+        Duration::from_secs(5),
+    )
+    .with_download_limit(1024 * 1024);
+
+    let fetched = super::blossom::fetch_blossom_blob_limited_with_transport(
+        &format!("{url}/blob"),
+        &transport,
+    )
+    .await
+    .expect("a progressing body inside the transfer bound completes");
+    server.abort();
+    assert_eq!(fetched, *body);
+}
+
+/// The overall deadline is the transfer bound, not a fixed startup interval.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn limited_fetch_is_bounded_by_the_transport_transfer_deadline() {
+    let body = Arc::new(vec![7_u8; 64 * 1024]);
+    let (url, _requests, server) =
+        spawn_progressing_http_server(body, Duration::from_secs(3)).await;
+    let transport = BlossomHttpTransport::for_test_with_transfer_timeout(
+        true,
+        Duration::from_secs(60),
+        Duration::from_millis(200),
+        Duration::from_millis(500),
+    )
+    .with_download_limit(1024 * 1024);
+
+    let started = Instant::now();
+    let result = super::blossom::fetch_blossom_blob_limited_with_transport(
+        &format!("{url}/blob"),
+        &transport,
+    )
+    .await;
+    server.abort();
+    assert!(
+        result.is_err(),
+        "a body longer than the transfer bound must fail"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the transfer bound, not a longer fixed deadline, ends the fetch"
+    );
+}
+
+/// The byte ceiling the transport carries is the one enforced on the body.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn limited_fetch_enforces_the_transport_download_limit() {
+    let body = Arc::new(vec![7_u8; 4 * 1024]);
+    let (url, _requests, server) =
+        spawn_progressing_http_server(body, Duration::from_millis(50)).await;
+    let transport = BlossomHttpTransport::for_test_with_transfer_timeout(
+        true,
+        Duration::from_secs(60),
+        Duration::from_millis(500),
+        Duration::from_secs(5),
+    )
+    .with_download_limit(1024);
+
+    let result = super::blossom::fetch_blossom_blob_limited_with_transport(
+        &format!("{url}/blob"),
+        &transport,
+    )
+    .await;
+    server.abort();
+    assert!(
+        result.is_err(),
+        "a body above the transport limit must be refused"
+    );
 }

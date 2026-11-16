@@ -1,5 +1,5 @@
 use super::*;
-use crate::runtime::account_worker::ManagedAccountWorker;
+use crate::runtime::account_worker::{ManagedAccountWorker, ReadReply};
 use marmot_account::AccountHome;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use storage_sqlite::{SqliteAccountStorage, StoredAppEvent};
@@ -63,7 +63,12 @@ impl Fixture {
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(Arc::new(crate::tests::ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
-        let group = client.create_group("window test", &[]).await.unwrap();
+        let group = client
+            .create_group("window test", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let store = app.account_storage("alice").unwrap();
         let runtime = MarmotAppRuntime::new(app.clone());
         let mode = Arc::new(AtomicUsize::new(0));
@@ -118,6 +123,8 @@ impl Fixture {
                 commands,
                 media_admission: Arc::new(Semaphore::new(1)),
                 shutdown,
+                unit: Default::default(),
+                read_state: Default::default(),
             },
         );
         let f = Self {
@@ -1141,7 +1148,7 @@ async fn production_reconnect_backoff_keeps_conversation_captures_retryable() {
         );
     }
     let capture = || {
-        let (respond, response) = oneshot::channel();
+        let (respond, response) = ReadReply::unobserved();
         commands
             .try_send(AccountWorkerCommand::CaptureConversation {
                 queued: None,
@@ -1426,7 +1433,12 @@ async fn send_checkpoints_are_query_scoped_coherent_and_released_on_close() {
         "intermediate navigation invalidates the speculative tail capture"
     );
 
-    let other_group = client.create_group("unrelated window", &[]).await.unwrap();
+    let other_group = client
+        .create_group("unrelated window", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     f.store
         .app_storage()
         .refresh_chat_list_row(&f.account, &hex::encode(other_group.as_slice()), &|_, _| {
@@ -1491,6 +1503,54 @@ async fn send_checkpoints_are_query_scoped_coherent_and_released_on_close() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_open_window_hints_its_groups_recovery_routes() {
+    let f = Fixture::new(1).await;
+    let worker = f
+        .runtime
+        .accounts
+        .workers
+        .lock()
+        .await
+        .remove(&f.account)
+        .unwrap();
+    worker.shutdown().await;
+    let mut client = f.app.client("alice").await.unwrap();
+    let group = f.group.as_slice().to_vec();
+    let hinted = |client: &AppClient| {
+        let routes: Vec<_> = client
+            .recovery_runner_routes()
+            .into_iter()
+            .filter(|route| route.group_id.as_ref() == Some(&group))
+            .collect();
+        assert!(!routes.is_empty(), "the group has a route");
+        routes.iter().all(|route| route.window)
+    };
+    assert!(!hinted(&client));
+
+    let capture = Arc::new(SendCapture::new(
+        f.group.clone(),
+        f.store
+            .app_storage()
+            .chat_presentation_version()
+            .unwrap()
+            .store_epoch,
+        ConversationWindowQuery {
+            opening: ConversationOpenQuery {
+                target: ConversationOpenTarget::Latest,
+                limit: 5,
+            },
+            before_anchor: None,
+        },
+    ));
+    client.register_conversation_capture(Some(Arc::downgrade(&capture)));
+    assert!(hinted(&client));
+    drop(capture);
+    assert!(!hinted(&client), "a closed window hints nothing");
+    drop(client);
+    f.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn checkpoint_older_than_drained_draft_invalidation_is_followed_by_a_fresh_read() {
     let f = Fixture::new(5).await;
     let initial = f.open(ConversationOpenTarget::Latest, 5).await.snapshot;
@@ -1510,7 +1570,7 @@ async fn checkpoint_older_than_drained_draft_invalidation_is_followed_by_a_fresh
         .chat_presentation_version()
         .unwrap()
         .store_epoch;
-    let (respond, response) = oneshot::channel();
+    let (respond, response) = ReadReply::unobserved();
     worker
         .send(AccountWorkerCommand::CaptureConversation {
             queued: None,
@@ -1530,7 +1590,7 @@ async fn checkpoint_older_than_drained_draft_invalidation_is_followed_by_a_fresh
     ));
     capture.state.lock().unwrap().pending = Some(checkpoint);
     let reader = Reader {
-        telemetry: f.runtime.shared.app_performance_telemetry().clone(),
+        telemetry: f.runtime.shared.observer.performance().clone(),
         authority_ready: None,
         send_ready: None,
         app: f.app.clone(),
@@ -1538,7 +1598,7 @@ async fn checkpoint_older_than_drained_draft_invalidation_is_followed_by_a_fresh
         account_id: f.account.clone(),
         group: f.group.clone(),
         store_epoch: epoch,
-        worker: watch::channel(Some(Ok(worker))).1,
+        worker: watch::channel(Some(Ok(worker.into()))).1,
         send_capture: capture,
     };
     let sources = Sources {
@@ -1742,6 +1802,8 @@ async fn closing_window_cannot_abandon_reconcile_worker_teardown() {
             commands,
             shutdown,
             media_admission: Arc::new(Semaphore::new(1)),
+            unit: Default::default(),
+            read_state: Default::default(),
         },
     );
     let mut sub = f
@@ -2017,7 +2079,7 @@ fn return_to_latest_reuses_checkpoint_when_background_presentation_is_cancelled(
                 .unwrap()
                 .store_epoch;
             f.draft("checkpoint composer");
-            let (respond, response) = oneshot::channel();
+            let (respond, response) = ReadReply::unobserved();
             worker
                 .send(AccountWorkerCommand::CaptureConversation {
                     queued: None,
@@ -2038,7 +2100,7 @@ fn return_to_latest_reuses_checkpoint_when_background_presentation_is_cancelled(
             assert!(capture.state.lock().unwrap().latest.is_none());
             // Any fallback worker read stays blocked, like relay publication.
             f.mode.store(5, Ordering::SeqCst);
-            let telemetry = f.runtime.shared.app_performance_telemetry().clone();
+            let telemetry = f.runtime.shared.observer.performance().clone();
             let reader = Reader {
                 telemetry: telemetry.clone(),
                 authority_ready: None,
@@ -2048,7 +2110,7 @@ fn return_to_latest_reuses_checkpoint_when_background_presentation_is_cancelled(
                 account_id: f.account.clone(),
                 group: f.group.clone(),
                 store_epoch: epoch,
-                worker: watch::channel(Some(Ok(worker))).1,
+                worker: watch::channel(Some(Ok(worker.into()))).1,
                 send_capture: capture.clone(),
             };
             let sources = Sources {
@@ -2236,7 +2298,7 @@ async fn publication_checkpoint_refreshes_epoch_and_dirty_rows_without_reviving_
     let observers = vec![Arc::downgrade(&observer)];
     publish_conversation_captures_from_session(
         &observers,
-        client.runtime.session(),
+        client.runtime.group_authority_view(),
         &f.app,
         "alice",
         &f.group,
@@ -2266,7 +2328,7 @@ async fn publication_checkpoint_refreshes_epoch_and_dirty_rows_without_reviving_
     ));
     publish_conversation_captures_from_session(
         &observers,
-        client.runtime.session(),
+        client.runtime.group_authority_view(),
         &f.app,
         "alice",
         &f.group,
@@ -2289,7 +2351,7 @@ async fn publication_checkpoint_refreshes_epoch_and_dirty_rows_without_reviving_
         .unwrap();
     publish_conversation_captures_from_session(
         &observers,
-        client.runtime.session(),
+        client.runtime.group_authority_view(),
         &f.app,
         "alice",
         &f.group,
@@ -2310,7 +2372,7 @@ async fn publication_checkpoint_refreshes_epoch_and_dirty_rows_without_reviving_
     ));
     publish_conversation_captures_from_session(
         &[Arc::downgrade(&wrong_store)],
-        client.runtime.session(),
+        client.runtime.group_authority_view(),
         &f.app,
         "alice",
         &f.group,
@@ -2324,14 +2386,14 @@ async fn publication_checkpoint_refreshes_epoch_and_dirty_rows_without_reviving_
         .unwrap();
     assert!(matches!(
         cold.runtime.session().group_authority(&f.group),
-        Err(cgka_session::SessionError::Engine(
+        Err(marmot_session::SessionError::Engine(
             cgka_traits::EngineError::GroupNotHydrated(_)
         ))
     ));
     f.add(3);
     publish_conversation_captures_from_session(
         &observers,
-        cold.runtime.session(),
+        cold.runtime.group_authority_view(),
         &f.app,
         "alice",
         &f.group,
@@ -2375,7 +2437,7 @@ async fn assert_hot_checkpoints_do_not_postpone_refresh(prior_not_ready: bool) {
         .unwrap()
         .store_epoch;
     f.add(99);
-    let (respond, response) = oneshot::channel();
+    let (respond, response) = ReadReply::unobserved();
     worker
         .send(AccountWorkerCommand::CaptureConversation {
             queued: None,
@@ -2411,7 +2473,7 @@ async fn assert_hot_checkpoints_do_not_postpone_refresh(prior_not_ready: bool) {
         epoch.clone(),
         query.clone(),
     ));
-    let telemetry = f.runtime.shared.app_performance_telemetry().clone();
+    let telemetry = f.runtime.shared.observer.performance().clone();
     let not_ready_count = || {
         telemetry
             .snapshot()
@@ -2432,7 +2494,7 @@ async fn assert_hot_checkpoints_do_not_postpone_refresh(prior_not_ready: bool) {
         account_id: f.account.clone(),
         group: f.group.clone(),
         store_epoch: epoch,
-        worker: watch::channel(Some(Ok(worker))).1,
+        worker: watch::channel(Some(Ok(worker.into()))).1,
         send_capture: capture.clone(),
     };
     let sources = Sources {
@@ -2526,4 +2588,43 @@ async fn hot_checkpoints_do_not_postpone_not_ready_retry() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hot_checkpoints_do_not_postpone_normal_refresh() {
     assert_hot_checkpoints_do_not_postpone_refresh(false).await;
+}
+
+/// A stale `Member` row reads as `DeviceRemoved` when the removed copy still
+/// lists the account, and as `Removed` when it does not (mdk#2628 D62).
+#[test]
+fn a_stale_member_row_reads_a_device_removal_apart_from_an_account_removal() {
+    let snapshot = |is_member, account_listed, removed| GroupAuthoritySnapshot {
+        facts: cgka_engine::group_authority::GroupAuthorityFacts {
+            epoch: cgka_traits::EpochId(2),
+            member_count: 2,
+            is_member,
+            account_listed,
+            is_admin: false,
+            admin_count: 0,
+            removed,
+            unrecoverable: false,
+            disbanded: false,
+            disbanding_enabled: false,
+            has_disbanding_blockers: false,
+        },
+        lifecycle: cgka_traits::GroupLifecycleState::Stable,
+        disbanding: false,
+    };
+    for (is_member, account_listed, removed, expected) in [
+        (true, true, false, None),
+        (
+            false,
+            true,
+            true,
+            Some(crate::SelfMembership::DeviceRemoved),
+        ),
+        (false, false, true, Some(crate::SelfMembership::Removed)),
+        (false, false, false, Some(crate::SelfMembership::Removed)),
+    ] {
+        assert_eq!(
+            stale_member_departure(&snapshot(is_member, account_listed, removed)),
+            expected
+        );
+    }
 }

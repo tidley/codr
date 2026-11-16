@@ -11,11 +11,20 @@ pub struct ConversationAuthority {
     pub admin_count: usize,
     pub pending_confirmation: bool,
     pub leave_request_pending: bool,
+    /// The outstanding leave is blocked: this account is the last active
+    /// admin on the selected branch (mdk#3014). Read with
+    /// `leave_request_pending` from the same engine row.
+    pub leave_blocked: bool,
     pub lifecycle: AppGroupLifecycleState,
     pub unrecoverable: bool,
     pub disbanding: bool,
     pub disbanding_enabled: bool,
     pub has_disbanding_blockers: bool,
+    /// Whether Leave takes an admin account off the admin list itself
+    /// (mdk#2628 D99): only while device groups are on. Otherwise an admin's
+    /// Leave is refused until the host demotes it (mdk#3014 interim); read
+    /// it from `MarmotApp::admin_leave_steps_down`.
+    pub admin_leave_steps_down: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,6 +37,9 @@ pub enum ConversationParticipation {
     Removed,
     Disbanded,
     Unavailable,
+    /// This device's leaf was removed while the account keeps another device
+    /// in the conversation. Not a removal from the conversation (mdk#2628 D62).
+    DeviceRemoved,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,6 +53,10 @@ pub struct ConversationCapabilities {
     pub can_edit_group: bool,
     pub can_leave: bool,
     pub requires_self_demote_before_leave: bool,
+    /// Offer Cancel on a blocked leave. The chat still reads as `Leaving`;
+    /// only the user's Cancel makes it joined again. `cancel_leave` rechecks
+    /// that the leave is blocked.
+    pub can_cancel_leave: bool,
     pub can_enable_disbanding: bool,
     pub can_disband: bool,
 }
@@ -59,6 +75,8 @@ impl ConversationAuthority {
             P::Disbanded
         } else if self.self_membership == SelfMembership::Removed {
             P::Removed
+        } else if self.self_membership == SelfMembership::DeviceRemoved {
+            P::DeviceRemoved
         } else if self.leave_request_pending {
             P::Leaving
         } else if self.self_membership == SelfMembership::Left {
@@ -79,6 +97,13 @@ impl ConversationAuthority {
         let admin =
             self.is_member && self.self_membership == SelfMembership::Member && self.is_admin;
         let manage = ordinary && admin;
+        // Declining a pending invitation is a Leave too, so an admin invitee
+        // demotes first as well.
+        let departs_as_admin = admin
+            && matches!(participation, P::Active | P::PendingInvitation)
+            && !self.disbanding
+            && !self.unrecoverable
+            && self.lifecycle != AppGroupLifecycleState::Unrecoverable;
         ConversationCapabilities {
             participation,
             is_self_admin: admin,
@@ -86,8 +111,12 @@ impl ConversationAuthority {
             can_send: ordinary,
             can_invite: manage,
             can_edit_group: manage,
-            can_leave: ordinary && !admin,
-            requires_self_demote_before_leave: manage,
+            // With device groups on, UserLeave performs any eligible account
+            // demotion in core. Otherwise the host demotes first.
+            can_leave: ordinary
+                && (!admin || (self.admin_leave_steps_down && self.admin_count > 1)),
+            requires_self_demote_before_leave: departs_as_admin && !self.admin_leave_steps_down,
+            can_cancel_leave: participation == P::Leaving && self.leave_blocked,
             can_enable_disbanding: manage
                 && self.lifecycle == AppGroupLifecycleState::Stable
                 && !self.disbanding_enabled

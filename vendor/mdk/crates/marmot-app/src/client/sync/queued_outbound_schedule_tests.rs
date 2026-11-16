@@ -28,7 +28,12 @@ async fn assert_restart_schedule(required_acks: usize) {
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = client_on_app_relay_plane(&app, "alice").await;
-    let group = client.create_group("queued restart", &[]).await.unwrap();
+    let group = client
+        .create_group("queued restart", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let account = client.runtime.session().self_id();
     let payload = MarmotAppEvent::new(
         hex::encode(account.as_slice()),
@@ -82,6 +87,8 @@ async fn assert_restart_schedule(required_acks: usize) {
         .record_target_failure(
             1,
             TransportEndpointFailure {
+                pre_send: false,
+                size_class: None,
                 endpoint: secondary,
                 reason: "acknowledgement unknown".into(),
                 kind: TransportEndpointFailureKind::PossiblyExposed,
@@ -169,7 +176,9 @@ async fn publication_barrier_rejects_unhydrated_inventory() {
     let group = client
         .create_group("deferred inventory", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     drop(client);
     let mut reopened = app
         .local_client_with_relay_plane_and_hydration("alice", &app.relay_plane, None, true, None)
@@ -214,7 +223,9 @@ async fn publication_barrier_keeps_pending_mls_after_quorum() {
     let group = client
         .create_group("pending confirmation", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let effects = client
         .runtime
         .session_mut()
@@ -224,7 +235,7 @@ async fn publication_barrier_keeps_pending_mls_after_quorum() {
         .await
         .unwrap();
     let (message, pending) = match &effects.publish[0] {
-        cgka_session::PublishWork::GroupEvolution { msg, pending, .. } => (msg.clone(), *pending),
+        marmot_session::PublishWork::GroupEvolution { msg, pending, .. } => (msg.clone(), *pending),
         other => panic!("expected staged evolution, got {other:?}"),
     };
     let transport_group_id = match &message.envelope {

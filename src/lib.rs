@@ -26,3 +26,4 @@ pub use state::BridgeState;
 pub mod forwarding;
 pub mod messaging;
 pub mod porter;
+pub mod prompt;

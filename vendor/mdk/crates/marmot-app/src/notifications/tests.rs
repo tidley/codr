@@ -114,6 +114,198 @@ fn token_records_by_server_keeps_hintless_records_for_10050_fallback() {
     assert_eq!(records.len(), 2);
 }
 
+fn device_token_record(
+    member_id_hex: &str,
+    leaf_index: u32,
+    device_token: &[u8],
+    owner_ts: i64,
+) -> GroupPushTokenRecord {
+    GroupPushTokenRecord {
+        group_id_hex: "ee".repeat(32),
+        member_id_hex: member_id_hex.to_owned(),
+        leaf_index,
+        platform: PushPlatform::Apns,
+        token_fingerprint: push_token_fingerprint(PushPlatform::Apns, device_token),
+        server_pubkey_hex: "aa".repeat(32),
+        relay_hint: Some("wss://hint.example".to_owned()),
+        encrypted_token: vec![leaf_index as u8; PUSH_ENCRYPTED_TOKEN_LEN],
+        owner_ts,
+        owner_sig: String::new(),
+        updated_at_ms: owner_ts,
+    }
+}
+
+fn selected_leaves(grouped: &BTreeMap<String, Vec<GroupPushTokenRecord>>) -> Vec<(String, u32)> {
+    grouped
+        .values()
+        .flatten()
+        .map(|record| (record.member_id_hex.clone(), record.leaf_index))
+        .collect()
+}
+
+#[test]
+fn token_records_by_server_keeps_every_sibling_leaf() {
+    let bob = "bb".repeat(32);
+    let tokens = vec![
+        device_token_record(&bob, 1, b"phone", 1),
+        device_token_record(&bob, 4, b"tablet", 1),
+    ];
+    let grouped = token_records_by_server(tokens, "dd".repeat(32).as_str());
+    assert_eq!(selected_leaves(&grouped), vec![(bob.clone(), 1), (bob, 4)]);
+}
+
+#[test]
+fn token_records_by_server_sends_one_push_per_device_token() {
+    let bob = "bb".repeat(32);
+    let carol = "cc".repeat(32);
+    let tokens = vec![
+        device_token_record(&bob, 1, b"phone", 10),
+        device_token_record(&bob, 2, b"tablet", 5),
+        device_token_record(&bob, 3, b"tablet", 5),
+        device_token_record(&bob, 4, b"phone", 20),
+        // Another account naming the same token is not collapsed into Bob's.
+        device_token_record(&carol, 5, b"phone", 1),
+    ];
+    let grouped = token_records_by_server(tokens, "dd".repeat(32).as_str());
+    // The newest owner_ts wins; equal stamps keep the lowest leaf.
+    assert_eq!(
+        selected_leaves(&grouped),
+        vec![(bob.clone(), 2), (bob, 4), (carol, 5)]
+    );
+}
+
+#[test]
+fn token_records_by_server_excludes_local_sibling_leaves() {
+    let local = "dd".repeat(32);
+    let bob = "bb".repeat(32);
+    let tokens = vec![
+        device_token_record(&bob, 1, b"bob-phone", 1),
+        device_token_record(&local, 0, b"local-phone", 1),
+        device_token_record(&local, 3, b"local-tablet", 1),
+    ];
+    let grouped = token_records_by_server(tokens, &local);
+    assert_eq!(selected_leaves(&grouped), vec![(bob, 1)]);
+}
+
+fn debug_info_for(
+    tokens: Vec<GroupPushTokenRecord>,
+    local: &str,
+    member_leaves: &[(&String, u32)],
+    local_leaf_index: Option<u32>,
+) -> GroupPushDebugInfo {
+    let member_leaves = member_leaves
+        .iter()
+        .map(|(member, leaf_index)| ((*member).clone(), *leaf_index))
+        .collect::<Vec<_>>();
+    group_debug_info(
+        NotificationSettings {
+            account_ref: "local".to_owned(),
+            account_id_hex: local.to_owned(),
+            local_notifications_enabled: true,
+            native_push_enabled: true,
+        },
+        None,
+        tokens,
+        local,
+        &member_leaves,
+        local_leaf_index,
+    )
+}
+
+/// `(member, leaf, active_leaf, member_matches_active_leaf)` per entry.
+fn debug_leaf_states(info: &GroupPushDebugInfo) -> Vec<(String, u32, bool, bool)> {
+    let mut states = info
+        .tokens
+        .iter()
+        .map(|entry| {
+            (
+                entry.member_id_hex.clone(),
+                entry.leaf_index,
+                entry.active_leaf,
+                entry.member_matches_active_leaf,
+            )
+        })
+        .collect::<Vec<_>>();
+    states.sort();
+    states
+}
+
+#[test]
+fn group_debug_info_matches_records_past_a_blank_leaf() {
+    let alice = "aa".repeat(32);
+    let bob = "bb".repeat(32);
+    let carol = "cc".repeat(32);
+    // Bob's removal blanked leaf 1, so Carol is second in member order but
+    // still holds leaf 2.
+    let info = debug_info_for(
+        vec![
+            device_token_record(&alice, 0, b"alice", 1),
+            device_token_record(&bob, 1, b"bob", 1),
+            device_token_record(&carol, 2, b"carol", 1),
+        ],
+        &carol,
+        &[(&alice, 0), (&carol, 2)],
+        Some(2),
+    );
+    assert_eq!(
+        debug_leaf_states(&info),
+        vec![
+            (alice, 0, true, true),
+            (bob, 1, false, false),
+            (carol, 2, true, true),
+        ]
+    );
+    assert_eq!(
+        (
+            info.total_token_count,
+            info.active_token_count,
+            info.stale_token_count
+        ),
+        (3, 2, 1)
+    );
+    assert_eq!(info.local_registration.local_leaf_index, Some(2));
+}
+
+#[test]
+fn group_debug_info_counts_each_sibling_leaf_and_old_leaves_as_stale() {
+    let local = "dd".repeat(32);
+    let bob = "bb".repeat(32);
+    // Bob's devices hold leaves 1 and 3; his record on leaf 2 is from a device
+    // that left. Leaf 2 now holds the local device's sibling.
+    let info = debug_info_for(
+        vec![
+            device_token_record(&bob, 1, b"bob-phone", 1),
+            device_token_record(&bob, 2, b"bob-old-phone", 1),
+            device_token_record(&bob, 3, b"bob-tablet", 1),
+            device_token_record(&bob, 5, b"bob-older-phone", 1),
+            device_token_record(&local, 4, b"local-tablet", 1),
+        ],
+        &local,
+        &[(&local, 0), (&bob, 1), (&local, 2), (&bob, 3), (&local, 4)],
+        Some(4),
+    );
+    assert_eq!(
+        debug_leaf_states(&info),
+        vec![
+            (bob.clone(), 1, true, true),
+            (bob.clone(), 2, true, false),
+            (bob.clone(), 3, true, true),
+            (bob, 5, true, false),
+            (local, 4, true, true),
+        ]
+    );
+    assert_eq!(
+        (
+            info.total_token_count,
+            info.active_token_count,
+            info.stale_token_count
+        ),
+        (5, 3, 2)
+    );
+    // The local account holds three leaves; the device's own is reported.
+    assert_eq!(info.local_registration.local_leaf_index, Some(4));
+}
+
 #[test]
 fn apns_token_encryption_uses_platform_byte_0x01() {
     let secret = server_secret();
@@ -269,8 +461,8 @@ async fn push_chunks_round_trip_at_wire_size_boundary() {
 
     let mut received = Vec::new();
     let mut chunk_sizes = Vec::new();
-    for chunk in notification_trigger_chunks(&tokens) {
-        let wrap = build_notification_gift_wrap(&server.public_key().to_hex(), chunk)
+    for chunk in padded_notification_trigger_chunks(&tokens) {
+        let wrap = build_notification_gift_wrap(&server.public_key().to_hex(), &chunk)
             .await
             .unwrap();
         let event = wrap.to_verified_nostr_event().unwrap();
@@ -283,10 +475,43 @@ async fn push_chunks_round_trip_at_wire_size_boundary() {
         let content = BASE64_STANDARD.decode(gift.rumor.content).unwrap();
         assert_eq!(content.len() % PUSH_ENCRYPTED_TOKEN_LEN, 0);
         chunk_sizes.push(content.len() / PUSH_ENCRYPTED_TOKEN_LEN);
-        received.extend(content);
+        let (real, padding) = content.split_at(content.len() - PUSH_ENCRYPTED_TOKEN_LEN);
+        assert!(!tokens.iter().any(|token| token == padding));
+        received.extend_from_slice(real);
     }
-    assert_eq!(chunk_sizes, [19, 1]);
+    // 18 real tokens plus one padding chunk fill the 19-chunk wire limit.
+    assert_eq!(chunk_sizes, [19, 3]);
     assert_eq!(received, tokens.concat());
+}
+
+#[test]
+fn trigger_padding_is_fresh_per_send_and_never_decrypts() {
+    let secret = server_secret();
+    let token = encrypted_push_token(
+        PushPlatform::Fcm,
+        b"opaque-fcm-token",
+        &server_pubkey_hex(&secret),
+    )
+    .unwrap();
+    let tokens = vec![token.clone()];
+    let first = padded_notification_trigger_chunks(&tokens).collect::<Vec<_>>();
+    let second = padded_notification_trigger_chunks(&tokens).collect::<Vec<_>>();
+    for chunks in [&first, &second] {
+        assert_eq!(chunks.len(), 1);
+        let [real, padding] = chunks[0].as_slice() else {
+            panic!("one real token and one padding chunk");
+        };
+        assert_eq!(real, &token);
+        assert!(decrypt_push_token_for_test(real, &secret).is_ok());
+        assert_eq!(padding.len(), PUSH_ENCRYPTED_TOKEN_LEN);
+        assert!(decrypt_push_token_for_test(padding, &secret).is_err());
+    }
+    // Servers dedup triggers on the decoded content's SHA-256.
+    let digest = |chunks: &[Vec<Vec<u8>>]| {
+        let content = build_notification_rumor_content(&chunks[0]).unwrap();
+        Sha256::digest(BASE64_STANDARD.decode(content).unwrap())
+    };
+    assert_ne!(digest(&first), digest(&second));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -699,6 +924,714 @@ fn surrounding_relay_hint_whitespace_is_deduplicated_before_verification() {
     }
 }
 
+fn push_gossip_test_app(dir: &tempfile::TempDir) -> MarmotApp {
+    marmot_account::AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    MarmotApp::with_relay(dir.path(), "wss://relay.example")
+}
+
+fn push_gossip_message(
+    sender: &Keys,
+    group_id: &cgka_traits::GroupId,
+    kind: u64,
+    plaintext: String,
+) -> ReceivedMessage {
+    ReceivedMessage {
+        authority: None,
+        message_id_hex: "11".repeat(32),
+        source_message_id_hex: "22".repeat(32),
+        sender: sender.public_key().to_hex(),
+        sender_display_name: None,
+        group_id: group_id.clone(),
+        source_epoch: 1,
+        retention: None,
+        plaintext,
+        kind,
+        tags: vec![vec!["v".to_owned(), PUSH_VERSION.to_owned()]],
+        recorded_at: 1,
+        received_at: 1,
+    }
+}
+
+fn removal_payload(removals: &[&PushTokenRemovalRecord]) -> String {
+    serde_json::to_string(&PushTokenRemovalPayload {
+        v: PUSH_VERSION.to_owned(),
+        removals: removals
+            .iter()
+            .map(|removal| PushTokenRemovalEntry::from_record(removal))
+            .collect(),
+    })
+    .unwrap()
+}
+
+/// Any member can relay a stored tombstone in a kind 449 that recipients
+/// verify under the group's owner-proof rules, legacy proof forms included. A
+/// tombstone written before migration 0118 lists as local-only until the same
+/// removal arrives again.
+#[test]
+fn stored_tombstones_relay_as_owner_verified_removals() {
+    let owner = Keys::generate();
+    let owner_id = owner.public_key().to_hex();
+    let group_id = cgka_traits::GroupId::new(vec![0xEF; 16]);
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let server = "cd".repeat(32);
+    let current = signed_removal_record(&owner, &group_id_hex, 1, &server, 100);
+    let mut raw_legacy = signed_removal_record(&owner, &group_id_hex, 2, &server, 100);
+    sign_removal_record_raw_legacy(&mut raw_legacy, &group_id_hex, &owner);
+    let leaves = [1, 2, 3].map(|leaf_index| cgka_traits::engine::GroupMemberLeaf {
+        member: cgka_traits::MemberId::new(owner.public_key().to_bytes().to_vec()),
+        leaf_index,
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let app = push_gossip_test_app(&dir);
+    app.ingest_push_gossip_message(
+        "alice",
+        &push_gossip_message(
+            &owner,
+            &group_id,
+            MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL,
+            removal_payload(&[&current, &raw_legacy]),
+        ),
+        &leaves,
+        ProtocolProfile::Legacy,
+    )
+    .unwrap();
+    let earlier = signed_removal_record(&owner, &group_id_hex, 3, &server, 100);
+    let mut local_only =
+        crate::conversions::account_push_token_tombstone_from_removal(&group_id_hex, &earlier, 1)
+            .unwrap();
+    local_only.removal_proof = None;
+    app.account_storage("alice")
+        .unwrap()
+        .app_storage()
+        .apply_group_push_token_tombstone(&local_only)
+        .unwrap();
+
+    let stored = app
+        .group_push_token_tombstones("alice", &group_id_hex)
+        .unwrap();
+    assert_eq!(stored.len(), 3);
+    assert_eq!(
+        stored[2].removal, None,
+        "pre-0118 tombstones start local-only"
+    );
+    assert_eq!(stored[2].record_digest, local_only.record_digest);
+
+    // A member relaying the same removal later makes it relayable here too.
+    app.ingest_push_gossip_message(
+        "alice",
+        &push_gossip_message(
+            &owner,
+            &group_id,
+            MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL,
+            removal_payload(&[&earlier]),
+        ),
+        &leaves,
+        ProtocolProfile::Current,
+    )
+    .unwrap();
+    let stored = app
+        .group_push_token_tombstones("alice", &group_id_hex)
+        .unwrap();
+    assert_eq!(stored.len(), 3);
+    for (tombstone, original) in stored.iter().zip([&current, &raw_legacy, &earlier]) {
+        let removal = tombstone.removal.as_ref().expect("tombstone is relayable");
+        assert_eq!(
+            removal, original,
+            "the relayed removal is the owner's, unchanged"
+        );
+        assert_eq!(
+            tombstone.record_digest,
+            removal.record_digest(&group_id_hex).unwrap()
+        );
+    }
+
+    // A recipient parses and verifies the relay exactly as it would the
+    // owner's own kind 449.
+    let relay = removal_payload(
+        &stored
+            .iter()
+            .filter_map(|tombstone| tombstone.removal.as_ref())
+            .collect::<Vec<_>>(),
+    );
+    let verified = |profile| match verify_push_gossip_for_profile(
+        parse_push_gossip(
+            MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL,
+            &group_id_hex,
+            &relay,
+        )
+        .unwrap(),
+        &group_id_hex,
+        std::slice::from_ref(&owner_id),
+        profile,
+    ) {
+        PushGossipAction::Remove(removals) => removals,
+        other => panic!("expected removals, got {other:?}"),
+    };
+    assert_eq!(
+        verified(ProtocolProfile::Legacy),
+        vec![current.clone(), raw_legacy, earlier.clone()]
+    );
+    assert_eq!(verified(ProtocolProfile::Current), vec![current, earlier]);
+}
+
+/// Read-back returns a record's stored digest only while the record's fields
+/// still produce it. The record itself is always returned.
+#[test]
+fn stored_token_digests_are_checked_on_read_back() {
+    let owner = Keys::generate();
+    let group_id_hex = hex::encode([0xEF; 16]);
+    let server = "cd".repeat(32);
+    let dir = tempfile::tempdir().unwrap();
+    let app = push_gossip_test_app(&dir);
+    let storage = app.account_storage("alice").unwrap().app_storage();
+
+    let matching = signed_token_record(&owner, &group_id_hex, 1, &server, 100);
+    let stale = signed_token_record(&owner, &group_id_hex, 2, &server, 100);
+    let mut placeholder = signed_token_record(&owner, &group_id_hex, 3, &server, 100);
+    placeholder.token_fingerprint = "not-a-fingerprint".to_owned();
+    for record in [&matching, &placeholder] {
+        app.upsert_group_push_token("alice", record).unwrap();
+    }
+    let mut stale_row = crate::conversions::account_group_push_token_from_app(&stale);
+    stale_row.record_digest = matching.record_digest().unwrap();
+    storage.upsert_group_push_token(&stale_row).unwrap();
+
+    let stored = app
+        .stored_group_push_tokens("alice", &group_id_hex)
+        .unwrap();
+    let digests = stored
+        .iter()
+        .map(|stored| stored.record_digest.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        digests,
+        vec![Some(matching.record_digest().unwrap()), None, None]
+    );
+    assert_eq!(
+        app.group_push_tokens("alice", &group_id_hex).unwrap(),
+        vec![matching, stale, placeholder]
+    );
+}
+
+fn stored_token(record: &GroupPushTokenRecord) -> StoredGroupPushToken {
+    StoredGroupPushToken {
+        record: record.clone(),
+        record_digest: Some(record.record_digest().unwrap()),
+    }
+}
+
+fn stored_tombstone(
+    group_id_hex: &str,
+    removal: &PushTokenRemovalRecord,
+) -> StoredPushTokenTombstone {
+    StoredPushTokenTombstone {
+        record_digest: removal.record_digest(group_id_hex).unwrap(),
+        removal: Some(removal.clone()),
+    }
+}
+
+/// Published size bound of the group message carrying one list `content`.
+fn list_published_len(
+    intent: crate::messages::AppMessageIntent,
+    sender_hex: &str,
+    group_id_len: usize,
+) -> usize {
+    let event = crate::messages::build_inner_event(&intent, sender_hex, u64::MAX).unwrap();
+    let inner = crate::messages::encode_inner_event(&event).unwrap();
+    lists::published_len_bound(group_id_len, inner.len())
+}
+
+/// A snapshot relays every stored record and tombstone exactly as its owner
+/// signed it, so a recipient verifies the relay as it would the owner's own
+/// update. A record whose stored digest its fields do not produce, and a
+/// tombstone without its removal proof, are left out.
+#[test]
+fn push_gossip_lists_relay_stored_entries_unchanged() {
+    let owner = Keys::generate();
+    let owner_id = owner.public_key().to_hex();
+    let relayer = Keys::generate().public_key().to_hex();
+    let group_id_hex = hex::encode([0xEF; 16]);
+    let server = "cd".repeat(32);
+    let now = unix_now_ms();
+    let records = [1, 2].map(|leaf| signed_token_record(&owner, &group_id_hex, leaf, &server, now));
+    let removal = signed_removal_record(&owner, &group_id_hex, 3, &server, now);
+    let mut unverified = stored_token(&signed_token_record(&owner, &group_id_hex, 4, &server, now));
+    unverified.record_digest = None;
+    let mut unsigned = stored_tombstone(
+        &group_id_hex,
+        &signed_removal_record(&owner, &group_id_hex, 5, &server, now),
+    );
+    unsigned.removal = None;
+
+    let lists = push_gossip_lists(
+        &[
+            stored_token(&records[0]),
+            unverified,
+            stored_token(&records[1]),
+        ],
+        &[unsigned, stored_tombstone(&group_id_hex, &removal)],
+        &relayer,
+        16,
+    )
+    .unwrap();
+    assert_eq!(
+        (
+            lists.unverified_records,
+            lists.unsigned_tombstones,
+            lists.oversized_entries
+        ),
+        (1, 1, 0)
+    );
+    assert_eq!((lists.token_lists.len(), lists.removal_lists.len()), (1, 1));
+
+    let verified = |kind, content: &str| {
+        verify_push_gossip_for_profile(
+            parse_push_gossip(kind, &group_id_hex, content).unwrap(),
+            &group_id_hex,
+            std::slice::from_ref(&owner_id),
+            ProtocolProfile::Current,
+        )
+    };
+    let PushGossipAction::Upsert(upserts) =
+        verified(MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST, &lists.token_lists[0])
+    else {
+        panic!("a token list upserts");
+    };
+    let signed = |record: &GroupPushTokenRecord| {
+        (
+            record.leaf_index,
+            record.relay_hint.clone(),
+            record.encrypted_token.clone(),
+            record.owner_ts,
+            record.owner_sig.clone(),
+        )
+    };
+    assert_eq!(
+        upserts.iter().map(signed).collect::<Vec<_>>(),
+        records.iter().map(signed).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        verified(
+            MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL,
+            &lists.removal_lists[0]
+        ),
+        PushGossipAction::Remove(vec![removal])
+    );
+    assert_eq!(
+        push_gossip_lists(&[], &[], &relayer, 16).unwrap(),
+        lists::PushGossipLists::default(),
+        "a device that holds nothing sends nothing"
+    );
+}
+
+/// The widest record entry this crate stores: an escape-heavy relay hint of
+/// `hint_len` characters, the widest leaf index and stamp.
+fn widest_token(group_id_hex: &str, server_index: usize, hint_len: usize) -> StoredGroupPushToken {
+    let hint = "\"\\\u{1}x"
+        .chars()
+        .cycle()
+        .take(hint_len)
+        .collect::<String>();
+    StoredGroupPushToken {
+        record: GroupPushTokenRecord {
+            group_id_hex: group_id_hex.to_owned(),
+            member_id_hex: "ab".repeat(32),
+            leaf_index: u32::MAX,
+            platform: PushPlatform::Apns,
+            token_fingerprint: push_token_fingerprint(PushPlatform::Apns, &[1]),
+            server_pubkey_hex: format!("{server_index:064x}"),
+            relay_hint: Some(hint),
+            encrypted_token: vec![0xFF; PUSH_ENCRYPTED_TOKEN_LEN],
+            owner_ts: i64::MIN,
+            owner_sig: "ef".repeat(64),
+            updated_at_ms: 0,
+        },
+        record_digest: Some("00".repeat(32)),
+    }
+}
+
+/// Each list fits the 64 KiB group message with at most 32 entries, packs as
+/// many entries as fit, and keeps storage order. One entry too large for a
+/// message on its own is left out; the largest one that fits is sent. Removals
+/// hit the 32-entry cap before the byte budget.
+#[test]
+fn push_gossip_lists_split_worst_case_entries_by_size_and_count() {
+    let sender = "ab".repeat(32);
+    for group_id_len in [16, 32, 255] {
+        let group_id_hex = hex::encode(vec![0xEF; group_id_len]);
+        let tokens = (0..100)
+            .map(|index| widest_token(&group_id_hex, index, (index * 211) % 4_000))
+            .collect::<Vec<_>>();
+        let lists = push_gossip_lists(&tokens, &[], &sender, group_id_len).unwrap();
+        assert_eq!(lists.oversized_entries, 0);
+        let parsed = lists
+            .token_lists
+            .iter()
+            .map(|content| {
+                serde_json::from_str::<PushTokenGossipPayload>(content)
+                    .unwrap()
+                    .tokens
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            parsed
+                .iter()
+                .flatten()
+                .map(|entry| entry.server_pubkey_hex.clone())
+                .collect::<Vec<_>>(),
+            tokens
+                .iter()
+                .map(|stored| stored.record.server_pubkey_hex.clone())
+                .collect::<Vec<_>>(),
+            "every entry is sent once, in storage order"
+        );
+        for (index, content) in lists.token_lists.iter().enumerate() {
+            let len = list_published_len(
+                crate::messages::AppMessageIntent::PushTokenList {
+                    content: content.clone(),
+                },
+                &sender,
+                group_id_len,
+            );
+            assert!(
+                len <= lists::PUSH_GOSSIP_EVENT_MAX_BYTES,
+                "list {index} is {len} bytes"
+            );
+            assert!((1..=32).contains(&parsed[index].len()));
+            if let Some(next) = parsed.get(index + 1).and_then(|next| next.first()) {
+                let mut grown = parsed[index].clone();
+                grown.push(next.clone());
+                let grown = serde_json::to_string(&PushTokenGossipPayload {
+                    v: PUSH_VERSION.to_owned(),
+                    tokens: grown,
+                })
+                .unwrap();
+                assert!(
+                    list_published_len(
+                        crate::messages::AppMessageIntent::PushTokenList { content: grown },
+                        &sender,
+                        group_id_len
+                    ) > lists::PUSH_GOSSIP_EVENT_MAX_BYTES,
+                    "list {index} could not take the next entry"
+                );
+            }
+        }
+
+        // The largest hint whose lone entry fits, by direct measurement.
+        let alone = |hint_len| {
+            let entry =
+                PushTokenGossipEntry::from_record(&widest_token(&group_id_hex, 0, hint_len).record);
+            let content = serde_json::to_string(&PushTokenGossipPayload {
+                v: PUSH_VERSION.to_owned(),
+                tokens: vec![entry],
+            })
+            .unwrap();
+            list_published_len(
+                crate::messages::AppMessageIntent::PushTokenList { content },
+                &sender,
+                group_id_len,
+            )
+        };
+        let (mut low, mut high) = (0_usize, 65_536);
+        while low < high {
+            let mid = (low + high).div_ceil(2);
+            if alone(mid) <= lists::PUSH_GOSSIP_EVENT_MAX_BYTES {
+                low = mid
+            } else {
+                high = mid - 1
+            }
+        }
+        let largest = widest_token(&group_id_hex, 1, low);
+        let too_large = widest_token(&group_id_hex, 2, low + 1);
+        assert!(alone(low + 1) > lists::PUSH_GOSSIP_EVENT_MAX_BYTES);
+        let lists =
+            push_gossip_lists(&[too_large, largest.clone()], &[], &sender, group_id_len).unwrap();
+        assert_eq!(lists.oversized_entries, 1);
+        assert_eq!(lists.token_lists.len(), 1);
+        assert_eq!(
+            serde_json::from_str::<PushTokenGossipPayload>(&lists.token_lists[0])
+                .unwrap()
+                .tokens,
+            vec![PushTokenGossipEntry::from_record(&largest.record)]
+        );
+    }
+
+    let group_id_hex = hex::encode([0xEF; 16]);
+    let removals = (0..70)
+        .map(|index| {
+            let removal = PushTokenRemovalRecord {
+                member_id_hex: "ab".repeat(32),
+                leaf_index: u32::MAX,
+                platform: PushPlatform::Apns,
+                token_fingerprint: push_token_fingerprint(PushPlatform::Apns, &[1]),
+                server_pubkey_hex: format!("{index:064x}"),
+                owner_ts: i64::MIN,
+                owner_sig: "ef".repeat(64),
+            };
+            stored_tombstone(&group_id_hex, &removal)
+        })
+        .collect::<Vec<_>>();
+    let lists = push_gossip_lists(&[], &removals, &sender, 16).unwrap();
+    assert_eq!(
+        lists
+            .removal_lists
+            .iter()
+            .map(
+                |content| serde_json::from_str::<PushTokenRemovalPayload>(content)
+                    .unwrap()
+                    .removals
+                    .len()
+            )
+            .collect::<Vec<_>>(),
+        vec![32, 32, 6]
+    );
+}
+
+/// An announce carries the sender's own records and names, each once, its
+/// own records, then the held records and tombstones they do not replace. A
+/// record whose stored digest does not verify is left out; a tombstone without
+/// its removal proof is still named.
+#[test]
+fn push_announce_names_what_the_sender_holds() {
+    let owner = Keys::generate();
+    let other = Keys::generate();
+    let sender = owner.public_key().to_hex();
+    let group_id_hex = hex::encode([0xEF; 16]);
+    let server = "cd".repeat(32);
+    let now = unix_now_ms();
+    let own = signed_token_record(&owner, &group_id_hex, 1, &server, now);
+    let replaced = signed_token_record(&owner, &group_id_hex, 1, &server, now - 1);
+    let held = signed_token_record(&other, &group_id_hex, 2, &server, now);
+    let mut unverified = stored_token(&signed_token_record(&other, &group_id_hex, 3, &server, now));
+    unverified.record_digest = None;
+    let removal = signed_removal_record(&other, &group_id_hex, 4, &server, now);
+    let mut unsigned = stored_tombstone(
+        &group_id_hex,
+        &signed_removal_record(&other, &group_id_hex, 5, &server, now),
+    );
+    unsigned.removal = None;
+    let replaced_removal = signed_removal_record(&owner, &group_id_hex, 1, &server, now - 2);
+    let element = |digest: String| push_have_element(&digest).unwrap();
+
+    let announce = push_announce(
+        std::slice::from_ref(&own),
+        &[
+            stored_token(&held),
+            stored_token(&replaced),
+            unverified,
+            stored_token(&held),
+        ],
+        &[
+            stored_tombstone(&group_id_hex, &removal),
+            stored_tombstone(&group_id_hex, &replaced_removal),
+            unsigned.clone(),
+        ],
+        &sender,
+        16,
+    )
+    .unwrap();
+    let payload: PushTokenAnnouncePayload = serde_json::from_str(&announce.content).unwrap();
+    assert_eq!(payload.v, PUSH_VERSION);
+    assert_eq!(
+        payload.tokens,
+        vec![PushTokenGossipEntry::from_record(&own)]
+    );
+    assert_eq!(
+        payload.have,
+        vec![
+            element(own.record_digest().unwrap()),
+            element(held.record_digest().unwrap()),
+            element(removal.record_digest(&group_id_hex).unwrap()),
+            element(unsigned.record_digest.clone()),
+        ]
+    );
+    assert!(payload.have.iter().all(|element| element.len() == 12));
+    assert_eq!(
+        (announce.listed, announce.unlisted, announce.unknown_digests),
+        (4, 0, 1)
+    );
+
+    // A device with no record of its own announces `tokens: []`.
+    let empty = push_announce(&[], &[], &[], &sender, 16).unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&empty.content).unwrap(),
+        serde_json::json!({"v": PUSH_VERSION, "tokens": [], "have": []})
+    );
+}
+
+/// A sender that holds more than fits names the prefix that keeps the
+/// carrying group message within 64 KiB, own records first.
+#[test]
+fn push_announce_names_a_prefix_that_fits_64_kib() {
+    let owner = Keys::generate();
+    let sender = owner.public_key().to_hex();
+    for group_id_len in [16, 32, 255] {
+        let group_id_hex = hex::encode(vec![0xEF; group_id_len]);
+        let own = signed_token_record(&owner, &group_id_hex, 1, &"cd".repeat(32), 100);
+        let tombstones = (0..5_000_u64)
+            .map(|index| StoredPushTokenTombstone {
+                record_digest: hex::encode(Sha256::digest(index.to_be_bytes())),
+                removal: None,
+            })
+            .collect::<Vec<_>>();
+        let announce = push_announce(
+            std::slice::from_ref(&own),
+            &[],
+            &tombstones,
+            &sender,
+            group_id_len,
+        )
+        .unwrap();
+        assert_eq!(announce.listed + announce.unlisted, 5_001);
+        assert!(announce.unlisted > 0);
+        let payload: PushTokenAnnouncePayload = serde_json::from_str(&announce.content).unwrap();
+        assert_eq!(payload.have.len(), announce.listed);
+        assert!(payload.have.len() <= PUSH_MAX_HAVE_ENTRIES);
+        assert_eq!(
+            payload.have[0],
+            push_have_element(&own.record_digest().unwrap()).unwrap()
+        );
+        let published = |content: String| {
+            list_published_len(
+                crate::messages::AppMessageIntent::PushTokenUpdate { content },
+                &sender,
+                group_id_len,
+            )
+        };
+        let len = published(announce.content.clone());
+        assert!(len <= lists::PUSH_GOSSIP_EVENT_MAX_BYTES, "{len} bytes");
+        let mut grown = payload;
+        grown
+            .have
+            .push(push_have_element(&tombstones[4_999].record_digest).unwrap());
+        assert!(
+            published(serde_json::to_string(&grown).unwrap()) > lists::PUSH_GOSSIP_EVENT_MAX_BYTES,
+            "the next element would not fit"
+        );
+    }
+}
+
+/// A kind 447 asks for repair as an announce, by the 8-byte digests its
+/// `have` names, or as a request, an empty or missing `tokens` with no `have`, which
+/// names nothing. A self-update without `have`, a `have` that is not an array
+/// or holds more than 4,096 elements, and another version ask for nothing.
+#[test]
+fn repair_ask_reads_have_and_takes_a_request_as_an_empty_have() {
+    let digest = "ab".repeat(32);
+    let element = push_have_element(&digest).unwrap();
+    let ask = |tokens: serde_json::Value, have: Option<serde_json::Value>| {
+        let mut content = serde_json::json!({"v": PUSH_VERSION, "tokens": tokens});
+        if let Some(have) = have {
+            content["have"] = have;
+        }
+        parse_push_repair_ask(&content.to_string())
+    };
+    let entry = serde_json::json!([{"member_id_hex": "not checked here"}]);
+    assert_eq!(ask(serde_json::json!([]), None), Some(PushHave::new()));
+    assert_eq!(
+        ask(serde_json::json!([]), Some(serde_json::json!([]))),
+        Some(PushHave::new())
+    );
+    assert_eq!(
+        ask(
+            entry.clone(),
+            Some(serde_json::json!([
+                element,
+                element,
+                "not base64!",
+                7,
+                null,
+                BASE64_STANDARD.encode([1_u8; 9]),
+                BASE64_STANDARD.encode([1_u8; 7]),
+            ]))
+        ),
+        Some(PushHave::from([push_have_prefix(&digest).unwrap()]))
+    );
+    let at_cap = vec![serde_json::json!(0); PUSH_MAX_HAVE_ENTRIES];
+    assert_eq!(
+        ask(
+            serde_json::json!([]),
+            Some(serde_json::Value::Array(at_cap))
+        ),
+        Some(PushHave::new())
+    );
+
+    assert_eq!(ask(entry, None), None, "a self-update");
+    for have in [
+        serde_json::json!("not an array"),
+        serde_json::Value::Null,
+        serde_json::json!({"0": element}),
+        serde_json::json!(7),
+        serde_json::Value::Array(vec![serde_json::json!(element); PUSH_MAX_HAVE_ENTRIES + 1]),
+    ] {
+        assert_eq!(ask(serde_json::json!([]), Some(have)), None);
+    }
+    assert_eq!(
+        parse_push_repair_ask(
+            &serde_json::json!({"v": "marmot-push-v2", "tokens": []}).to_string()
+        ),
+        None
+    );
+    assert_eq!(
+        parse_push_repair_ask(r#"{"v": "marmot-push-v1"}"#),
+        Some(PushHave::new()),
+        "a missing `tokens` reads as an empty one"
+    );
+    assert_eq!(
+        parse_push_repair_ask(r#"{"v": "marmot-push-v1", "tokens": {}}"#),
+        None
+    );
+    assert_eq!(parse_push_repair_ask("not json"), None);
+}
+
+/// Inbound kind 447 decoding ignores `have`, whatever it holds, and applies
+/// the announce's `tokens` as a self-update.
+#[test]
+fn inbound_announce_applies_its_tokens_and_ignores_have() {
+    let owner = Keys::generate();
+    let group_id_hex = hex::encode([0xEF; 16]);
+    let record = signed_token_record(&owner, &group_id_hex, 1, &"cd".repeat(32), unix_now_ms());
+    let entry = serde_json::to_value(PushTokenGossipEntry::from_record(&record)).unwrap();
+    let element = push_have_element(&record.record_digest().unwrap()).unwrap();
+    for have in [
+        serde_json::json!([element]),
+        serde_json::json!(["not base64", 7, null]),
+        serde_json::json!("not an array"),
+        serde_json::Value::Array(vec![serde_json::json!(element); PUSH_MAX_HAVE_ENTRIES + 1]),
+    ] {
+        let content =
+            serde_json::json!({"v": PUSH_VERSION, "tokens": [entry], "have": have}).to_string();
+        let PushGossipAction::Upsert(records) = verify_push_gossip_for_profile(
+            parse_push_gossip(
+                MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE,
+                &group_id_hex,
+                &content,
+            )
+            .unwrap(),
+            &group_id_hex,
+            &[owner.public_key().to_hex()],
+            ProtocolProfile::Current,
+        ) else {
+            panic!("an announce upserts its tokens");
+        };
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].owner_sig, record.owner_sig);
+    }
+    let request = serde_json::json!({"v": PUSH_VERSION, "tokens": [], "have": []}).to_string();
+    assert_eq!(
+        parse_push_gossip(
+            MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE,
+            &group_id_hex,
+            &request
+        )
+        .unwrap(),
+        PushGossipAction::Upsert(Vec::new())
+    );
+}
+
 #[test]
 fn mixed_entry_permutations_apply_the_same_valid_winner() {
     let owner = Keys::generate();
@@ -1019,15 +1952,7 @@ fn muted_chat_live_event_resolver_emits_only_direct_mentions() {
     let sender = "bb".repeat(32);
     let group = "ee".repeat(32);
     let mut resolver = NotificationResolver::default();
-    seed_group_state_resolver(
-        &mut resolver,
-        "alice",
-        &receiver,
-        &group,
-        Some(&sender),
-        true,
-        true,
-    );
+    seed_group_state_resolver(&app, &mut resolver, "alice", &group, Some(&sender), true);
 
     let mut cases = vec![
         ("ordinary", received_chat("hi", vec![]), false),
@@ -1059,9 +1984,7 @@ fn muted_chat_live_event_resolver_emits_only_direct_mentions() {
         }
     }
 
-    resolver
-        .chat_muted
-        .insert(("alice".to_owned(), group), false);
+    app.clear_chat_muted("alice", &group).unwrap();
     let event = MarmotAppEvent::MessageReceived(RuntimeMessageReceived {
         account_id_hex: receiver,
         account_label: "alice".to_owned(),
@@ -1095,6 +2018,88 @@ fn group_invite_notification_is_not_a_mention() {
     assert!(matches!(update.trigger, NotificationTrigger::GroupInvite));
     assert_eq!(update.traffic_class, NotificationTrafficClass::Standard);
     assert!(!update.is_mention);
+}
+
+#[test]
+fn notification_dm_projection() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let account = app.account_home().create_account("alice").unwrap();
+    let local = &account.account_id_hex;
+    let actor = Keys::generate().public_key().to_hex();
+    let mut message = received_chat("hello", vec![]);
+    message.sender = actor.clone();
+    app.set_local_notifications_enabled("alice", true).unwrap();
+    let mut state = app.load_state("alice").unwrap();
+    let group_id = message.group_id.clone();
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let events = [
+        MarmotAppEvent::MessageReceived(RuntimeMessageReceived {
+            account_id_hex: local.clone(),
+            account_label: "alice".to_owned(),
+            message,
+        }),
+        MarmotAppEvent::GroupJoined {
+            account_id_hex: local.clone(),
+            account_label: "alice".to_owned(),
+            group_id: group_id.clone(),
+        },
+        MarmotAppEvent::GroupEvent(RuntimeGroupEvent {
+            account_id_hex: local.clone(),
+            account_label: "alice".to_owned(),
+            event: group_state_event(
+                group_id,
+                Some(&actor),
+                cgka_traits::engine::GroupStateChange::AdminAdded {
+                    member: member_id_from_hex(local),
+                },
+            ),
+        }),
+    ];
+    for (name, members, pending, expected) in [
+        (Some(""), Some(2), false, true),
+        (Some(" \t"), Some(2), true, true),
+        (Some("Team"), Some(2), false, false),
+        (Some(""), Some(3), false, false),
+        (Some(""), Some(1), false, false),
+        (Some(""), None, false, false),
+        (None, None, false, false),
+    ] {
+        let mut group = AppGroupRecord::new(
+            group_id_hex.clone(),
+            crate::AppGroupNostrRoutingComponent::new(
+                cgka_traits::NostrRoutingV1::new(
+                    [0xEE; 32],
+                    vec!["wss://relay.example".to_owned()],
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+            name.unwrap_or_default().to_owned(),
+            String::new(),
+            crate::AppGroupImageInput::default(),
+            crate::AppGroupAdminPolicyComponent::new(Vec::new()),
+            crate::AppGroupMessageRetentionComponent::disabled(),
+        );
+        group.welcomer_account_id_hex = Some(actor.clone());
+        group.member_count = members;
+        group.pending_confirmation = pending;
+        state.groups = name.map(|_| group).into_iter().collect();
+        app.save_state(&state).unwrap();
+        let mut resolver = NotificationResolver::default();
+        for event in &events {
+            let update = notification_update_from_event_cached(&app, &mut resolver, event).unwrap();
+            if name.is_none() && matches!(event, MarmotAppEvent::MessageReceived(_)) {
+                assert_eq!(update, None, "messages from unknown groups are suppressed");
+                continue;
+            }
+            let update = update.expect("eligible notification");
+            assert_eq!(
+                update.is_dm, expected,
+                "{name:?} {members:?} {pending} {event:?}"
+            );
+        }
+    }
 }
 
 // #639: the per-batch NotificationResolver caches the raw directory-derived user
@@ -1294,15 +2299,28 @@ fn poll_notification_alerts_without_exposing_question_or_options() {
     );
 }
 
+/// A device-group kind neither alerts nor previews, even as a reaction's
+/// target, so its content never reaches a notification.
+#[test]
+fn device_group_kinds_never_notify_or_preview() {
+    for kind in [457, 458, 459, 460, 461, 473, 475, 476] {
+        assert_eq!(notification_traffic_for_kind(kind), None);
+        assert_eq!(preview_text_for_kind(kind, "{\"v\":1}"), None);
+    }
+}
+
 #[test]
 fn agent_activity_notification_is_non_mention_and_respects_group_mute() {
     use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY;
 
     let dir = tempfile::tempdir().unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-    app.account_home().create_account("alice").unwrap();
     let account_label = "alice";
-    let account_id_hex = "aa".repeat(32);
+    let account_id_hex = app
+        .account_home()
+        .create_account(account_label)
+        .unwrap()
+        .account_id_hex;
     let sender_id_hex = "bb".repeat(32);
     let group_id_hex = "ee".repeat(32);
     let message = RuntimeMessageReceived {
@@ -1326,28 +2344,14 @@ fn agent_activity_notification_is_non_mention_and_respects_group_mute() {
         },
     };
     let mut resolver = NotificationResolver::default();
-    resolver.settings.insert(
-        account_label.to_owned(),
-        NotificationSettings {
-            account_ref: account_label.to_owned(),
-            account_id_hex: account_id_hex.clone(),
-            local_notifications_enabled: true,
-            native_push_enabled: true,
-        },
+    seed_group_state_resolver(
+        &app,
+        &mut resolver,
+        account_label,
+        &group_id_hex,
+        Some(&sender_id_hex),
+        false,
     );
-    let conversation = (account_label.to_owned(), group_id_hex.clone());
-    resolver.groups.insert(conversation.clone(), None);
-    resolver.chat_muted.insert(conversation.clone(), false);
-    for account_id in [&account_id_hex, &sender_id_hex] {
-        resolver.users.insert(
-            account_id.clone(),
-            NotificationUser {
-                account_id_hex: account_id.clone(),
-                display_name: None,
-                picture_url: None,
-            },
-        );
-    }
 
     let update = notification_update_from_message(&app, &mut resolver, &message)
         .unwrap()
@@ -1359,7 +2363,8 @@ fn agent_activity_notification_is_non_mention_and_respects_group_mute() {
     assert_eq!(update.preview_text.as_deref(), Some("Searching relays"));
     assert!(!update.is_mention);
 
-    resolver.chat_muted.insert(conversation, true);
+    app.set_chat_muted(account_label, &group_id_hex, None)
+        .unwrap();
     assert_eq!(
         notification_update_from_message(&app, &mut resolver, &message).unwrap(),
         None,
@@ -1881,27 +2886,36 @@ fn group_state_event(
 }
 
 fn seed_group_state_resolver(
+    app: &MarmotApp,
     resolver: &mut NotificationResolver,
     account_label: &str,
-    account_id_hex: &str,
     group_id_hex: &str,
     actor_id_hex: Option<&str>,
-    local_enabled: bool,
     muted: bool,
 ) {
-    resolver.settings.insert(
-        account_label.to_owned(),
-        NotificationSettings {
-            account_ref: account_label.to_owned(),
-            account_id_hex: account_id_hex.to_owned(),
-            local_notifications_enabled: local_enabled,
-            native_push_enabled: true,
-        },
-    );
-    let conversation = (account_label.to_owned(), group_id_hex.to_owned());
-    resolver.groups.insert(conversation.clone(), None);
-    resolver.chat_muted.insert(conversation, muted);
-    let mut users = vec![account_id_hex];
+    let account = app.account_home().account(account_label).unwrap();
+    let mut state = app.load_state(account_label).unwrap();
+    state.groups.push(crate::AppGroupRecord::new(
+        group_id_hex.to_owned(),
+        crate::groups::AppGroupNostrRoutingComponent::new(cgka_traits::NostrRoutingV1 {
+            nostr_group_id: [0xDD; 32],
+            relays: vec!["wss://relay.example".into()],
+        })
+        .unwrap(),
+        String::new(),
+        String::new(),
+        crate::AppGroupImageInput::default(),
+        crate::groups::AppGroupAdminPolicyComponent::new(Vec::new()),
+        crate::groups::AppGroupMessageRetentionComponent::disabled(),
+    ));
+    app.save_state(&state).unwrap();
+    app.set_local_notifications_enabled(account_label, true)
+        .unwrap();
+    if muted {
+        app.set_chat_muted(account_label, group_id_hex, None)
+            .unwrap();
+    }
+    let mut users = vec![account.account_id_hex.as_str()];
     if let Some(actor_id_hex) = actor_id_hex {
         users.push(actor_id_hex);
     }
@@ -2005,9 +3019,12 @@ fn group_state_classifier_notifies_only_local_self_affecting_changes() {
 fn group_state_live_classification_respects_settings_and_mute() {
     let dir = tempfile::tempdir().unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-    app.account_home().create_account("alice").unwrap();
     let account_label = "alice";
-    let local = "aa".repeat(32);
+    let local = app
+        .account_home()
+        .create_account(account_label)
+        .unwrap()
+        .account_id_hex;
     let actor = "bb".repeat(32);
     let group_id = cgka_traits::GroupId::new(vec![0xEE; 16]);
     let group_id_hex = hex::encode(group_id.as_slice());
@@ -2025,12 +3042,11 @@ fn group_state_live_classification_respects_settings_and_mute() {
 
     let mut resolver = NotificationResolver::default();
     seed_group_state_resolver(
+        &app,
         &mut resolver,
         account_label,
-        &local,
         &group_id_hex,
         Some(&actor),
-        true,
         false,
     );
     let update = notification_update_from_event_cached(&app, &mut resolver, &event)
@@ -2044,24 +3060,17 @@ fn group_state_live_classification_respects_settings_and_mute() {
     assert!(!update.is_from_self);
     assert!(update.notification_key.starts_with("group-state:"));
 
-    resolver
-        .chat_muted
-        .insert((account_label.to_owned(), group_id_hex.clone()), true);
+    app.set_chat_muted(account_label, &group_id_hex, None)
+        .unwrap();
     assert_eq!(
         notification_update_from_event_cached(&app, &mut resolver, &event).unwrap(),
         None,
         "muted groups must suppress membership notifications"
     );
 
-    seed_group_state_resolver(
-        &mut resolver,
-        account_label,
-        &local,
-        &group_id_hex,
-        Some(&actor),
-        false,
-        false,
-    );
+    app.clear_chat_muted(account_label, &group_id_hex).unwrap();
+    app.set_local_notifications_enabled(account_label, false)
+        .unwrap();
     assert!(
         matches!(
             notification_update_from_event_cached(&app, &mut resolver, &event),
@@ -2075,9 +3084,12 @@ fn group_state_live_classification_respects_settings_and_mute() {
 fn group_state_live_and_recovery_share_a_deterministic_key() {
     let dir = tempfile::tempdir().unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-    app.account_home().create_account("alice").unwrap();
     let account_label = "alice";
-    let local = "aa".repeat(32);
+    let local = app
+        .account_home()
+        .create_account(account_label)
+        .unwrap()
+        .account_id_hex;
     let actor = "bb".repeat(32);
     let group_id = cgka_traits::GroupId::new(vec![0xEE; 16]);
     let group_id_hex = hex::encode(group_id.as_slice());
@@ -2091,12 +3103,11 @@ fn group_state_live_and_recovery_share_a_deterministic_key() {
 
     let mut resolver = NotificationResolver::default();
     seed_group_state_resolver(
+        &app,
         &mut resolver,
         account_label,
-        &local,
         &group_id_hex,
         Some(&actor),
-        true,
         false,
     );
     let live = notification_update_from_event_cached(
@@ -2384,15 +3395,7 @@ fn system_reaction_notifications_use_stored_actor_and_respect_origin_withdrawal(
     let group = cgka_traits::GroupId::new(vec![0xEE; 16]);
     let group_hex = hex::encode(group.as_slice());
     let mut resolver = NotificationResolver::default();
-    seed_group_state_resolver(
-        &mut resolver,
-        "alice",
-        &local,
-        &group_hex,
-        Some(&peer),
-        true,
-        false,
-    );
+    seed_group_state_resolver(&app, &mut resolver, "alice", &group_hex, Some(&peer), false);
     for (index, actor) in [Some(local.as_str()), Some(peer.as_str()), None]
         .into_iter()
         .enumerate()

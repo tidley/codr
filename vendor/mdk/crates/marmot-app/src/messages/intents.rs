@@ -14,6 +14,9 @@ use cgka_traits::app_event::{
 use cgka_traits::app_event::{
     MARMOT_APP_EVENT_KIND_REMOVE, MARMOT_APP_EVENT_KIND_REPORT, MARMOT_APP_EVENT_KIND_REVIEW,
 };
+use cgka_traits::polls::{
+    POLL_ENDS_AT_TAG, POLL_MAX_TAGS, POLL_OPTION_TAG, POLL_RESPONSE_TAG, POLL_TYPE_TAG,
+};
 use cgka_traits::reporting::ReportReason;
 use cgka_traits::{
     MARMOT_APP_EVENT_KIND_POLL, MARMOT_APP_EVENT_KIND_POLL_RESPONSE, PollType, poll_response_tags,
@@ -210,6 +213,10 @@ pub(crate) enum AppMessageIntent {
         content: String,
         tags: Vec<Vec<String>>,
     },
+    Sticker {
+        sticker_ref: crate::AppStickerRef,
+        message_tags: Vec<Vec<String>>,
+    },
     Reaction {
         target_message_id: String,
         emoji: String,
@@ -241,6 +248,7 @@ pub(crate) enum AppMessageIntent {
         options: Vec<String>,
         poll_type: PollType,
         ends_at: Option<u64>,
+        message_tags: Vec<Vec<String>>,
     },
     PollResponse {
         poll_event_id: String,
@@ -288,6 +296,9 @@ pub(crate) enum AppMessageIntent {
     PushTokenUpdate {
         content: String,
     },
+    PushTokenList {
+        content: String,
+    },
     PushTokenRemoval {
         content: String,
     },
@@ -313,7 +324,7 @@ pub(crate) fn build_inner_event(
     build_inner_event_with_media_reply(intent, sender_pubkey_hex, created_at, None)
 }
 
-/// The draft-only media reply context keeps the public Media intent compatible.
+/// The optional media reply context keeps the public Media intent compatible.
 /// Tags and validation still belong to this single event builder.
 pub(crate) fn build_inner_event_with_media_reply(
     intent: &AppMessageIntent,
@@ -345,6 +356,21 @@ pub(crate) fn build_inner_event_with_media_reply(
                 }
             }
             Ok(event(MARMOT_APP_EVENT_KIND_CHAT, tags, content.clone()))
+        }
+        AppMessageIntent::Sticker {
+            sticker_ref,
+            message_tags,
+        } => {
+            validate_message_tags(message_tags)?;
+            if message_tags.iter().any(|tag| tag[0] == "sticker") {
+                return Err(AppError::InvalidAppMessagePayload(
+                    "sticker context cannot carry another sticker".into(),
+                ));
+            }
+            let mut tags = Vec::with_capacity(1 + message_tags.len());
+            tags.push(crate::stickers::sticker_ref_tag(sticker_ref)?);
+            tags.extend_from_slice(message_tags);
+            Ok(event(MARMOT_APP_EVENT_KIND_CHAT, tags, String::new()))
         }
         AppMessageIntent::Reaction {
             target_message_id,
@@ -467,9 +493,27 @@ pub(crate) fn build_inner_event_with_media_reply(
             options,
             poll_type,
             ends_at,
+            message_tags,
         } => {
-            let tags = poll_tags(created_at, question, options, *poll_type, *ends_at)
+            validate_message_tags(message_tags)?;
+            if message_tags.iter().any(|tag| {
+                matches!(
+                    tag[0].as_str(),
+                    POLL_OPTION_TAG | POLL_TYPE_TAG | POLL_ENDS_AT_TAG | POLL_RESPONSE_TAG
+                )
+            }) {
+                return Err(AppError::InvalidAppMessagePayload(
+                    "poll context cannot override poll fields".into(),
+                ));
+            }
+            let mut tags = poll_tags(created_at, question, options, *poll_type, *ends_at)
                 .map_err(|error| AppError::InvalidAppMessagePayload(error.to_string()))?;
+            if tags.len() + message_tags.len() > POLL_MAX_TAGS {
+                return Err(AppError::InvalidAppMessagePayload(
+                    "poll tags exceed limits".into(),
+                ));
+            }
+            tags.extend_from_slice(message_tags);
             Ok(event(MARMOT_APP_EVENT_KIND_POLL, tags, question.clone()))
         }
         AppMessageIntent::PollResponse {
@@ -728,6 +772,11 @@ pub(crate) fn build_inner_event_with_media_reply(
             vec![vec!["v".to_owned(), crate::PUSH_VERSION.to_owned()]],
             content.clone(),
         )),
+        AppMessageIntent::PushTokenList { content } => Ok(event(
+            MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST,
+            vec![vec!["v".to_owned(), crate::PUSH_VERSION.to_owned()]],
+            content.clone(),
+        )),
         AppMessageIntent::PushTokenRemoval { content } => Ok(event(
             MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL,
             vec![vec!["v".to_owned(), crate::PUSH_VERSION.to_owned()]],
@@ -747,7 +796,8 @@ pub(crate) fn build_inner_event_with_media_reply(
 /// Inner app-event kinds MDK assigns protocol semantics to. The custom-event
 /// path rejects these so an app cannot forge, e.g., a kind-5 delete or a
 /// kind-447 push-token update that other members' clients would act on under
-/// MDK's interpretation.
+/// MDK's interpretation. Device-group kinds are reserved too, through
+/// `is_device_group_kind`, which owns their list.
 const RESERVED_APP_EVENT_KINDS: &[u64] = &[
     MARMOT_APP_EVENT_KIND_REPORT,
     MARMOT_APP_EVENT_KIND_REVIEW,
@@ -768,9 +818,10 @@ const RESERVED_APP_EVENT_KINDS: &[u64] = &[
 ];
 
 /// True when `kind` is one MDK owns (chat, reactions, edits, agent, group
-/// system, push token). Custom sends must use any other kind.
+/// system, push token, device group). Custom sends must use any other kind.
 pub fn is_reserved_app_event_kind(kind: u64) -> bool {
     RESERVED_APP_EVENT_KINDS.contains(&kind)
+        || crate::client::device_group::is_device_group_kind(kind)
 }
 
 // Application tags may decorate chat, but encrypted media references remain typed.
@@ -1038,6 +1089,7 @@ mod mention_tests {
                     media_type: "image/jpeg".into(),
                     version: "2".into(),
                     source_epoch: 0,
+                    source_epoch_identity: None,
                     dim: None,
                     thumbhash: None,
                 }],
@@ -1220,6 +1272,7 @@ mod application_tag_tests {
             media_type: "image/png".into(),
             version: "encrypted-media-v2".into(),
             source_epoch: 1,
+            source_epoch_identity: None,
             dim: None,
             thumbhash: None,
         }

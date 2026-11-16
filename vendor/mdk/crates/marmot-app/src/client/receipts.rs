@@ -3,16 +3,13 @@
 
 use std::collections::HashSet;
 
-use storage_sqlite::{
-    SqliteAccountStorage, TransportReconciliationInventory, TransportReconciliationRoute,
-};
+use storage_sqlite::SqliteAccountStorage;
 
 use super::AppClient;
 use crate::{AppError, remember_seen_event};
 
 pub(crate) struct SynchronizedTransportReceipts<'a> {
     client: &'a mut AppClient,
-    storage: SqliteAccountStorage,
     released: HashSet<String>,
 }
 
@@ -55,8 +52,9 @@ impl AppClient {
         storage: &SqliteAccountStorage,
     ) -> Result<HashSet<String>, AppError> {
         let released = storage.consume_released_transport_receipts()?;
-        self.released_backfill_reload_pending |= !released.is_empty();
-        if !self.released_backfill_reload_pending {
+        self.history_recovery
+            .note_released_receipts(!released.is_empty());
+        if !self.history_recovery.released_backfill_reload_pending() {
             return Ok(HashSet::new());
         }
         let released = released
@@ -84,6 +82,9 @@ impl AppClient {
                 released_count = released.len(),
                 "retired released transport receipt claims and restored replay eligibility"
             );
+            // A released receipt un-covered its second: the runner reads its
+            // debt again.
+            self.wake_recovery_runner();
         }
         #[cfg(test)]
         if std::mem::take(&mut self.fail_next_released_backfill_reload) {
@@ -95,7 +96,7 @@ impl AppClient {
         self.restore_persisted_epoch_backfill_intents(
             storage.app_storage().pending_epoch_backfill_intents()?,
         );
-        self.released_backfill_reload_pending = false;
+        self.history_recovery.finish_released_backfill_reload();
         Ok(released)
     }
 
@@ -117,7 +118,6 @@ impl AppClient {
         let released = self.synchronize_released_transport_receipts(&storage)?;
         Ok(SynchronizedTransportReceipts {
             client: self,
-            storage,
             released,
         })
     }
@@ -136,17 +136,6 @@ impl<'a> SynchronizedTransportReceipts<'a> {
 
     pub(crate) fn contains(&self, event_id: &str) -> bool {
         self.client.seen_events_index.0.contains(event_id)
-    }
-
-    pub(crate) fn inventory(
-        &self,
-        route: &TransportReconciliationRoute,
-        until: u64,
-    ) -> Result<TransportReconciliationInventory, AppError> {
-        Ok(self
-            .storage
-            .app_storage()
-            .transport_reconciliation_inventory(route, until)?)
     }
 
     pub(crate) fn pending_seen_events(&self) -> Vec<String> {
@@ -168,6 +157,7 @@ mod tests {
     use cgka_traits::{EpochId, MessageId, MessageRecord, MessageState};
     use marmot_account::AccountHome;
     use std::sync::Arc;
+    use storage_sqlite::TransportReconciliationRoute;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn receipt_access_retires_lost_releases_without_caller_reconciliation() {
@@ -186,7 +176,12 @@ mod tests {
             let app = MarmotApp::with_relay(dir.path(), "wss://receipts.example")
                 .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
             let mut client = app.client("alice").await.unwrap();
-            let group = client.create_group("receipt boundary", &[]).await.unwrap();
+            let group = client
+                .create_group("receipt boundary", &[])
+                .await
+                .unwrap()
+                .operation
+                .expect("eligible fixture members");
             let storage = app.account_storage("alice").unwrap();
             let route = TransportReconciliationRoute::Group(
                 hex::decode(
@@ -246,7 +241,12 @@ mod tests {
                 ));
                 assert!(!client.seen_events_index.contains(&id));
                 assert!(!client.state.seen_events.contains(&id));
-                assert!(client.released_backfill_reload_pending);
+                assert!(
+                    client
+                        .history_recovery
+                        .test_state()
+                        .released_backfill_reload_pending
+                );
                 assert!(
                     storage
                         .consume_released_transport_receipts()
@@ -261,8 +261,9 @@ mod tests {
                 "duplicate" => assert!(!receipts.contains(&id)),
                 "inventory" => {
                     assert!(
-                        !receipts
-                            .inventory(&route, item.created_at)
+                        !storage
+                            .app_storage()
+                            .transport_reconciliation_inventory(&route, item.created_at)
                             .unwrap()
                             .items
                             .contains(&item)
@@ -274,7 +275,12 @@ mod tests {
             }
             assert!(!client.state.seen_events.contains(&id));
             assert!(client.has_pending_epoch_backfill());
-            assert!(!client.released_backfill_reload_pending);
+            assert!(
+                !client
+                    .history_recovery
+                    .test_state()
+                    .released_backfill_reload_pending
+            );
             client
                 .save_state_with_pending_local_group_deletion_frontier_clears()
                 .unwrap();

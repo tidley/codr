@@ -39,6 +39,8 @@ pub struct Submission {
     fingerprint: Option<String>,
     pub submitted_at: u64,
     pub warned: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_message_id: Option<String>,
 }
 
 impl Submission {
@@ -49,6 +51,7 @@ impl Submission {
             fingerprint: UserInput::new(String::new(), text).fingerprint,
             submitted_at: at,
             warned: false,
+            native_message_id: None,
         }
     }
 
@@ -64,9 +67,22 @@ impl Submission {
             .enumerate()
             .filter_map(|(index, submission)| {
                 let fingerprint = submission.fingerprint.as_ref()?;
+                if let Some(id) = &submission.native_message_id {
+                    return inputs
+                        .iter()
+                        .any(|input| {
+                            input.complete
+                                && input.id == format!("opencode:{id}")
+                                && input.fingerprint.as_ref() == Some(fingerprint)
+                        })
+                        .then_some(index);
+                }
                 let peers: Vec<_> = submissions
                     .iter()
-                    .filter(|other| other.fingerprint.as_ref() == Some(fingerprint))
+                    .filter(|other| {
+                        other.native_message_id.is_none()
+                            && other.fingerprint.as_ref() == Some(fingerprint)
+                    })
                     .collect();
                 let mut ids = HashSet::new();
                 let echoes: Vec<_> = inputs
@@ -74,6 +90,8 @@ impl Submission {
                     .filter(|input| {
                         input.complete
                             && input.fingerprint.as_ref() == Some(fingerprint)
+                            // API IDs remain reserved after their receipt clears.
+                            && !input.id.starts_with("opencode:msg_codr_")
                             && peers.iter().any(|peer| {
                                 peer.before
                                     .as_ref()

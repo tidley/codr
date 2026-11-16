@@ -5,8 +5,12 @@ use super::{MarmotAppRuntime, blocking_app_task, wait_for_runtime_shutdown};
 use crate::chat_presentation::signals::PresentationInvalidation;
 use crate::{AppError, MarmotApp, MarmotAppEvent, PresentedChatRow};
 use std::{sync::Arc, time::Duration};
-use storage_sqlite::{ChatListCursor, ChatListWindowQuery, ChatListWindowRead};
-pub use storage_sqlite::{ChatListPageDirection, ChatListView};
+pub use storage_sqlite::{
+    ChatListCondition, ChatListFilter, ChatListFilterNode, ChatListPageDirection,
+    ChatListQueryError, ChatListView, ChatListViewQuery, MAX_CHAT_LIST_FILTER_DEPTH,
+    MAX_CHAT_LIST_FILTER_GROUP_IDS, MAX_CHAT_LIST_FILTER_NODES, MAX_CHAT_LIST_FILTER_TEXT_BYTES,
+};
+use storage_sqlite::{ChatListWindowQuery, ChatListWindowRead};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 pub const CHAT_LIST_WINDOW_INITIAL_ROWS: usize = 50;
@@ -61,10 +65,9 @@ impl std::fmt::Debug for ChatListAnchorOutcome {
 pub struct ChatListWindowSnapshot {
     pub subscription_generation: String,
     pub sequence: u64,
+    /// The query's base view.
     pub view: ChatListView,
     pub rows: Vec<PresentedChatRow>,
-    pub first: Option<ChatListCursor>,
-    pub last: Option<ChatListCursor>,
     pub has_more_before: bool,
     pub has_more_after: bool,
     pub anchor: ChatListAnchorOutcome,
@@ -181,16 +184,28 @@ struct Reader {
     label: String,
     account_id: String,
     store_epoch: Vec<u8>,
-    view: ChatListView,
+    query: ChatListViewQuery,
+    /// Re-read on a draft change to any chat, not only visible ones, because
+    /// the filter's matches depend on drafts.
+    drafts_anywhere: bool,
+    /// Re-read on a profile change to anyone, because a `Text` filter's
+    /// matches depend on peer names. The read itself catches search text up
+    /// (`prepare_search_batch`), so this holds without an account worker.
+    profiles_anywhere: bool,
 }
 
 impl MarmotAppRuntime {
-    /// Additive four-list API. No legacy full-list subscription or account-wide
-    /// selected-presentation preparation is used on this path.
+    /// A live window over `query`: a fixed view (`ChatListView`), or a view
+    /// narrowed by a filter matched in SQL before paging. No legacy full-list
+    /// subscription or account-wide selected-presentation preparation is used
+    /// on this path. An invalid query fails here with `InvalidChatListQuery`,
+    /// as does one testing message text (`MessageTextInWindow`): its cost grows
+    /// with history, so only `chat_list_ids` and `revalidate_chat_list_ids`
+    /// accept it.
     pub async fn open_chat_list_window(
         &self,
         account_ref: &str,
-        view: ChatListView,
+        query: impl Into<ChatListViewQuery>,
         initial_rows: Option<usize>,
     ) -> Result<RuntimeChatListWindowSubscription, ChatListWindowError> {
         self.shared.lifecycle().ensure_running()?;
@@ -198,6 +213,11 @@ impl MarmotAppRuntime {
         if !(1..=100).contains(&count) {
             return Err(ChatListWindowError::InvalidLimit);
         }
+        let query = super::chat_list_selection::prepare_query(query)?;
+        query
+            .validate_for_window()
+            .map_err(AppError::InvalidChatListQuery)?;
+        let view = query.view;
         let account = self.accounts.resolve(account_ref)?;
         // All invalidations attach BEFORE the first local read.
         let events = self.events.subscribe();
@@ -222,7 +242,9 @@ impl MarmotAppRuntime {
             label: account.label,
             account_id: account.account_id_hex,
             store_epoch: Vec::new(),
-            view,
+            drafts_anywhere: query.references(ChatListCondition::HasDraft),
+            profiles_anywhere: query.references_text(),
+            query,
         };
         let position = Position {
             limit: count,
@@ -243,13 +265,14 @@ impl MarmotAppRuntime {
             .store_epoch
             .clone();
         let generation = hex::encode(rand::random::<[u8; 16]>());
+        let mute_wake = read.next_mute_expiry_ms;
         let snapshot = snapshot(read, &position, generation, 0, view);
         let (updates, rx) = watch::channel(Ok(snapshot.clone()));
         let (commands, command_rx) = mpsc::channel(8);
         tokio::spawn(run(
             reader,
             position,
-            snapshot.clone(),
+            (snapshot.clone(), mute_wake),
             Sources {
                 drafts,
                 avatars,
@@ -313,10 +336,11 @@ impl Reader {
             }
         }
         let query = ChatListWindowQuery {
-            view: self.view,
+            query: self.query.clone(),
             limit: position.limit,
             anchors,
             before_anchor: position.before,
+            now_ms: self.app.chat_list_now_ms(),
         };
         let app = self.app.clone();
         let label = self.label.clone();
@@ -344,6 +368,17 @@ impl Reader {
                 &storage.app_storage(),
                 &account_id,
             )?;
+            // A text query waits for search text across its whole view. Prepare
+            // one bounded batch of it here; the account worker does the rest.
+            if query.query.references_text() {
+                crate::chat_presentation::maintenance::prepare_search_batch(
+                    &app,
+                    &label,
+                    &storage,
+                    &account_id,
+                    query.query.view,
+                )?;
+            }
             let read = || storage.app_storage().read_chat_list_window(query.clone());
             let mut result = match read().inspect_err(|_| app.presentation_signals.wake()) {
                 Ok(result) => result,
@@ -381,7 +416,7 @@ impl Reader {
                 .collect::<Vec<_>>();
             app.hydrate_chat_list_rows(&mut rows)?;
             for (selected, mut row) in snapshot.rows.iter_mut().zip(rows) {
-                if row.pending_confirmation || query.view == ChatListView::Left {
+                if row.pending_confirmation || query.query.view == ChatListView::Left {
                     row.unread_count = 0;
                     row.unread_mention_count = 0;
                     row.has_unread = false;
@@ -397,8 +432,14 @@ impl Reader {
         .map_err(|error| match error {
             storage_sqlite::ChatListPageError::Storage(
                 cgka_traits::storage::StorageError::NotFound,
-            ) => AppError::ChatPresentationNotReady.into(),
+            )
+            | storage_sqlite::ChatListPageError::SearchTextNotReady => {
+                AppError::ChatPresentationNotReady.into()
+            }
             storage_sqlite::ChatListPageError::Storage(error) => AppError::Storage(error).into(),
+            storage_sqlite::ChatListPageError::InvalidQuery(error) => {
+                AppError::InvalidChatListQuery(error).into()
+            }
             error => ChatListWindowError::Query(Arc::new(error)),
         })
     }
@@ -438,8 +479,6 @@ fn snapshot(
         sequence,
         view,
         rows,
-        first: read.page.first,
-        last: read.page.last,
         has_more_before: read.page.has_more_before,
         has_more_after: read.page.has_more_after,
         anchor,
@@ -485,12 +524,13 @@ impl Sources {
         loop {
             tokio::select! {
                 event = self.drafts.recv() => match event {
-                    Ok(event) if event.account_label == reader.label && rows.iter().any(|r| r.row.group_id_hex == event.group_id_hex) => return,
+                    Ok(event) if event.account_label == reader.label
+                        && (reader.drafts_anywhere || rows.iter().any(|r| r.row.group_id_hex == event.group_id_hex)) => return,
                     Err(_) => return, _ => {}
                 },
                 event = self.avatars.recv() => match event { Ok(label) if label == reader.label => return, Err(_) => return, _ => {} },
                 profile = self.profiles.recv() => match profile {
-                    Ok(profile) if rows.iter().any(|r| {
+                    Ok(profile) if reader.profiles_anywhere || rows.iter().any(|r| {
                         r.row.last_message.as_ref().is_some_and(|m| {
                             m.sender.eq_ignore_ascii_case(&profile)
                                 || m.group_system.as_ref().is_some_and(|e| {
@@ -513,7 +553,7 @@ impl Sources {
                     _ => {},
                 },
                 _ = async {
-                    if let Some(at) = expiry { tokio::time::sleep(Duration::from_millis(at.saturating_sub(crate::notifications::unix_now_ms()).max(0) as u64)).await; }
+                    if let Some(at) = expiry { tokio::time::sleep(Duration::from_millis(at.saturating_sub(reader.app.chat_list_now_ms()).max(0) as u64)).await; }
                     else { std::future::pending::<()>().await; }
                 } => return,
             }
@@ -585,7 +625,9 @@ fn command_position(
 async fn run(
     reader: Reader,
     mut position: Position,
-    mut current: ChatListWindowSnapshot,
+    // The published window, and for a Muted filter the next mute expiry its
+    // read reported among chats in the view, visible or not.
+    (mut current, mut mute_wake): (ChatListWindowSnapshot, Option<i64>),
     mut sources: Sources,
     mut resets: broadcast::Receiver<String>,
     mut commands: mpsc::Receiver<Command>,
@@ -596,10 +638,13 @@ async fn run(
     // First published sequence showing the viewport the latest command moved to.
     let mut viewport_sequence = current.sequence;
     loop {
+        // Visible rows show their mute state; a Muted filter's matches also
+        // change when an off-screen chat's mute expires.
         let expiry = current
             .rows
             .iter()
             .filter_map(|r| r.row.muted_until_ms)
+            .chain(mute_wake)
             .min();
         let command = if dirty {
             tokio::select! {
@@ -647,16 +692,16 @@ async fn run(
         };
         match result {
             Ok(read) => {
+                mute_wake = read.next_mute_expiry_ms;
                 let mut replacement = snapshot(
                     read,
                     &next,
                     current.subscription_generation.clone(),
                     current.sequence,
-                    reader.view,
+                    reader.query.view,
                 );
-                // Storage revisions also change for activity outside this window.
-                // Do not invalidate client commands or redraw unchanged visible content
-                // solely because opaque boundary tokens acquired a newer revision.
+                // Activity outside this window also triggers re-reads. Do not invalidate
+                // client commands or redraw when the visible content is unchanged.
                 let changed = replacement.rows != current.rows
                     || replacement.has_more_before != current.has_more_before
                     || replacement.has_more_after != current.has_more_after

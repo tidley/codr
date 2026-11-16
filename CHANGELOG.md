@@ -13,6 +13,17 @@ Changes planned for the next minor release. Not yet published.
 
 ### Changed
 
+- Submit OpenCode V2 phone prompts through its authenticated local API with a
+  persisted message ID and native acceptance receipt. Reconcile uncertain sends
+  by ID after restart without retrying or falling back to terminal typing.
+  Codex, Claude Code and legacy OpenCode retain their existing terminal delivery.
+
+- Update the embedded and standalone MDK connector source from 0.14.0 to 0.17.0,
+  pinned to release commit `4df811aea99269b437a6023be9446a5141e93cbe`.
+  Retain Codr's media-reference and graceful-shutdown extensions; use upstream
+  founding-admin controls. Declare the new `mdk-0.17` storage cohort so normal
+  updates cannot silently migrate existing accounts. Migration needs separate
+  approval and a stopped backup; downgrade after migration is unsupported.
 - Accept serial phone controls such as `/recent /unmute` in one message. Validate
   the full sequence before dispatch, run controls left-to-right, and retain
   completed-command receipts across retries and restarts. Launches, updates and

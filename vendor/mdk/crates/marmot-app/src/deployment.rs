@@ -3,9 +3,8 @@
 //! MDK serves any Marmot client, so these are configuration, not protocol.
 //! [`MarmotDeployment::white_noise`] is White Noise's deployment and keeps its
 //! behaviour exactly. [`MarmotDeployment::neutral`] configures none of them.
-//! See `docs/marmot-architecture/review/brief-host-configuration.md`.
 
-pub use nostr_directory::config::{KeyPackageClientPreference, OpenRankingProvider};
+pub use nostr_directory::config::OpenRankingProvider;
 
 /// The services and identifiers one deployment's users rely on.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -13,8 +12,7 @@ pub struct MarmotDeployment {
     /// Relays this deployment operates. A route's history certifies once its
     /// operated relays finish an untruncated comparison; every other relay on
     /// the route is best effort and never blocks completion. A route with no
-    /// operated relay requires all of its relays. The raw strings feed the
-    /// recovery route-policy hash, so a change rebuilds pending scopes.
+    /// operated relay requires all of its relays.
     pub recovery_operated_relays: Vec<String>,
     /// Public relays onboarding and account setup also search for an account's
     /// relay list and profile, besides the discovery relays the host passes.
@@ -32,8 +30,6 @@ pub struct MarmotDeployment {
     pub profile_image_endpoint: Option<String>,
     /// Optional Open Ranking discovery tier for directory search.
     pub open_ranking: Option<OpenRankingProvider>,
-    /// How KeyPackage candidates rank by their self-asserted `client` tag.
-    pub key_package_client_preference: KeyPackageClientPreference,
     /// NIP-32 namespace of the origin label on moderation reports. The
     /// operator's report parser matches it. Reporting refuses a destination
     /// while this is unset.
@@ -41,6 +37,20 @@ pub struct MarmotDeployment {
     /// Platform keychain service name for account secrets. Changing it for an
     /// existing install strands the secrets stored under the old name.
     pub keychain_service: String,
+    /// The largest event each listed relay accepts, for relays that do not
+    /// advertise it (mdk#2334). MDK sends no group event, Welcome or
+    /// account-signed event over a relay's known limit. A send that fits none
+    /// of its relays reaches none, and a call that returns relay errors then
+    /// fails as `EventTooLarge`. An unlisted relay is limited only by the message size
+    /// its NIP-11 document advertises, and otherwise not at all.
+    pub relay_event_limits: Vec<RelayEventLimit>,
+}
+
+/// The largest event, in bytes of serialized event JSON, one relay accepts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RelayEventLimit {
+    pub relay: String,
+    pub max_event_bytes: u64,
 }
 
 /// Neutral keychain service name for hosts that never chose one.
@@ -60,17 +70,15 @@ mod white_noise {
         "wss://relay.ditto.pub",
         "wss://relay.primal.net",
     ];
-    pub(super) const MEDIA_SERVERS: &[&str] = &[
-        "https://blossom.divine.video",
-        "https://blossom.ditto.pub",
-        "https://cdn.hzrd149.com",
-    ];
+    pub(super) const MEDIA_SERVERS: &[&str] =
+        &["https://blossom.divine.video", "https://blossom.ditto.pub"];
     pub(super) const PROFILE_IMAGE_SERVER: &str = "https://blossom.primal.net";
     pub(super) const OPEN_RANKING_SEARCH: &str = "https://ranking.vertexlab.io/search/pubkeys";
-    pub(super) const PREFERRED_CLIENTS: &[&str] = &["whitenoise"];
-    pub(super) const LAST_CLIENTS: &[&str] = &["amethyst"];
     pub(super) const MODERATION_LABEL_NAMESPACE: &str = "chat.whitenoise.report";
     pub(super) const KEYCHAIN_SERVICE: &str = "com.marmot.whitenoise";
+    /// The operated relays' strfry `events.maxEventSize`, which their NIP-11
+    /// documents do not advertise.
+    pub(super) const OPERATED_RELAY_MAX_EVENT_BYTES: u64 = 2 * 1024 * 1024;
 }
 
 fn owned(values: &[&str]) -> Vec<String> {
@@ -88,14 +96,15 @@ impl MarmotDeployment {
             group_image_endpoint: None,
             profile_image_endpoint: None,
             open_ranking: None,
-            key_package_client_preference: KeyPackageClientPreference::default(),
             moderation_label_namespace: None,
             keychain_service: NEUTRAL_KEYCHAIN_SERVICE_NAME.to_owned(),
+            relay_event_limits: Vec::new(),
         }
     }
 
-    /// White Noise's deployment, byte for byte what MDK compiled in before
-    /// these became configuration.
+    /// White Noise's deployment: what MDK compiled in before these became
+    /// configuration, less `cdn.hzrd149.com` (it now refuses uploads from
+    /// unlisted pubkeys), plus its operated relays' event limit.
     pub fn white_noise() -> Self {
         Self {
             recovery_operated_relays: owned(white_noise::OPERATED_RELAYS),
@@ -107,12 +116,15 @@ impl MarmotDeployment {
                 search_endpoint: white_noise::OPEN_RANKING_SEARCH.to_owned(),
                 profile_relays: vec![white_noise::VERTEX_RELAY.to_owned()],
             }),
-            key_package_client_preference: KeyPackageClientPreference {
-                preferred: owned(white_noise::PREFERRED_CLIENTS),
-                last: owned(white_noise::LAST_CLIENTS),
-            },
             moderation_label_namespace: Some(white_noise::MODERATION_LABEL_NAMESPACE.to_owned()),
             keychain_service: white_noise::KEYCHAIN_SERVICE.to_owned(),
+            relay_event_limits: white_noise::OPERATED_RELAYS
+                .iter()
+                .map(|relay| RelayEventLimit {
+                    relay: (*relay).to_owned(),
+                    max_event_bytes: white_noise::OPERATED_RELAY_MAX_EVENT_BYTES,
+                })
+                .collect(),
         }
     }
 
@@ -134,15 +146,12 @@ impl MarmotDeployment {
                 },
             )
         });
-        self.key_package_client_preference.preferred =
-            normalize_list(self.key_package_client_preference.preferred);
-        self.key_package_client_preference.last =
-            normalize_list(self.key_package_client_preference.last);
         self.moderation_label_namespace = trim_optional(self.moderation_label_namespace);
         self.keychain_service = match self.keychain_service.trim() {
             "" => NEUTRAL_KEYCHAIN_SERVICE_NAME.to_owned(),
             name => name.to_owned(),
         };
+        self.relay_event_limits = normalize_event_limits(self.relay_event_limits);
         self
     }
 
@@ -200,6 +209,26 @@ fn trim_optional(value: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// Trimmed relays with a nonzero limit, one entry per relay: a relay listed
+/// twice keeps the smaller limit.
+fn normalize_event_limits(limits: Vec<RelayEventLimit>) -> Vec<RelayEventLimit> {
+    let mut normalized: Vec<RelayEventLimit> = Vec::new();
+    for limit in limits {
+        let relay = limit.relay.trim().to_owned();
+        if relay.is_empty() || limit.max_event_bytes == 0 {
+            continue;
+        }
+        match normalized.iter_mut().find(|known| known.relay == relay) {
+            Some(known) => known.max_event_bytes = known.max_event_bytes.min(limit.max_event_bytes),
+            None => normalized.push(RelayEventLimit {
+                relay,
+                max_event_bytes: limit.max_event_bytes,
+            }),
+        }
+    }
+    normalized
+}
+
 fn normalize_list(values: Vec<String>) -> Vec<String> {
     let mut normalized: Vec<String> = Vec::new();
     for value in values {
@@ -216,9 +245,9 @@ mod tests {
     use super::*;
 
     /// The preset must keep White Noise's behaviour: these are the values MDK
-    /// compiled in before they became configuration. The recovery set's raw
-    /// strings feed the route-policy hash, so any drift there would rebuild
-    /// every pending recovery scope.
+    /// compiled in before they became configuration. The recovery set decides
+    /// each route's required relays, so any drift there would change which
+    /// relays recovery waits on.
     #[test]
     fn white_noise_preset_keeps_the_values_mdk_compiled_in() {
         let deployment = MarmotDeployment::white_noise();
@@ -241,11 +270,7 @@ mod tests {
         );
         assert_eq!(
             deployment.new_group_media_endpoints,
-            [
-                "https://blossom.divine.video",
-                "https://blossom.ditto.pub",
-                "https://cdn.hzrd149.com",
-            ]
+            ["https://blossom.divine.video", "https://blossom.ditto.pub",]
         );
         assert_eq!(
             deployment.group_image_endpoint.as_deref(),
@@ -263,15 +288,23 @@ mod tests {
             })
         );
         assert_eq!(
-            deployment.key_package_client_preference.preferred,
-            ["whitenoise"]
-        );
-        assert_eq!(deployment.key_package_client_preference.last, ["amethyst"]);
-        assert_eq!(
             deployment.moderation_label_namespace.as_deref(),
             Some("chat.whitenoise.report")
         );
         assert_eq!(deployment.keychain_service, "com.marmot.whitenoise");
+        assert_eq!(
+            deployment.relay_event_limits,
+            [
+                RelayEventLimit {
+                    relay: "wss://relay.eu.whitenoise.chat".into(),
+                    max_event_bytes: 2 * 1024 * 1024,
+                },
+                RelayEventLimit {
+                    relay: "wss://relay.us.whitenoise.chat".into(),
+                    max_event_bytes: 2 * 1024 * 1024,
+                },
+            ]
+        );
         assert_eq!(deployment.clone().normalize(), deployment);
     }
 
@@ -284,12 +317,9 @@ mod tests {
         assert_eq!(deployment.group_image_endpoint, None);
         assert_eq!(deployment.profile_image_endpoint, None);
         assert_eq!(deployment.open_ranking, None);
-        assert_eq!(
-            deployment.key_package_client_preference,
-            KeyPackageClientPreference::default()
-        );
         assert_eq!(deployment.moderation_label_namespace, None);
         assert_eq!(deployment.keychain_service, NEUTRAL_KEYCHAIN_SERVICE_NAME);
+        assert!(deployment.relay_event_limits.is_empty());
     }
 
     #[test]
@@ -321,18 +351,25 @@ mod tests {
             blank_keychain.keychain_service,
             NEUTRAL_KEYCHAIN_SERVICE_NAME
         );
-    }
-
-    #[test]
-    fn key_package_preference_ranks_by_client_tag() {
-        let white_noise = MarmotDeployment::white_noise().key_package_client_preference;
-        assert_eq!(white_noise.rank_for_test(Some("WhiteNoise")), 2);
-        assert_eq!(white_noise.rank_for_test(Some(" amethyst ")), 0);
-        assert_eq!(white_noise.rank_for_test(Some("other")), 1);
-        assert_eq!(white_noise.rank_for_test(None), 1);
-        let neutral = KeyPackageClientPreference::default();
-        assert_eq!(neutral.rank_for_test(Some("whitenoise")), 1);
-        assert_eq!(neutral.rank_for_test(Some("amethyst")), 1);
+        let limit = |relay: &str, max_event_bytes| RelayEventLimit {
+            relay: relay.into(),
+            max_event_bytes,
+        };
+        let limits = MarmotDeployment {
+            relay_event_limits: vec![
+                limit(" wss://a.example ", 200),
+                limit("  ", 100),
+                limit("wss://b.example", 0),
+                limit("wss://a.example", 150),
+            ],
+            ..MarmotDeployment::neutral()
+        }
+        .normalize();
+        assert_eq!(
+            limits.relay_event_limits,
+            [limit("wss://a.example", 150)],
+            "blank relays and zero limits are unset; a repeat keeps the smaller"
+        );
     }
 
     #[test]

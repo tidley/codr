@@ -6,6 +6,16 @@ This crate defines the `marmot.agent-control.v2` request/response/event types an
 `wn-agent` Unix socket. The Hermes and OpenClaw plugins (and other host integrations) are thin clients of this
 protocol; `agent-connector` is the server.
 
+## Codr media-reference extension
+
+`timeline_message_get` accepts optional `include_media: true` to return the
+non-secret download references used by live inbound messages. The response adds
+`media`; missing, deleted, invalidated and non-chat records return no media.
+Without the flag, lookups and timeline pages keep their summary-only projection.
+Content keys stay inside MDK. This does not provide quoted-message handling:
+historical attachment clients should use the native `attachment_get` and
+`download_attachment` source-validation and acquisition controls described below.
+
 ## What this crate does
 
 - Owns `AgentControlEnvelope` and the typed control DTOs (bootstrap, send, subscribe, timeline history, invite policy,
@@ -15,6 +25,9 @@ protocol; `agent-connector` is the server.
 
 It does not contain engine, storage, account, or transport logic, the socket daemon or process lifecycle (see
 `agent-connector`), or QUIC preview composition (see `agent-stream-compose`).
+
+To write a client of this protocol, start with [Build your own client](../../integrations/custom-client.md): framing,
+group creation, sends and `subscribe_inbound`, with wire examples.
 
 ## Compatibility
 
@@ -30,15 +43,70 @@ Invite-policy values serialize on the wire as `deny`, `allowlist`, `any_authenti
 `any_authenticated`. Deserialization also accepts the CLI spellings `any-authenticated-direct` and
 `any-authenticated`.
 
-## Group creation
+## Media sends
 
-`group_create_capabilities` reports founding-admin support before creation is submitted.
+`send_media` accepts an optional `reply_to_message_id_hex`: the original inner
+message id as 64 hexadecimal characters. Omitted or null targets send ordinary
+media messages. Malformed targets fail with `invalid_hex` before upload.
 
-`group_create_with_admins` accepts the same fields as `group_create`, plus an `admins` list of invited member references.
-The creator remains an admin. Selected invitees receive admin rights in the founding state and initial Welcome.
-Non-member admins are rejected before creation. The response is `group_created`; creation remains non-idempotent.
-Older connectors reject this distinct operation rather than silently dropping admin rights. Legacy `group_create`
-keeps its creator-only admin policy.
+The captured target applies to the whole ordered attachment batch, with or
+without a caption. The kind-9 message carries `imeta` tags and matching `e` and
+`q` reply references. Sending media never changes the user's composer draft.
+
+A matching `idempotency_key` retry returns the original message ids without
+another upload or publication. Reusing a retained key with different inputs,
+including a different reply target, fails with `media_idempotency_conflict`.
+Existing plain-send fingerprints remain valid across upgrades.
+
+## Historical attachment recovery
+
+Three additive v2 operations use MDK's native attachment pipeline:
+
+- `attachment_get { account_id_hex, group_id_hex, message_id_hex, attachment_index }`
+  inspects one current source slot locally. It does not request acquisition or start network work.
+- `download_attachment` takes the same fields. It requests explicit native acquisition,
+  then returns immediately with native transfer status when bytes are not retained.
+  Poll with backoff; another download request joins the existing work without resetting
+  retries, deadlines, cancellation, removal suppression or permission policy.
+- `release_attachment { lease }` removes the private plaintext handoff and replies
+  `attachment_released`. Releasing an unknown or already released lease succeeds.
+
+Both reads reply with `attachment { attachment: ... }`. A null attachment means the
+current message/source/slot is unavailable, including deletion, invalidation and expiry.
+Native acquisition admission refusal also returns a null attachment, not pending work.
+The zero-based index counts **all original `imeta` tags**, including rejected slots;
+it is not an index into a filtered list of attachment summaries. Each call resolves
+the current authenticated source again. An old response does not authorize a later read.
+
+Identity fields are `source_message_id_hex`, `attachment_index`, `source_epoch`,
+`plaintext_sha256` and `ciphertext_sha256`. These describe the authenticated reference,
+not verified downloaded bytes or recipient-download proof. No locators, nonces, keys,
+peer size hints or native asset handles cross the socket. Unknown epochs fail with
+`attachment_epoch_unavailable`; malformed or unsupported references fail with
+`attachment_rejected`. Native failed/blocked states include an actionable `failure_hint`;
+this API cannot reconstruct a missing old epoch key or clear a native retry limit.
+
+`state`, `retry_at` and advisory `locally_available` report native transfer state.
+Only a successful download includes `handoff { lease, path, size_bytes }`: a private
+host-local file copied by `open_attachment_handoff`, with a verified byte count.
+Hash those bytes and compare with `plaintext_sha256` to verify the expected artifact;
+filenames and MIME agreement are not artifact identity. A later poll may resolve a
+changed source, so compare the returned source and digest too.
+
+Release each handoff when finished, including on client errors. A release failure
+with code `attachment_release_failed` is retryable. Keep the lease and retry the
+same release until cleanup succeeds. Malformed leases are not retryable. Each successful
+download call can create a new lease. A leased copy is a snapshot: later source
+removal does not revoke an already delivered file. Copies last until release,
+account removal, or stale-copy cleanup when an account worker starts in a new
+process. They are not a durable cache. Undelivered replies release their leases.
+Local operations have the connector's 15-second deadline; acquisition has native
+budgets/deadlines and continues independently. Plaintext bytes never enter a control
+frame, and existing timeline reads remain network-free and unchanged.
+
+Older connectors do not support these new request types. Do not fall back to a saved
+raw `download_media` reference for historical recovery: that does not provide these
+source checks or native acquisition controls.
 
 ## Stream sessions
 
@@ -99,12 +167,23 @@ Connectors use the same API both to attach a recent ID-bearing chat window to an
 on-demand history tool. This is also the recovery path after `resync_required`; clients should re-page the
 materialized timeline rather than attempting to reconstruct history from the lossy event stream.
 
-For media recovery, `timeline_message_get` accepts optional `include_media: true`.
-The response adds a `media` array with the same non-secret download references as
-live inbound events. Pass each reference to `download_media`; content keys stay
-inside MDK. Missing, deleted, invalidated, and non-chat records return no media.
-The existing frame-size limit still applies. Without this flag, lookups and
-timeline pages retain their summary-only projection.
+## Media reference provenance
+
+`AgentControlMediaRef.source_epoch_identity` is optional local upload metadata.
+Preserve it when forwarding a returned upload reference within the local control
+plane. References reconstructed from received `imeta` tags omit it, and remain
+valid download inputs. Sending a reference without known upload provenance
+requires a fresh upload; the field is never carried in Marmot events.
+
+## Group creation
+
+`group_create_capabilities` reports founding-admin support before creation is submitted.
+`group_create_with_admins` accepts the same fields as `group_create`, plus an `admins` list of invited member references.
+The creator may also be listed redundantly; all other admins must be invited members.
+The creator remains an admin. Selected invitees receive admin rights in the founding state and initial Welcome.
+Non-member admins are rejected before creation. The response is `group_created`; creation remains non-idempotent.
+Older connectors reject this distinct operation rather than silently dropping admin rights. Legacy `group_create`
+keeps its creator-only admin policy.
 
 ## Run the tests
 

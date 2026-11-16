@@ -23,6 +23,11 @@ The current setup code uses **👾** as the public name and display name when it
 
 ## Install
 
+The 0.12.0 development source updates MDK to 0.17.0. Its account-storage migration
+is not an automatic update from the released 0.14 cohort. Keep the running
+installation unchanged until a separately approved, backed-up migration; see the
+[combined-runtime storage boundary](docs/COMBINED.md#mdk-017-storage-boundary).
+
 **0.11.2 targets existing accounts.** Fresh accounts use the
 supported 0.9.0 setup below, then the owner-confirmed chat handover. See the
 [0.11.2 release notes](docs/releases/0.11.2.md) and

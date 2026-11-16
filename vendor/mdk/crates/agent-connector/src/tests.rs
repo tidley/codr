@@ -1,5 +1,7 @@
 //! White-box tests for the connector exercising private/`pub(crate)` internals across modules.
 
+mod media_replies;
+
 use agent_control::{
     AGENT_CONTROL_STREAM_STATUS_STARTED, AgentControlAccountSelection, AgentControlEnvelope,
     AgentControlEvent, AgentControlInvitePolicy, AgentControlProfileLookupStatus,
@@ -33,7 +35,7 @@ use tokio::io::BufReader;
 use tokio::net::UnixStream;
 use tokio::time::{Duration, sleep, timeout};
 
-use crate::account::ProfileUpdateFields;
+use crate::account::{GroupAdminChange, ProfileUpdateFields};
 use crate::allowlist::{AllowlistRecord, AllowlistStore};
 use crate::event_projection::{
     DeliveredInboundCursor, InboundCatchUpDriver, control_event_from_debug_event,
@@ -325,6 +327,7 @@ fn profile_field_validation_bounds_free_text_and_rejects_control_characters() {
 
 #[tokio::test]
 async fn connector_profile_publish_rejects_hostile_optional_fields_without_publishing() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
     let relay_url = relay.url().await.to_string();
@@ -382,7 +385,7 @@ async fn connector_profile_publish_rejects_hostile_optional_fields_without_publi
     );
 }
 
-fn test_config(
+pub(crate) fn test_config(
     home: &Path,
     socket: impl Into<std::path::PathBuf>,
     relays: Vec<String>,
@@ -427,6 +430,7 @@ fn received_message(
 
 #[tokio::test]
 async fn control_event_requires_a_durable_row_for_received_messages() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
         .create_account("agent")
@@ -803,6 +807,7 @@ async fn inbound_catch_up_driver_resets_promptly_on_runtime_activity() {
 
 #[tokio::test]
 async fn invite_policy_worker_backs_off_with_zero_candidates() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let account_home = AccountHome::open(dir.path());
     account_home.create_account("agent").unwrap();
@@ -921,6 +926,7 @@ async fn inbound_catch_up_driver_preserves_delayed_cadence_after_a_slow_pass() {
 
 #[tokio::test]
 async fn invite_policy_worker_does_not_spin_when_enumeration_fails_with_a_due_retry() {
+    storage_sqlite::relax_storage_for_test_process();
     let setup = setup_existing_pending_invite("retry enumeration failure").await;
     let connector = AgentConnector::open(test_config(
         setup.dir.path(),
@@ -999,6 +1005,7 @@ async fn invite_policy_worker_does_not_spin_when_enumeration_fails_with_a_due_re
 
 #[tokio::test]
 async fn invite_policy_retry_delay_starts_after_the_failed_attempt_returns() {
+    storage_sqlite::relax_storage_for_test_process();
     let setup = setup_existing_pending_invite("retry delay after completion").await;
     let connector = AgentConnector::open(test_config(
         setup.dir.path(),
@@ -1070,6 +1077,7 @@ async fn stream_store_evicts_idle() {
     use marmot_app::{AgentPublisherOptions, AgentPublisherRouting};
     use std::time::Instant;
 
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
     let url = relay.url().await.to_string();
@@ -1088,7 +1096,9 @@ async fn stream_store_evicts_idle() {
     let group = runtime
         .create_group(&account.account.account_id_hex, "idle streams", &[], None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("fixture group is created");
     let store = StreamSessionStore::default();
     for (id, age) in [(0xaa, 3600), (0xbb, 0)] {
         let publisher = runtime
@@ -1107,23 +1117,31 @@ async fn stream_store_evicts_idle() {
             )
             .await
             .unwrap();
-        store.insert(
-            hex::encode([id; 32]),
-            ActiveStreamSession {
-                publisher,
-                stream_capability: [0x77; 32],
-                last_activity: Instant::now() - Duration::from_secs(age),
-            },
-        );
+        store
+            .insert_new(
+                hex::encode([id; 32]),
+                ActiveStreamSession {
+                    publisher,
+                    stream_capability: [0x77; 32],
+                    last_activity: Instant::now() - Duration::from_secs(age),
+                },
+            )
+            .unwrap();
     }
     assert_eq!(store.sweep_idle(Duration::from_secs(300)).await, 1);
-    assert!(store.get(&"AA".repeat(32)).is_err());
+    assert!(
+        store
+            .get_authorized(&"AA".repeat(32), &"77".repeat(32))
+            .is_err()
+    );
     assert!(
         store
             .get_authorized(&"BB".repeat(32), &"77".repeat(32))
             .is_ok()
     );
-    let active = store.remove(&"BB".repeat(32)).unwrap();
+    let active = store
+        .remove_authorized(&"BB".repeat(32), &"77".repeat(32))
+        .unwrap();
     active.publisher.cancel().await;
     assert!(!active.publisher.is_idle_evictable());
     runtime.shutdown_and_close().await.unwrap();
@@ -1137,6 +1155,7 @@ async fn stream_store_sweep_spares_sealed_session() {
     use marmot_app::{AgentPublisherOptions, AgentPublisherRouting};
     use std::time::Instant;
 
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
     let url = relay.url().await.to_string();
@@ -1155,7 +1174,9 @@ async fn stream_store_sweep_spares_sealed_session() {
     let group = runtime
         .create_group(&account.account.account_id_hex, "sealed streams", &[], None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("fixture group is created");
     let publisher = runtime
         .open_agent_publisher(
             account.account.account_id_hex.clone(),
@@ -1182,16 +1203,20 @@ async fn stream_store_sweep_spares_sealed_session() {
         Err(marmot_app::AppError::AgentStreamSendFailed(_))
     ));
     let store = StreamSessionStore::default();
-    store.insert(
-        hex::encode([0xcc; 32]),
-        ActiveStreamSession {
-            publisher,
-            stream_capability: [0x77; 32],
-            last_activity: Instant::now() - Duration::from_secs(3600),
-        },
-    );
+    store
+        .insert_new(
+            hex::encode([0xcc; 32]),
+            ActiveStreamSession {
+                publisher,
+                stream_capability: [0x77; 32],
+                last_activity: Instant::now() - Duration::from_secs(3600),
+            },
+        )
+        .unwrap();
     assert_eq!(store.sweep_idle(Duration::from_secs(300)).await, 0);
-    let sealed = store.remove(&"CC".repeat(32)).unwrap();
+    let sealed = store
+        .remove_authorized(&"CC".repeat(32), &"77".repeat(32))
+        .unwrap();
     assert!(!sealed.publisher.is_idle_evictable());
     sealed.publisher.cancel().await;
     runtime.shutdown_and_close().await.unwrap();
@@ -1217,12 +1242,72 @@ async fn connector_socket_bind_preserves_existing_non_socket_path() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("dev").join("wn-agent.sock");
     std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    // A private parent, so the bind reaches the path itself instead of
+    // refusing a umask-default directory first.
+    std::fs::set_permissions(
+        socket.parent().unwrap(),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
     std::fs::write(&socket, b"not a socket").unwrap();
 
     let error = bind_connector_socket(&socket).unwrap_err();
 
     assert_eq!(error.code(), "io_error");
+    assert!(
+        error
+            .client_message()
+            .starts_with("the control socket path exists and is not a Unix socket")
+    );
     assert_eq!(std::fs::read(&socket).unwrap(), b"not a socket");
+}
+
+#[tokio::test]
+async fn connector_socket_bind_names_a_live_socket_without_removing_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("dev").join("wn-agent.sock");
+    let _live = bind_connector_socket(&socket).unwrap();
+
+    let error = bind_connector_socket(&socket).unwrap_err();
+
+    assert_eq!(error.code(), "io_error");
+    assert!(
+        error
+            .client_message()
+            .starts_with("the control socket is already in use")
+    );
+    assert!(socket.exists());
+}
+
+#[tokio::test]
+async fn connector_socket_bind_explains_a_world_accessible_directory_without_chmodding_it() {
+    // A socket placed directly in a 0755 home: the home is not connector-owned,
+    // so its mode is kept and the bind refuses it. A short base keeps the
+    // socket path under the platform limit.
+    let dir = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+    let home = dir.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let error = bind_connector_socket(&home.join("wn-agent.sock")).unwrap_err();
+
+    assert_eq!(error.code(), "io_error");
+    let crate::ConnectorError::Io(io) = &error else {
+        panic!("expected an I/O rejection: {error:?}");
+    };
+    assert_eq!(io.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(
+        error
+            .client_message()
+            .starts_with("the control socket directory must not be world-accessible")
+    );
+    assert!(
+        !error
+            .client_message()
+            .contains(dir.path().to_str().unwrap())
+    );
+    assert_eq!(home.metadata().unwrap().permissions().mode() & 0o777, 0o755);
+    assert!(!home.join("wn-agent.sock").exists());
 }
 
 #[tokio::test]
@@ -1376,6 +1461,11 @@ async fn connector_socket_bind_rejects_unconfigured_group_writable_parent() {
         .expect_err("unexpected group write access must be rejected");
 
     assert_eq!(error.code(), "io_error");
+    assert!(
+        error
+            .client_message()
+            .starts_with("the control socket directory is group-writable")
+    );
     assert!(!shared_parent.join("wn-agent.sock").exists());
 }
 
@@ -1794,6 +1884,7 @@ async fn connector_socket_requires_configured_auth_token() {
 
 #[tokio::test]
 async fn connector_edit_message_replaces_own_text_and_reports_refusals() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
     let relay_url = relay.url().await.to_string();
@@ -1809,7 +1900,9 @@ async fn connector_edit_message_replaces_own_text_and_reports_refusals() {
     let group_id = setup_runtime
         .create_group(&agent.account.account_id_hex, "agent status", &[], None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("fixture group is created");
     setup_runtime.shutdown().await;
 
     let account_id_hex = agent.account.account_id_hex.clone();
@@ -1912,6 +2005,7 @@ fn invalid_edit_target_is_a_final_connector_error() {
 
 #[tokio::test]
 async fn connector_socket_subscribes_to_inbound_messages() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
     let relay_url = relay.url().await.to_string();
@@ -1936,7 +2030,9 @@ async fn connector_socket_subscribes_to_inbound_messages() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("fixture group is created");
     accept_group_invite_retrying_busy(&setup_runtime, &human.account.account_id_hex, &group_id)
         .await;
     setup_runtime.shutdown().await;
@@ -2786,6 +2882,7 @@ async fn stream_begin_reservations_do_not_serialize_unrelated_requests() {
 
 #[tokio::test]
 async fn connector_policy_accepts_allowed_welcomer() {
+    storage_sqlite::relax_storage_for_test_process();
     let agent_dir = tempfile::tempdir().unwrap();
     let human_dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
@@ -2839,7 +2936,9 @@ async fn connector_policy_accepts_allowed_welcomer() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("fixture group is created");
     let group_id_hex = hex::encode(group_id.as_slice());
     wait_for_group_state(&agent_app, &agent.account.label, &group_id_hex, |group| {
         !group.pending_confirmation && !group.archived
@@ -2853,6 +2952,7 @@ async fn connector_policy_accepts_allowed_welcomer() {
 
 #[tokio::test]
 async fn connector_policy_declines_unlisted_welcomer() {
+    storage_sqlite::relax_storage_for_test_process();
     let agent_dir = tempfile::tempdir().unwrap();
     let human_dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
@@ -2897,7 +2997,9 @@ async fn connector_policy_declines_unlisted_welcomer() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("fixture group is created");
     let group_id_hex = hex::encode(group_id.as_slice());
     wait_for_group_state(&agent_app, &agent.account.label, &group_id_hex, |group| {
         !group.pending_confirmation && group.archived
@@ -2911,6 +3013,7 @@ async fn connector_policy_declines_unlisted_welcomer() {
 
 #[tokio::test]
 async fn connector_policy_any_authenticated_direct_accepts_unlisted_direct_welcomer() {
+    storage_sqlite::relax_storage_for_test_process();
     let agent_dir = tempfile::tempdir().unwrap();
     let human_dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
@@ -2965,7 +3068,9 @@ async fn connector_policy_any_authenticated_direct_accepts_unlisted_direct_welco
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("fixture group is created");
     let group_id_hex = hex::encode(group_id.as_slice());
     wait_for_group_state(&agent_app, &agent.account.label, &group_id_hex, |group| {
         !group.pending_confirmation && !group.archived
@@ -3042,7 +3147,9 @@ async fn assert_multiparty_invite_policy(policy: AgentControlInvitePolicy, expec
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("fixture group is created");
     let group_id_hex = hex::encode(group_id.as_slice());
     wait_for_group_state(&agent_app, &agent.account.label, &group_id_hex, |group| {
         !group.pending_confirmation && group.archived == expect_archived
@@ -3056,11 +3163,13 @@ async fn assert_multiparty_invite_policy(policy: AgentControlInvitePolicy, expec
 
 #[tokio::test]
 async fn connector_policy_any_authenticated_direct_declines_multiparty_invite() {
+    storage_sqlite::relax_storage_for_test_process();
     assert_multiparty_invite_policy(AgentControlInvitePolicy::AnyAuthenticatedDirect, true).await;
 }
 
 #[tokio::test]
 async fn connector_policy_any_authenticated_accepts_multiparty_invite() {
+    storage_sqlite::relax_storage_for_test_process();
     assert_multiparty_invite_policy(AgentControlInvitePolicy::AnyAuthenticated, false).await;
 }
 
@@ -3123,6 +3232,7 @@ fn dev_allow_any_invites_requires_debug_controls() {
 
 #[tokio::test]
 async fn connector_start_reconciles_existing_allowed_pending_invite() {
+    storage_sqlite::relax_storage_for_test_process();
     let setup = setup_existing_pending_invite("existing pending invite").await;
     let connector = AgentConnector::open(test_config(
         setup.dir.path(),
@@ -3151,6 +3261,7 @@ async fn connector_start_reconciles_existing_allowed_pending_invite() {
 
 #[tokio::test]
 async fn connector_start_reconciles_existing_unlisted_pending_invite_by_declining() {
+    storage_sqlite::relax_storage_for_test_process();
     let setup = setup_existing_pending_invite("existing unlisted pending invite").await;
     let connector = AgentConnector::open(test_config(
         setup.dir.path(),
@@ -3182,13 +3293,23 @@ fn invite_policy_retry_state_uses_capped_backoff_and_prunes_non_pending() {
     let now = tokio::time::Instant::now();
 
     assert!(retry_state.is_due(&key, now));
-    let (attempts, delay) = retry_state.record_failure(key.clone(), now);
+    let (attempts, delay) = retry_state.record_failure_with(
+        key.clone(),
+        now,
+        crate::INVITE_POLICY_RETRY_BASE,
+        crate::INVITE_POLICY_RETRY_MAX,
+    );
     assert_eq!(attempts, 1);
     assert_eq!(delay, crate::INVITE_POLICY_RETRY_BASE);
     assert!(!retry_state.is_due(&key, now + delay - Duration::from_millis(1)));
     assert!(retry_state.is_due(&key, now + delay));
 
-    let (attempts, delay) = retry_state.record_failure(key.clone(), now + delay);
+    let (attempts, delay) = retry_state.record_failure_with(
+        key.clone(),
+        now + delay,
+        crate::INVITE_POLICY_RETRY_BASE,
+        crate::INVITE_POLICY_RETRY_MAX,
+    );
     assert_eq!(attempts, 2);
     assert_eq!(delay, crate::INVITE_POLICY_RETRY_BASE * 2);
 
@@ -3196,14 +3317,24 @@ fn invite_policy_retry_state_uses_capped_backoff_and_prunes_non_pending() {
     let mut capped_delay = delay;
     for expected_attempt in 3..=20 {
         current += capped_delay;
-        let (attempts, delay) = retry_state.record_failure(key.clone(), current);
+        let (attempts, delay) = retry_state.record_failure_with(
+            key.clone(),
+            current,
+            crate::INVITE_POLICY_RETRY_BASE,
+            crate::INVITE_POLICY_RETRY_MAX,
+        );
         assert_eq!(attempts, expected_attempt);
         assert!(delay <= crate::INVITE_POLICY_RETRY_MAX);
         capped_delay = delay;
     }
     assert_eq!(capped_delay, crate::INVITE_POLICY_RETRY_MAX);
 
-    retry_state.record_failure(other_key.clone(), now);
+    retry_state.record_failure_with(
+        other_key.clone(),
+        now,
+        crate::INVITE_POLICY_RETRY_BASE,
+        crate::INVITE_POLICY_RETRY_MAX,
+    );
     retry_state.retain_pending(&HashSet::from([key.clone()]));
     assert!(retry_state.failures.contains_key(&key));
     assert!(!retry_state.failures.contains_key(&other_key));
@@ -3222,7 +3353,12 @@ fn invite_policy_retry_state_reports_next_due_wake() {
     assert!(!retry_state.has_pending());
     assert_eq!(retry_state.next_due(), None);
 
-    retry_state.record_failure(key_a.clone(), now);
+    retry_state.record_failure_with(
+        key_a.clone(),
+        now,
+        crate::INVITE_POLICY_RETRY_BASE,
+        crate::INVITE_POLICY_RETRY_MAX,
+    );
     assert!(retry_state.has_pending());
     assert_eq!(
         retry_state.next_due(),
@@ -3230,13 +3366,23 @@ fn invite_policy_retry_state_reports_next_due_wake() {
     );
 
     // A second, later failure must not move the earliest wake earlier.
-    retry_state.record_failure(key_b.clone(), now + Duration::from_millis(500));
+    retry_state.record_failure_with(
+        key_b.clone(),
+        now + Duration::from_millis(500),
+        crate::INVITE_POLICY_RETRY_BASE,
+        crate::INVITE_POLICY_RETRY_MAX,
+    );
     assert_eq!(
         retry_state.next_due(),
         Some(now + crate::INVITE_POLICY_RETRY_BASE)
     );
 
-    retry_state.record_failure(key_a.clone(), now + Duration::from_millis(500));
+    retry_state.record_failure_with(
+        key_a.clone(),
+        now + Duration::from_millis(500),
+        crate::INVITE_POLICY_RETRY_BASE,
+        crate::INVITE_POLICY_RETRY_MAX,
+    );
     assert_eq!(
         retry_state.next_due(),
         Some(now + Duration::from_millis(500) + crate::INVITE_POLICY_RETRY_BASE)
@@ -3297,6 +3443,7 @@ async fn connector_socket_creates_local_account() {
 
 #[tokio::test]
 async fn connector_socket_publishes_key_package() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
     let relay_url = relay.url().await.to_string();
@@ -3356,6 +3503,7 @@ async fn connector_socket_publishes_key_package() {
 
 #[tokio::test]
 async fn connector_socket_publishes_profile_metadata() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
     let relay_url = relay.url().await.to_string();
@@ -3430,6 +3578,7 @@ async fn connector_socket_publishes_profile_metadata() {
 
 #[tokio::test]
 async fn connector_profile_publish_preserves_fields_the_request_did_not_name() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
     let relay_url = relay.url().await.to_string();
@@ -3499,6 +3648,7 @@ async fn connector_profile_publish_preserves_fields_the_request_did_not_name() {
 #[tokio::test]
 async fn connector_profile_publish_falls_back_to_the_cached_profile_when_the_read_relays_hold_none()
 {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     // The account published through one relay; a later connector reads and
     // publishes through another. Re-bootstrapping with new `--relay` values is
@@ -3594,6 +3744,7 @@ async fn connector_profile_publish_falls_back_to_the_cached_profile_when_the_rea
 
 #[tokio::test]
 async fn connector_profile_publish_prefers_the_newer_cached_profile_over_a_lagging_relay() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     // A read relay can be *stale* rather than empty: it keeps serving the
     // pre-edit kind:0 while the newer edit is already in the local directory
@@ -3728,6 +3879,7 @@ async fn connector_profile_publish_prefers_the_newer_cached_profile_over_a_laggi
 
 #[tokio::test]
 async fn connector_profile_lookup_distinguishes_existing_and_absent_profiles() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
     let relay_url = relay.url().await.to_string();
@@ -3810,6 +3962,7 @@ async fn connector_profile_lookup_without_relays_is_indeterminate() {
 
 #[tokio::test]
 async fn connector_start_publishes_key_package_for_existing_local_account() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
     let relay_url = relay.url().await.to_string();
@@ -3842,6 +3995,7 @@ async fn connector_start_publishes_key_package_for_existing_local_account() {
 
 #[tokio::test]
 async fn connector_socket_sends_final_message() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
     let relay_url = relay.url().await.to_string();
@@ -3866,7 +4020,9 @@ async fn connector_socket_sends_final_message() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("fixture group is created");
     setup_runtime.shutdown().await;
 
     let group_id_hex = hex::encode(group_id.as_slice());
@@ -4010,6 +4166,7 @@ fn group_info_framing_preserves_named_subject_and_omits_absent_subject() {
 
 #[tokio::test]
 async fn group_info_reads_current_chat_list_group_name_without_using_title() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
     let relay_url = relay.url().await.to_string();
@@ -4042,7 +4199,9 @@ async fn group_info_reads_current_chat_list_group_name_without_using_title() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("fixture group is created");
     let unnamed_group = setup_runtime
         .create_group(
             &agent.account.account_id_hex,
@@ -4051,7 +4210,9 @@ async fn group_info_reads_current_chat_list_group_name_without_using_title() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("fixture group is created");
     let other_group = setup_runtime
         .create_group(
             &other_agent.account.account_id_hex,
@@ -4060,7 +4221,9 @@ async fn group_info_reads_current_chat_list_group_name_without_using_title() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("fixture group is created");
     setup_runtime.shutdown().await;
 
     let named_group_hex = hex::encode(named_group.as_slice());
@@ -4188,6 +4351,7 @@ async fn group_info_reads_current_chat_list_group_name_without_using_title() {
 
 #[tokio::test]
 async fn connector_socket_composes_and_finalizes_stream_without_quic_candidates() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
     let relay_url = relay.url().await.to_string();
@@ -4212,7 +4376,9 @@ async fn connector_socket_composes_and_finalizes_stream_without_quic_candidates(
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("fixture group is created");
     setup_runtime.shutdown().await;
 
     let group_id_hex = hex::encode(group_id.as_slice());
@@ -4488,7 +4654,7 @@ async fn preview_receipts_do_not_evict_durable_receipts_or_persist_on_restart() 
                 preview.record(key, fingerprint, Vec::new());
                 reservation.complete(Vec::new(), AgentControlSendMaintenanceDisposition::Ready);
             }
-            crate::stream_session::StrictIdempotencyAcquisition::Completed => {
+            crate::stream_session::StrictIdempotencyAcquisition::Completed(_) => {
                 panic!("fresh preview key unexpectedly replayed")
             }
             crate::stream_session::StrictIdempotencyAcquisition::Conflict => {
@@ -4536,7 +4702,7 @@ async fn preview_receipts_do_not_evict_durable_receipts_or_persist_on_restart() 
         .unwrap()
     {
         crate::stream_session::StrictIdempotencyAcquisition::Leader(_) => {}
-        crate::stream_session::StrictIdempotencyAcquisition::Completed => {
+        crate::stream_session::StrictIdempotencyAcquisition::Completed(_) => {
             panic!("preview receipt must not survive restart")
         }
         crate::stream_session::StrictIdempotencyAcquisition::Conflict => {
@@ -4551,6 +4717,7 @@ async fn preview_receipts_do_not_evict_durable_receipts_or_persist_on_restart() 
 /// completes the stream.
 #[tokio::test]
 async fn connector_socket_finalize_mismatch_keeps_stream_session_retryable() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
     let relay_url = relay.url().await.to_string();
@@ -4575,7 +4742,9 @@ async fn connector_socket_finalize_mismatch_keeps_stream_session_retryable() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("fixture group is created");
     setup_runtime.shutdown().await;
 
     let group_id_hex = hex::encode(group_id.as_slice());
@@ -4715,6 +4884,7 @@ async fn connector_finish_reuses_receipt() {
     use crate::error::ConnectorError;
     use crate::validation::normalize_hex;
 
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
     let relay_url = relay.url().await.to_string();
@@ -4739,7 +4909,9 @@ async fn connector_finish_reuses_receipt() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("fixture group is created");
     setup_runtime.shutdown().await;
 
     let group_id_hex = hex::encode(group_id.as_slice());
@@ -4781,7 +4953,10 @@ async fn connector_finish_reuses_receipt() {
     // Model a successful publisher finish whose control response was lost.
     // The retained publisher must return its receipt without a second send.
     let stream_id_norm = normalize_hex(&stream_id_hex).unwrap();
-    let session = connector.streams.get(&stream_id_norm).unwrap();
+    let session = connector
+        .streams
+        .get_authorized(&stream_id_norm, &stream_capability)
+        .unwrap();
     session
         .publisher
         .append(
@@ -4812,7 +4987,10 @@ async fn connector_finish_reuses_receipt() {
     );
     assert_eq!(mismatch.unwrap_err().code(), "stream_finalize_mismatch");
     assert!(
-        connector.streams.get(&stream_id_norm).is_ok(),
+        connector
+            .streams
+            .get_authorized(&stream_id_norm, &stream_capability)
+            .is_ok(),
         "a rejected retry must not drop the session"
     );
 
@@ -4866,7 +5044,10 @@ async fn connector_finish_reuses_receipt() {
         "a concurrent stream finalize must reuse the leader message ids"
     );
     assert!(
-        connector.streams.get(&stream_id_norm).is_err(),
+        connector
+            .streams
+            .get_authorized(&stream_id_norm, &stream_capability)
+            .is_err(),
         "a successful durable finish must remove the session"
     );
 
@@ -4912,6 +5093,7 @@ async fn connector_finish_reuses_receipt() {
 
 #[tokio::test]
 async fn connector_socket_cancels_stream_session() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
     let relay_url = relay.url().await.to_string();
@@ -4936,7 +5118,9 @@ async fn connector_socket_cancels_stream_session() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("fixture group is created");
     setup_runtime.shutdown().await;
 
     let group_id_hex = hex::encode(group_id.as_slice());
@@ -5184,7 +5368,9 @@ async fn setup_existing_pending_invite(group_name: &str) -> ExistingPendingInvit
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("fixture group is created");
     let group_id_hex = hex::encode(group_id.as_slice());
     wait_for_group_state(&app, &agent.account.label, &group_id_hex, |group| {
         group.pending_confirmation && !group.archived
@@ -5740,6 +5926,7 @@ fn delivered_inbound_cursor_dedups_and_evicts_oldest() {
 
 #[tokio::test]
 async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
+    storage_sqlite::relax_storage_for_test_process();
     // End-to-end regression for mdk#210: when the inbound broadcast lags, the
     // connector re-queries storage and re-delivers the genuinely-missed inbound messages on
     // the existing InboundMessage path the consumer already handles. A real send populates
@@ -5769,7 +5956,9 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("fixture group is created");
     setup_runtime.shutdown().await;
     let group_id_hex = hex::encode(group_id.as_slice());
 
@@ -6067,6 +6256,7 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
 
 #[tokio::test]
 async fn concurrent_send_final_with_repeated_idempotency_key_sends_once() {
+    storage_sqlite::relax_storage_for_test_process();
     // GAP-06: a retry that reuses the same idempotency key must return the
     // ORIGINAL durable message ids without re-sending, so a post-write-timeout
     // retry can never double-post an unrecallable encrypted message. Observable
@@ -6095,7 +6285,9 @@ async fn concurrent_send_final_with_repeated_idempotency_key_sends_once() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("fixture group is created");
     setup_runtime.shutdown().await;
     let group_id_hex = hex::encode(group_id.as_slice());
 
@@ -6635,10 +6827,16 @@ fn send_media_fingerprint_is_content_bound() {
         dim: None,
         thumbhash: None,
     };
-    let first = send_media_fingerprint("aa", "bb", Some("caption"), &[attachment(b"same bytes")]);
+    let first = send_media_fingerprint(
+        "aa",
+        "bb",
+        Some("caption"),
+        &[attachment(b"same bytes")],
+        None,
+    );
     assert_eq!(
-        first,
-        send_media_fingerprint("aa", "bb", Some("caption"), &[attachment(b"same bytes")],)
+        first, "9a0352dc88b6b8244b4ebd1863b2ddc73773eeb43adbcef368a4e1f0902a1d5e",
+        "persisted plain-send retries must retain their pre-reply fingerprint"
     );
     assert_ne!(
         first,
@@ -6647,17 +6845,19 @@ fn send_media_fingerprint_is_content_bound() {
             "bb",
             Some("caption"),
             &[attachment(b"different bytes")],
+            None,
         )
     );
     assert_ne!(
         first,
-        send_media_fingerprint("aa", "bb", None, &[attachment(b"same bytes")])
+        send_media_fingerprint("aa", "bb", None, &[attachment(b"same bytes")], None)
     );
     let ordered = send_media_fingerprint(
         "aa",
         "bb",
         Some("caption"),
         &[attachment(b"one"), attachment(b"two")],
+        None,
     );
     assert_ne!(
         ordered,
@@ -6666,13 +6866,39 @@ fn send_media_fingerprint_is_content_bound() {
             "bb",
             Some("caption"),
             &[attachment(b"two"), attachment(b"one")],
+            None,
         ),
         "attachment order must change the fingerprint"
     );
     assert_ne!(
         first,
-        send_media_fingerprint("aa", "cc", Some("caption"), &[attachment(b"same bytes")]),
+        send_media_fingerprint(
+            "aa",
+            "cc",
+            Some("caption"),
+            &[attachment(b"same bytes")],
+            None
+        ),
         "destination group must change the fingerprint"
+    );
+    let reply = send_media_fingerprint(
+        "aa",
+        "bb",
+        Some("caption"),
+        &[attachment(b"same bytes")],
+        Some("cc"),
+    );
+    assert_ne!(first, reply, "adding a reply must change the fingerprint");
+    assert_ne!(
+        reply,
+        send_media_fingerprint(
+            "aa",
+            "bb",
+            Some("caption"),
+            &[attachment(b"same bytes")],
+            Some("dd")
+        ),
+        "a different reply target must change the fingerprint"
     );
 }
 
@@ -7053,7 +7279,9 @@ async fn bench_idle_reconciliation_scaling() {
                 None,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("fixture group is created");
         accept_group_invite_retrying_busy(&setup_runtime, &agent.account.account_id_hex, &group_id)
             .await;
         group_ids.push(group_id);
@@ -7253,8 +7481,10 @@ async fn optional_management_socket_cannot_interrupt_regular_control() {
     }
 }
 
+/// Verify co-admin validation, alias deduplication, and rights in the initial Welcome.
 #[tokio::test]
-async fn connector_creates_owner_admin_in_the_founding_group_state() {
+async fn connector_creates_admin_in_founding_state() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
     let socket = dir.path().join("dev/wn-agent.sock");
@@ -7279,7 +7509,7 @@ async fn connector_creates_owner_admin_in_the_founding_group_state() {
         &connector,
         &listener,
         &socket,
-        "creation-capabilities",
+        "capabilities",
         AgentControlRequest::GroupCreateCapabilities,
     )
     .await;
@@ -7290,41 +7520,45 @@ async fn connector_creates_owner_admin_in_the_founding_group_state() {
         }
     ));
     assert!(connector.app.groups(&agent.label).unwrap().is_empty());
-    for (index, admins) in [
-        vec![outsider.account_id_hex.clone()],
-        vec![marmot_app::npub_for_account_id(&owner.account_id_hex).unwrap()],
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let before = connector.app.groups(&agent.label).unwrap().len();
-        let request: AgentControlRequest = serde_json::from_value(serde_json::json!({
-            "type":"group_create_with_admins","account_id_hex":agent.account_id_hex,
-            "name":"Owner-admin group","members":[owner.account_id_hex],"admins":admins
-        }))
-        .expect("owner-admin creation must be a supported, explicit control operation");
+    for (error_code, admins) in [
+        (
+            Some("invalid_group_create"),
+            vec![outsider.account_id_hex.clone()],
+        ),
+        (Some("app_error"), vec!["invalid".to_owned()]),
+        (Some("app_error"), vec![String::new()]),
+        (
+            None,
+            vec![
+                marmot_app::npub_for_account_id(&owner.account_id_hex).unwrap(),
+                owner.account_id_hex.clone(),
+            ],
+        ),
+    ] {
         let response = serve_control_request_once(
             &connector,
             &listener,
             &socket,
-            "owner-admin-create",
-            request,
+            "create",
+            AgentControlRequest::GroupCreateWithAdmins {
+                account_id_hex: agent.account_id_hex.clone(),
+                name: "Team".into(),
+                members: vec![owner.account_id_hex.clone()],
+                admins,
+                description: None,
+                relays: None,
+            },
         )
         .await;
-        if index == 0 {
-            assert!(matches!(
-                response.payload,
-                AgentControlResponse::Error { .. }
-            ));
-            assert_eq!(
-                connector.app.groups(&agent.label).unwrap().len(),
-                before,
-                "A non-member admin must be rejected before creation"
+        if let Some(expected_code) = error_code {
+            assert!(
+                matches!(response.payload, AgentControlResponse::Error { code, .. } if code == expected_code)
             );
+            assert!(connector.app.groups(&agent.label).unwrap().is_empty());
             continue;
         }
         let AgentControlResponse::GroupCreated { group_id_hex, .. } = response.payload else {
-            panic!("Expected canonical owner-admin creation");
+            panic!("Expected founding-admin creation");
         };
         let group = connector
             .app
@@ -7335,22 +7569,18 @@ async fn connector_creates_owner_admin_in_the_founding_group_state() {
             group
                 .admin_policy
                 .admins
-                .iter()
-                .cloned()
+                .into_iter()
                 .collect::<HashSet<_>>(),
             HashSet::from([agent.account_id_hex.clone(), owner.account_id_hex.clone()])
         );
         let group_id = GroupId::new(hex::decode(&group_id_hex).unwrap());
         timeout(Duration::from_secs(10), async {
-            loop {
-                if connector
-                    .app
-                    .group(&owner.label, &group_id_hex)
-                    .unwrap()
-                    .is_some()
-                {
-                    break;
-                }
+            while connector
+                .app
+                .group(&owner.label, &group_id_hex)
+                .unwrap()
+                .is_none()
+            {
                 sleep(Duration::from_millis(10)).await;
             }
         })
@@ -7362,16 +7592,14 @@ async fn connector_creates_owner_admin_in_the_founding_group_state() {
             .group(&owner.label, &group_id_hex)
             .unwrap()
             .unwrap();
-        assert!(
-            joined.admin_policy.admins.contains(&owner.account_id_hex),
-            "The owner must receive admin rights in its initial Welcome state"
-        );
+        assert!(joined.admin_policy.admins.contains(&owner.account_id_hex));
     }
     connector.runtime.shutdown().await;
 }
 
 #[tokio::test]
 async fn connector_socket_creates_group_with_member_refs_and_relay_override() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
     let relay_url = relay.url().await.to_string();
@@ -7399,6 +7627,29 @@ async fn connector_socket_creates_group_with_member_refs_and_relay_override() {
         peer.account_id_hex.clone(),
         marmot_app::npub_for_account_id(&peer.account_id_hex).unwrap(),
     ];
+    let unavailable = connector
+        .account_home
+        .create_account("unavailable")
+        .unwrap();
+    let rejected = serve_control_request_once(
+        &connector,
+        &listener,
+        &socket,
+        "atomic-create",
+        AgentControlRequest::GroupCreate {
+            account_id_hex: agent.account_id_hex.clone(),
+            name: "Atomic control request".into(),
+            members: vec![peer.label.clone(), unavailable.label],
+            description: None,
+            relays: None,
+        },
+    )
+    .await;
+    assert!(matches!(
+        rejected.payload,
+        AgentControlResponse::Error { code, .. } if code == "app_error"
+    ));
+    assert!(connector.app.groups(&agent.label).unwrap().is_empty());
     for (index, member_ref) in member_refs.into_iter().enumerate() {
         let relays = (index == 1).then(|| vec![alternate_url.clone()]);
         let response = serve_control_request_once(
@@ -7447,7 +7698,7 @@ async fn connector_socket_creates_group_with_member_refs_and_relay_override() {
         assert_eq!(
             group.admin_policy.admins,
             vec![agent.account_id_hex.clone()],
-            "Legacy creation must retain creator-only admins"
+            "Legacy creation keeps creator-only admins"
         );
         assert_eq!(
             group.profile.description,
@@ -7484,7 +7735,9 @@ async fn connector_socket_creates_group_with_member_refs_and_relay_override() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("fixture group is created");
     assert!(matches!(
         connector
             .group_info_response(&agent.account_id_hex, &hex::encode(other.as_slice()))
@@ -7508,6 +7761,7 @@ async fn connector_socket_creates_group_with_member_refs_and_relay_override() {
             &agent.account_id_hex,
             "Untracked group".into(),
             vec![peer.label.clone()],
+            Vec::new(),
             None,
             None,
         )
@@ -7546,6 +7800,7 @@ async fn connector_socket_creates_group_with_member_refs_and_relay_override() {
 
 #[tokio::test]
 async fn connector_group_profile_update_preserves_fields_and_requires_current_admin() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let relay = MockRelay::run().await.unwrap();
     let socket = dir.path().join("dev/wn-agent.sock");
@@ -7573,7 +7828,9 @@ async fn connector_group_profile_update_preserves_fields_and_requires_current_ad
             Some("Keep this description".into()),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("fixture group is created");
     let group_id_hex = hex::encode(group_id.as_slice());
     let listener = bind_connector_socket(&socket).unwrap();
 
@@ -7682,6 +7939,7 @@ async fn connector_group_profile_update_preserves_fields_and_requires_current_ad
 
 #[tokio::test]
 async fn connector_group_create_rejects_invalid_inputs_without_creating_groups() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("dev/wn-agent.sock");
     let connector = AgentConnector::open(test_config(
@@ -7880,11 +8138,13 @@ fn agent_created_groups_store_removal_is_durable_and_scoped() {
 
 #[tokio::test]
 async fn connector_socket_leaves_group_and_removes_activation_provenance() {
+    storage_sqlite::relax_storage_for_test_process();
     connector_leave_group_case(false).await;
 }
 
 #[tokio::test]
 async fn connector_leave_acknowledges_success_when_provenance_cleanup_fails() {
+    storage_sqlite::relax_storage_for_test_process();
     connector_leave_group_case(true).await;
 }
 
@@ -7912,6 +8172,7 @@ async fn connector_leave_group_case(block_cleanup: bool) {
             &agent.account_id_hex,
             "Leave test".into(),
             vec![peer.label.clone()],
+            Vec::new(),
             None,
             None,
         )
@@ -8127,6 +8388,7 @@ async fn relay_list_test_relay(
 
 #[tokio::test]
 async fn connector_relay_list_edit_preserves_entries_the_request_did_not_name() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let (_added_relay, added_url) = mock_relay_url().await;
     // Seed on the primary relay. For the NIP-65 add, both old outbox relays
@@ -8332,6 +8594,7 @@ async fn connector_relay_list_edit_preserves_entries_the_request_did_not_name() 
 
 #[tokio::test]
 async fn connector_relay_lists_reports_the_cached_lists() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let (_relay, relay_url) = mock_relay_url().await;
     let (_read_relay, read_url) = mock_relay_url().await;
@@ -8390,6 +8653,7 @@ async fn connector_relay_lists_reports_the_cached_lists() {
 
 #[tokio::test]
 async fn connector_relay_list_edit_refuses_an_unconfirmed_published_list() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     // The relay the connector reads through holds no relay-list event, and the
     // account has never published one: the read is unconfirmed, so the edit must
@@ -8486,6 +8750,7 @@ async fn connector_relay_list_edit_rejects_invalid_inputs_before_reading() {
 
 #[tokio::test]
 async fn connector_relay_list_edit_starts_from_the_newer_cached_list() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let (_lagging_relay, lagging_url) = mock_relay_url().await;
     let (_current_relay, current_url) = mock_relay_url().await;
@@ -8610,4 +8875,513 @@ async fn connector_relay_list_edit_starts_from_the_newer_cached_list() {
             .any(|relay| relay == &old_entry_url),
         "the pre-edit entries the lagging relay served must not come back"
     );
+}
+
+/// Hex secret for an identity that already exists elsewhere: a fixed scalar
+/// keeps the import path (`wn-agent import-identity`) deterministic.
+const IMPORTED_IDENTITY_SECRET_HEX: &str =
+    "1111111111111111111111111111111111111111111111111111111111111111";
+
+#[tokio::test]
+async fn connector_start_adopts_relay_lists_an_imported_identity_already_published() {
+    storage_sqlite::relax_storage_for_test_process();
+    // The identity published its lists from another device. The import runs
+    // offline, so the agent home has no cached copy of either list.
+    let (_relay, relay_url) = mock_relay_url().await;
+    let (_read_relay, read_url) = mock_relay_url().await;
+    let (_write_relay, write_url) = mock_relay_url().await;
+    let (_inbox_relay, inbox_url) = mock_relay_url().await;
+    let relay_endpoint = crate::validation::endpoint(&relay_url);
+    let source = tempfile::tempdir().unwrap();
+    let source_account = AccountHome::open(source.path())
+        .import_account_idempotent("source", IMPORTED_IDENTITY_SECRET_HEX)
+        .unwrap();
+    let source_app = MarmotApp::with_relay(source.path(), relay_url.clone());
+    publish_nip65_and_inbox(
+        &source_app,
+        &source_account,
+        relay_endpoint.clone(),
+        crate::validation::endpoint(&read_url),
+        crate::validation::endpoint(&write_url),
+        crate::validation::endpoint(&inbox_url),
+    )
+    .await;
+    let published = source_app
+        .account_relay_list_status(&source_account.label)
+        .unwrap();
+    // A replacement published by the start below must land in a later second,
+    // or same-second ordering could hide it.
+    sleep(Duration::from_millis(1_100)).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let imported = crate::identity::import_existing_identity_secret(
+        dir.path(),
+        "agent",
+        IMPORTED_IDENTITY_SECRET_HEX,
+        None,
+    )
+    .unwrap();
+    assert_eq!(imported.account_id_hex, source_account.account_id_hex);
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        dir.path().join("dev").join("wn-agent.sock"),
+        vec![relay_url.clone()],
+        false,
+        false,
+    ))
+    .unwrap();
+    assert!(
+        !connector
+            .app
+            .account_relay_list_status(&imported.label)
+            .unwrap()
+            .complete,
+        "the offline import must start without cached relay lists"
+    );
+
+    connector.start().await.unwrap();
+
+    // The relay still serves the lists the identity published, not a
+    // replacement naming only the connector's relay.
+    let on_relay = source_app
+        .directory()
+        .fetch_current_account_relay_list_status_for_account_id(
+            &source_account.account_id_hex,
+            vec![relay_endpoint],
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("published relay lists");
+    assert_eq!(on_relay.nip65.created_at, published.nip65.created_at);
+    assert_eq!(on_relay.inbox.created_at, published.inbox.created_at);
+    assert!(on_relay.nip65.read_relays.contains(&read_url));
+    assert!(on_relay.nip65.write_relays.contains(&write_url));
+    assert!(on_relay.inbox.relays.contains(&inbox_url));
+
+    // The agent home adopted them.
+    let adopted = connector
+        .app
+        .account_relay_list_status(&imported.label)
+        .unwrap();
+    assert!(adopted.complete);
+    assert_eq!(adopted.nip65.created_at, published.nip65.created_at);
+    assert!(adopted.inbox.relays.contains(&inbox_url));
+
+    connector.runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn connector_start_publishes_configured_relay_lists_once_their_absence_is_read() {
+    storage_sqlite::relax_storage_for_test_process();
+    let (_relay, relay_url) = mock_relay_url().await;
+    let relay_endpoint = crate::validation::endpoint(&relay_url);
+    let dir = tempfile::tempdir().unwrap();
+    let imported = crate::identity::import_existing_identity_secret(
+        dir.path(),
+        "agent",
+        IMPORTED_IDENTITY_SECRET_HEX,
+        None,
+    )
+    .unwrap();
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        dir.path().join("dev").join("wn-agent.sock"),
+        vec![relay_url.clone()],
+        false,
+        false,
+    ))
+    .unwrap();
+
+    // Every configured relay answered and none holds a list: absence is
+    // established, so the connector publishes its own relays.
+    connector.start().await.unwrap();
+
+    let reader = tempfile::tempdir().unwrap();
+    let published = MarmotApp::with_relay(reader.path(), relay_url.clone())
+        .directory()
+        .fetch_current_account_relay_list_status_for_account_id(
+            &imported.account_id_hex,
+            vec![relay_endpoint],
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("published relay lists");
+    assert_eq!(published.nip65.relays, vec![relay_url.clone()]);
+    assert_eq!(published.inbox.relays, vec![relay_url]);
+
+    connector.runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn connector_start_publishes_no_relay_list_when_a_configured_relay_cannot_answer() {
+    storage_sqlite::relax_storage_for_test_process();
+    let (_relay, relay_url) = mock_relay_url().await;
+    // A loopback port nothing listens on: that relay cannot confirm absence.
+    let unreachable_url = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("ws://{}", listener.local_addr().unwrap())
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let imported = crate::identity::import_existing_identity_secret(
+        dir.path(),
+        "agent",
+        IMPORTED_IDENTITY_SECRET_HEX,
+        None,
+    )
+    .unwrap();
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        dir.path().join("dev").join("wn-agent.sock"),
+        vec![relay_url.clone(), unreachable_url],
+        false,
+        false,
+    ))
+    .unwrap();
+
+    let error = connector.start().await.unwrap_err();
+    assert_eq!(error.code(), "relay_list_inconclusive");
+    assert!(error.retryable());
+
+    // The reachable relay received no list: an unconfirmed read never turns
+    // into a replacement.
+    let reader = tempfile::tempdir().unwrap();
+    let published = MarmotApp::with_relay(reader.path(), relay_url.clone())
+        .directory()
+        .fetch_current_account_relay_list_status_for_account_id(
+            &imported.account_id_hex,
+            vec![crate::validation::endpoint(&relay_url)],
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(published.is_none(), "{published:?}");
+    assert!(
+        !connector
+            .app
+            .account_relay_list_status(&imported.label)
+            .unwrap()
+            .complete
+    );
+
+    connector.runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn connector_start_without_relays_reports_missing_relay_lists() {
+    storage_sqlite::relax_storage_for_test_process();
+    // An imported identity on a daemon run with no relays: nothing can read or
+    // publish its lists, so startup names that instead of `app_error`.
+    let dir = tempfile::tempdir().unwrap();
+    crate::identity::import_existing_identity_secret(
+        dir.path(),
+        "agent",
+        IMPORTED_IDENTITY_SECRET_HEX,
+        None,
+    )
+    .unwrap();
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        dir.path().join("dev").join("wn-agent.sock"),
+        Vec::new(),
+        false,
+        false,
+    ))
+    .unwrap();
+
+    let error = connector.start().await.unwrap_err();
+
+    assert_eq!(error.code(), "missing_relay_lists");
+    assert!(error.client_message().contains("--relay or MARMOT_RELAYS"));
+    connector.runtime.shutdown().await;
+}
+
+#[test]
+fn missing_relay_configuration_errors_share_one_code() {
+    for error in [
+        AppError::MissingRelayLists(vec![marmot_app::MissingRelayListKind::Inbox]),
+        AppError::MissingDefaultRelays,
+    ] {
+        let error = crate::ConnectorError::App(error);
+        assert_eq!(error.code(), "missing_relay_lists");
+        assert_eq!(error.privacy_safe_code(), "missing_relay_lists");
+        assert!(error.client_message().contains("--relay or MARMOT_RELAYS"));
+        assert!(!error.retryable());
+    }
+}
+
+#[tokio::test]
+async fn serve_socket_rejects_an_unusable_relay_url_before_binding() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("dev").join("wn-agent.sock");
+    let mut config = test_config(
+        dir.path(),
+        socket.clone(),
+        vec!["ws://relay.example".to_owned()],
+        false,
+        false,
+    );
+    config.allow_loopback_relays = false;
+
+    let error = serve_socket(config).await.unwrap_err();
+
+    assert_eq!(error.code(), "invalid_relay_url");
+    assert!(!socket.exists());
+}
+
+#[tokio::test]
+async fn connector_restarts_keep_an_imported_read_only_relay_list() {
+    storage_sqlite::relax_storage_for_test_process();
+    // A kind 10002 with only a read relay has no write route, so MDK counts it
+    // as missing. The first start caches it and stops; a restart must not then
+    // treat the cached read entry as a list and let the KeyPackage publish
+    // replace it with the daemon's relays.
+    let (_relay, relay_url) = mock_relay_url().await;
+    let (_read_relay, read_url) = mock_relay_url().await;
+    let (_inbox_relay, inbox_url) = mock_relay_url().await;
+    let relay_endpoint = crate::validation::endpoint(&relay_url);
+    let source = tempfile::tempdir().unwrap();
+    let source_account = AccountHome::open(source.path())
+        .import_account_idempotent("source", IMPORTED_IDENTITY_SECRET_HEX)
+        .unwrap();
+    let source_app = MarmotApp::with_relay(source.path(), relay_url.clone());
+    source_app
+        .publish_account_nip65_relay_set(
+            &source_account.label,
+            vec![crate::validation::endpoint(&read_url)],
+            Vec::new(),
+            vec![relay_endpoint.clone()],
+        )
+        .await
+        .unwrap();
+    source_app
+        .publish_account_relay_list_kind(
+            &source_account.label,
+            "inbox",
+            vec![crate::validation::endpoint(&inbox_url)],
+            vec![relay_endpoint.clone()],
+        )
+        .await
+        .unwrap();
+    let published = source_app
+        .account_relay_list_status(&source_account.label)
+        .unwrap();
+    assert_eq!(published.nip65.read_relays, vec![read_url.clone()]);
+    assert!(published.nip65.write_relays.is_empty());
+    sleep(Duration::from_millis(1_100)).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    crate::identity::import_existing_identity_secret(
+        dir.path(),
+        "agent",
+        IMPORTED_IDENTITY_SECRET_HEX,
+        None,
+    )
+    .unwrap();
+    for start in ["first", "restart"] {
+        let connector = AgentConnector::open(test_config(
+            dir.path(),
+            dir.path().join("dev").join("wn-agent.sock"),
+            vec![relay_url.clone()],
+            false,
+            false,
+        ))
+        .unwrap();
+        let error = connector.start().await.unwrap_err();
+        assert_eq!(error.code(), "missing_relay_lists", "{start} start");
+        connector.runtime.shutdown_and_close().await.unwrap();
+    }
+
+    let on_relay = source_app
+        .directory()
+        .fetch_current_account_relay_list_status_for_account_id(
+            &source_account.account_id_hex,
+            vec![relay_endpoint],
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("published relay lists");
+    assert_eq!(on_relay.nip65.created_at, published.nip65.created_at);
+    assert_eq!(on_relay.nip65.read_relays, vec![read_url]);
+    assert!(on_relay.nip65.write_relays.is_empty());
+    assert_eq!(on_relay.inbox.created_at, published.inbox.created_at);
+}
+
+#[tokio::test]
+async fn group_admin_checks_authority_changes_membership_and_reads_back() {
+    storage_sqlite::relax_storage_for_test_process();
+    let dir = tempfile::tempdir().unwrap();
+    let relay = MockRelay::run().await.unwrap();
+    let connector = AgentConnector::open(test_config(
+        dir.path(),
+        dir.path().join("dev/admin.sock"),
+        vec![relay.url().await.to_string()],
+        false,
+        false,
+    ))
+    .unwrap();
+    // First opens of encrypted account databases stay sequential so the
+    // fixture does not compete for the startup budget.
+    let mut accounts = Vec::new();
+    for label in ["admin-agent", "admin-peer", "admin-new"] {
+        let account = connector.account_home.create_account(label).unwrap();
+        connector
+            .runtime
+            .publish_key_package(&account.label)
+            .await
+            .unwrap();
+        accounts.push(account);
+    }
+    let [agent, peer, newcomer] = accounts.try_into().ok().unwrap();
+    let id = connector
+        .runtime
+        .create_group(
+            &agent.label,
+            "Admin test",
+            std::slice::from_ref(&peer.label),
+            None,
+        )
+        .await
+        .unwrap()
+        .operation
+        .expect("fixture group is created");
+    let group = hex::encode(id.as_slice());
+    let change = |promote, add, remove| GroupAdminChange {
+        promote,
+        add,
+        remove,
+    };
+    let status = |actor: &str, member: &str, change| {
+        let connector = &connector;
+        let group = &group;
+        let (actor, member) = (actor.to_owned(), member.to_owned());
+        async move {
+            match connector
+                .group_admin_response(&actor, group, &member, change)
+                .await?
+            {
+                AgentControlResponse::GroupAdminStatus {
+                    is_member,
+                    is_admin,
+                    message_ids_hex,
+                    accept_disposition,
+                } => {
+                    // The mock relay acknowledges at once, so every sent change
+                    // is published and a request that sends nothing has no
+                    // disposition.
+                    assert_eq!(
+                        accept_disposition,
+                        (!message_ids_hex.is_empty())
+                            .then_some(agent_control::AgentControlSendAcceptDisposition::Published)
+                    );
+                    Ok::<_, crate::ConnectorError>((is_member, is_admin, message_ids_hex.len()))
+                }
+                other => panic!("unexpected response {other:?}"),
+            }
+        }
+    };
+    let (agent_id, peer_id, new_id) = (
+        agent.account_id_hex.as_str(),
+        peer.account_id_hex.as_str(),
+        newcomer.account_id_hex.as_str(),
+    );
+
+    // The peer joins, then as a non-admin cannot promote itself, invite or remove.
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while connector
+            .runtime
+            .accept_group_invite(&peer.label, &id)
+            .await
+            .is_err()
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("peer joins the group");
+    for (member, change) in [
+        (peer_id, change(true, false, false)),
+        (new_id, change(false, true, false)),
+        (agent_id, change(false, false, true)),
+    ] {
+        let error = status(peer_id, member, change).await.unwrap_err();
+        assert_eq!(error.code(), "not_group_admin", "{error}");
+    }
+    let short_id = &agent_id[2..];
+    let error = status(agent_id, short_id, change(false, false, false))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "invalid_hex");
+    let unavailable_home = tempfile::tempdir().unwrap();
+    let unavailable = marmot_account::AccountHome::open(unavailable_home.path())
+        .create_account("unpublished")
+        .unwrap()
+        .account_id_hex;
+    let error = status(agent_id, &unavailable, change(false, true, false))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), "app_error");
+    assert_eq!(
+        status(agent_id, &unavailable, change(false, false, false))
+            .await
+            .unwrap(),
+        (false, false, 0)
+    );
+    // Read-only query, promotion, and an idempotent repeat.
+    assert_eq!(
+        status(agent_id, peer_id, change(false, false, false))
+            .await
+            .unwrap(),
+        (true, false, 0)
+    );
+    let (member, admin, commits) = status(agent_id, peer_id, change(true, false, false))
+        .await
+        .unwrap();
+    assert!(member && admin && commits > 0);
+    assert_eq!(
+        status(agent_id, peer_id, change(true, false, false))
+            .await
+            .unwrap(),
+        (true, true, 0)
+    );
+    // Promote alone never invites a non-member.
+    assert_eq!(
+        status(agent_id, new_id, change(true, false, false))
+            .await
+            .unwrap(),
+        (false, false, 0)
+    );
+    // Add with promote invites as an initial admin, once.
+    let (member, admin, commits) = status(agent_id, new_id, change(true, true, false))
+        .await
+        .unwrap();
+    assert!(member && admin && commits > 0);
+    assert_eq!(
+        status(agent_id, new_id, change(true, true, false))
+            .await
+            .unwrap(),
+        (true, true, 0)
+    );
+    // Removing an admin publishes one commit that also drops its admin key;
+    // remove wins over add and promote and is idempotent.
+    assert_eq!(
+        status(agent_id, new_id, change(true, true, true))
+            .await
+            .unwrap(),
+        (false, false, 1)
+    );
+    assert_eq!(
+        status(agent_id, new_id, change(false, false, true))
+            .await
+            .unwrap(),
+        (false, false, 0)
+    );
+    // Add alone invites a plain member.
+    let (member, admin, commits) = status(agent_id, new_id, change(false, true, false))
+        .await
+        .unwrap();
+    assert!(member && !admin && commits > 0);
+    connector.runtime.shutdown().await;
 }

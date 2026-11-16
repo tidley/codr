@@ -25,4 +25,13 @@ class CombinedPackagingTests(unittest.TestCase):
     def test_both_worker_packaging_paths_include_embedded_dependency_licenses(self):
         workflow = (Path(__file__).resolve().parents[1] / ".github/workflows/build.yml").read_text()
         self.assertEqual(workflow.count('-C "$GITHUB_WORKSPACE/vendor/mdk" LICENSE README.codr.md'), 2)
-        self.assertEqual(workflow.count('-C "$GITHUB_WORKSPACE/vendor/mdk/vendor/hpke-rs-libcrux" LICENSE-MPL-2.0'), 2)
+        self.assertEqual(workflow.count('LICENSE README.codr.md LICENSE-MPL-2.0 NOTICE.codr'), 2)
+        self.assertNotIn('vendor/mdk/vendor/hpke-rs-libcrux', workflow)
+
+    def test_every_rust_build_job_installs_the_pinned_odin_compiler(self):
+        workflow = (Path(__file__).resolve().parents[1] / ".github/workflows/build.yml").read_text()
+        for name, end in [("checks", "checks-macos"), ("checks-macos", "binaries"),
+                          ("binaries", "linux-preview"), ("linux-preview", "publish-linux-preview")]:
+            job = workflow.split(f"  {name}:\n", 1)[1].split(f"  {end}:\n", 1)[0]
+            self.assertIn("uses: ./.github/actions/setup-odin", job)
+            self.assertLess(job.index("uses: ./.github/actions/setup-odin"), job.index("cargo "))

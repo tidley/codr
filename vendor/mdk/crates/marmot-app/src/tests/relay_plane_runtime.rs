@@ -7,9 +7,8 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use cgka_traits::transport::Timestamp;
 use cgka_traits::{
-    MemberId, MessageId, TransportAdapterError, TransportEndpoint, TransportEndpointFailure,
+    MemberId, TransportAdapterError, TransportEndpoint, TransportEndpointFailure,
     TransportEndpointReceipt,
 };
 use tokio::time::timeout;
@@ -22,11 +21,15 @@ use transport_nostr::{
     AccountDeliveryReceive, DirectoryFetchRequest, DirectoryRelayEventRecord, DirectoryRelayFetcher,
 };
 
-/// A relay client that records subscriptions and accepts nothing. A copy of
-/// the relay plane's own test fake: once the plane is its own crate, its test
-/// module is not visible here.
+/// A relay client that records subscriptions, answers each REQ with EOSE on
+/// each of its relays, and accepts no publish. A copy of the relay plane's own
+/// test fake: once the plane is its own crate, its test module is not visible
+/// here.
 #[derive(Default)]
 struct RecordingRelayClient {
+    /// What its relays send the plane: an EOSE for each accepted REQ on each
+    /// relay.
+    messages: Arc<transport_nostr::test_support::ScriptedRelayMessages>,
     subscriptions: StdMutex<Vec<NostrSubscription>>,
     unsubscribed: StdMutex<Vec<NostrSubscription>>,
     unsubscribed_accounts: StdMutex<Vec<MemberId>>,
@@ -44,6 +47,21 @@ impl DirectoryRelayFetcher for RecordingRelayClient {
 
 #[async_trait]
 impl NostrRelayClient for RecordingRelayClient {
+    fn relay_notification_source(
+        &self,
+    ) -> Option<Arc<dyn transport_nostr_adapter::NostrRelayNotificationSource>> {
+        Some(self.messages.clone())
+    }
+
+    async fn reply_sent_nothing(
+        &self,
+        _account: Option<&MemberId>,
+        _endpoint: &TransportEndpoint,
+        subscription_id: &str,
+    ) -> bool {
+        self.messages.reply_sent_nothing(subscription_id)
+    }
+
     async fn publish_event_for_account(
         &self,
         _account_id: &MemberId,
@@ -57,6 +75,10 @@ impl NostrRelayClient for RecordingRelayClient {
         &self,
         subscription: NostrSubscription,
     ) -> Result<(), TransportAdapterError> {
+        let id = subscription.subscription_id();
+        for endpoint in subscription.endpoints() {
+            self.messages.eose(endpoint, &id);
+        }
         self.subscriptions.lock().unwrap().push(subscription);
         Ok(())
     }
@@ -95,6 +117,19 @@ impl NostrRelayClient for RecordingRelayClient {
     }
 }
 
+impl RecordingRelayClient {
+    /// These relays are connected, as a running app's are before its account
+    /// subscribes: wait until the plane has heard each connection, so a REQ
+    /// it issues there later counts from its own issue.
+    async fn connect_relays(&self, endpoints: &[&str]) {
+        for endpoint in endpoints {
+            self.messages
+                .connect(&TransportEndpoint((*endpoint).to_owned()));
+        }
+        self.messages.handled().await;
+    }
+}
+
 fn inbox_subscription_count(relay: &RecordingRelayClient) -> usize {
     relay
         .subscriptions
@@ -114,6 +149,7 @@ async fn managed_account_worker_reopens_transport_after_notification_consumer_ex
     let relay = Arc::new(RecordingRelayClient::default());
     let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(relay.clone());
+    relay.connect_relays(&["wss://relay.example"]).await;
     let relay_plane = app.relay_plane.clone();
     let runtime = crate::MarmotAppRuntime::new(app);
 
@@ -153,6 +189,7 @@ async fn managed_account_worker_keeps_its_session_through_notification_lag() {
     let relay = Arc::new(RecordingRelayClient::default());
     let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(relay.clone());
+    relay.connect_relays(&["wss://relay.example"]).await;
     let relay_plane = app.relay_plane.clone();
     let storage = app.account_storage("alice").unwrap().app_storage();
     let runtime = crate::MarmotAppRuntime::new(app);
@@ -166,6 +203,9 @@ async fn managed_account_worker_keeps_its_session_through_notification_lag() {
     .await
     .expect("the managed account worker should activate its initial inbox subscription");
     let subscriptions = inbox_subscription_count(&relay);
+    let before_loss = storage.recovery_coverage_mark().unwrap();
+    let retained_since = crate::unix_now_seconds()
+        .saturating_sub(storage_sqlite::TRANSPORT_RECONCILIATION_RETENTION_SECS);
 
     relay_plane.simulate_notification_lag_for_test(
         &account,
@@ -173,28 +213,20 @@ async fn managed_account_worker_keeps_its_session_through_notification_lag() {
         NostrNotificationLossFloor::Since(1_700_000_000),
     );
     timeout(Duration::from_secs(5), async {
-        while storage
-            .recovery_loss_watermarks(
-                "alice",
-                storage_sqlite::RecoveryLossCause::NotificationConsumer,
-            )
-            .unwrap()
-            .is_empty()
-        {
+        while storage.recovery_coverage_mark().unwrap() == before_loss {
             tokio::task::yield_now().await;
         }
     })
     .await
     .expect("the worker persists the lag");
-    assert_eq!(
-        storage
-            .recovery_loss_goal_floor(
-                "alice",
-                storage_sqlite::RecoveryLossCause::NotificationConsumer,
-            )
-            .unwrap(),
-        Some(1_700_000_000)
-    );
+    // The new owner reclaims the raw watermark after durably importing it.
+    // This old floor is outside retention: its owed history must be parked,
+    // rather than silently dropped when that watermark goes away.
+    assert!(storage.recovery_coverage_remainders().unwrap().iter().any(
+        |remainder| remainder.route == storage_sqlite::TransportReconciliationRoute::Inbox
+            && remainder.range.since_seconds <= 1_700_000_000
+            && remainder.range.until_seconds >= retained_since.saturating_sub(1)
+    ));
     for _ in 0..20 {
         assert!(
             !matches!(
@@ -218,10 +250,15 @@ async fn managed_account_worker_keeps_its_session_through_notification_lag() {
     runtime.shutdown().await;
 }
 
+/// A notification lag reaches the worker's receive boundary with its own
+/// token and REQ floor, and its overflow identity survives a receiver
+/// replacement. An unexpected consumer exit still closes the route, and a
+/// later lag whose control record cannot reach the closed queue is received
+/// before the closed queue is. What the ledger owes for a lag is the
+/// recovery coverage scenario tests' (`notification_lag_*`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn notification_loss_is_durable_and_survives_receiver_replacement() {
+async fn notification_lag_reaches_the_receive_boundary_and_survives_receiver_replacement() {
     use crate::tests::{ScriptedPushRelayClient, client_on_app_relay_plane};
-    use storage_sqlite::RecoveryLossCause::NotificationConsumer;
     let dir = tempfile::tempdir().unwrap();
     crate::AccountHome::open(dir.path())
         .create_account("alice")
@@ -234,12 +271,11 @@ async fn notification_loss_is_durable_and_survives_receiver_replacement() {
     )
     .with_test_relay_client(relay);
     let mut client = client_on_app_relay_plane(&app, "alice").await;
-    let storage = app.account_storage("alice").unwrap().app_storage();
     let account = client.adapter.account_id().clone();
     app.relay_plane
         .set_account_delivery_recovery_marker_for_test(
             &account,
-            Arc::new(|_, _, _| panic!("notification lag must never use the queue writer")),
+            Arc::new(|_, _, _, _| panic!("notification lag must never use the queue writer")),
         );
     app.relay_plane.simulate_notification_lag_for_test(
         &account,
@@ -250,53 +286,21 @@ async fn notification_loss_is_durable_and_survives_receiver_replacement() {
     assert_eq!(loss.dropped, 0);
     assert_eq!(loss.notification_losses, 1);
     assert_eq!(loss.notification_floor, Some(1_700_000_000));
-    assert!(
-        storage
-            .recovery_loss_watermarks("alice", NotificationConsumer)
-            .unwrap()
-            .is_empty()
-    );
-    // The real worker receive boundary persists the typed lag, bounded by
-    // the REQ floor read at the lag, and the route stays open.
+    // The real worker receive boundary takes the typed lag, bounded by the
+    // REQ floor read at the lag, and the route stays open.
     assert!(matches!(
         client.receive_next_delivery().await,
         Ok(AccountDeliveryReceive::Overflow(overflow))
             if overflow.notification_token == loss.notification_token
+                && overflow.notification_floor == Some(1_700_000_000)
     ));
-    let evidence = storage
-        .recovery_loss_watermarks("alice", NotificationConsumer)
-        .unwrap();
-    assert_eq!(evidence.len(), 1);
-    assert_eq!(
-        storage
-            .recovery_loss_goal_floor("alice", NotificationConsumer)
-            .unwrap(),
-        Some(1_700_000_000)
-    );
-    assert!(
-        storage
-            .pending_recovery_demands()
-            .unwrap()
-            .iter()
-            .any(|d| d.cause == storage_sqlite::RecoveryCause::NotificationLoss)
-    );
-    assert!(
-        storage
-            .account_delivery_recovery("alice")
-            .unwrap()
-            .is_none()
-    );
     let prior = client.adapter.delivery_overflow_identity_for_test();
     drop(client);
     let mut replacement = client_on_app_relay_plane(&app, "alice").await;
     assert!(prior.same_as(&replacement.adapter.delivery_overflow_identity_for_test()));
-    let attempt = replacement
-        .adapter
-        .start_delivery_overflow_recovery(loss.marker_token);
     // An unexpected consumer exit still closes the route.
     app.relay_plane
         .simulate_notification_consumer_exit_for_test();
-    assert_eq!(replacement.adapter.notification_losses_for_test(), 1);
     // A lag whose control record cannot reach the closed queue, and whose
     // floor is unknown.
     app.relay_plane.simulate_notification_lag_for_test(
@@ -304,37 +308,16 @@ async fn notification_loss_is_durable_and_survives_receiver_replacement() {
         1,
         NostrNotificationLossFloor::Unbounded,
     );
-    assert!(
-        replacement
-            .adapter
-            .finish_delivery_overflow_recovery(attempt)
-            .is_none()
-    );
-    replacement.adapter.fail_delivery_overflow_recovery();
     let newer = replacement.adapter.pending_delivery_overflow().unwrap();
-    assert_eq!(newer.notification_losses, 2);
     assert_ne!(newer.notification_token, loss.notification_token);
     assert_eq!(newer.notification_floor, None);
-    // Persisted without its control record, before the closed queue is seen.
+    // Received without its control record, before the closed queue is seen.
     assert!(matches!(
         replacement.receive_next_delivery().await,
         Ok(AccountDeliveryReceive::Overflow(overflow))
             if overflow.notification_token == newer.notification_token
+                && overflow.notification_floor.is_none()
     ));
-    assert_eq!(
-        storage
-            .recovery_loss_watermarks("alice", NotificationConsumer)
-            .unwrap()
-            .len(),
-        2
-    );
-    assert_eq!(
-        storage
-            .recovery_loss_goal_floor("alice", NotificationConsumer)
-            .unwrap(),
-        None,
-        "an unknown floor leaves the whole goal unbounded"
-    );
     assert!(matches!(
         replacement.receive_next_delivery().await,
         Err(crate::AppError::TransportClosed)
@@ -378,7 +361,9 @@ async fn sdk_account_worker_reopens_after_notification_consumer_exit() {
             },
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     runtime.group_members(&alice.label, &group).await.unwrap();
 
     runtime
@@ -386,20 +371,22 @@ async fn sdk_account_worker_reopens_after_notification_consumer_exit() {
         .relay_plane()
         .simulate_notification_consumer_exit_for_test();
     // The first reconnect waits two seconds plus jitter; later ones double.
+    // A group read answers from the published read state, which outlives the
+    // client, so the probe is a command the worker itself must answer.
     timeout(Duration::from_secs(20), async {
         let mut reconnecting = false;
         loop {
-            match runtime.group_members(&alice.label, &group).await {
-                Ok(_) if reconnecting => break,
-                Ok(_) => {}
+            match crate::worker_fences::worker_round_trip(&runtime, &alice.label).await {
+                Ok(()) if reconnecting => break,
+                Ok(()) => {}
                 Err(crate::AppError::TransportClosed) => reconnecting = true,
-                Err(error) => panic!("unexpected group read error: {error:?}"),
+                Err(error) => panic!("unexpected worker command error: {error:?}"),
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
     .await
-    .expect("the reopened worker serves reads again");
+    .expect("the reopened worker serves commands again");
     timeout(Duration::from_secs(30), runtime.catch_up_accounts())
         .await
         .expect("the reopened worker catches up")
@@ -446,7 +433,9 @@ async fn sdk_account_worker_keeps_serving_through_notification_lag() {
             },
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     runtime.group_members(&alice.label, &group).await.unwrap();
     let plane = runtime.shared_services().relay_plane().clone();
     let sdk = plane.sdk_relay_client_for_test().unwrap();
@@ -456,33 +445,30 @@ async fn sdk_account_worker_keeps_serving_through_notification_lag() {
         "after catch-up every live REQ of the account carries a since"
     );
 
+    let before_loss = storage.recovery_coverage_mark().unwrap();
     plane.simulate_notification_lag_for_test(&account, 1, floor);
     timeout(Duration::from_secs(10), async {
-        while storage
-            .recovery_loss_watermarks(
-                &alice.label,
-                storage_sqlite::RecoveryLossCause::NotificationConsumer,
-            )
-            .unwrap()
-            .is_empty()
-        {
+        while storage.recovery_coverage_mark().unwrap() == before_loss {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
     .expect("the worker persists the lag");
-    assert_eq!(
-        storage
-            .recovery_loss_goal_floor(
-                &alice.label,
-                storage_sqlite::RecoveryLossCause::NotificationConsumer,
-            )
-            .unwrap(),
-        floor.since_seconds()
+    // Raw watermarks are reclaimed after import; the durable un-cover fence
+    // and goals now retain the lag even if the runner has already re-proved it.
+    let since = floor.since_seconds().unwrap();
+    let routes = storage.recovery_coverage_goal_routes().unwrap();
+    assert!(
+        routes.len() >= 2,
+        "the inbox and group both retain their goals"
     );
+    for route in routes {
+        assert!(storage.recovery_coverage_goal(&route).unwrap().unwrap() <= since);
+    }
+    // A worker command, not a group read: the read state would answer a read
+    // even with the account's transport closed.
     for _ in 0..20 {
-        runtime
-            .group_members(&alice.label, &group)
+        crate::worker_fences::worker_round_trip(&runtime, &alice.label)
             .await
             .expect("a lag never closes the account's transport");
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -499,110 +485,6 @@ async fn sdk_account_worker_keeps_serving_through_notification_lag() {
         0
     );
     runtime.shutdown().await;
-}
-
-/// A post-join maintenance REQ is floored at the Welcome that installed the
-/// copy, so a lag while it is live still charges a bounded loss, which a
-/// comparison can certify, instead of an unbounded one that parks as "history
-/// may be incomplete". The Welcome here is older than every other REQ floor,
-/// so the lag's floor is the maintenance REQ's own.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn notification_lag_while_post_join_maintenance_is_live_stays_bounded() {
-    use cgka_traits::storage::{GroupStorage, MaintenanceStorage};
-    let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
-    let url = relay.url().await.to_string();
-    let dir = tempfile::tempdir().unwrap();
-    let alice = marmot_account::AccountHome::open(dir.path())
-        .create_account("alice")
-        .unwrap();
-    let account = MemberId::new(hex::decode(&alice.account_id_hex).unwrap());
-    let app = crate::MarmotApp::with_relay_and_config(
-        dir.path(),
-        url.clone(),
-        crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
-    );
-    let storage = app.account_storage(&alice.label).unwrap();
-    // Other live REQs have a settled floor newer than the Welcome below.
-    let mut state = app.load_state(&alice.label).unwrap();
-    state.last_transport_timestamp = Some(crate::unix_now_seconds());
-    app.save_state(&state).unwrap();
-    let mut client = crate::tests::client_on_app_relay_plane(&app, &alice.label).await;
-    client.prepare_transport().await.unwrap();
-    let group = client
-        .create_group_with_options(
-            "maintenance lag",
-            &[],
-            crate::AppCreateGroupOptions {
-                relays: Some(vec![url]),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-    // Model a copy installed from a Welcome five days old, still catching up.
-    let welcome_at = crate::unix_now_seconds() - 5 * 86_400;
-    let mut record = storage.get_group(&group).unwrap();
-    record.local_copy_welcome_created_at = Some(Timestamp(welcome_at));
-    storage.put_group(&record).unwrap();
-    storage
-        .put_maintenance_obligation(&cgka_traits::MaintenanceObligation {
-            id: MessageId::new(vec![0x55; 32]),
-            group_id: group.clone(),
-            trigger: cgka_traits::MaintenanceTrigger::PostJoin,
-            phase: cgka_traits::MaintenancePhase::CatchUp,
-            created_at: Timestamp(crate::unix_now_seconds()),
-            operational_target_at: None,
-            overdue: false,
-            eose_deadline_at: None,
-            grace_until: None,
-            quiet_since: None,
-            own_leaf_baseline_hash: None,
-            sampled_jitter_ms: 0,
-            not_before: None,
-            attempt_count: 0,
-            semantic_rearm_count: 0,
-            last_failure_code: None,
-        })
-        .unwrap();
-    // Advance requests the boundary; the recovery job installs its REQ.
-    client
-        .advance_post_join_maintenance_subscriptions()
-        .await
-        .unwrap();
-    let grant = client
-        .authorize_account_recovery(
-            None,
-            marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    client.run_recovery_grant_for_test(grant).await.unwrap();
-    assert!(
-        client
-            .post_join_maintenance_subscriptions
-            .contains_key(&group),
-        "the post-join maintenance REQ is live"
-    );
-
-    let plane = app.relay_plane.clone();
-    let sdk = plane.sdk_relay_client_for_test().unwrap();
-    let floor = sdk.notification_loss_floor_for_account(&account).await;
-    assert_eq!(
-        floor,
-        NostrNotificationLossFloor::Since(crate::history_floor(welcome_at).0),
-        "the lowest REQ floor is the maintenance REQ's Welcome floor"
-    );
-    plane.simulate_notification_lag_for_test(&account, 1, floor);
-    assert_eq!(
-        client
-            .adapter
-            .pending_delivery_overflow()
-            .expect("the lag is pending loss")
-            .notification_floor,
-        Some(crate::history_floor(welcome_at).0)
-    );
-    plane.shutdown().await;
 }
 
 /// A retained route stored before switch times were kept is stamped at the
@@ -639,7 +521,9 @@ async fn notification_lag_with_a_legacy_retained_route_stays_bounded() {
                 },
             )
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         drop(client);
         let storage = app.account_storage(&alice.label).unwrap().app_storage();
         let mut stored = storage
@@ -686,156 +570,504 @@ async fn notification_lag_with_a_legacy_retained_route_stays_bounded() {
     app.relay_plane.shutdown().await;
 }
 
-/// A member that was offline joins from a Welcome made before the group's
-/// next commit. Its live group REQ resumes from the account cursor, after that
-/// commit, so only the post-join maintenance REQ, floored at the Welcome, can
-/// bring the commit back before the member's first self-update.
-///
-/// Test-policy builds settle convergence at once. A directly driven client has
-/// no worker timer for the pinned quiescence window, so it needs that.
-#[cfg(feature = "test-policy-overrides")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn offline_member_post_join_catch_up_sees_the_commit_made_before_its_join() {
-    use transport_nostr::MarmotRelayPlane;
+async fn liveness_cache_failure() {
     let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
     let url = relay.url().await.to_string();
-    let config = || crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
-    let alice_dir = tempfile::tempdir().unwrap();
-    let bob_dir = tempfile::tempdir().unwrap();
-    marmot_account::AccountHome::open(alice_dir.path())
-        .create_account("alice")
-        .unwrap();
-    let bob = marmot_account::AccountHome::open(bob_dir.path())
-        .create_account("bob")
-        .unwrap();
-
-    // Bob publishes a KeyPackage, settles his cold-start history, and leaves.
-    {
-        let setup = crate::MarmotApp::with_relay_and_config(bob_dir.path(), url.clone(), config());
-        let mut client = crate::tests::client_on_app_relay_plane(&setup, "bob").await;
-        client.publish_key_package().await.unwrap();
-        client.sync().await.unwrap();
-        drop(client);
-        setup.relay_plane.shutdown().await;
-    }
-
-    // Alice invites Bob, then renames the group before he is back.
-    let alice_app =
-        crate::MarmotApp::with_relay_and_config(alice_dir.path(), url.clone(), config());
-    let mut alice = crate::tests::client_on_app_relay_plane(&alice_app, "alice").await;
-    let group = alice
-        .create_group_with_options(
-            "before bob returns",
-            &[bob.account_id_hex.as_str()],
-            crate::AppCreateGroupOptions {
-                relays: Some(vec![url.clone()]),
-                ..Default::default()
-            },
-        )
+    let dir = tempfile::tempdir().unwrap();
+    let app = crate::MarmotApp::with_relay_and_config(
+        dir.path(),
+        url.clone(),
+        crate::MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
+    let alice = app.account_home().create_account("alice").unwrap();
+    let mut client = app
+        .local_client_with_relay_plane(&alice.label, &app.relay_plane, None)
         .await
         .unwrap();
-    let rename = alice
-        .update_group_profile(&group, Some("renamed while bob was away"), None)
+    let bob = app.account_home().create_account("bob").unwrap();
+    std::fs::create_dir(app.directory_cache_path(&bob.label)).unwrap();
+
+    client
+        .prepare_transport()
+        .await
+        .expect("diagnostic cache failures must not prevent receive activation");
+    assert!(client.adapter.replay_admission().await.active());
+    let mut changes = app.relay_plane.relay_liveness_changes().unwrap();
+    let sdk = app
+        .relay_plane
+        .account_history_relay_client(client.adapter.account_id())
         .await
         .unwrap();
-    let renamed_at = crate::unix_now_seconds();
-    let renamed_epoch = alice.runtime.group_record(&group).unwrap().epoch;
-    assert!(!rename.message_ids.is_empty());
-
-    // Bob returns with a one-second rebuild lookback and a cursor past the
-    // rename, so his live REQs start after it.
-    let resume_at = renamed_at + 2;
-    while crate::unix_now_seconds() < resume_at + 1 {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    let mut bob_app = crate::MarmotApp::with_relay_and_config(bob_dir.path(), url, config());
-    bob_app.relay_plane =
-        MarmotRelayPlane::runtime_default_with_loopback(Duration::from_secs(1), true);
-    let mut state = bob_app.load_state("bob").unwrap();
-    state.last_transport_timestamp = Some(resume_at);
-    bob_app.save_state(&state).unwrap();
-    let mut bob_client = crate::tests::client_on_app_relay_plane(&bob_app, "bob").await;
-    bob_client.prepare_transport().await.unwrap();
-    timeout(Duration::from_secs(20), async {
-        while bob_client.runtime.group_record(&group).is_err() {
-            bob_client.next_event().await.unwrap();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            changes.borrow_and_update();
+            if sdk
+                .relay_liveness()
+                .await
+                .iter()
+                .any(|row| row.status == crate::RelayLivenessStatus::Connected)
+            {
+                break;
+            }
+            changes.changed().await.unwrap();
         }
     })
     .await
-    .expect("Bob joins from the Welcome");
-    let joined_epoch = bob_client.runtime.group_record(&group).unwrap().epoch;
-    assert!(
-        joined_epoch < renamed_epoch,
-        "the Welcome predates the rename"
-    );
+    .expect("the account installs a real receive connection despite the other cache");
+    app.relay_plane.shutdown().await;
+    relay.shutdown();
+}
 
-    // Control: the live REQs, which resume after the rename, never bring it.
-    while let Ok(summary) = timeout(Duration::from_millis(1_500), bob_client.next_event()).await {
-        summary.unwrap();
-    }
-    assert_eq!(
-        bob_client.runtime.group_record(&group).unwrap().epoch,
-        joined_epoch,
-        "no live REQ reaches back to the rename"
-    );
+#[tokio::test]
+async fn late_activation_liveness() {
+    use nostr_sdk::prelude::{EventBuilder, FinalizeEvent, Keys, Kind, Tag};
 
-    // The maintenance tick runs after the cold-start comparison's paced retry
-    // deadline; move the owner clock there instead of waiting. Advance
-    // requests the boundary; the recovery job installs its REQ.
-    let bob_storage = bob_app.account_storage("bob").unwrap();
-    bob_client
-        .recovery_owner
-        .test_advance_to_retry(&bob_storage);
-    bob_client
-        .advance_post_join_maintenance_subscriptions()
+    let receive = nostr_relay_builder::MockRelay::run().await.unwrap();
+    let writer = nostr_relay_builder::MockRelay::run().await.unwrap();
+    let receive_url = receive.url().await.to_string();
+    let writer_url = writer.url().await.to_string();
+    let dir = tempfile::tempdir().unwrap();
+    let app = crate::MarmotApp::with_relay_and_config(
+        dir.path(),
+        receive_url.clone(),
+        crate::MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
+    let account = app.account_home().create_account("alice").unwrap();
+    let mut lists = crate::AccountRelayListStatus::empty();
+    lists.nip65.created_at = crate::unix_now_seconds();
+    lists.nip65.relays = vec![receive_url];
+    lists.nip65.write_relays = vec![writer_url.clone()];
+    lists.refresh();
+    app.directory()
+        .remember_directory_relay_lists(&account.account_id_hex, &lists)
+        .unwrap();
+    app.test_fail_runner_preparation
+        .store(true, std::sync::atomic::Ordering::Release);
+    let account_id = MemberId::new(hex::decode(&account.account_id_hex).unwrap());
+    let mut changes = app.relay_plane.relay_liveness_changes().unwrap();
+    let runtime = crate::MarmotAppRuntime::new(app.clone());
+    runtime.reconcile_accounts().await.unwrap();
+    let sdk = timeout(Duration::from_secs(5), async {
+        loop {
+            changes.borrow_and_update();
+            if let Some(client) = app
+                .relay_plane
+                .account_history_relay_client(&account_id)
+                .await
+                && client
+                    .relay_liveness()
+                    .await
+                    .iter()
+                    .any(|row| row.status == crate::RelayLivenessStatus::Connected)
+            {
+                break client;
+            }
+            changes.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("the subscription retry activates transport after preparation recovers");
+    crate::worker_fences::worker_startup_finished(&runtime, "alice")
         .await
         .unwrap();
-    let grant = bob_client
-        .authorize_account_recovery(
-            None,
-            marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
-        )
+    let event = EventBuilder::new(Kind::MlsGroupMessage, "late activation")
+        .tag(Tag::custom("h", ["ab".repeat(32)]))
+        .finalize(&Keys::generate())
+        .unwrap();
+    let event = NostrTransportEvent::from_nostr_event(&event).unwrap();
+    let endpoint = TransportEndpoint(writer_url.clone());
+    sdk.publish_event(std::slice::from_ref(&endpoint), &event, 1)
+        .await
+        .unwrap();
+    let before = runtime.account_relay_liveness("alice").await.unwrap();
+    let before = before.iter().find(|row| row.url == writer_url).unwrap();
+    assert_eq!(before.status, crate::RelayLivenessStatus::Connected);
+    assert!(before.last_attempt_unix.is_some());
+
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(61)).await;
+    for _ in 0..1000 {
+        if sdk
+            .client()
+            .relay(writer_url.as_str())
+            .await
+            .unwrap()
+            .is_none()
+        {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        sdk.client()
+            .relay(writer_url.as_str())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let after = runtime.account_relay_liveness("alice").await.unwrap();
+    let after = after.iter().find(|row| row.url == writer_url).unwrap();
+    assert_eq!(after.status, crate::RelayLivenessStatus::Offline);
+    assert_eq!(after.last_attempt_unix, before.last_attempt_unix);
+    runtime.shutdown().await;
+    writer.shutdown();
+    receive.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn liveness_manual_lifetime() {
+    let receive = nostr_relay_builder::MockRelay::run().await.unwrap();
+    let manual = nostr_relay_builder::MockRelay::run().await.unwrap();
+    let unconfigured = nostr_relay_builder::MockRelay::run().await.unwrap();
+    let receive_url = receive.url().await.to_string();
+    let manual_url = manual.url().await.to_string();
+    let unconfigured_url = unconfigured.url().await.to_string();
+    let dir = tempfile::tempdir().unwrap();
+    let account = marmot_account::AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = crate::MarmotApp::with_relay_and_config(
+        dir.path(),
+        receive_url.clone(),
+        crate::MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
+    let mut lists = crate::AccountRelayListStatus::empty();
+    lists.nip65.created_at = crate::unix_now_seconds();
+    lists.nip65.relays = vec![receive_url.clone()];
+    lists.inbox.created_at = lists.nip65.created_at;
+    lists.inbox.relays = vec![receive_url.clone(), "relay.example.com".into()];
+    lists.refresh();
+    app.directory()
+        .remember_directory_relay_lists(&account.account_id_hex, &lists)
+        .unwrap();
+    let account_id = MemberId::new(hex::decode(&account.account_id_hex).unwrap());
+    let mut changes = app.relay_plane.relay_liveness_changes().unwrap();
+    let runtime = crate::MarmotAppRuntime::new(app.clone());
+    runtime.reconcile_accounts().await.unwrap();
+    let sdk = timeout(Duration::from_secs(5), async {
+        loop {
+            changes.borrow_and_update();
+            if let Some(client) = app
+                .relay_plane
+                .account_history_relay_client(&account_id)
+                .await
+                && client.relay_liveness().await.iter().any(|row| {
+                    row.url.trim_end_matches('/') == receive_url.trim_end_matches('/')
+                        && row.status == crate::RelayLivenessStatus::Connected
+                })
+            {
+                break client;
+            }
+            changes.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("the managed account activates its receive socket");
+
+    // An existing pool socket outside the configured union is not a retry target.
+    sdk.client().add_relay(&unconfigured_url).await.unwrap();
+    sdk.reconnect_relay(&TransportEndpoint(unconfigured_url.clone()))
+        .await
+        .unwrap();
+    let outside = sdk
+        .client()
+        .relay(&unconfigured_url)
         .await
         .unwrap()
         .unwrap();
-    bob_client.run_recovery_grant_for_test(grant).await.unwrap();
-    assert!(
-        bob_client
-            .post_join_maintenance_subscriptions
-            .contains_key(&group)
-    );
-    let comparisons = bob_app
-        .relay_telemetry()
+    let attempts = outside.stats().attempts();
+    assert!(matches!(
+        runtime
+            .reconnect_relay(&account.label, &unconfigured_url)
+            .await,
+        Err(crate::AppError::Transport(TransportAdapterError::Subscription(message)))
+            if message == "relay is not configured for this account"
+    ));
+    assert_eq!(outside.stats().attempts(), attempts);
+
+    lists.nip65.created_at += 1;
+    lists.nip65.write_relays = vec![manual_url.clone()];
+    lists.refresh();
+    app.directory()
+        .remember_directory_relay_lists(&account.account_id_hex, &lists)
+        .unwrap();
+    runtime
+        .reconnect_relay(&account.label, &manual_url)
         .await
-        .metrics
-        .reconciliation_attempts;
-    timeout(Duration::from_secs(20), async {
-        while bob_client.runtime.group_record(&group).unwrap().epoch < renamed_epoch {
-            // Group replay is native-owned; next_event admits it only after
-            // this maintenance source reaches its own relay boundary.
-            bob_client.next_event().await.unwrap();
+        .unwrap();
+    assert!(
+        runtime
+            .account_relay_liveness(&account.label)
+            .await
+            .unwrap()
+            .iter()
+            .all(|row| row.url != "relay.example.com")
+    );
+    let socket = sdk.client().relay(&manual_url).await.unwrap().unwrap();
+    assert!(!socket.capabilities().can_read());
+    assert!(!socket.capabilities().can_write());
+
+    // No UI subscription or read drives cleanup after this configuration commit.
+    lists.nip65.created_at += 1;
+    lists.nip65.write_relays.clear();
+    lists.refresh();
+    app.directory()
+        .remember_directory_relay_lists(&account.account_id_hex, &lists)
+        .unwrap();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            changes.borrow_and_update();
+            if sdk.client().relay(&manual_url).await.unwrap().is_none() {
+                break;
+            }
+            changes.changed().await.unwrap();
         }
     })
     .await
-    .expect("the maintenance REQ admits the rename made before Bob joined");
+    .expect("the account worker releases a no-longer-configured manual socket");
+    assert!(sdk.relay_liveness().await.iter().any(|row| {
+        row.url.trim_end_matches('/') == receive_url.trim_end_matches('/')
+            && row.status == crate::RelayLivenessStatus::Connected
+    }));
+    runtime.shutdown().await;
+    receive.shutdown();
+    manual.shutdown();
+    unconfigured.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn liveness_socket_watch() {
+    async fn wait_for_status(
+        subscription: &crate::RuntimeRelayLivenessSubscription,
+        url: &str,
+        status: crate::RelayLivenessStatus,
+    ) -> crate::RelayLiveness {
+        let mut rows = subscription.snapshot.clone();
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(row) = rows
+                    .iter()
+                    .find(|row| row.url == url && row.status == status)
+                {
+                    return row.clone();
+                }
+                rows = subscription
+                    .recv()
+                    .await
+                    .unwrap()
+                    .expect("live relay watch");
+            }
+        })
+        .await
+        .unwrap_or_else(|error| panic!("expected {status:?}, last snapshot {rows:?}: {error}"))
+    }
+
+    let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
+    // MockRelay's shutdown notification can miss a busy connection handler.
+    // Own the TCP streams so this test closes every socket deterministically.
+    let upstream = relay.url().await.to_string();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let (stop, mut stopped) = tokio::sync::oneshot::channel();
+    let proxy = tokio::spawn(async move {
+        let upstream = upstream
+            .strip_prefix("ws://")
+            .unwrap()
+            .trim_end_matches('/');
+        let mut sockets = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                _ = &mut stopped => break,
+                accepted = listener.accept() => {
+                    let (mut incoming, _) = accepted.unwrap();
+                    let mut outgoing = tokio::net::TcpStream::connect(upstream).await.unwrap();
+                    sockets.spawn(async move {
+                        tokio::io::copy_bidirectional(&mut incoming, &mut outgoing).await
+                    });
+                }
+            }
+        }
+        sockets.shutdown().await;
+    });
+    let canonical = url.trim_end_matches('/').to_owned();
+    let slash_url = format!("{canonical}/");
+    let dir = tempfile::tempdir().unwrap();
+    let alice = marmot_account::AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = crate::MarmotApp::with_relay_and_config(
+        dir.path(),
+        slash_url.clone(),
+        crate::MarmotAppConfig::default().with_allow_loopback_relay_endpoints(true),
+    );
+    let mut lists = crate::AccountRelayListStatus::empty();
+    lists.nip65.created_at = crate::unix_now_seconds();
+    lists.nip65.relays = vec![slash_url.clone()];
+    lists.inbox.created_at = lists.nip65.created_at;
+    lists.inbox.relays = vec![slash_url];
+    lists.refresh();
+    app.directory()
+        .remember_directory_relay_lists(&alice.account_id_hex, &lists)
+        .unwrap();
+    let runtime = crate::MarmotAppRuntime::new(app.clone());
+    let subscription = runtime
+        .subscribe_relay_liveness(&alice.label)
+        .await
+        .unwrap();
+    assert_eq!(subscription.snapshot.len(), 1);
+    assert_eq!(subscription.snapshot[0].url, canonical);
     assert_eq!(
-        bob_app
-            .relay_telemetry()
+        subscription.snapshot[0].status,
+        crate::RelayLivenessStatus::Unknown
+    );
+
+    runtime.reconcile_accounts().await.unwrap();
+    let connected = wait_for_status(
+        &subscription,
+        &canonical,
+        crate::RelayLivenessStatus::Connected,
+    )
+    .await;
+    assert!(connected.last_attempt_unix.is_some());
+    assert_eq!(connected.last_error, None);
+
+    // Add a configured-only URL after activation so it never joins the pool.
+    lists.nip65.created_at += 1;
+    lists.nip65.write_relays = vec!["wss://configured-only.example".into()];
+    lists.refresh();
+    app.directory()
+        .remember_directory_relay_lists(&alice.account_id_hex, &lists)
+        .unwrap();
+    let rows = runtime.account_relay_liveness(&alice.label).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows.iter().find(|row| row.url == canonical),
+        Some(&connected)
+    );
+    let absent = rows
+        .iter()
+        .find(|row| row.url == "wss://configured-only.example")
+        .unwrap();
+    assert_eq!(absent.status, crate::RelayLivenessStatus::Unknown);
+    assert_eq!(absent.last_attempt_unix, None);
+    assert_eq!(absent.last_error, None);
+    drop(subscription);
+
+    // A host reconnects using the canonical row URL, not its slash-spelled
+    // configuration, even when that account socket is already Connected.
+    let retried = runtime
+        .reconnect_relay(&alice.label, &connected.url)
+        .await
+        .unwrap();
+    assert_eq!(retried.url, canonical);
+    assert!(retried.last_attempt_unix.is_some());
+    assert!(matches!(
+        retried.status,
+        crate::RelayLivenessStatus::Connecting | crate::RelayLivenessStatus::Connected
+    ));
+    let subscription = runtime
+        .subscribe_relay_liveness(&alice.label)
+        .await
+        .unwrap();
+    let reconnected = wait_for_status(
+        &subscription,
+        &canonical,
+        crate::RelayLivenessStatus::Connected,
+    )
+    .await;
+    assert!(reconnected.last_attempt_unix.is_some());
+    assert_eq!(reconnected.last_error, None);
+
+    stop.send(()).unwrap();
+    proxy.await.unwrap();
+    let offline = wait_for_status(
+        &subscription,
+        &canonical,
+        crate::RelayLivenessStatus::Offline,
+    )
+    .await;
+    assert!(offline.last_attempt_unix.is_some());
+    runtime.shutdown().await;
+    relay.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_liveness_account_watch() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = marmot_account::AccountHome::open(dir.path());
+    let alice = home.create_account("alice").unwrap();
+    let bob = home.create_account("bob").unwrap();
+    let app = crate::MarmotApp::with_relay_and_config(
+        dir.path(),
+        "wss://relay.example",
+        crate::MarmotAppConfig::white_noise(),
+    );
+    let runtime = crate::MarmotAppRuntime::new(app.clone());
+    let subscription = runtime
+        .subscribe_relay_liveness(&alice.label)
+        .await
+        .unwrap();
+    assert!(subscription.snapshot.is_empty());
+
+    let mut lists = crate::AccountRelayListStatus::empty();
+    lists.nip65.created_at = crate::unix_now_seconds();
+    lists.nip65.relays = vec!["wss://relay.example/".into()];
+    lists.nip65.read_relays = vec!["wss://read.example/path/".into()];
+    lists.inbox.created_at = lists.nip65.created_at;
+    lists.inbox.relays = vec!["wss://relay.example".into()];
+    lists.refresh();
+    app.directory()
+        .remember_directory_relay_lists(&alice.account_id_hex, &lists)
+        .unwrap();
+    let rows = timeout(Duration::from_secs(2), subscription.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let mut urls = rows.iter().map(|row| row.url.as_str()).collect::<Vec<_>>();
+    urls.sort_unstable();
+    assert_eq!(
+        urls,
+        vec!["wss://read.example/path/", "wss://relay.example"]
+    );
+    assert!(
+        rows.iter()
+            .all(|row| row.status == crate::RelayLivenessStatus::Unknown
+                && row.last_attempt_unix.is_none()
+                && row.last_error.is_none())
+    );
+    assert!(
+        runtime
+            .account_relay_liveness(&bob.label)
             .await
-            .metrics
-            .reconciliation_attempts,
-        comparisons,
-        "no comparison stood in for the maintenance REQ"
+            .unwrap()
+            .is_empty()
     );
+    // A cancelled receive must not consume the next configured-list replacement.
+    {
+        let receive = subscription.recv();
+        tokio::pin!(receive);
+        assert!(futures::poll!(receive.as_mut()).is_pending());
+    }
+    lists.nip65.created_at += 1;
+    lists.nip65.relays = vec!["wss://replacement.example".into()];
+    lists.nip65.read_relays.clear();
+    lists.inbox.created_at += 1;
+    lists.inbox.relays.clear();
+    lists.refresh();
+    app.directory()
+        .remember_directory_relay_lists(&alice.account_id_hex, &lists)
+        .unwrap();
+    let rows = timeout(Duration::from_secs(2), subscription.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     assert_eq!(
-        bob_app
-            .group("bob", &hex::encode(group.as_slice()))
-            .unwrap()
-            .unwrap()
-            .profile
-            .name,
-        "renamed while bob was away"
+        rows.iter().map(|row| row.url.as_str()).collect::<Vec<_>>(),
+        vec!["wss://replacement.example"]
     );
-    bob_app.relay_plane.shutdown().await;
-    alice_app.relay_plane.shutdown().await;
+    runtime.shutdown().await;
+    assert!(subscription.recv().await.unwrap().is_none());
 }

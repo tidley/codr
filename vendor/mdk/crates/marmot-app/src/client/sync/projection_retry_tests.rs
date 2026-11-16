@@ -40,11 +40,16 @@ async fn restored_copy_retry_preserves_a_new_pending_send() {
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(relay.clone());
     let mut client = app.client("alice").await.unwrap();
-    let group = client.create_group("retry", &[]).await.unwrap();
+    let group = client
+        .create_group("retry", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let connection =
         super::runtime_group_subscription_refresh_tests::projection_fault_connection(&app);
     connection.execute_batch("CREATE TRIGGER fail_activity BEFORE INSERT ON app_events WHEN NEW.kind = 1210 BEGIN SELECT RAISE(FAIL, 'injected activity'); END;").unwrap();
-    let effects = marmot_account::AccountDeviceEffects {
+    let effects = marmot_session::AccountDeviceEffects {
         events: vec![
             GroupEvent::LocalGroupCopyTerminated {
                 group_id: group.clone(),
@@ -118,11 +123,16 @@ async fn assert_repaired_activity_precedes_withdrawal(checkpoint_retry: bool) {
     let app =
         MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
     let mut client = app.client("alice").await.unwrap();
-    let group = client.create_group("retry", &[]).await.unwrap();
+    let group = client
+        .create_group("retry", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let connection =
         super::runtime_group_subscription_refresh_tests::projection_fault_connection(&app);
     connection.execute_batch("CREATE TRIGGER fail_activity BEFORE INSERT ON app_events WHEN NEW.kind = 1210 BEGIN SELECT RAISE(FAIL, 'injected activity'); END;").unwrap();
-    let effects = marmot_account::AccountDeviceEffects {
+    let effects = marmot_session::AccountDeviceEffects {
         events: vec![rename(&group, &account.account_id_hex, 0x76)],
         ..Default::default()
     };
@@ -135,7 +145,7 @@ async fn assert_repaired_activity_precedes_withdrawal(checkpoint_retry: bool) {
     connection
         .execute_batch("DROP TRIGGER fail_activity")
         .unwrap();
-    let newer = marmot_account::AccountDeviceEffects {
+    let newer = marmot_session::AccountDeviceEffects {
         events: vec![GroupEvent::GroupStateInvalidated {
             group_id: group.clone(),
             epoch: cgka_traits::EpochId(1),
@@ -148,7 +158,7 @@ async fn assert_repaired_activity_precedes_withdrawal(checkpoint_retry: bool) {
     if checkpoint_retry {
         client
             .observe_account_device_effects(
-                &marmot_account::AccountDeviceEffects::default(),
+                &marmot_session::AccountDeviceEffects::default(),
                 &mut returned,
                 "older",
                 122,
@@ -182,11 +192,21 @@ async fn assert_repaired_activity_precedes_withdrawal(checkpoint_retry: bool) {
         has_more_after: false,
     };
     for update in &returned.projection_updates {
-        crate::runtime::apply_projection_to_window(&mut window, update, 100, true);
+        crate::runtime::apply_projection_to_window(
+            &mut window,
+            update,
+            100,
+            crate::runtime::TimelineOrder::GroupCanonical,
+        );
     }
     let buffered = client.take_pending_applied_sync_summary();
     for update in &buffered.projection_updates {
-        crate::runtime::apply_projection_to_window(&mut window, update, 100, true);
+        crate::runtime::apply_projection_to_window(
+            &mut window,
+            update,
+            100,
+            crate::runtime::TimelineOrder::GroupCanonical,
+        );
     }
     let stored = timeline(&app, &group);
     assert_eq!(stored.messages.len(), 1);
@@ -209,11 +229,16 @@ async fn quiet_public_clients_return_repaired_activity_once() {
         let app =
             MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
         let mut client = app.client("alice").await.unwrap();
-        let group = client.create_group("retry", &[]).await.unwrap();
+        let group = client
+            .create_group("retry", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let connection =
             super::runtime_group_subscription_refresh_tests::projection_fault_connection(&app);
         connection.execute_batch(&format!("CREATE TRIGGER fail_activity BEFORE INSERT ON app_events WHEN NEW.kind = 1210 AND NEW.origin_commit_id = '{}' BEGIN SELECT RAISE(FAIL, 'injected activity'); END;", "77".repeat(32))).unwrap();
-        let effects = marmot_account::AccountDeviceEffects {
+        let effects = marmot_session::AccountDeviceEffects {
             events: vec![
                 rename(&group, &account.account_id_hex, 0x76),
                 rename(&group, &account.account_id_hex, 0x77),
@@ -277,11 +302,13 @@ async fn cancelled_drain_checkpoint_retains_progress_and_notifications() {
         .with_test_relay_client(relay.clone());
     let mut client = app.client("alice").await.unwrap();
     client.prepare_transport().await.unwrap();
-    let telemetry = AppPerformanceTelemetry::default();
+    let telemetry = PerformanceRecorder::default();
     let group = client
         .create_group_with_options_and_telemetry("retry", &[], Default::default(), &telemetry)
         .await
         .unwrap()
+        .operation
+        .expect("eligible fixture members")
         .group_id;
     client
         .create_group_with_options_and_telemetry(
@@ -291,8 +318,10 @@ async fn cancelled_drain_checkpoint_retains_progress_and_notifications() {
             &telemetry,
         )
         .await
-        .unwrap();
-    let effects = marmot_account::AccountDeviceEffects {
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    let effects = marmot_session::AccountDeviceEffects {
         events: vec![
             GroupEvent::LocalGroupCopyTerminated {
                 group_id: group.clone(),
@@ -366,7 +395,7 @@ async fn cancelled_commit_keeps_output() {
             .with_test_relay_client(relay.clone());
         let mut client = app.client("alice").await.unwrap();
         client.prepare_transport().await.unwrap();
-        let telemetry = AppPerformanceTelemetry::default();
+        let telemetry = PerformanceRecorder::default();
         let group = client
             .create_group_with_options_and_telemetry(
                 "before rename",
@@ -376,6 +405,8 @@ async fn cancelled_commit_keeps_output() {
             )
             .await
             .unwrap()
+            .operation
+            .expect("eligible fixture members")
             .group_id;
         client
             .create_group_with_options_and_telemetry(
@@ -385,7 +416,9 @@ async fn cancelled_commit_keeps_output() {
                 &telemetry,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         client.take_pending_applied_sync_summary();
         client.take_pending_projection_updates();
         let mut effects = client
@@ -506,11 +539,16 @@ async fn partial_sync_failure_transfers_the_committed_prefix_once() {
     let app =
         MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
     let mut client = app.client("alice").await.unwrap();
-    let group = client.create_group("retry", &[]).await.unwrap();
+    let group = client
+        .create_group("retry", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let connection =
         super::runtime_group_subscription_refresh_tests::projection_fault_connection(&app);
     connection.execute_batch(&format!("CREATE TRIGGER fail_activity BEFORE INSERT ON app_events WHEN NEW.kind = 1210 AND NEW.origin_commit_id = '{}' BEGIN SELECT RAISE(FAIL, 'injected activity'); END;", "77".repeat(32))).unwrap();
-    let effects = marmot_account::AccountDeviceEffects {
+    let effects = marmot_session::AccountDeviceEffects {
         events: vec![
             rename(&group, &account.account_id_hex, 0x76),
             rename(&group, &account.account_id_hex, 0x77),
@@ -553,7 +591,12 @@ async fn committed_cleanup_retries_conversion_without_sweeping_new_sends() {
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(relay.clone());
     let mut client = app.client("alice").await.unwrap();
-    let group = client.create_group("retry", &[]).await.unwrap();
+    let group = client
+        .create_group("retry", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     relay.fail_publishes_as_unavailable();
     client
         .send(&group, b"purged before restoration")
@@ -562,7 +605,7 @@ async fn committed_cleanup_retries_conversion_without_sweeping_new_sends() {
     let connection =
         super::runtime_group_subscription_refresh_tests::projection_fault_connection(&app);
     connection.execute_batch("CREATE TRIGGER fail_cleanup_conversion BEFORE INSERT ON chat_list_rows WHEN EXISTS (SELECT 1 FROM app_events WHERE direction = 'sent' AND invalidated = 1) BEGIN SELECT RAISE(FAIL, 'injected cleanup conversion'); END;").unwrap();
-    let effects = marmot_account::AccountDeviceEffects {
+    let effects = marmot_session::AccountDeviceEffects {
         events: vec![
             GroupEvent::LocalGroupCopyTerminated {
                 group_id: group.clone(),
@@ -630,11 +673,13 @@ async fn cancelling_public_waits_keeps_repaired_notifications() {
             .with_test_relay_client(relay.clone());
         let mut client = app.client("alice").await.unwrap();
         client.prepare_transport().await.unwrap();
-        let telemetry = AppPerformanceTelemetry::default();
+        let telemetry = PerformanceRecorder::default();
         let group = client
             .create_group_with_options_and_telemetry("retry", &[], Default::default(), &telemetry)
             .await
             .unwrap()
+            .operation
+            .expect("eligible fixture members")
             .group_id;
         client
             .create_group_with_options_and_telemetry(
@@ -644,7 +689,9 @@ async fn cancelling_public_waits_keeps_repaired_notifications() {
                 &telemetry,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let connection =
             super::runtime_group_subscription_refresh_tests::projection_fault_connection(&app);
         connection.execute_batch("CREATE TRIGGER fail_activity BEFORE INSERT ON app_events WHEN NEW.kind = 1210 BEGIN SELECT RAISE(FAIL, 'injected activity'); END;").unwrap();
@@ -661,7 +708,7 @@ async fn cancelling_public_waits_keeps_repaired_notifications() {
             ]);
         }
         events.push(rename(&group, &account.account_id_hex, 0x76));
-        let effects = marmot_account::AccountDeviceEffects {
+        let effects = marmot_session::AccountDeviceEffects {
             events,
             ..Default::default()
         };
@@ -724,7 +771,12 @@ async fn failed_message_projection_does_not_duplicate_its_deferred_summary() {
     let app =
         MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
     let mut client = app.client("alice").await.unwrap();
-    let group = client.create_group("retry", &[]).await.unwrap();
+    let group = client
+        .create_group("retry", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let payload = cgka_traits::app_event::MarmotAppEvent::new(
         account.account_id_hex.clone(),
         unix_now_seconds(),
@@ -734,12 +786,13 @@ async fn failed_message_projection_does_not_duplicate_its_deferred_summary() {
     )
     .encode()
     .unwrap();
-    let effects = marmot_account::AccountDeviceEffects {
+    let effects = marmot_session::AccountDeviceEffects {
         events: vec![GroupEvent::MessageReceived {
             authority: None,
             group_id: group.clone(),
             message_id: cgka_traits::MessageId::new(vec![0x81; 32]),
             sender: cgka_traits::MemberId::new(hex::decode(account.account_id_hex).unwrap()),
+            sender_leaf_index: None,
             epoch: client.runtime.group_record(&group).unwrap().epoch,
             payload,
             retention: None,
@@ -772,99 +825,6 @@ async fn failed_message_projection_does_not_duplicate_its_deferred_summary() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cancelling_public_sync_while_waiting_for_recovery_keeps_repaired_activity() {
-    use crate::runtime::account_worker::recovery_credits;
-    let dir = tempfile::tempdir().unwrap();
-    let account = AccountHome::open(dir.path())
-        .create_account("alice")
-        .unwrap();
-    let relay = Arc::new(ScriptedPushRelayClient::default());
-    let app =
-        MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
-    let mut client = crate::tests::client_on_app_relay_plane(&app, "alice").await;
-    client.recovery_credits = recovery_credits::private_recovery_credit_pool_for_test();
-    let group = client.create_group("retry", &[]).await.unwrap();
-    let connection =
-        super::runtime_group_subscription_refresh_tests::projection_fault_connection(&app);
-    connection.execute_batch("CREATE TRIGGER fail_activity BEFORE INSERT ON app_events WHEN NEW.kind = 1210 BEGIN SELECT RAISE(FAIL, 'injected activity'); END;").unwrap();
-    let effects = marmot_account::AccountDeviceEffects {
-        events: vec![rename(&group, &account.account_id_hex, 0x82)],
-        ..Default::default()
-    };
-    assert!(
-        client
-            .observe_account_device_effects(&effects, &mut SyncSummary::default(), "source", 123)
-            .await
-            .is_err()
-    );
-    connection
-        .execute_batch("DROP TRIGGER fail_activity")
-        .unwrap();
-    assert!(client.recovery_pending().unwrap());
-    assert!(client.recovery_endpoints_admitted());
-    let comparison_before = app
-        .account_storage("alice")
-        .unwrap()
-        .app_storage()
-        .recovery_comparison()
-        .unwrap()
-        .revision;
-    let held = recovery_credits::hold_all_credits_for_test(&client.recovery_credits);
-    assert!(
-        tokio::time::timeout(Duration::from_secs(2), client.sync())
-            .await
-            .is_err()
-    );
-    assert!(
-        client.pending_applied_effects.is_empty(),
-        "repair completed before the credit wait"
-    );
-    assert!(
-        app.account_storage("alice")
-            .unwrap()
-            .app_storage()
-            .recovery_comparison()
-            .unwrap()
-            .revision
-            > comparison_before,
-        "the public call requested comparison after finishing its first drain"
-    );
-    assert_eq!(
-        app.account_storage("alice")
-            .unwrap()
-            .app_storage()
-            .recovery_retry_state()
-            .unwrap()
-            .attempt_serial,
-        0,
-        "held credits prevent recovery from starting"
-    );
-    drop(held);
-    client.test_comparison_results = Some(ScriptedComparisons::by_route(|_| {
-        Ok(Some((
-            transport_nostr_adapter::NostrReconciliationSummary {
-                relays_succeeded: 1,
-                ..Default::default()
-            },
-            Vec::new(),
-        )))
-    }));
-    let summary = tokio::time::timeout(Duration::from_secs(10), client.sync())
-        .await
-        .unwrap()
-        .unwrap();
-    let count_activity = |summary: &SyncSummary| {
-        summary.projection_updates.iter().flat_map(|update| &update.timeline_changes).filter(|change| matches!(change, crate::TimelineMessageChange::Upsert { message, .. } if message.kind == 1210)).count()
-    };
-    assert_eq!(
-        count_activity(&summary),
-        1,
-        "the cancelled call's repaired notification is returned once"
-    );
-    assert_eq!(count_activity(&client.sync().await.unwrap()), 0);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn second_local_delete_discards_retry_that_crossed_the_old_frontier() {
     for drained in [false, true] {
         let dir = tempfile::tempdir().unwrap();
@@ -875,7 +835,12 @@ async fn second_local_delete_discards_retry_that_crossed_the_old_frontier() {
         let app =
             MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
         let mut client = app.client("alice").await.unwrap();
-        let group = client.create_group("deleted retry", &[]).await.unwrap();
+        let group = client
+            .create_group("deleted retry", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         client.delete_group_local(&group).await.unwrap();
         let payload = cgka_traits::app_event::MarmotAppEvent::new(
             &account.account_id_hex,
@@ -895,12 +860,13 @@ async fn second_local_delete_discards_retry_that_crossed_the_old_frontier() {
             })
             .await
             .unwrap();
-        let effects = marmot_account::AccountDeviceEffects {
+        let effects = marmot_session::AccountDeviceEffects {
             events: vec![GroupEvent::MessageReceived {
                 authority: None,
                 group_id: group.clone(),
                 message_id: sent.reports[0].message_id.clone(),
                 sender: cgka_traits::MemberId::new(hex::decode(&account.account_id_hex).unwrap()),
+                sender_leaf_index: None,
                 epoch: client.runtime.group_record(&group).unwrap().epoch,
                 payload,
                 retention: None,
@@ -979,7 +945,12 @@ async fn identical_fork_activity_adopts_canonical_origin_atomically() {
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let group = client.create_group("fork", &[]).await.unwrap();
+    let group = client
+        .create_group("fork", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let loser = rename(&group, &account.account_id_hex, 0x76);
     let mut winner = loser.clone();
     if let GroupEvent::GroupStateChanged {
@@ -1011,7 +982,7 @@ async fn identical_fork_activity_adopts_canonical_origin_atomically() {
     let connection =
         super::runtime_group_subscription_refresh_tests::projection_fault_connection(&app);
     connection.execute_batch("CREATE TRIGGER fail_revival BEFORE UPDATE OF invalidated ON app_events WHEN OLD.invalidated = 1 AND NEW.invalidated = 0 BEGIN SELECT RAISE(FAIL, 'injected revival'); END;").unwrap();
-    let effects = marmot_account::AccountDeviceEffects {
+    let effects = marmot_session::AccountDeviceEffects {
         events: vec![winner],
         ..Default::default()
     };
@@ -1085,7 +1056,12 @@ async fn eventless_failed_messages_retry_committed_conversion_and_prefix_once() 
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let group = client.create_group("metadata retry", &[]).await.unwrap();
+    let group = client
+        .create_group("metadata retry", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let mut failed_app_messages = Vec::new();
     for (index, content) in ["first", "second"].iter().enumerate() {
         let event = cgka_traits::app_event::MarmotAppEvent::new(
@@ -1098,7 +1074,7 @@ async fn eventless_failed_messages_retry_committed_conversion_and_prefix_once() 
         client
             .record_send_intent_projection(&group, &account.account_id_hex, &event)
             .unwrap();
-        failed_app_messages.push(marmot_account::FailedApplicationMessage {
+        failed_app_messages.push(marmot_session::FailedApplicationMessage {
             group_id: group.clone(),
             app_event_id: event.id,
             message_id: cgka_traits::MessageId::new(vec![index as u8; 32]),
@@ -1109,7 +1085,7 @@ async fn eventless_failed_messages_retry_committed_conversion_and_prefix_once() 
     let connection =
         super::runtime_group_subscription_refresh_tests::projection_fault_connection(&app);
     connection.execute_batch(&format!("CREATE TRIGGER fail_metadata_conversion BEFORE INSERT ON chat_list_rows WHEN EXISTS (SELECT 1 FROM app_events WHERE message_id_hex = '{second}' AND invalidated = 1) BEGIN SELECT RAISE(FAIL, 'injected metadata conversion'); END;")).unwrap();
-    let effects = marmot_account::AccountDeviceEffects {
+    let effects = marmot_session::AccountDeviceEffects {
         failed_app_messages,
         ..Default::default()
     };
@@ -1162,8 +1138,18 @@ async fn never_projected_terminal_group_does_not_stall_live_effects() {
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let terminal = client.create_group("terminal", &[]).await.unwrap();
-    let healthy = client.create_group("healthy", &[]).await.unwrap();
+    let terminal = client
+        .create_group("terminal", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    let healthy = client
+        .create_group("healthy", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     crate::tests::make_group_terminal(&client, &terminal, true);
     // Model terminal MLS apply completing before the first app projection.
     let terminal_hex = hex::encode(terminal.as_slice());
@@ -1180,7 +1166,7 @@ async fn never_projected_terminal_group_does_not_stall_live_effects() {
         .groups
         .retain(|group| group.group_id_hex != terminal_hex);
     assert!(app.group("alice", &terminal_hex).unwrap().is_none());
-    let effects = marmot_account::AccountDeviceEffects {
+    let effects = marmot_session::AccountDeviceEffects {
         events: vec![
             GroupEvent::GroupJoined {
                 group_id: terminal.clone(),
@@ -1217,12 +1203,20 @@ async fn early_bookkeeping_failure_retains_native_effects() {
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let group = client.create_group("bookkeeping", &[]).await.unwrap();
-    let effects = marmot_account::AccountDeviceEffects {
+    let group = client
+        .create_group("bookkeeping", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    let effects = marmot_session::AccountDeviceEffects {
         events: vec![rename(&group, &account.account_id_hex, 0x76)],
         ..Default::default()
     };
-    client.released_backfill_reload_pending = true;
+    client
+        .history_recovery
+        .test_state()
+        .released_backfill_reload_pending = true;
     client.fail_next_released_backfill_reload = true;
     assert!(
         client
@@ -1250,7 +1244,12 @@ async fn accepted_own_group_command_retains_failed_activity_without_republishing
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(relay.clone());
     let mut client = app.client("alice").await.unwrap();
-    let group = client.create_group("own activity", &[]).await.unwrap();
+    let group = client
+        .create_group("own activity", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let connection =
         super::runtime_group_subscription_refresh_tests::projection_fault_connection(&app);
     connection.execute_batch("CREATE TRIGGER fail_own_activity BEFORE INSERT ON app_events WHEN NEW.kind = 1210 BEGIN SELECT RAISE(FAIL, 'injected own activity'); END;").unwrap();
@@ -1289,7 +1288,12 @@ async fn accepted_own_activity_survives_later_local_refresh_failure() {
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(relay.clone());
     let mut client = app.client("alice").await.unwrap();
-    let group = client.create_group("before refresh", &[]).await.unwrap();
+    let group = client
+        .create_group("before refresh", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     client.take_pending_projection_updates();
     client.take_pending_applied_sync_summary();
     let connection =
@@ -1331,7 +1335,12 @@ async fn accepted_source_finalization_rolls_back_when_revival_conversion_fails()
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let group = client.create_group("source atomicity", &[]).await.unwrap();
+    let group = client
+        .create_group("source atomicity", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let event = cgka_traits::app_event::MarmotAppEvent::new(
         &account.account_id_hex,
         unix_now_seconds(),
@@ -1427,7 +1436,9 @@ async fn resumed_publication_wakes_after_revival_and_checkpoint() {
             let group = client
                 .create_group("resumed push", &[&bob.account_id_hex])
                 .await
-                .unwrap();
+                .unwrap()
+                .operation
+                .expect("eligible fixture members");
             let group_hex = hex::encode(group.as_slice());
             app.upsert_group_push_token(
                 "alice",
@@ -1688,8 +1699,18 @@ async fn quarantined_group_events_do_not_retain_account_projection() {
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(relay.clone());
         let mut client = app.client("alice").await.unwrap();
-        let broken = client.create_group("quarantined", &[]).await.unwrap();
-        let healthy = client.create_group("healthy", &[]).await.unwrap();
+        let broken = client
+            .create_group("quarantined", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
+        let healthy = client
+            .create_group("healthy", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         if locally_deleted {
             assert!(client.delete_group_local(&broken).await.unwrap());
         }
@@ -1815,8 +1836,18 @@ async fn strict_quarantined_group_read_defers_instead_of_holding_receives() {
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(relay.clone());
         let mut client = app.client("alice").await.unwrap();
-        let broken = client.create_group("quarantined", &[]).await.unwrap();
-        let healthy = client.create_group("healthy", &[]).await.unwrap();
+        let broken = client
+            .create_group("quarantined", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
+        let healthy = client
+            .create_group("healthy", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         if locally_deleted {
             assert!(client.delete_group_local(&broken).await.unwrap());
         }
@@ -1887,11 +1918,16 @@ async fn ordinary_projection_failure_stays_retained_and_counts_toward_stall_warn
     let app =
         MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
     let mut client = app.client("alice").await.unwrap();
-    let group = client.create_group("retry", &[]).await.unwrap();
+    let group = client
+        .create_group("retry", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let connection =
         super::runtime_group_subscription_refresh_tests::projection_fault_connection(&app);
     connection.execute_batch("CREATE TRIGGER fail_activity BEFORE INSERT ON app_events WHEN NEW.kind = 1210 BEGIN SELECT RAISE(FAIL, 'injected activity'); END;").unwrap();
-    let effects = marmot_account::AccountDeviceEffects {
+    let effects = marmot_session::AccountDeviceEffects {
         events: vec![rename(&group, &account.account_id_hex, 0x76)],
         ..Default::default()
     };
@@ -1950,18 +1986,20 @@ fn deferral_skips_only_unprojected_events_of_deferred_groups() {
         &joined(&deferred),
         groups,
         false,
-        &mut summary
+        &mut summary,
+        |_| true
     ));
     assert!(summary.events.is_empty(), "an outbox event replays instead");
     assert!(
-        !defer_event_projection(&joined(&deferred), groups, true, &mut summary),
+        !defer_event_projection(&joined(&deferred), groups, true, &mut summary, |_| true),
         "a projected outbox event must stage its acknowledgement"
     );
     assert!(!defer_event_projection(
         &joined(&healthy),
         groups,
         false,
-        &mut summary
+        &mut summary,
+        |_| true
     ));
     assert!(summary.events.is_empty());
 
@@ -1969,7 +2007,8 @@ fn deferral_skips_only_unprojected_events_of_deferred_groups() {
         &quarantined,
         groups,
         false,
-        &mut summary
+        &mut summary,
+        |_| true
     ));
     assert_eq!(
         summary.events.len(),
@@ -1980,13 +2019,26 @@ fn deferral_skips_only_unprojected_events_of_deferred_groups() {
         &quarantined,
         groups,
         true,
-        &mut summary
+        &mut summary,
+        |_| true
     ));
     assert_eq!(
         summary.events.len(),
         1,
         "a projected event is not published twice"
     );
+
+    // A group the host may not see, the account's device group, is deferred
+    // like any other, but none of its events reach subscribers.
+    let mut summary = SyncSummary::default();
+    assert!(defer_event_projection(
+        &quarantined,
+        groups,
+        false,
+        &mut summary,
+        |_| false
+    ));
+    assert!(summary.events.is_empty());
 }
 
 /// A drained batch whose projection succeeds but whose checkpoint keeps
@@ -2001,9 +2053,14 @@ async fn failed_drained_checkpoint_counts_toward_stall_warning() {
     let app =
         MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
     let mut client = app.client("alice").await.unwrap();
-    let group = client.create_group("checkpoint", &[]).await.unwrap();
+    let group = client
+        .create_group("checkpoint", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     client.fail_drained_effect_checkpoints = true;
-    let effects = marmot_account::AccountDeviceEffects {
+    let effects = marmot_session::AccountDeviceEffects {
         events: vec![rename(&group, &account.account_id_hex, 0x78)],
         ..Default::default()
     };
@@ -2033,4 +2090,275 @@ async fn failed_drained_checkpoint_counts_toward_stall_warning() {
         .unwrap();
     assert!(!client.has_pending_effect_projections());
     assert_eq!(client.retained_projection_failures, 0);
+}
+
+/// A source is usable only once its authenticated media key is durable too.
+/// A failed key write must leave the engine's outbox available across restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn received_media_key_failure_rolls_back_source_and_replays_after_restart() {
+    use cgka_traits::app_components::{
+        GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY, GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+    };
+    use cgka_traits::storage::MessageStorage;
+
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app =
+        MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
+    let mut client = app.client("alice").await.unwrap();
+    let group = client
+        .create_group("media key retry", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    let group_hex = hex::encode(group.as_slice());
+    let (epoch, source_secret) = client
+        .runtime
+        .exporter_secret_with_epoch(&group, GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY, 32)
+        .unwrap();
+    let (mut reference, _) = crate::media::tests::attachment_worker_fixture_with_secret(
+        b"atomic media source",
+        source_secret.as_ref(),
+    );
+    reference.source_epoch = epoch.0;
+    reference.locators.push(crate::MediaLocator {
+        kind: "blossom-v1".into(),
+        value: format!("https://media.example/{}", reference.ciphertext_sha256),
+    });
+    let event = cgka_traits::app_event::MarmotAppEvent::new(
+        &account.account_id_hex,
+        unix_now_seconds(),
+        MARMOT_APP_EVENT_KIND_CHAT,
+        vec![reference.imeta_tag()],
+        "atomic media source",
+    );
+    let app_message_id = event.id.clone();
+    let payload = event.encode().unwrap();
+    let sent = client
+        .runtime
+        .send(cgka_traits::SendIntent::AppMessage {
+            group_id: group.clone(),
+            payload: payload.clone(),
+            expected_epoch: None,
+        })
+        .await
+        .unwrap();
+    let source_id = sent.reports[0].message_id.clone();
+    let received = GroupEvent::MessageReceived {
+        authority: None,
+        group_id: group.clone(),
+        message_id: source_id.clone(),
+        sender: cgka_traits::MemberId::new(hex::decode(&account.account_id_hex).unwrap()),
+        sender_leaf_index: None,
+        epoch,
+        payload,
+        retention: None,
+        encrypted_media_secret: Some(cgka_traits::EncryptedMediaSecret::new(
+            source_secret.clone(),
+        )),
+    };
+    let storage = app.account_storage("alice").unwrap();
+    // The runtime owns a durable delivery before app projection, as on ingest.
+    storage.put_pending_application_event(&received).unwrap();
+    storage
+        .app_storage()
+        .remember_encrypted_media_epoch_secret(
+            &group_hex,
+            GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+            epoch.0,
+            &[0xcc; 32],
+        )
+        .unwrap();
+    let connection =
+        super::runtime_group_subscription_refresh_tests::projection_fault_connection(&app);
+    connection.execute_batch("CREATE TRIGGER fail_media_secret BEFORE UPDATE OF secret ON encrypted_media_epoch_secrets BEGIN SELECT RAISE(FAIL, 'injected media secret cache'); END;").unwrap();
+    let effects = marmot_session::AccountDeviceEffects {
+        events: vec![received],
+        ..Default::default()
+    };
+    let mut summary = SyncSummary::default();
+    let failed = client
+        .observe_account_device_effects(&effects, &mut summary, "media source", unix_now_seconds())
+        .await;
+    assert!(
+        matches!(failed,
+        Err(AppError::Storage(cgka_traits::StorageError::Backend(ref details)))
+            if details.contains("injected media secret cache")),
+        "the required media-key write failure must remain retryable"
+    );
+    assert!(summary.messages.is_empty());
+    assert!(summary.projection_updates.is_empty());
+    assert!(
+        storage
+            .app_storage()
+            .timeline_message(&group_hex, &app_message_id)
+            .unwrap()
+            .is_none(),
+        "a source without its correct key must not become live"
+    );
+    assert!(
+        storage
+            .app_storage()
+            .attachment_history_page(&group_hex, 1, None)
+            .unwrap()
+            .entries
+            .is_empty()
+    );
+    assert!(!client.pending_application_event_acks.contains(&source_id));
+    assert!(storage.list_pending_application_events().unwrap().iter().any(|event|
+        matches!(event, GroupEvent::MessageReceived { message_id, .. } if message_id == &source_id)));
+    drop(client);
+
+    let mut reopened = app.client("alice").await.unwrap();
+    connection
+        .execute_batch("DROP TRIGGER fail_media_secret")
+        .unwrap();
+    let repaired = reopened.drain_pending_session_events().await.unwrap();
+    assert_eq!(repaired.messages.len(), 1);
+    assert_eq!(repaired.messages[0].message_id_hex, app_message_id);
+    let source = storage
+        .app_storage()
+        .timeline_message(&group_hex, &app_message_id)
+        .unwrap()
+        .unwrap();
+    assert!(!source.deleted && source.invalidation_status.is_none());
+    assert_eq!(
+        storage
+            .app_storage()
+            .attachment_history_page(&group_hex, 1, None)
+            .unwrap()
+            .entries
+            .len(),
+        1
+    );
+    let secret = storage
+        .app_storage()
+        .encrypted_media_epoch_secret(&group_hex, GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID, epoch.0)
+        .unwrap()
+        .unwrap();
+    assert!(
+        secret.as_slice() == source_secret.as_slice(),
+        "the authenticated source key must replace the stale cached key"
+    );
+    assert!(
+        storage
+            .list_pending_application_events()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// A legacy event may outlive its retained source exporter. Missing historic
+/// material must not block valid message content from inbox projection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn media_metadata_without_a_source_exporter_still_projects() {
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        "wss://relay.example",
+        crate::MarmotAppConfig::default().with_deployment(crate::MarmotDeployment::neutral()),
+    )
+    .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group = client
+        .create_group("metadata only", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    assert!(!client.state.groups[0].encrypted_media.required);
+    let epoch = client.runtime.group_record(&group).unwrap().epoch;
+    let (mut reference, _) = crate::media::tests::attachment_worker_fixture(b"metadata only");
+    reference.locators.push(crate::MediaLocator {
+        kind: "blossom-v1".into(),
+        value: format!("https://media.example/{}", reference.ciphertext_sha256),
+    });
+    let app_event = cgka_traits::app_event::MarmotAppEvent::new(
+        &account.account_id_hex,
+        unix_now_seconds(),
+        MARMOT_APP_EVENT_KIND_CHAT,
+        vec![reference.imeta_tag()],
+        "keep media metadata",
+    );
+    let app_message_id = app_event.id.clone();
+    let payload = app_event.encode().unwrap();
+    let sent = client
+        .runtime
+        .send(cgka_traits::SendIntent::AppMessage {
+            group_id: group.clone(),
+            payload: payload.clone(),
+            expected_epoch: None,
+        })
+        .await
+        .unwrap();
+    // A legacy durable event may already be authenticated while projection
+    // waits long enough for its source anchor to leave the retained horizon.
+    for _ in 0..6 {
+        client
+            .runtime
+            .send(cgka_traits::SendIntent::SelfUpdate {
+                group_id: group.clone(),
+            })
+            .await
+            .unwrap();
+    }
+    assert!(
+        client
+            .runtime
+            .retained_encrypted_media_exporter_secret(&group, epoch)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        app.account_storage("alice")
+            .unwrap()
+            .app_storage()
+            .encrypted_media_epoch_secret(
+                &hex::encode(group.as_slice()),
+                cgka_traits::app_components::GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+                epoch.0,
+            )
+            .unwrap()
+            .is_none()
+    );
+    let effects = marmot_session::AccountDeviceEffects {
+        events: vec![GroupEvent::MessageReceived {
+            authority: None,
+            group_id: group.clone(),
+            message_id: sent.reports[0].message_id.clone(),
+            sender: cgka_traits::MemberId::new(hex::decode(&account.account_id_hex).unwrap()),
+            sender_leaf_index: None,
+            epoch,
+            payload,
+            retention: None,
+            encrypted_media_secret: None,
+        }],
+        ..Default::default()
+    };
+    let mut summary = SyncSummary::default();
+    client
+        .observe_account_device_effects(
+            &effects,
+            &mut summary,
+            "metadata source",
+            unix_now_seconds(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(summary.messages.len(), 1);
+    assert_eq!(summary.messages[0].plaintext, "keep media metadata");
+    let storage = app.account_storage("alice").unwrap().app_storage();
+    let row = storage
+        .timeline_message(&hex::encode(group.as_slice()), &app_message_id)
+        .unwrap()
+        .unwrap();
+    assert!(!row.deleted && row.invalidation_status.is_none());
+    assert_eq!(row.tags, vec![reference.imeta_tag()]);
 }

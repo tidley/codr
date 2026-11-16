@@ -1,19 +1,19 @@
-//! Forensic audit-log feature: settings, per-account-device JSONL recorders,
-//! file enumeration, HTTP upload, and audit-log path validation.
+//! Forensic audit-log feature: settings, the host-supplied source metadata,
+//! per-account-device JSONL recorders, file enumeration, and audit-log path
+//! validation.
 //!
 //! The audit log is an opt-in, privacy-safe forensic measure recorded per
 //! account-device at `<account_dir>/audit-<engine_id>-v5.jsonl`. This module owns
 //! the audit DTOs, the stable domain-separated hash identity derivation, the
-//! per-attempt pinned upload path, and the `MarmotApp` methods that drive
-//! recording, enumeration, validation, and upload.
+//! audit files, and the `MarmotApp` methods that drive recording, enumeration
+//! and validation. Recorded v5 rows leave the device only through the runtime's
+//! OTLP delivery (`runtime/audit_tracker.rs`); older local files stay listable
+//! and deletable until retention expires them.
 
 use std::fs;
-use std::future::Future;
 use std::io::Write;
-use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use cgka_traits::MemberId;
 use marmot_account::AccountSummary;
@@ -21,42 +21,30 @@ use rand::RngCore;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncReadExt;
 use zeroize::Zeroizing;
 
-use crate::collector_host_safety;
+use crate::MarmotApp;
 use crate::conversions::{audit_log_settings_from_storage, audit_log_settings_to_storage};
 use crate::error::AppError;
-use crate::{MarmotApp, config, retired_relay_hosts};
 
 mod legacy_cleanup;
 pub(crate) use legacy_cleanup::cleanup_legacy_audit_logs;
+mod retention;
+pub use retention::{
+    AUDIT_LOG_DEFAULT_MAX_BYTES_PER_ACCOUNT, AUDIT_LOG_MAX_AGE_DAYS,
+    AUDIT_LOG_MIN_MAX_BYTES_PER_ACCOUNT, AuditLogRetention,
+};
+pub(crate) use retention::{AuditRetentionWorker, cleanup_expired_audit_logs};
 
-const AUDIT_LOG_CONTENT_TYPE: &str = "application/x-ndjson";
-// The whole-file Goggles endpoint accepts the historical v4 contract only.
-// New v5 records use the separately configured, explicit OTLP delivery path.
-const GOGGLES_UPLOAD_SCHEMA_VERSION: &str = "marmot-forensics-audit/v4";
+pub(crate) type AuditRecorderSlot =
+    std::sync::Arc<std::sync::Mutex<Option<marmot_forensics::WeakRecorder>>>;
+
 const AUDIT_DEVICE_ID_FILE: &str = "audit-device-id";
 /// Always-on, append-only per-account key-reveal audit log (mdk#543).
 /// The name matches the `audit-*.jsonl` glob so it is enumerable via
 /// [`MarmotApp::audit_log_files`].
 const KEY_REVEAL_AUDIT_FILE: &str = "audit-key-reveal.jsonl";
-/// Per-account record of which audit files the tracker has already handed to
-/// the upload endpoint (mdk#1181).
-///
-/// Deliberately *not* an `audit-*.jsonl` name: it must never be enumerated by
-/// [`MarmotApp::audit_log_files`] and uploaded as if it were forensic data.
-const AUDIT_UPLOAD_CHECKPOINT_FILE: &str = "audit-upload-checkpoint.json";
 pub(crate) const AUDIT_ID_BYTES: usize = 16;
-pub(crate) const AUDIT_LOG_UPLOAD_MAX_BYTES: u64 = 64 * 1024 * 1024;
-const AUDIT_LOG_UPLOAD_TIMEOUT: Duration = Duration::from_secs(60);
-pub(crate) static AUDIT_UPLOAD_SCHEMA: LazyLock<jsonschema::Validator> = LazyLock::new(|| {
-    let schema = serde_json::from_str(include_str!(
-        "../../marmot-forensics/schema/audit-log-event.v4.schema.json"
-    ))
-    .expect("bundled audit schema must be valid JSON");
-    jsonschema::validator_for(&schema).expect("bundled audit schema must compile offline")
-});
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AuditLogFile {
@@ -67,20 +55,33 @@ pub struct AuditLogFile {
     pub modified_at_ms: Option<u64>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AuditLogUploadResult {
-    pub path: String,
-    pub status: u16,
-    pub bytes_sent: u64,
+/// Host-supplied provenance recorded in each new recorder's `source_context`
+/// row. Not persisted: hosts set it at startup, before account sessions open.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AuditLogSource {
+    /// System model identifier (for example `iPhone17,3`); never a
+    /// user-assigned device name, hostname, or serial number.
+    pub hardware_model: Option<String>,
+    pub platform: Option<String>,
+    pub app_version: Option<String>,
+}
+
+impl AuditLogSource {
+    /// Trim every field; a blank field becomes `None`.
+    pub(crate) fn normalize(self) -> Self {
+        Self {
+            hardware_model: marmot_observability::trim_optional(self.hardware_model),
+            platform: marmot_observability::trim_optional(self.platform),
+            app_version: marmot_observability::trim_optional(self.app_version),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AuditLogTrackerUpdateResult {
+    /// Whether audit logging is enabled.
     pub enabled: bool,
-    /// Historical whole-file v4 uploads to the Goggles endpoint.
-    pub uploaded: Vec<AuditLogUploadResult>,
-    pub skipped_reason: Option<String>,
-    /// v5 OTLP delivery, present when a dedicated sender was configured.
+    /// v5 OTLP delivery, present when a dedicated sender is configured.
     pub v5: Option<AuditOtlpTrackerResult>,
 }
 
@@ -93,116 +94,92 @@ pub struct AuditOtlpTrackerResult {
     pub skipped_reason: Option<String>,
 }
 
-/// Internal receipt: only a complete snapshot of the enumerated file may be
-/// checkpointed. The public upload result describes bytes actually sent.
-pub(crate) struct AuditUploadReceipt {
-    pub result: AuditLogUploadResult,
-    pub observed_bytes: u64,
-    pub modified_at_ms: Option<u64>,
-    pub complete: bool,
+/// Why the most recent v5 delivery attempt for an account failed.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditDeliveryFailureKind {
+    /// The local delivery cursor outgrew its size limit.
+    StateOverLimit,
+    /// The process ran out of file descriptors.
+    TooManyOpenFiles,
+    /// Another local file-system failure.
+    LocalIo,
+    /// A local source journal is blocked, for example by a truncated file.
+    LocalBlocked,
+    /// The receiver refused the configuration (`401`, `403`, `404`), returned
+    /// another unexpected status or an invalid success response, or the
+    /// sender refused the batch before dialing. Automatic delivery pauses
+    /// until the host changes the configuration or retries manually.
+    ReceiverBlocked,
+    /// The receiver rejected a batch's content (`400`, `413`, `422`).
+    /// Delivery continues past it, so these rows are lost to the receiver.
+    ReceiverRejected,
+    /// The receiver was throttled, unavailable, or possibly stored part of
+    /// the batch (`409`, `429`, `5xx`); the same range is retried.
+    ReceiverRetryable,
+    /// No usable response: connection failure, timeout, or a lost reply.
+    NoResponse,
+    /// Any other runtime failure.
+    Internal,
 }
 
-pub(crate) enum AuditUploadAttempt {
-    Uploaded(AuditUploadReceipt),
-    Ineligible {
-        observed_bytes: u64,
-        modified_at_ms: Option<u64>,
-    },
-    Deferred,
-    FileFailure(AppError),
-    Rejected {
-        status: u16,
-        retry_after: Option<Duration>,
-    },
-}
-
-/// Retry-After accepts either delta seconds or an HTTP date. Bound untrusted
-/// deadlines to five minutes so one response cannot silence incident evidence for a day.
-/// `None` means the header was absent. A header we cannot parse is still a
-/// request to retry, so it yields a zero minimum instead of disappearing.
-fn audit_retry_after(value: Option<&str>, now: SystemTime) -> Option<Duration> {
-    let value = value?.trim();
-    let delay = value
-        .parse::<u64>()
-        .ok()
-        .map(Duration::from_secs)
-        .or_else(|| {
-            httpdate::parse_http_date(value)
-                .ok()
-                .map(|date| date.duration_since(now).unwrap_or_default())
-        })
-        .unwrap_or_default();
-    Some(delay.min(Duration::from_secs(5 * 60)))
-}
-
-struct AuditUploadSnapshot {
-    body: Vec<u8>,
-    observed_bytes: u64,
-    modified_at_ms: Option<u64>,
-    complete: bool,
-}
-
-impl AuditUploadSnapshot {
-    async fn capture(file: tokio::fs::File) -> Result<Self, AppError> {
-        let metadata = file.metadata().await?;
-        let observed_bytes = metadata.len();
-        if observed_bytes > AUDIT_LOG_UPLOAD_MAX_BYTES {
-            return Err(AppError::AuditLogUpload(format!(
-                "audit log exceeds {} byte upload limit",
-                AUDIT_LOG_UPLOAD_MAX_BYTES
-            )));
-        }
-        let mut body = Vec::with_capacity(observed_bytes as usize);
-        // Opening once preserves identity across rename/replacement. Bounding
-        // the read excludes later appends, but is not sufficient by itself:
-        // metadata can have sampled the middle of a JSONL write/flush.
-        file.take(observed_bytes).read_to_end(&mut body).await?;
-        let end = body
-            .iter()
-            .rposition(|byte| *byte == b'\n')
-            .map_or(0, |i| i + 1);
-        body.truncate(end);
-        Ok(Self {
-            complete: body.len() as u64 == observed_bytes,
-            body,
-            observed_bytes,
-            modified_at_ms: metadata.modified().ok().and_then(system_time_ms),
-        })
-    }
-
-    /// Validate the exact immutable bytes that will be sent. No legacy migration
-    /// or redaction: a single invalid complete row rejects the whole snapshot.
-    fn validate(&self) -> Result<(), AppError> {
-        let mut has_record = false;
-        for line in self.body.split(|byte| *byte == b'\n') {
-            if line.iter().all(u8::is_ascii_whitespace) {
-                continue;
-            }
-            // Strict typed decoding also rejects duplicate and unknown fields
-            // before serde_json::Value could collapse duplicate object keys.
-            let event = serde_json::from_slice::<marmot_forensics::AuditEvent>(line)
-                .map_err(|_| invalid_audit_upload())?;
-            if event.schema_version != GOGGLES_UPLOAD_SCHEMA_VERSION {
-                return Err(invalid_audit_upload());
-            }
-            let value: serde_json::Value =
-                serde_json::from_slice(line).map_err(|_| invalid_audit_upload())?;
-            if !AUDIT_UPLOAD_SCHEMA.is_valid(&value) {
-                return Err(invalid_audit_upload());
-            }
-            has_record = true;
-        }
-        if has_record {
-            Ok(())
-        } else {
-            Err(invalid_audit_upload())
+impl AuditDeliveryFailureKind {
+    /// Privacy-safe category for logs.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::StateOverLimit => "state_over_limit",
+            Self::TooManyOpenFiles => "too_many_open_files",
+            Self::LocalIo => "local_io",
+            Self::LocalBlocked => "local_blocked",
+            Self::ReceiverBlocked => "receiver_blocked",
+            Self::ReceiverRejected => "receiver_rejected",
+            Self::ReceiverRetryable => "receiver_retryable",
+            Self::NoResponse => "no_response",
+            Self::Internal => "internal",
         }
     }
 }
 
-fn invalid_audit_upload() -> AppError {
-    // Never expose schema validation errors: they can contain the rejected data.
-    AppError::InvalidAuditLogFile("only valid v4 forensic audit records may be uploaded".into())
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuditDeliveryFailure {
+    pub kind: AuditDeliveryFailureKind,
+    /// The receiver's HTTP status, when it answered.
+    pub http_status: Option<u16>,
+    pub at_ms: u64,
+}
+
+/// Undelivered local v5 audit data, as of `observed_at_ms`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuditDeliveryBacklog {
+    pub undelivered_bytes: u64,
+    pub undelivered_segments: u64,
+    /// Recorded delivery gaps (data the receiver will never get).
+    pub gaps: u64,
+    /// Recorder wall time of the oldest undelivered record, when readable.
+    pub oldest_undelivered_at_ms: Option<u64>,
+    /// When delivery last measured this backlog. It is not refreshed while
+    /// local delivery cannot open its state or automatic delivery is paused.
+    pub observed_at_ms: u64,
+}
+
+/// Per-account v5 OTLP audit delivery status, persisted across restarts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuditDeliveryStatus {
+    pub account_ref: String,
+    /// Whether the host has configured a v5 audit OTLP destination.
+    pub destination_configured: bool,
+    /// Last delivery attempt that delivered a batch or found nothing left to deliver.
+    pub last_success_at_ms: Option<u64>,
+    pub last_failure: Option<AuditDeliveryFailure>,
+    /// Failed delivery attempts since the last success.
+    pub consecutive_failures: u64,
+    /// Batches the receiver rejected, in total.
+    pub rejected_batches: u64,
+    /// Automatic delivery is paused for the configured destination after a
+    /// [`AuditDeliveryFailureKind::ReceiverBlocked`] failure. A changed
+    /// configuration or a manual tracker update lifts it.
+    pub paused: bool,
+    pub backlog: Option<AuditDeliveryBacklog>,
 }
 
 fn audit_v5_producer() -> marmot_forensics::v5::Producer {
@@ -234,100 +211,6 @@ fn audit_v5_producer() -> marmot_forensics::v5::Producer {
         },
         platform,
         host_build: None,
-    }
-}
-
-/// What the tracker already did with one audit file.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum AuditUploadOutcome {
-    /// The endpoint accepted the file's whole content.
-    Uploaded,
-    /// The tracker will not re-post this file's content: it is over the local
-    /// `AUDIT_LOG_UPLOAD_MAX_BYTES` ceiling, or the endpoint answered `413`
-    /// without `Retry-After` (RFC 9110 15.5.14 has a server send that header
-    /// when the refusal is temporary). Recorded so the tracker reports it once
-    /// instead of re-attempting on every trigger. Like every checkpoint entry
-    /// it is keyed on the file's size and mtime, so deleting the sidecar clears
-    /// it, and a manual per-file upload never consults it. A `413` that
-    /// carries `Retry-After` is a cooldown, not this outcome.
-    TooLargeToUpload,
-    /// Contains legacy, malformed, or schema-ineligible records. Never sent.
-    IneligibleSchema,
-}
-
-/// One acknowledged audit file, identified by the size and mtime it had when
-/// the tracker was done with it.
-///
-/// Identity is metadata, not a content hash, precisely because the point of the
-/// checkpoint is to *avoid reading* the file again. Audit files only ever grow
-/// (segments never change at all), so a later enumeration reporting the exact
-/// same pair means the acknowledged content is still the whole file. Every
-/// mismatch — including the racy ones, where the file grew between enumeration
-/// and upload — falls back to re-uploading, which the endpoint's `file_sha256`
-/// short-circuit absorbs without parsing.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct AuditUploadCheckpointEntry {
-    size_bytes: u64,
-    #[serde(default)]
-    modified_at_ms: Option<u64>,
-    outcome: AuditUploadOutcome,
-}
-
-/// Per-account upload checkpoint (mdk#1181).
-///
-/// Losing or corrupting this file is safe by design: the worst case is that
-/// each still-present file transfers once more, and the upload endpoint
-/// short-circuits a byte-identical re-upload on `file_sha256` without parsing
-/// a line. That is why it is a plain sidecar rather than a migration in the
-/// account database.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub(crate) struct AuditUploadCheckpoint {
-    #[serde(default)]
-    files: std::collections::BTreeMap<String, AuditUploadCheckpointEntry>,
-}
-
-impl AuditUploadCheckpoint {
-    /// What the tracker already did with `file`, if its content is unchanged
-    /// since then.
-    pub(crate) fn acknowledged(&self, file: &AuditLogFile) -> Option<AuditUploadOutcome> {
-        self.files
-            .get(&file.file_name)
-            .filter(|entry| {
-                entry.size_bytes == file.size_bytes && entry.modified_at_ms == file.modified_at_ms
-            })
-            .map(|entry| entry.outcome)
-    }
-
-    /// Record an oversized/ineligible-file verdict or an accepted complete snapshot.
-    /// Successful uploads are checked against enumeration before checkpointing.
-    pub(crate) fn acknowledge(
-        &mut self,
-        file: &AuditLogFile,
-        acknowledged_bytes: u64,
-        outcome: AuditUploadOutcome,
-    ) {
-        self.files.insert(
-            file.file_name.clone(),
-            AuditUploadCheckpointEntry {
-                size_bytes: acknowledged_bytes,
-                modified_at_ms: file.modified_at_ms,
-                outcome,
-            },
-        );
-    }
-
-    /// Drop entries for files that are no longer on disk, so the sidecar stays
-    /// bounded by the account's live audit files. Returns whether anything
-    /// changed.
-    pub(crate) fn retain_present<'a>(
-        &mut self,
-        present: impl IntoIterator<Item = &'a str>,
-    ) -> bool {
-        let present: std::collections::BTreeSet<&str> = present.into_iter().collect();
-        let before = self.files.len();
-        self.files.retain(|name, _| present.contains(name.as_str()));
-        before != self.files.len()
     }
 }
 
@@ -434,143 +317,28 @@ fn audit_log_file_name(path: &Path) -> Option<String> {
         .then(|| file_name.into_owned())
 }
 
-fn system_time_ms(time: SystemTime) -> Option<u64> {
+/// Milliseconds since the Unix epoch, truncated; `None` before the epoch.
+pub(crate) fn system_time_ms(time: SystemTime) -> Option<u64> {
     time.duration_since(UNIX_EPOCH)
         .ok()
         .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok())
 }
 
-pub(crate) fn audit_upload_host_is_retired(host: &str) -> bool {
-    let host = host.trim_end_matches('.');
-    retired_relay_hosts()
-        .iter()
-        .any(|retired| host.eq_ignore_ascii_case(retired))
-}
-
-fn validate_audit_upload_endpoint(
-    endpoint: &str,
-    authorization_bearer_token: Option<&str>,
-) -> Result<String, AppError> {
-    let endpoint = endpoint.trim();
-    if endpoint.is_empty() {
-        return Err(AppError::AuditLogUpload(
-            "forensic upload endpoint is empty".to_owned(),
-        ));
-    }
-    let Some(url) = config::parse_relay_telemetry_endpoint(endpoint) else {
-        return Err(AppError::AuditLogUpload(
-            if config::endpoint_transport_allowed(endpoint) {
-                "forensic upload endpoint is invalid".to_owned()
-            } else {
-                "forensic upload endpoint must be https, or loopback http for local testing"
-                    .to_owned()
-            },
-        ));
-    };
-    if url.host_str().is_some_and(audit_upload_host_is_retired) {
-        return Err(AppError::AuditLogUpload(
-            "forensic upload endpoint is not allowed".to_owned(),
-        ));
-    }
-    if !config::endpoint_host_is_loopback(endpoint)
-        && authorization_bearer_token.is_none_or(|token| token.trim().is_empty())
-    {
-        return Err(AppError::AuditLogUpload(
-            "forensic upload endpoint requires an authorization bearer token unless it is loopback"
-                .to_owned(),
-        ));
-    }
-    Ok(endpoint.to_owned())
-}
-
-async fn audit_network_attempt<T, Fut>(op: Fut) -> Result<T, AppError>
-where
-    Fut: Future<Output = Result<T, AppError>>,
-{
-    tokio::time::timeout(AUDIT_LOG_UPLOAD_TIMEOUT, op)
-        .await
-        .map_err(|_| AppError::AuditLogUpload("request timed out".into()))?
-}
-
-async fn send_audit_upload<F, Fut>(
-    endpoint: &str,
-    body: Vec<u8>,
-    authorization_bearer_token: Option<&str>,
-    hardware_model: Option<&str>,
-    platform: Option<&str>,
-    app_version: Option<&str>,
-    resolver: F,
-) -> Result<reqwest::Response, AppError>
-where
-    F: FnOnce(String, u16) -> Fut,
-    Fut: Future<Output = std::io::Result<Vec<IpAddr>>>,
-{
-    let pin = collector_host_safety::resolve_with(endpoint, resolver)
-        .await
-        .map_err(|_| AppError::AuditLogUpload("request failed".into()))?;
-    let client = pin
-        .build_client()
-        .map_err(|_| AppError::AuditLogUpload("request failed".into()))?;
-    audit_upload_request(
-        &client,
-        pin.url,
-        body,
-        authorization_bearer_token,
-        hardware_model,
-        platform,
-        app_version,
-    )
-    .send()
-    .await
-    .map_err(audit_log_reqwest_error)
-}
-
-fn audit_upload_request(
-    client: &reqwest::Client,
-    url: reqwest::Url,
-    body: Vec<u8>,
-    authorization_bearer_token: Option<&str>,
-    hardware_model: Option<&str>,
-    platform: Option<&str>,
-    app_version: Option<&str>,
-) -> reqwest::RequestBuilder {
-    let bytes_sent = body.len() as u64;
-    let mut request = client
-        .post(url)
-        .timeout(AUDIT_LOG_UPLOAD_TIMEOUT)
-        .header(reqwest::header::CONTENT_TYPE, AUDIT_LOG_CONTENT_TYPE)
-        .header(reqwest::header::CONTENT_LENGTH, bytes_sent)
-        .body(body);
-    if let Some(token) = authorization_bearer_token {
-        request = request.bearer_auth(token);
-    }
-    if let Some(value) = hardware_model {
-        request = request.header("X-Goggles-Hardware-Model", value);
-    }
-    if let Some(value) = platform {
-        request = request.header("X-Goggles-Platform", value);
-    }
-    if let Some(value) = app_version {
-        request = request.header("X-Goggles-App-Version", value);
-    }
-    request
-}
-
-fn audit_log_reqwest_error(err: reqwest::Error) -> AppError {
-    if let Some(status) = err.status() {
-        AppError::AuditLogUpload(format!("HTTP {}", status.as_u16()))
-    } else if err.is_timeout() {
-        AppError::AuditLogUpload("request timed out".into())
-    } else if err.is_connect() {
-        AppError::AuditLogUpload("connection failed".into())
-    } else if err.is_body() {
-        AppError::AuditLogUpload("invalid response body".into())
-    } else {
-        AppError::AuditLogUpload("request failed".into())
-    }
-}
-
 impl MarmotApp {
+    pub(crate) fn audit_recorder_slot(&self, label: &str) -> AuditRecorderSlot {
+        let mut recorders = self
+            .audit_recorders
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        recorders.retain(|_, slot| {
+            std::sync::Arc::strong_count(slot) > 1
+                || slot.try_lock().map_or(true, |state| {
+                    state.as_ref().is_some_and(|weak| weak.upgrade().is_some())
+                })
+        });
+        recorders.entry(label.to_owned()).or_default().clone()
+    }
+
     pub fn audit_log_settings(&self) -> Result<AuditLogSettings, AppError> {
         Ok(audit_log_settings_from_storage(
             self.shared_storage()?.audit_log_settings()?,
@@ -599,23 +367,24 @@ impl MarmotApp {
         ))
     }
 
-    pub(crate) fn audit_log_tracker_config(&self) -> config::AuditLogTrackerConfig {
-        self.audit_log_tracker_config
+    pub(crate) fn audit_log_source(&self) -> AuditLogSource {
+        self.audit_log_source
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
     }
 
-    pub(crate) fn set_audit_log_tracker_config(
+    /// Store the source metadata later recorder opens record, normalized.
+    pub(crate) fn set_audit_log_source(
         &self,
-        config: config::AuditLogTrackerConfig,
-    ) -> Result<config::AuditLogTrackerConfig, AppError> {
-        let config = config.normalize().map_err(AppError::AuditLogUpload)?;
+        source: AuditLogSource,
+    ) -> Result<AuditLogSource, AppError> {
+        let source = source.normalize();
         *self
-            .audit_log_tracker_config
+            .audit_log_source
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = config.clone();
-        Ok(config)
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = source.clone();
+        Ok(source)
     }
 
     fn audit_source_context_for_recorder(
@@ -623,12 +392,12 @@ impl MarmotApp {
         device_id_hex: &str,
         account_id: &MemberId,
     ) -> marmot_forensics::AuditSourceContext {
-        let upload_source = self.audit_log_tracker_config().source;
+        let source = self.audit_log_source();
         marmot_forensics::AuditSourceContext {
             device_id: Some(device_id_hex.to_owned()),
-            hardware_model: upload_source.hardware_model,
-            platform: upload_source.platform,
-            app_version: upload_source.app_version,
+            hardware_model: source.hardware_model,
+            platform: source.platform,
+            app_version: source.app_version,
             local_member_ref: Some(marmot_forensics::member_ref_hex(account_id.as_slice())),
             ..Default::default()
         }
@@ -668,162 +437,6 @@ impl MarmotApp {
         Ok(files)
     }
 
-    /// Load the tracker's upload checkpoint for `account_ref`.
-    ///
-    /// Never fails: a missing, unreadable, or malformed sidecar reads as empty,
-    /// which costs one re-upload per still-present file and nothing else.
-    pub(crate) fn audit_upload_checkpoint(&self, account_ref: &str) -> AuditUploadCheckpoint {
-        let path = self
-            .account_dir(account_ref)
-            .join(AUDIT_UPLOAD_CHECKPOINT_FILE);
-        fs::read(path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default()
-    }
-
-    /// Persist the tracker's upload checkpoint for `account_ref`.
-    ///
-    /// Written to an owner-only staging sibling and renamed into place, so a
-    /// crash mid-write leaves the previous checkpoint intact rather than a torn
-    /// one that would strand every entry.
-    pub(crate) fn store_audit_upload_checkpoint(
-        &self,
-        account_ref: &str,
-        checkpoint: &AuditUploadCheckpoint,
-    ) -> Result<(), AppError> {
-        let path = self
-            .account_dir(account_ref)
-            .join(AUDIT_UPLOAD_CHECKPOINT_FILE);
-        let mut staged = path.clone().into_os_string();
-        staged.push(".tmp");
-        let staged = PathBuf::from(staged);
-        fs_private::write_private(&staged, &serde_json::to_vec(checkpoint)?)?;
-        // `rename` preserves the staged 0600 mode, so the checkpoint is never
-        // reachable at umask-default permissions.
-        if let Err(err) = fs::rename(&staged, &path) {
-            let _ = fs::remove_file(&staged);
-            return Err(err.into());
-        }
-        Ok(())
-    }
-
-    pub async fn post_audit_log_file(
-        &self,
-        path: &str,
-        endpoint: &str,
-    ) -> Result<AuditLogUploadResult, AppError> {
-        let config = config::AuditLogTrackerConfig {
-            endpoint: Some(endpoint.to_owned()),
-            ..Default::default()
-        };
-        self.post_audit_log_file_with_tracker_config(path, &config)
-            .await
-    }
-
-    pub async fn post_audit_log_file_with_tracker_config(
-        &self,
-        path: &str,
-        config: &config::AuditLogTrackerConfig,
-    ) -> Result<AuditLogUploadResult, AppError> {
-        match self.post_audit_log_snapshot(path, config).await? {
-            AuditUploadAttempt::Uploaded(receipt) => Ok(receipt.result),
-            AuditUploadAttempt::Deferred => Err(AppError::AuditLogUpload(
-                "audit snapshot has no complete lines".into(),
-            )),
-            AuditUploadAttempt::FileFailure(error) => Err(error),
-            AuditUploadAttempt::Ineligible { .. } => Err(invalid_audit_upload()),
-            AuditUploadAttempt::Rejected { status, .. } => Err(AppError::AuditLogUpload(format!(
-                "upload returned HTTP {status}"
-            ))),
-        }
-    }
-
-    /// An empty complete-line prefix is deferred without an HTTP request.
-    pub(crate) async fn post_audit_log_snapshot(
-        &self,
-        path: &str,
-        config: &config::AuditLogTrackerConfig,
-    ) -> Result<AuditUploadAttempt, AppError> {
-        let path = match self.validate_audit_log_path(path) {
-            Ok(path) => path,
-            Err(error) => return Ok(AuditUploadAttempt::FileFailure(error)),
-        };
-        let config = config
-            .clone()
-            .normalize()
-            .map_err(AppError::AuditLogUpload)?;
-        let endpoint = config
-            .resolved_endpoint(self.service_endpoints())
-            .ok_or_else(|| AppError::AuditLogUpload("forensic upload endpoint is empty".into()))
-            .and_then(|endpoint| {
-                validate_audit_upload_endpoint(
-                    &endpoint,
-                    config.authorization_bearer_token.as_deref(),
-                )
-            })?;
-        let snapshot = match async {
-            let file = tokio::fs::File::open(&path).await?;
-            AuditUploadSnapshot::capture(file).await
-        }
-        .await
-        {
-            Ok(snapshot) => snapshot,
-            Err(error) => return Ok(AuditUploadAttempt::FileFailure(error)),
-        };
-        if snapshot.body.is_empty() {
-            return Ok(AuditUploadAttempt::Deferred);
-        }
-        // Validation of a bounded but potentially large file is CPU work. Keep
-        // it off runtime workers; cancellation still prevents the later POST.
-        let (snapshot, eligible) = tokio::task::spawn_blocking(move || {
-            let eligible = snapshot.validate().is_ok();
-            (snapshot, eligible)
-        })
-        .await
-        .map_err(|_| AppError::AuditLogUpload("audit validation worker failed".into()))?;
-        if !eligible {
-            return Ok(AuditUploadAttempt::Ineligible {
-                observed_bytes: snapshot.observed_bytes,
-                modified_at_ms: snapshot.modified_at_ms,
-            });
-        }
-        let bytes_sent = snapshot.body.len() as u64;
-        let response = audit_network_attempt(send_audit_upload(
-            &endpoint,
-            snapshot.body,
-            config.authorization_bearer_token.as_deref(),
-            config.source.hardware_model.as_deref(),
-            config.source.platform.as_deref(),
-            config.source.app_version.as_deref(),
-            collector_host_safety::system_resolve,
-        ))
-        .await?;
-        let status = response.status();
-        if !status.is_success() {
-            return Ok(AuditUploadAttempt::Rejected {
-                status: status.as_u16(),
-                retry_after: audit_retry_after(
-                    response
-                        .headers()
-                        .get(reqwest::header::RETRY_AFTER)
-                        .map(|value| value.to_str().unwrap_or_default()),
-                    SystemTime::now(),
-                ),
-            });
-        }
-        Ok(AuditUploadAttempt::Uploaded(AuditUploadReceipt {
-            observed_bytes: snapshot.observed_bytes,
-            modified_at_ms: snapshot.modified_at_ms,
-            complete: snapshot.complete,
-            result: AuditLogUploadResult {
-                path: path.to_string_lossy().into_owned(),
-                status: status.as_u16(),
-                bytes_sent,
-            },
-        }))
-    }
-
     /// Open the file-backed forensic recorder for `label`, or `None` if it
     /// could not be prepared.
     ///
@@ -859,7 +472,8 @@ impl MarmotApp {
         // while the recorder kept appending to the orphaned inode.
         let account_dir = fs::canonicalize(&account_dir).unwrap_or(account_dir);
         // Start a distinct v5 file. Exclusive-root startup retires v1-v3 files;
-        // historical v4 files remain available for explicit legacy upload.
+        // historical v4 files stay listable and deletable until retention
+        // expires them.
         let audit_path = marmot_forensics::default_v5_jsonl_path(&account_dir, &engine_id_hex);
         match marmot_forensics::JsonlRecorder::open_v5_with_account_ref(
             &audit_path,
@@ -869,7 +483,7 @@ impl MarmotApp {
         ) {
             Ok(recorder) => {
                 // Emit a source_context row identifying the producing account and
-                // the host-supplied device/client metadata from tracker config.
+                // the host-supplied device/client metadata (`AuditLogSource`).
                 // JsonlRecorder repeats the latest explicit source row in each
                 // size-rotated segment; metadata remains in the validated body.
                 use marmot_forensics::ForensicRecorder as _;
@@ -937,7 +551,7 @@ impl MarmotApp {
         }
         // Refuse a symlinked final component. `canonicalize` below resolves it
         // to its target, so without this an `audit-*.jsonl` symlink could make
-        // us delete (or upload) an unrelated file that merely sits under the app
+        // us delete an unrelated file that merely sits under the app
         // root — e.g. the shared storage database.
         if fs::symlink_metadata(&path)?.file_type().is_symlink() {
             return Err(AppError::InvalidAuditLogFile(
@@ -1119,311 +733,11 @@ impl MarmotApp {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn retry_after_supports_seconds_dates_and_bounded_invalid_input() {
-        let now = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
-        assert_eq!(
-            audit_retry_after(Some("120"), now),
-            Some(Duration::from_secs(120))
-        );
-        let date = httpdate::fmt_http_date(now + Duration::from_secs(180));
-        assert_eq!(
-            audit_retry_after(Some(&date), now),
-            Some(Duration::from_secs(180))
-        );
-        let past = httpdate::fmt_http_date(now - Duration::from_secs(1));
-        assert_eq!(audit_retry_after(Some(&past), now), Some(Duration::ZERO));
-        assert_eq!(
-            audit_retry_after(Some("18446744073709551615"), now),
-            Some(Duration::from_secs(300))
-        );
-        assert_eq!(audit_retry_after(None, now), None);
-        for malformed in ["nonsense", "-1", ""] {
-            assert_eq!(
-                audit_retry_after(Some(malformed), now),
-                Some(Duration::ZERO),
-                "a malformed Retry-After is still a request to retry"
-            );
-        }
-    }
-
-    fn assert_privacy_safe(error: &AppError) {
-        let display = error.to_string();
-        let debug = format!("{error:?}");
-        for leak in [
-            "secret.example",
-            "secret-query",
-            "bearer-secret",
-            "127.0.0.1",
-            "10.0.0.1",
-            "169.254.169.254",
-            "Location",
-            "/stolen",
-        ] {
-            assert!(
-                !display.contains(leak) && !debug.contains(leak),
-                "leaked {leak} via {display} / {debug}"
-            );
-        }
-    }
-
-    #[test]
-    fn audit_upload_timeouts_keep_sixty_second_request_and_thirty_second_collector() {
-        assert_eq!(AUDIT_LOG_UPLOAD_TIMEOUT, Duration::from_secs(60));
-        assert_eq!(
-            collector_host_safety::REQUEST_TIMEOUT,
-            Duration::from_secs(30)
-        );
-        assert_eq!(
-            collector_host_safety::CONNECT_TIMEOUT,
-            Duration::from_secs(10)
-        );
-    }
-
-    #[test]
-    #[allow(clippy::disallowed_methods)]
-    fn audit_upload_request_overrides_the_collector_timeout() {
-        let client = reqwest::Client::builder()
-            .timeout(collector_host_safety::REQUEST_TIMEOUT)
-            .build()
-            .expect("collector-default client");
-        let request = audit_upload_request(
-            &client,
-            "https://example.test/ingest".parse().expect("url"),
-            Vec::new(),
-            None,
-            None,
-            None,
-            None,
-        )
-        .build()
-        .expect("audit request");
-        assert_eq!(request.timeout(), Some(&AUDIT_LOG_UPLOAD_TIMEOUT));
-        assert_ne!(
-            request.timeout(),
-            Some(&collector_host_safety::REQUEST_TIMEOUT)
-        );
-    }
-
-    #[test]
-    fn audit_endpoint_gate_rejects_structure_retired_hosts_and_missing_tokens() {
-        let retired = retired_relay_hosts()
-            .into_iter()
-            .next()
-            .expect("centralized retired host list");
-        for endpoint in [
-            "",
-            "   ",
-            "http://public.example/ingest",
-            "http://10.0.0.1/ingest",
-            "http://dev.localhost/ingest",
-            "ftp://localhost/ingest",
-            "https://user:password@secret.example/path?token=secret-query",
-            "https://secret.example/path?token=secret-query#frag",
-            "https://secret.example:0/ingest",
-            "https:///",
-            &format!("https://{retired}/ingest"),
-            &format!("https://{}/ingest", retired.to_ascii_uppercase()),
-            &format!("https://{retired}./ingest"),
-        ] {
-            let err = validate_audit_upload_endpoint(endpoint, Some("bearer-secret")).unwrap_err();
-            assert_privacy_safe(&err);
-        }
-        let remote = "https://secret.example/path?token=secret-query";
-        let missing_token = validate_audit_upload_endpoint(remote, None).unwrap_err();
-        assert!(
-            missing_token
-                .to_string()
-                .contains("authorization bearer token")
-        );
-        assert_privacy_safe(&missing_token);
-        let subdomain =
-            validate_audit_upload_endpoint("https://dev.localhost/ingest", None).unwrap_err();
-        assert!(
-            subdomain.to_string().contains("authorization bearer token"),
-            "localhost subdomains are not the local-test exception"
-        );
-        assert_privacy_safe(&subdomain);
-        assert!(
-            validate_audit_upload_endpoint("http://127.0.0.1:9/ingest", None).is_ok(),
-            "literal loopback remains the local-test opt-in"
-        );
-        assert!(validate_audit_upload_endpoint("https://localhost/ingest", None).is_ok());
-        assert!(
-            validate_audit_upload_endpoint(remote, Some("bearer-secret")).is_ok(),
-            "structurally valid public HTTPS with a token is admitted before DNS"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn audit_helper_failures_are_context_free() {
-        let marker = "https://secret.example/path?token=secret-query";
-        let errors = [
-            send_audit_upload(
-                marker,
-                Vec::new(),
-                Some("bearer-secret"),
-                None,
-                None,
-                None,
-                |_, _| async { Ok(Vec::new()) },
-            )
-            .await
-            .unwrap_err(),
-            send_audit_upload(
-                marker,
-                Vec::new(),
-                Some("bearer-secret"),
-                None,
-                None,
-                None,
-                |_, _| async {
-                    Err(std::io::Error::other(
-                        "secret.example secret-query 127.0.0.1 bearer-secret",
-                    ))
-                },
-            )
-            .await
-            .unwrap_err(),
-            send_audit_upload(
-                marker,
-                Vec::new(),
-                Some("bearer-secret"),
-                None,
-                None,
-                None,
-                |_, _| async { Ok(vec!["10.0.0.1".parse().unwrap()]) },
-            )
-            .await
-            .unwrap_err(),
-            send_audit_upload(
-                "https://10.0.0.1/ingest",
-                Vec::new(),
-                Some("bearer-secret"),
-                None,
-                None,
-                None,
-                |_, _| async { panic!("literal address must not use DNS") },
-            )
-            .await
-            .unwrap_err(),
-        ];
-        for error in errors {
-            assert_eq!(error.to_string(), "audit log upload failed: request failed");
-            assert_privacy_safe(&error);
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn invalid_structure_never_resolves() {
-        for endpoint in [
-            "http://public.example/ingest",
-            "https://user:password@secret.example/",
-            "https://secret.example/#frag",
-        ] {
-            assert!(
-                send_audit_upload(
-                    endpoint,
-                    Vec::new(),
-                    Some("bearer-secret"),
-                    None,
-                    None,
-                    None,
-                    |_, _| async {
-                        panic!("invalid URL reached DNS");
-                    }
-                )
-                .await
-                .is_err()
-            );
-        }
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn audit_network_deadline_is_sixty_seconds() {
-        let start = tokio::time::Instant::now();
-        let error = audit_network_attempt(async {
-            std::future::pending::<Result<reqwest::Response, AppError>>().await
-        })
-        .await
-        .unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "audit log upload failed: request timed out"
-        );
-        assert_eq!(start.elapsed(), AUDIT_LOG_UPLOAD_TIMEOUT);
-        assert_privacy_safe(&error);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn audit_resolution_keeps_the_shared_ten_second_dns_bound() {
-        let start = tokio::time::Instant::now();
-        let error = send_audit_upload(
-            "https://secret.example/path?token=secret-query",
-            Vec::new(),
-            Some("bearer-secret"),
-            None,
-            None,
-            None,
-            |_, _| async { std::future::pending().await },
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(start.elapsed(), collector_host_safety::CONNECT_TIMEOUT);
-        assert_eq!(error.to_string(), "audit log upload failed: request failed");
-        assert_privacy_safe(&error);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn upload_snapshot_excludes_unfinished_tail_and_recovers_it_later() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("audit-active.jsonl");
-        let prefix = b"{\"seq\":1}\n";
-        let mut bytes = prefix.to_vec();
-        bytes.extend_from_slice(b"{\"seq\":2,\"value\":\"part");
-        fs::write(&path, &bytes).unwrap();
-        let snapshot = AuditUploadSnapshot::capture(tokio::fs::File::open(&path).await.unwrap())
-            .await
-            .unwrap();
-        assert_eq!(snapshot.body, prefix);
-        assert!(!snapshot.complete);
-        let mut writer = fs::OpenOptions::new().append(true).open(&path).unwrap();
-        writer.write_all(b"ial\"}\n").unwrap();
-        let complete = AuditUploadSnapshot::capture(tokio::fs::File::open(&path).await.unwrap())
-            .await
-            .unwrap();
-        assert!(complete.complete);
-        let rows: Vec<serde_json::Value> = std::str::from_utf8(&complete.body)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[1]["value"], "partial");
-        assert_eq!(
-            snapshot.body, prefix,
-            "later appends cannot mutate the captured request"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn upload_snapshot_keeps_the_opened_file_across_path_replacement() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("audit-active.jsonl");
-        fs::write(&path, b"{\"seq\":1}\n").unwrap();
-        let file = tokio::fs::File::open(&path).await.unwrap();
-        fs::rename(&path, dir.path().join("audit-segment.jsonl")).unwrap();
-        fs::write(&path, b"{\"seq\":2}\n").unwrap();
-        let snapshot = AuditUploadSnapshot::capture(file).await.unwrap();
-        assert_eq!(snapshot.body, b"{\"seq\":1}\n");
-        assert!(snapshot.complete);
-    }
-
     use super::*;
 
     use marmot_account::AccountHome;
 
-    use crate::{AuditLogTrackerConfig, AuditLogUploadSource, MarmotApp};
+    use crate::MarmotApp;
 
     #[test]
     fn audit_engine_id_is_stable_hash_not_raw_account_prefix() {
@@ -1588,15 +902,14 @@ mod tests {
         let home = AccountHome::open(dir.path());
         home.create_account("alice").unwrap();
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-        app.set_audit_log_tracker_config(AuditLogTrackerConfig {
-            source: AuditLogUploadSource {
-                hardware_model: Some("iPhone17,3".to_owned()),
+        let stored = app
+            .set_audit_log_source(AuditLogSource {
+                hardware_model: Some(" iPhone17,3 ".to_owned()),
                 platform: Some("ios".to_owned()),
                 app_version: Some("2026.6.8".to_owned()),
-            },
-            ..Default::default()
-        })
-        .unwrap();
+            })
+            .unwrap();
+        assert_eq!(stored.hardware_model.as_deref(), Some("iPhone17,3"));
 
         let recorder = app.build_audit_recorder("alice", true);
         let path = recorder
@@ -1639,20 +952,17 @@ mod tests {
         assert!(!first_line.contains("alice"));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn size_rotated_audit_segments_keep_configured_source_in_validated_body() {
+    #[test]
+    fn size_rotated_audit_segments_keep_configured_source_in_validated_body() {
         let dir = tempfile::tempdir().unwrap();
         AccountHome::open(dir.path())
             .create_account("alice")
             .unwrap();
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-        app.set_audit_log_tracker_config(AuditLogTrackerConfig {
-            source: AuditLogUploadSource {
-                hardware_model: Some("iPhone17,3".into()),
-                platform: Some("ios".into()),
-                app_version: Some("2026.9.18".into()),
-            },
-            ..Default::default()
+        app.set_audit_log_source(AuditLogSource {
+            hardware_model: Some("iPhone17,3".into()),
+            platform: Some("ios".into()),
+            app_version: Some("2026.9.18".into()),
         })
         .unwrap();
         let recorder = app.build_audit_recorder("alice", true);
@@ -1674,13 +984,9 @@ mod tests {
             for field in ["source_ref", "session_id"] {
                 assert_eq!(source[field], initial[field]);
             }
-            let snapshot =
-                AuditUploadSnapshot::capture(tokio::fs::File::open(&file.path).await.unwrap())
-                    .await
-                    .unwrap();
-            assert!(snapshot.complete);
-            for line in snapshot
-                .body
+            let body = fs::read(&file.path).unwrap();
+            assert!(body.ends_with(b"\n"), "segments hold only complete rows");
+            for line in body
                 .split(|byte| *byte == b'\n')
                 .filter(|line| !line.is_empty())
             {
@@ -1765,75 +1071,14 @@ mod tests {
     }
 
     #[test]
-    fn audit_upload_checkpoint_round_trips_and_is_never_enumerated_as_forensic_data() {
-        let dir = tempfile::tempdir().unwrap();
-        let home = AccountHome::open(dir.path());
-        home.create_account("alice").unwrap();
-        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-        std::fs::write(
-            home.account_dir("alice").join("audit-engine-v3.jsonl"),
-            b"{\"seq\":1}\n",
-        )
-        .unwrap();
-        let file = app.audit_log_files().unwrap().remove(0);
-
-        assert!(
-            app.audit_upload_checkpoint("alice")
-                .acknowledged(&file)
-                .is_none()
-        );
-        let mut checkpoint = AuditUploadCheckpoint::default();
-        checkpoint.acknowledge(&file, file.size_bytes, AuditUploadOutcome::Uploaded);
-        app.store_audit_upload_checkpoint("alice", &checkpoint)
-            .unwrap();
-
+    fn file_timestamp_milliseconds_use_the_unix_epoch_and_truncate_submilliseconds() {
+        use std::time::Duration;
+        assert_eq!(system_time_ms(UNIX_EPOCH), Some(0));
+        assert_eq!(system_time_ms(UNIX_EPOCH - Duration::from_nanos(1)), None);
         assert_eq!(
-            app.audit_upload_checkpoint("alice").acknowledged(&file),
-            Some(AuditUploadOutcome::Uploaded)
+            system_time_ms(UNIX_EPOCH + Duration::from_nanos(1_234_567)),
+            Some(1)
         );
-        // The sidecar must never be uploaded as if it were forensic data.
-        let enumerated = app.audit_log_files().unwrap();
-        assert_eq!(enumerated.len(), 1);
-        assert_eq!(enumerated[0].file_name, "audit-engine-v3.jsonl");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let path = home.account_dir("alice").join(AUDIT_UPLOAD_CHECKPOINT_FILE);
-            assert_eq!(
-                fs::metadata(path).unwrap().permissions().mode() & 0o777,
-                0o600
-            );
-        }
-    }
-
-    #[test]
-    fn audit_upload_checkpoint_acknowledgement_is_scoped_to_unchanged_content() {
-        let file = AuditLogFile {
-            account_ref: "alice".to_owned(),
-            path: "/tmp/audit-engine-v3.jsonl".to_owned(),
-            file_name: "audit-engine-v3.jsonl".to_owned(),
-            size_bytes: 10,
-            modified_at_ms: Some(1_000),
-        };
-        let mut checkpoint = AuditUploadCheckpoint::default();
-        checkpoint.acknowledge(&file, file.size_bytes, AuditUploadOutcome::Uploaded);
-
-        let grown = AuditLogFile {
-            size_bytes: 20,
-            modified_at_ms: Some(1_100),
-            ..file.clone()
-        };
-        assert!(checkpoint.acknowledged(&grown).is_none());
-        // Same length, rewritten content: the mtime change still forces a
-        // re-upload rather than silently skipping unsent forensic data.
-        let replaced = AuditLogFile {
-            modified_at_ms: Some(2_000),
-            ..file.clone()
-        };
-        assert!(checkpoint.acknowledged(&replaced).is_none());
-
-        assert!(checkpoint.retain_present(["audit-other.jsonl"]));
-        assert!(checkpoint.acknowledged(&file).is_none());
     }
 
     #[test]

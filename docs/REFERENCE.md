@@ -387,6 +387,14 @@ prove failure or authorize a second install.
 
 ### Immediate text and persistent pending deliveries
 
+With a configured OpenCode V2 service, Codr submits phone prompts directly to the
+mapped native session. It saves a unique message ID before submission and checks
+the returned durable inbox receipt. Uncertain results are reconciled by that ID
+from the session's saved messages or inbox, including after restart. A failed or
+timed-out API request never falls back to terminal typing or repeats the POST.
+The session's current model and agent remain unchanged. Codex, Claude Code and
+legacy OpenCode without a configured V2 service keep the terminal path below.
+
 Herdr's terminal-write acknowledgement does not prove native acceptance. For
 supported transcript readers, Codr saves a private fingerprint and the native
 input IDs observed before submission. Only complete, matching new native input

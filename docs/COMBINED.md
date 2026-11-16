@@ -1,6 +1,6 @@
-# Combined codr daemon (0.10.0)
+# Combined codr daemon
 
-This build can host the bridge and MDK 0.14 messaging runtime in one process.
+The 0.12.0 development source can host the bridge and MDK 0.17.0 messaging runtime in one process.
 It does not spawn `wn-agent`. MDK keeps ownership of keys, account storage,
 cryptography, relay transport, and invitations. The existing private
 `marmot.agent-control.v2` socket remains available to local setup tools.
@@ -9,7 +9,36 @@ Build with the normal `cargo build --locked` command. The three patched MDK
 crates and their license are in `vendor/mdk`; other MDK crates use the existing
 immutable source pin. The combined binary uses MDK's SQLCipher dependency.
 This does not authorize opening older or incompatible account storage.
-The repository pins Rust 1.97.1, matching the MDK build cohort.
+The repository pins Rust 1.97.1 with `llvm-tools-preview`, matching the MDK build
+cohort. The LLVM tools are required by optimized native Linux Markdown builds.
+
+MDK 0.17's native Markdown parser also requires Odin `dev-2026-10` at
+`84bc3fc2100b0f7880a3af37f71bccdcda41c6f9`. Run
+`bash scripts/install-odin.sh /absolute/path/to/odin`, then put that directory
+on `PATH` before invoking Cargo. The installer verifies upstream archive hashes;
+Intel macOS builds the exact compiler source with Homebrew LLVM 21. CI installs
+the same compiler before host and standalone-connector builds. Platform CI still
+has to verify the target-specific outputs; a local Linux check is not that proof.
+
+## MDK 0.17 storage boundary
+
+The current source declares `storage_cohort = "mdk-0.17"`, replacing the previous
+`mdk-0.14` cohort. Normal whole-binary updates reject that mismatch. Do not bypass
+the gate: migration requires separate owner approval and a private, verified cold
+backup of the complete account home and credentials. MDK 0.17 upgrades account
+databases to schema 207; downgrade is unsupported. Review the upstream
+[0.17 integration guide](https://github.com/marmot-protocol/mdk/blob/v0.17.0/docs/integration/0.17.0.md)
+and its linked earlier guides before planning a 0.14-to-0.17 migration.
+
+That jump also includes 0.16's shared-database schema 3-to-4 migration and v5
+audit-cursor upgrade. Back up the complete home, not only `session.sqlite`.
+New groups can require the account-devices component when every founder supports
+it; clients older than 0.15 cannot later join those groups. Existing groups are
+not automatically opted in. Verify phone interoperability before any live rollout.
+
+The legacy automatic external-to-combined handover remains restricted to 0.14.
+The following 0.9/0.10 procedures describe that historical compatible cohort;
+they do not authorize opening a 0.14 account with the new 0.17 runtime.
 
 ## Chat-only upgrade from 0.9
 

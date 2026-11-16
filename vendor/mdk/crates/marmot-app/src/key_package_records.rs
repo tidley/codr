@@ -18,24 +18,12 @@ use crate::{
 // Names the test module below reaches through `super::*`; the code they test
 // moved to `nostr_directory::published_records`.
 #[cfg(test)]
-#[allow(unused_imports)]
-use crate::error::MissingKeyPackageReason;
-#[cfg(test)]
-#[allow(unused_imports)]
-use crate::{AccountRelayListStatus, DirectoryKeyPackage, UserDirectoryRecord};
-#[cfg(test)]
-#[allow(unused_imports)]
 use cgka_traits::engine::KeyPackage;
 #[cfg(test)]
-#[allow(unused_imports)]
-use transport_nostr::{DirectoryEventQuery, DirectoryRelayEventRecord as RelayEventRecord};
+use transport_nostr::DirectoryRelayEventRecord as RelayEventRecord;
 #[cfg(test)]
-#[allow(unused_imports)]
-use transport_nostr_adapter::{
-    KIND_MARMOT_INBOX_RELAY_LIST, KIND_MARMOT_KEY_PACKAGE, KIND_NIP65_RELAY_LIST,
-};
+use transport_nostr_adapter::{KIND_MARMOT_INBOX_RELAY_LIST, KIND_NIP65_RELAY_LIST};
 #[cfg(test)]
-#[allow(unused_imports)]
 use transport_nostr_peeler::NostrTransportEvent;
 
 // The other-account half moved to `nostr_directory::published_records`. The
@@ -43,10 +31,9 @@ use transport_nostr_peeler::NostrTransportEvent;
 // tests below still cover the rest through `super::*`.
 #[cfg(test)]
 pub(crate) use nostr_directory::{
-    fresh_or_cached_key_package, latest_fresh_key_package_from_records,
-    preferred_fresh_key_package_from_records, relay_list_queries, relay_list_status_from_records,
+    fresh_or_cached_key_package, relay_list_queries, relay_list_status_from_records,
     require_key_package_tag, require_multi_value_key_package_tag_matches,
-    validated_cached_key_package,
+    select_key_packages_from_records, validated_cached_key_package,
 };
 pub(crate) use nostr_directory::{
     key_package_from_hex_with_optional_source, key_package_from_record,
@@ -451,21 +438,31 @@ mod merge_tests {
 
     #[test]
     fn local_and_relay_copy_merge_without_losing_distinct_relay_events() {
-        let records = merge_key_package_records(vec![
+        let input = vec![
             record("", "ref", true, false),
             record("event-b", "ref", false, true),
             record("event-a", "ref", false, true),
-        ]);
-        assert_eq!(records.len(), 2);
-        assert!(records.iter().all(|record| record.local && record.relay));
-        assert_eq!(event_ids(&records), BTreeSet::from(["event-a", "event-b"]));
-        assert_eq!(
-            records
-                .iter()
-                .map(|record| record.key_package_id.as_str())
-                .collect::<BTreeSet<_>>(),
-            BTreeSet::from(["slot-event-a-ref", "slot-event-b-ref"])
-        );
+        ];
+
+        for input in [input.clone(), input.into_iter().rev().collect()] {
+            let records = merge_key_package_records(input);
+            assert_eq!(records.len(), 2);
+            assert!(records.iter().all(|record| record.local && record.relay));
+            assert_eq!(
+                records
+                    .iter()
+                    .map(|record| record.key_package_event_id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["event-a", "event-b"]
+            );
+            assert_eq!(
+                records
+                    .iter()
+                    .map(|record| record.key_package_id.as_str())
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from(["slot-event-a-ref", "slot-event-b-ref"])
+            );
+        }
     }
 
     #[test]
@@ -857,18 +854,6 @@ mod merge_tests {
             assert_eq!(status.inbox.relays, vec!["wss://lower-inbox.example"]);
         }
     }
-
-    #[test]
-    fn merge_is_independent_of_input_order() {
-        let input = vec![
-            record("", "ref", true, false),
-            record("event-b", "ref", false, true),
-            record("event-a", "ref", false, true),
-        ];
-        let expected = merge_key_package_records(input.clone());
-        let actual = merge_key_package_records(input.into_iter().rev().collect());
-        assert_eq!(actual, expected);
-    }
 }
 
 #[cfg(test)]
@@ -939,6 +924,8 @@ mod tests {
             not_after: Timestamp(2),
             replaced_at: Timestamp(1),
             consumed: false,
+            authored_event_id: None,
+            awaiting_confirmed_replacement: false,
         }];
 
         assert_eq!(

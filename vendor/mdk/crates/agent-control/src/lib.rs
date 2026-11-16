@@ -2,6 +2,29 @@
 
 mod diagnostics;
 
+#[cfg(test)]
+mod attachment_wire_tests {
+    use super::*;
+
+    #[test]
+    fn historical_attachment_requests_are_additive_and_slot_scoped() {
+        for operation in ["attachment_get", "download_attachment"] {
+            let value = serde_json::json!({
+                "type": operation,
+                "account_id_hex": "aa".repeat(32),
+                "group_id_hex": "bb".repeat(16),
+                "message_id_hex": "cc".repeat(32),
+                "attachment_index": 3
+            });
+            let request: AgentControlRequest = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(request).unwrap(), value);
+        }
+        let value = serde_json::json!({"type": "release_attachment", "lease": "aa".repeat(16)});
+        let request: AgentControlRequest = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(request).unwrap(), value);
+    }
+}
+
 pub use diagnostics::{
     AgentControlAccountSelection, AgentControlDiagnosticHome, AgentControlDiagnosticKeyPackage,
     AgentControlDiagnosticRelays, AgentControlDiagnosticReplay, AgentControlDiagnosticStatus,
@@ -467,12 +490,14 @@ pub enum AgentControlRequest {
     },
     /// Read creation support before submitting a non-idempotent create.
     GroupCreateCapabilities,
-    /// Create a group with selected invited members as founding admins. This
-    /// distinct operation prevents older connectors silently ignoring admin rights.
+    /// Create with selected invitees as founding admins; older connectors must refuse.
     GroupCreateWithAdmins {
         account_id_hex: String,
         name: String,
+        /// Invited local account or public-key references, as in legacy creation.
         members: Vec<String>,
+        /// Founding admin references; the creator is already an admin.
+        /// Each reference must resolve to an entry in `members` or the creator.
         admins: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         description: Option<String>,
@@ -487,6 +512,25 @@ pub enum AgentControlRequest {
     GroupInfo {
         account_id_hex: String,
         group_id_hex: String,
+    },
+    /// Read a member's membership and admin status in a group, or change it
+    /// through the account runtime's admin checks. With no flags set this is a
+    /// read-only status query.
+    GroupAdmin {
+        account_id_hex: String,
+        group_id_hex: String,
+        member_id_hex: String,
+        /// Grant admin to a current member that is not an admin yet.
+        #[serde(default)]
+        promote: bool,
+        /// Invite the member first when it is not in the group yet. With
+        /// `promote`, the member joins as an initial admin.
+        #[serde(default)]
+        add: bool,
+        /// Remove the member; an admin loses its admin rights in the same
+        /// commit. Takes precedence over `add` and `promote`.
+        #[serde(default)]
+        remove: bool,
     },
     /// Update authenticated group profile fields. Omitted fields keep their
     /// current value; an empty string explicitly clears a field. Only a current
@@ -560,6 +604,9 @@ pub enum AgentControlRequest {
         group_id_hex: String,
         attachments: Vec<AgentControlMediaUpload>,
         caption: Option<String>,
+        /// Original inner message id for the whole attachment batch.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reply_to_message_id_hex: Option<String>,
         /// Optional client-supplied dedup key. Matching retries return the
         /// original durable message ids without re-uploading or re-publishing.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -572,6 +619,25 @@ pub enum AgentControlRequest {
         account_id_hex: String,
         group_id_hex: String,
         media: AgentControlMediaRef,
+    },
+    /// Inspect one current historical source slot without starting acquisition.
+    AttachmentGet {
+        account_id_hex: String,
+        group_id_hex: String,
+        message_id_hex: String,
+        attachment_index: u32,
+    },
+    /// Request native acquisition. Returns status immediately if not retained;
+    /// repeat to obtain a private handoff once ready. Does not reset retries.
+    DownloadAttachment {
+        account_id_hex: String,
+        group_id_hex: String,
+        message_id_hex: String,
+        attachment_index: u32,
+    },
+    /// Release a private plaintext handoff; already released leases are accepted.
+    ReleaseAttachment {
+        lease: String,
     },
 }
 
@@ -607,6 +673,9 @@ pub struct AgentControlMediaRef {
     pub nonce_hex: String,
     pub version: String,
     pub source_epoch: u64,
+    /// Local upload branch identity. Absent on received references.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_epoch_identity: Option<String>,
     pub locators: Vec<AgentControlMediaLocator>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dim: Option<String>,
@@ -718,6 +787,17 @@ pub enum AgentControlResponse {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         subject: Option<String>,
     },
+    /// Readback after a `group_admin` request. `accept_disposition` is absent
+    /// when the request sent no change. When a change was accepted but is
+    /// `accepted_pending` or `completion_unknown`, the readback may not show it
+    /// yet and `message_ids_hex` may be empty; do not send the change again.
+    GroupAdminStatus {
+        is_member: bool,
+        is_admin: bool,
+        message_ids_hex: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        accept_disposition: Option<AgentControlSendAcceptDisposition>,
+    },
     GroupProfileUpdated {
         group_id_hex: String,
         message_ids_hex: Vec<String>,
@@ -767,6 +847,70 @@ pub enum AgentControlResponse {
         file_name: String,
         size_bytes: u64,
     },
+    /// None means the current source or slot is unavailable, not a successful
+    /// download. Reference identity is not proof that anyone downloaded bytes.
+    Attachment {
+        attachment: Option<AgentControlAttachment>,
+    },
+    AttachmentReleased,
+}
+
+/// Bounded authenticated identity and native acquisition status for one slot.
+/// No locators, keys, peer size hints or opaque native asset handles are exported.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentControlAttachment {
+    pub source_message_id_hex: String,
+    pub attachment_index: u32,
+    pub source_epoch: u64,
+    pub plaintext_sha256: String,
+    pub ciphertext_sha256: String,
+    pub state: AgentControlAttachmentState,
+    /// Advisory retained-asset availability; each handoff revalidates it.
+    pub locally_available: bool,
+    pub retry_at: Option<u64>,
+    pub failure_hint: Option<String>,
+    /// Present only after a verified, source-revalidated native copy succeeds.
+    pub handoff: Option<AgentControlAttachmentHandoff>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentControlAttachmentHandoff {
+    pub lease: String,
+    pub path: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentControlAttachmentState {
+    NotRequested,
+    Queued,
+    Downloading,
+    VerifyingCiphertext,
+    Decrypting,
+    VerifyingPlaintext,
+    Ready,
+    RetryScheduled,
+    Failed,
+    Cancelled,
+    Paused,
+    Removed,
+    PolicyBlocked,
+    PreviouslyAcquiredUnavailable,
+    CompletedUnretained,
+    RetryExhausted,
+    StorageBlocked,
+    CleanedBySetting,
+}
+
+/// Whether an accepted group change reached the transport, waits in the
+/// group's durable outbound queue, or has unknown transport completion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentControlSendAcceptDisposition {
+    Published,
+    AcceptedPending,
+    CompletionUnknown,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1312,6 +1456,44 @@ mod tests {
         );
     }
 
+    /// Pin the wire shapes of founding-admin creation and its capability probe.
+    #[test]
+    fn founding_admin_creation_round_trips() {
+        let value = serde_json::json!({
+            "type": "group_create_with_admins", "account_id_hex": "11".repeat(32),
+            "name": "Team", "members": ["22".repeat(32)], "admins": ["22".repeat(32)]
+        });
+        let request: AgentControlRequest = serde_json::from_value(value.clone()).unwrap();
+        let encoded = encode_frame(&AgentControlEnvelope::request(
+            Some("create".into()),
+            request,
+        ))
+        .unwrap();
+        let decoded: Value = serde_json::from_slice(&encoded).unwrap();
+        for key in ["type", "members", "admins"] {
+            assert_eq!(decoded[key], value[key]);
+        }
+        let capabilities: AgentControlRequest =
+            serde_json::from_value(serde_json::json!({"type": "group_create_capabilities"}))
+                .unwrap();
+        assert!(matches!(
+            capabilities,
+            AgentControlRequest::GroupCreateCapabilities
+        ));
+        let response = AgentControlResponse::GroupCreateCapabilities {
+            initial_admins: true,
+        };
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"type": "group_create_capabilities", "initial_admins": true})
+        );
+        assert_eq!(
+            serde_json::from_value::<AgentControlResponse>(value).unwrap(),
+            response
+        );
+    }
+
     #[test]
     fn group_creation_with_admins_round_trips_without_changing_legacy_defaults() {
         let value = serde_json::json!({"type":"group_create_with_admins","account_id_hex":"11".repeat(32),"name":"Team","members":["22".repeat(32)],"admins":["22".repeat(32)]});
@@ -1380,6 +1562,48 @@ mod tests {
                 response
             );
         }
+    }
+
+    #[test]
+    fn group_admin_flags_default_to_a_read_only_status_query() {
+        let legacy = serde_json::json!({
+            "marmot_agent_control": crate::AGENT_CONTROL_PROTOCOL_V2,
+            "type": "group_admin",
+            "account_id_hex": "ab".repeat(32),
+            "group_id_hex": "cd".repeat(16),
+            "member_id_hex": "ef".repeat(32),
+        });
+        let decoded =
+            decode_envelope::<AgentControlRequest>(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert_eq!(
+            decoded.payload,
+            AgentControlRequest::GroupAdmin {
+                account_id_hex: "ab".repeat(32),
+                group_id_hex: "cd".repeat(16),
+                member_id_hex: "ef".repeat(32),
+                promote: false,
+                add: false,
+                remove: false,
+            }
+        );
+
+        let response = AgentControlEnvelope::new(
+            Some("admin-1".into()),
+            AgentControlResponse::GroupAdminStatus {
+                is_member: true,
+                is_admin: false,
+                message_ids_hex: Vec::new(),
+                accept_disposition: Some(crate::AgentControlSendAcceptDisposition::AcceptedPending),
+            },
+        );
+        let encoded = encode_frame(&response).unwrap();
+        let json: Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(json["type"], "group_admin_status");
+        assert_eq!(json["accept_disposition"], "accepted_pending");
+        assert_eq!(
+            decode_envelope::<AgentControlResponse>(&encoded).unwrap(),
+            response
+        );
     }
 
     #[test]
@@ -1681,6 +1905,7 @@ mod tests {
             group_id_hex: "cc".repeat(32),
             attachments: vec![upload()],
             caption: Some("look".to_owned()),
+            reply_to_message_id_hex: None,
             idempotency_key: None,
         };
         let value = serde_json::to_value(&without).unwrap();
@@ -1691,6 +1916,7 @@ mod tests {
             group_id_hex: "cc".repeat(32),
             attachments: vec![upload()],
             caption: Some("look".to_owned()),
+            reply_to_message_id_hex: Some("dd".repeat(32)),
             idempotency_key: Some("media-key-1".to_owned()),
         };
         let value = serde_json::to_value(&with).unwrap();
@@ -2159,6 +2385,17 @@ mod tests {
                 "group_leave",
             ),
             (
+                AgentControlRequest::GroupAdmin {
+                    account_id_hex: account(),
+                    group_id_hex: group(),
+                    member_id_hex: account(),
+                    promote: true,
+                    add: true,
+                    remove: false,
+                },
+                "group_admin",
+            ),
+            (
                 AgentControlRequest::MaintenanceStatus {
                     account_id_hex: account(),
                     group_id_hex: group(),
@@ -2268,6 +2505,7 @@ mod tests {
                         thumbhash: None,
                     }],
                     caption: Some("look".to_owned()),
+                    reply_to_message_id_hex: None,
                     idempotency_key: None,
                 },
                 "send_media",
@@ -2284,6 +2522,7 @@ mod tests {
                         nonce_hex: "0".repeat(24),
                         version: "marmot.encrypted-media.v1".to_owned(),
                         source_epoch: 0,
+                        source_epoch_identity: None,
                         locators: vec![crate::AgentControlMediaLocator {
                             kind: "blossom-v1".to_owned(),
                             value: "https://example.invalid/a".to_owned(),

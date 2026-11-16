@@ -1,7 +1,7 @@
 use zeroize::Zeroizing;
 
 use crate::RuntimePerformanceOperation as RuntimeOp;
-use crate::app_telemetry::runtime::Outcome as TelemetryOutcome;
+use marmot_observability::Outcome as TelemetryOutcome;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{
@@ -19,7 +19,7 @@ use cgka_traits::{GroupId, MemberId, SecretBytes, TransportAdapterError, Transpo
 use futures::stream::{FuturesUnordered, StreamExt};
 use marmot_account::{
     AccountHome, AccountHomeError, AccountSetupKind, AccountSetupPhase, AccountSummary,
-    NostrAccountImport,
+    Nip46Removal, NostrAccountImport,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{
@@ -29,10 +29,8 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{sleep, timeout};
 
 use crate::agent_streams::AgentStreamWatchManager;
-use crate::app_telemetry::{
-    AppPerformanceOperation, AppPerformanceTelemetry, SyncErrorClass, SyncFailureClassification,
-    SyncFailureStage, bounded_advisory_step,
-};
+use crate::client::read_state::read_state_channel;
+use crate::client::sign_out::{SiblingSignOut, SignOutAdminLeave, SignOutLeave};
 use crate::directory_resources::directory_account;
 use crate::ids::{account_id_hex_from_ref, normalize_group_id_hex_app};
 use crate::messages::AppMessageIntent;
@@ -46,24 +44,29 @@ use crate::{
     AgentTextStreamFinishRequest, AppBlobEndpoint, AppCreateGroupOptions, AppDisbandRequest,
     AppError, AppGroupConversationSnapshot, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord,
     AppGroupRoster, AppMessageQuery, AppMessageRecord, AppProjectionUpdate, AppQuarantinedGroup,
-    AuditLogDeleteOutcome, AuditLogFile, AuditLogSettings, AuditLogTrackerConfig,
-    AuditLogTrackerUpdateResult, AuditLogUploadResult, BackgroundNotificationCollection,
-    ChatListRow, ChatNotificationSettings, ChatPinState, ExistingDirectConversation,
-    GroupInviteDeclineResult, GroupPushDebugInfo, KeyPackageDeletionResult,
-    KeyPackageDeletionTarget, MAX_SEEN_EVENT_IDS, MarmotApp, MarmotRelayPlane,
-    MarmotServiceEndpoints, MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest,
-    MediaUploadResult, MessageDraft, MessageDraftAttachment, MessageDraftSummary,
-    NotificationCollectionStatus, NotificationSettings, NotificationUpdate, NotificationWakeSource,
-    PendingWelcomeDelivery, PushPlatform, PushRegistration, PushRegistrationShareOutcome,
-    PushRegistrationSyncResult, ReceivedMessage, RelayTelemetryExportConfig,
-    RelayTelemetryRuntimeConfig, RelayTelemetrySettings, RetentionSweepReport,
-    SecureDeleteExpiredResult, SendSummary, TimelineMessageQuery, TimelineMessageRecord,
-    TimelinePage, UserDirectoryRefresh, UserProfileMetadata, default_profile_pseudonym,
-    unix_now_seconds,
+    AuditLogDeleteOutcome, AuditLogFile, AuditLogRetention, AuditLogSettings, AuditLogSource,
+    AuditLogTrackerUpdateResult, BackgroundNotificationCollection, BackupSettings, ChatListRow,
+    ChatNotificationSettings, ChatPinState, ExistingDirectConversation, GroupInviteDeclineResult,
+    GroupPushDebugInfo, MAX_SEEN_EVENT_IDS, MarmotApp, MarmotRelayPlane, MarmotServiceEndpoints,
+    MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest, MediaUploadResult,
+    MessageDraft, MessageDraftAttachment, MessageDraftSummary, NotificationCollectionStatus,
+    NotificationSettings, NotificationUpdate, NotificationWakeSource, PendingWelcomeDelivery,
+    PushPlatform, PushRegistration, PushRegistrationShareOutcome, PushRegistrationSyncResult,
+    ReceivedMessage, RecoveryWords, RelayTelemetryExportConfig, RelayTelemetryRuntimeConfig,
+    RelayTelemetrySettings, RetentionSweepReport, SecureDeleteExpiredResult, SendSummary,
+    TimelineMessageQuery, TimelineMessageRecord, TimelinePage, UserDirectoryRefresh,
+    UserProfileMetadata, default_profile_pseudonym, unix_now_seconds,
 };
+use marmot_observability::{
+    AppPerformanceOperation, AppPerformanceTelemetry, SyncErrorClass, SyncFailureClassification,
+    SyncFailureStage, bounded_advisory_step,
+};
+use nostr::prelude::PublicKey;
 use nostr_directory::DirectorySyncHandle;
 
 const MEDIA_COMMAND_QUEUE_LIMIT: usize = 8;
+/// Attachment downloads in flight at once across every account of a runtime.
+pub(crate) const ATTACHMENT_TRANSFER_LIMIT: usize = 4;
 
 pub(crate) mod account_worker;
 mod agent_publisher;
@@ -72,14 +75,16 @@ pub use agent_publisher::{
     AgentPublisher, AgentPublisherOptions, AgentPublisherRecord, AgentPublisherRouting,
 };
 mod account_attention;
+mod audit_delivery_status;
 mod audit_otlp_delivery;
 pub use audit_otlp_delivery::AuditOtlpAttemptOutcome;
-pub(crate) use audit_otlp_delivery::send_audit_otlp_once_for_app;
+pub(crate) use audit_otlp_delivery::{AttemptStatus, attempt_audit_otlp_once};
 mod audit_tracker;
 pub use account_attention::{
     AccountAttentionEntry, AccountAttentionSnapshot, AccountAttentionState, AccountAttentionTotal,
     AccountAttentionUnavailable, RuntimeAccountAttentionSubscription,
 };
+mod chat_list_selection;
 mod chat_list_window;
 mod conversation_window;
 mod worker_startup;
@@ -119,17 +124,22 @@ mod commands;
 mod event_routing;
 mod local_submission_queue;
 mod local_submissions;
+mod nip46;
 mod onboarding;
 mod presentation;
 mod presented_chat_list;
 mod reactions;
+mod relay_liveness;
 pub use chat_list_window::{
     CHAT_LIST_WINDOW_INITIAL_ROWS, CHAT_LIST_WINDOW_MAX_ROWS, ChatListAnchorOutcome,
-    ChatListPageDirection, ChatListView, ChatListWindowError, ChatListWindowHandle,
-    ChatListWindowSnapshot, RuntimeChatListWindowSubscription,
+    ChatListCondition, ChatListFilter, ChatListFilterNode, ChatListPageDirection,
+    ChatListQueryError, ChatListView, ChatListViewQuery, ChatListWindowError, ChatListWindowHandle,
+    ChatListWindowSnapshot, MAX_CHAT_LIST_FILTER_DEPTH, MAX_CHAT_LIST_FILTER_GROUP_IDS,
+    MAX_CHAT_LIST_FILTER_NODES, MAX_CHAT_LIST_FILTER_TEXT_BYTES, RuntimeChatListWindowSubscription,
 };
 pub use onboarding::*;
 pub use presented_chat_list::{PresentedChatListUpdate, RuntimePresentedChatListSubscription};
+pub use relay_liveness::RuntimeRelayLivenessSubscription;
 mod subscriptions;
 mod user_blocks;
 pub use user_blocks::RuntimeBlockListSubscription;
@@ -147,7 +157,8 @@ pub use subscriptions::{
 
 // Bring split-out items the orchestration core references back into scope.
 pub(crate) use account_worker::{
-    AccountStartupProgress, AccountWorkerCommand, AccountWorkerRuntime, ManagedAccountWorker,
+    AccountStartupProgress, AccountWorkerCommand, AccountWorkerRuntime, Emit, ManagedAccountWorker,
+    ReadClass, ReadReply, Unpublished, WorkerLane, WorkerUnitGauge,
     publish_app_runtime_group_state_updated, spawn_app_runtime_account_worker,
 };
 pub(crate) use audit_tracker::{
@@ -169,8 +180,8 @@ pub(crate) use agent_stream_watch::{
 };
 #[cfg(test)]
 pub(crate) use subscriptions::{
-    TIMELINE_WINDOW_LIMIT, TimelineQueryFn, TimelineSubscriptionSignal, TimelineWindow,
-    TimelineWindowEdge, apply_projection_to_window, chat_list_row_fingerprint,
+    TIMELINE_WINDOW_LIMIT, TimelineOrder, TimelineQueryFn, TimelineSubscriptionSignal,
+    TimelineWindow, TimelineWindowEdge, apply_projection_to_window, chat_list_row_fingerprint,
     merge_timeline_window_with_order, messages_recovery_query, received_message_update_from_record,
     reconcile_chat_list_snapshot, recovery_row_is_pre_subscription, send_atomic_chat_list_snapshot,
     send_chat_list_remove_update,
@@ -191,6 +202,7 @@ pub struct MarmotAppRuntime {
     events: broadcast::Sender<MarmotAppEvent>,
     shared: RuntimeSharedServices,
     accounts: AccountManager,
+    setup: onboarding::SetupState,
     follow_list_updates: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     initial_directory_sync: Arc<Mutex<Option<JoinHandle<()>>>>,
     #[cfg(test)]
@@ -254,19 +266,13 @@ pub struct AccountManager {
     tearing_down: Arc<StdMutex<HashSet<String>>>,
     worker_transactions: Arc<Mutex<()>>,
     startup_retries: Arc<StdMutex<worker_startup::WorkerStartupRetries>>,
-    generated_setup_local_transaction: Arc<Mutex<()>>,
-    onboarding_transactions: Arc<StdMutex<HashMap<String, std::sync::Weak<Mutex<()>>>>>,
-    onboarding_state: Arc<StdMutex<HashMap<String, std::sync::Weak<StdMutex<()>>>>>,
-    onboarding_updates: Arc<StdMutex<HashMap<String, watch::Sender<OnboardingSnapshot>>>>,
-    onboarding_cancellations: Arc<StdMutex<OnboardingCancellationTasks>>,
-    onboarding_retirements:
-        Arc<StdMutex<HashMap<String, watch::Sender<Option<onboarding::OnboardingAttempt>>>>>,
-    #[cfg(test)]
-    onboarding_test_holds: Arc<OnboardingTestHolds>,
+    /// Account setup's state, held for its three hooks only: reconcile,
+    /// removal and the two shutdown phases.
+    setup: onboarding::SetupState,
     #[cfg(test)]
     reconcile_invocations: Arc<std::sync::atomic::AtomicU64>,
     invite_catch_up_tasks: Arc<StdMutex<InviteCatchUpTasks>>,
-    generated_setup_tasks: Arc<StdMutex<GeneratedSetupTasks>>,
+    nip46_adoption_owner: Arc<()>,
 }
 
 #[derive(Default)]
@@ -319,17 +325,9 @@ struct InviteCatchUpTasks {
     handles: Vec<JoinHandle<()>>,
 }
 
-struct GeneratedSetupTasks {
-    accepting: bool,
-    active_accounts: HashSet<String>,
-    handles: Vec<JoinHandle<()>>,
-}
-
-const GENERATED_SETUP_BACKGROUND_MAX_ATTEMPTS: usize = 3;
 // Existing-account discovery includes two relay-list hops and an advisory
 // profile read, each bounded by connection and fetch budgets (5s + 3s).
 const ACCOUNT_DIRECTORY_PREFLIGHT_WAIT: Duration = Duration::from_secs(26);
-const GENERATED_SETUP_BACKGROUND_RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
 const ACCOUNT_CATCH_UP_TRANSIENT_RETRY_DELAYS: [Duration; 3] = [
     Duration::from_millis(250),
     Duration::from_secs(1),
@@ -343,10 +341,26 @@ pub(crate) struct OrdinaryDeliveryDropTarget {
     pub(crate) event_id: [u8; 32],
 }
 
-#[cfg(test)]
-pub(crate) struct RecoverySelectionWitnessTarget {
-    pub(crate) account_label: String,
-    pub(crate) sink: Arc<StdMutex<Vec<crate::client::TestRecoverySelection>>>,
+/// Result of awaiting one existing or newly admitted due background backup pass.
+/// A finished attempt may have failed and does not prove pointer publication.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackgroundBackupOutcome {
+    /// Current conditions, due state, role or capacity admitted no pass.
+    NotStarted,
+    /// The admitted pass and its serialized settlement attempt finished.
+    FinishedAttempt,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct BackupBackgroundConditions {
+    wifi: bool,
+    charging: bool,
+}
+
+impl BackupBackgroundConditions {
+    fn allowed(self) -> bool {
+        self.wifi && self.charging
+    }
 }
 
 #[derive(Clone)]
@@ -354,13 +368,6 @@ pub struct RuntimeSharedServices {
     /// Every production runtime points at the same process capacity. The
     /// indirection permits explicit isolation of capacity-sensitive fixtures.
     recovery_credits: Arc<StdMutex<Arc<account_worker::recovery_credits::RecoveryCreditPool>>>,
-    #[cfg(test)]
-    pub(crate) comparison_test_trace: Arc<StdMutex<Vec<&'static str>>>,
-    #[cfg(test)]
-    pub(crate) comparison_activity_witness:
-        Arc<StdMutex<Option<(String, crate::client::TestComparisonActivityWitness)>>>,
-    #[cfg(test)]
-    pub(crate) recovery_selection_witness: Arc<StdMutex<Option<RecoverySelectionWitnessTarget>>>,
     /// One exact ordinary SDK delivery may be omitted before worker ingest.
     #[cfg(test)]
     pub(crate) ordinary_drop_once: Arc<StdMutex<Option<OrdinaryDeliveryDropTarget>>>,
@@ -373,22 +380,27 @@ pub struct RuntimeSharedServices {
     // global mutex is never held during storage, engine, or network work.
     local_submission_queue: Arc<StdMutex<local_submission_queue::LocalSubmissionQueue>>,
     attachment_transfer: Arc<tokio::sync::Semaphore>,
-    attachment_updates: watch::Sender<()>,
+    /// The largest attachment transfer limit any account admitted under.
+    attachment_limit_bound: Arc<std::sync::atomic::AtomicU64>,
+    attachment_updates: attachment_controls::AttachmentUpdates,
     attachment_cancellations: watch::Sender<()>,
+    /// Latest platform facts survive an interval with no workers/receivers.
+    backup_background_conditions: watch::Sender<BackupBackgroundConditions>,
     attachment_permissions: attachment_permission::Permissions,
-    product_analytics: crate::ProductAnalytics,
+    /// The recording handle: the app's product collector, shared, and this runtime's own
+    /// performance recorder.
+    observer: marmot_observability::Observer,
     product_worker: Arc<StdMutex<Option<JoinHandle<()>>>>,
     diagnostics_executor: Arc<StdMutex<Option<tokio::runtime::Handle>>>,
     relay_plane: MarmotRelayPlane,
-    app_performance_telemetry: AppPerformanceTelemetry,
     agent_streams: AgentStreamWatchManager,
     lifecycle: RuntimeLifecycle,
     relay_telemetry_exporter: Arc<StdMutex<Option<JoinHandle<()>>>>,
     relay_telemetry_runtime_config: Arc<StdMutex<RelayTelemetryRuntimeConfig>>,
-    audit_log_tracker_config: Arc<StdMutex<AuditLogTrackerConfig>>,
-    audit_otlp_sender: Arc<StdMutex<Option<Arc<crate::audit_otlp_sender::AuditOtlpSender>>>>,
+    audit_otlp_sender: Arc<StdMutex<Option<Arc<marmot_observability::AuditOtlpSender>>>>,
     service_endpoints: MarmotServiceEndpoints,
     audit_log_tracker_uploader: Option<AuditLogTrackerUploader>,
+    audit_retention: Option<crate::audit_log::AuditRetentionWorker>,
     /// Test-only barrier the detached post-create-group catch-up waits on, so
     /// integration tests can observe the caller boundary without depending on
     /// scheduler timing. Consulted only with the `test-policy-overrides`
@@ -474,26 +486,21 @@ impl Default for RuntimeSharedServices {
                 account_worker::recovery_credits::shared_recovery_credit_pool(),
             )),
             #[cfg(test)]
-            comparison_test_trace: Arc::new(StdMutex::new(Vec::new())),
-            #[cfg(test)]
-            comparison_activity_witness: Arc::new(StdMutex::new(None)),
-            #[cfg(test)]
-            recovery_selection_witness: Arc::new(StdMutex::new(None)),
-            #[cfg(test)]
             ordinary_drop_once: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             ordinary_drop_witness: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             ordinary_delivery_dropped: Arc::new(Notify::new()),
-            attachment_transfer: Arc::new(tokio::sync::Semaphore::new(1)),
+            attachment_transfer: Arc::new(tokio::sync::Semaphore::new(ATTACHMENT_TRANSFER_LIMIT)),
+            attachment_limit_bound: Default::default(),
             local_submission_wakeups: watch::channel(()).0,
             local_submission_queue: Arc::new(StdMutex::new(Default::default())),
-            attachment_updates: watch::channel(()).0,
+            attachment_updates: Default::default(),
             attachment_cancellations: watch::channel(()).0,
+            backup_background_conditions: watch::channel(BackupBackgroundConditions::default()).0,
             attachment_permissions: attachment_permission::Permissions::default(),
             relay_plane: MarmotRelayPlane::runtime_default(APP_RUNTIME_RELAY_REBUILD_LOOKBACK),
-            app_performance_telemetry: AppPerformanceTelemetry::default(),
-            product_analytics: crate::ProductAnalytics::default(),
+            observer: marmot_observability::Observer::default(),
             product_worker: Arc::new(StdMutex::new(None)),
             diagnostics_executor: Arc::new(StdMutex::new(None)),
             agent_streams: AgentStreamWatchManager::default(),
@@ -502,10 +509,10 @@ impl Default for RuntimeSharedServices {
             relay_telemetry_runtime_config: Arc::new(StdMutex::new(
                 RelayTelemetryRuntimeConfig::default(),
             )),
-            audit_log_tracker_config: Arc::new(StdMutex::new(AuditLogTrackerConfig::default())),
             audit_otlp_sender: Arc::new(StdMutex::new(None)),
             service_endpoints: MarmotServiceEndpoints::default(),
             audit_log_tracker_uploader: None,
+            audit_retention: None,
             create_group_catch_up_barrier: Arc::new(StdMutex::new(None)),
             #[cfg(any(test, feature = "test-policy-overrides"))]
             next_startup_sync_barrier: Arc::new(StdMutex::new(None)),
@@ -518,6 +525,17 @@ impl Default for RuntimeSharedServices {
 }
 
 impl RuntimeSharedServices {
+    fn report_backup_background_conditions(
+        &self,
+        wifi: bool,
+        charging: bool,
+    ) -> Result<(), AppError> {
+        self.lifecycle.ensure_running()?;
+        self.backup_background_conditions
+            .send_replace(BackupBackgroundConditions { wifi, charging });
+        Ok(())
+    }
+
     fn local_submission_gate(&self, account: &str) -> Arc<Mutex<()>> {
         self.local_submission_queue
             .lock()
@@ -549,51 +567,46 @@ impl RuntimeSharedServices {
     }
 
     fn for_app(app: &MarmotApp) -> Self {
-        app.product_analytics.telemetry_origin(
+        marmot_observability::wiring::telemetry_origin(
+            &app.product_analytics,
             app.service_endpoints()
                 .relay_telemetry_otlp_endpoint
                 .as_deref(),
         );
-        app.product_analytics.silence(
+        marmot_observability::wiring::silence(
+            &app.product_analytics,
             app.config.usage_diagnostics_silent
                 || app.config.cursor_persistence == crate::CursorPersistence::Frozen,
         );
         let lifecycle = RuntimeLifecycle::new();
-        let audit_log_tracker_config = app.audit_log_tracker_config.clone();
         let audit_otlp_sender = Arc::new(StdMutex::new(None));
+        let audit_retention = crate::audit_log::AuditRetentionWorker::new(app.clone());
         let audit_log_tracker_uploader = AuditLogTrackerUploader::new(
             app.clone(),
-            audit_log_tracker_config.clone(),
             audit_otlp_sender.clone(),
             lifecycle.clone(),
+            audit_retention.clone(),
         );
         Self {
             recovery_credits: Arc::new(StdMutex::new(
                 account_worker::recovery_credits::shared_recovery_credit_pool(),
             )),
             #[cfg(test)]
-            comparison_test_trace: Arc::new(StdMutex::new(Vec::new())),
-            #[cfg(test)]
-            comparison_activity_witness: Arc::new(StdMutex::new(None)),
-            #[cfg(test)]
-            recovery_selection_witness: Arc::new(StdMutex::new(None)),
-            #[cfg(test)]
             ordinary_drop_once: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             ordinary_drop_witness: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             ordinary_delivery_dropped: Arc::new(Notify::new()),
-            attachment_transfer: Arc::new(tokio::sync::Semaphore::new(1)),
-            attachment_updates: watch::channel(()).0,
+            attachment_transfer: Arc::new(tokio::sync::Semaphore::new(ATTACHMENT_TRANSFER_LIMIT)),
+            attachment_limit_bound: Default::default(),
+            attachment_updates: Default::default(),
             local_submission_wakeups: watch::channel(()).0,
             local_submission_queue: Arc::new(StdMutex::new(Default::default())),
             attachment_cancellations: watch::channel(()).0,
+            backup_background_conditions: watch::channel(BackupBackgroundConditions::default()).0,
             attachment_permissions: attachment_permission::Permissions::default(),
             relay_plane: app.relay_plane.clone(),
-            app_performance_telemetry: AppPerformanceTelemetry::with_product_analytics(
-                app.product_analytics.clone(),
-            ),
-            product_analytics: app.product_analytics.clone(),
+            observer: marmot_observability::Observer::sharing(&app.product_analytics),
             product_worker: Arc::new(StdMutex::new(None)),
             diagnostics_executor: Arc::new(StdMutex::new(None)),
             agent_streams: AgentStreamWatchManager::default(),
@@ -602,10 +615,10 @@ impl RuntimeSharedServices {
             relay_telemetry_runtime_config: Arc::new(StdMutex::new(
                 RelayTelemetryRuntimeConfig::default(),
             )),
-            audit_log_tracker_config,
             audit_otlp_sender,
             service_endpoints: app.service_endpoints().clone(),
             audit_log_tracker_uploader: Some(audit_log_tracker_uploader),
+            audit_retention: Some(audit_retention),
             create_group_catch_up_barrier: Arc::new(StdMutex::new(None)),
             #[cfg(any(test, feature = "test-policy-overrides"))]
             next_startup_sync_barrier: Arc::new(StdMutex::new(None)),
@@ -621,7 +634,7 @@ impl RuntimeSharedServices {
     }
 
     pub fn app_performance_telemetry(&self) -> AppPerformanceTelemetry {
-        self.app_performance_telemetry.clone()
+        AppPerformanceTelemetry::clone(self.observer.performance())
     }
 
     pub fn agent_streams(&self) -> AgentStreamWatchManager {
@@ -724,7 +737,7 @@ impl RuntimeSharedServices {
         self.stop_relay_telemetry_exporter();
         #[cfg(feature = "otlp-export")]
         {
-            let Some(permit) = self.product_analytics.permit() else {
+            let Some(permit) = self.observer.product().permit() else {
                 return;
             };
             let Some(executor) = self.diagnostics_executor() else {
@@ -734,7 +747,8 @@ impl RuntimeSharedServices {
                 crate::RelayTelemetryExporter::new(&self.relay_plane, config, permit)
             {
                 let shutdown = self.lifecycle.subscribe_shutdown();
-                let app_performance_telemetry = self.app_performance_telemetry.clone();
+                let app_performance_telemetry =
+                    AppPerformanceTelemetry::clone(self.observer.performance());
                 let handle = executor
                     .spawn(exporter.run_with_app_performance(shutdown, app_performance_telemetry));
                 *self
@@ -747,7 +761,7 @@ impl RuntimeSharedServices {
         {
             if config.enabled {
                 tracing::warn!(
-                    target: "marmot_app::relay_telemetry_export",
+                    target: "marmot_app::runtime",
                     method = "configure_relay_telemetry_exporter",
                     "relay telemetry export requested, but marmot-app was built without otlp-export",
                 );
@@ -773,14 +787,7 @@ impl RuntimeSharedServices {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = config;
     }
 
-    fn audit_log_tracker_config(&self) -> AuditLogTrackerConfig {
-        self.audit_log_tracker_config
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
-    }
-
-    fn audit_otlp_sender(&self) -> Option<Arc<crate::audit_otlp_sender::AuditOtlpSender>> {
+    fn audit_otlp_sender(&self) -> Option<Arc<marmot_observability::AuditOtlpSender>> {
         self.audit_otlp_sender
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -809,43 +816,17 @@ impl RuntimeSharedServices {
             );
             return;
         }
-        let config = self.audit_log_tracker_config();
-        if self.audit_otlp_sender().is_some() {
-            if let Some(uploader) = &self.audit_log_tracker_uploader {
-                uploader.schedule(trigger);
-            }
-            return;
+        // Recording activity seals segments whether or not anything uploads.
+        if let Some(retention) = &self.audit_retention {
+            retention.request_budget_check();
         }
-        if config.resolved_endpoint(self.service_endpoints()).is_none() {
+        // Delivery runs only toward a configured v5 OTLP destination.
+        if self.audit_otlp_sender().is_none() {
             tracing::debug!(
                 target: "marmot_app::audit_log",
                 method = "schedule_audit_log_tracker_update",
                 trigger,
-                skipped_reason = "audit_log_tracker_endpoint_missing",
-                "skipped forensic audit log tracker update"
-            );
-            return;
-        }
-        if config
-            .authorization_bearer_token
-            .as_deref()
-            .is_none_or(|token| token.trim().is_empty())
-        {
-            tracing::debug!(
-                target: "marmot_app::audit_log",
-                method = "schedule_audit_log_tracker_update",
-                trigger,
-                skipped_reason = "audit_log_tracker_authorization_token_missing",
-                "skipped forensic audit log tracker update"
-            );
-            return;
-        }
-        if !config.upload_allowed_with_endpoints(self.service_endpoints()) {
-            tracing::debug!(
-                target: "marmot_app::audit_log",
-                method = "schedule_audit_log_tracker_update",
-                trigger,
-                skipped_reason = "audit_log_tracker_not_configured",
+                skipped_reason = "audit_otlp_destination_missing",
                 "skipped forensic audit log tracker update"
             );
             return;
@@ -856,6 +837,9 @@ impl RuntimeSharedServices {
     }
 
     async fn shutdown_audit_log_tracker_uploader(&self) {
+        if let Some(retention) = &self.audit_retention {
+            retention.shutdown().await;
+        }
         if let Some(uploader) = &self.audit_log_tracker_uploader {
             uploader.shutdown().await;
         }
@@ -1033,6 +1017,10 @@ async fn wait_for_runtime_shutdown(stopping: &mut watch::Receiver<bool>) {
     }
 }
 
+/// How often `sign_out_and_wipe` checks whether its `leaving` commit is
+/// confirmed (mdk#2628 D67).
+const SIGN_OUT_LEAVING_POLL: Duration = Duration::from_millis(250);
+
 fn runtime_shutdown_requested(stopping: &watch::Receiver<bool>) -> bool {
     *stopping.borrow()
 }
@@ -1044,6 +1032,11 @@ pub struct ManagedAccount {
     pub external_signing: bool,
     pub signed_out: bool,
     pub running: bool,
+    /// The account's device group removed this device after its link was
+    /// made. The account is signed out here for good: show that this device
+    /// was unlinked from the account, and offer `sign_out_and_wipe`, after
+    /// which signing in again is a new link (mdk#2628 D67).
+    pub unlinked: bool,
 }
 
 /// Structured outcome of [`MarmotAppRuntime::sign_out_and_wipe`].
@@ -1056,17 +1049,37 @@ pub struct ManagedAccount {
 /// [`MarmotAppRuntime::sign_out_and_wipe`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WipeOutcome {
-    /// Number of active MLS groups this account successfully left.
+    /// Active MLS groups whose local leave call succeeded, not confirmed removal,
+    /// except a chat whose leave the sign-out waits for (an admin chat the
+    /// account steps down in, or one this device was already leaving), which
+    /// counts only once this device sees its removal (mdk#2818).
+    /// A chat this device is no longer in, its copy removed or disbanded, is
+    /// neither counted nor reported as a failure.
     pub groups_left: u32,
     /// Per-group leave failures. Best-effort: the wipe does not abort on these.
     pub group_leave_failures: Vec<GroupLeaveFailure>,
-    /// Number of relay-published KeyPackage events successfully deleted.
+    /// `1` when relays accepted the deletion of this device's KeyPackage slot,
+    /// otherwise `0`. Other devices' slots are never deleted.
     pub key_packages_deleted: u32,
-    /// Per-relay KeyPackage deletion failures. Best-effort.
+    /// KeyPackage slot deletion failures. Best-effort.
     pub key_package_failures: Vec<RelayFailure>,
     /// Whether the local cleanup stage (MLS DB, media cache, SQL account row,
     /// secret-store nsec, ephemeral relay/subscription state) completed.
     pub local_cleanup: LocalCleanupReport,
+    /// Chats this device did not leave itself because another of the
+    /// account's devices takes it out of them: it signed out through its
+    /// siblings, and each of these chats takes a same-account removal from a
+    /// sibling that is in it (mdk#2628 D67).
+    #[serde(default)]
+    pub groups_left_to_siblings: u32,
+    /// This device could not ask its siblings to take it out within about
+    /// 30 seconds, or the runtime began shutting down before it could ask.
+    /// It tried to leave every chat itself; one it could not leave is in
+    /// `group_leave_failures`. Tell the user its other devices
+    /// could not be asked: they may still list it until the user removes it
+    /// from one of them.
+    #[serde(default)]
+    pub siblings_not_reached: bool,
 }
 
 /// A failed attempt to leave a single MLS group during the wipe.
@@ -1079,11 +1092,11 @@ pub struct GroupLeaveFailure {
     pub reason: String,
 }
 
-/// A failed relay-side operation (currently KeyPackage deletion) during the
-/// wipe. `event_id_hex` identifies the KeyPackage event the deletion targeted
-/// (empty when the failure happened during discovery, before any specific
-/// event was known) and `reason` is a privacy-safe summary — it MUST NOT
-/// contain relay URLs, pubkeys, payloads, or key material.
+/// A failed relay-side operation (currently KeyPackage deletion) during sign-out
+/// or the wipe. `event_id_hex` identifies the KeyPackage event the deletion
+/// targeted, and is empty when it targeted this device's whole slot. `reason`
+/// is a privacy-safe summary — it MUST NOT contain relay URLs, pubkeys,
+/// payloads, or key material.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelayFailure {
     pub event_id_hex: String,
@@ -1115,10 +1128,10 @@ pub struct LocalCleanupReport {
 /// (mdk#477, parent mdk-android#347).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignOutOptions {
-    /// Publish kind:5 deletions for every relay-published KeyPackage of this
-    /// account so strangers cannot pull a stale KeyPackage and gift-wrap a
-    /// Welcome into a group while the account is signed out. Defaults to
-    /// `true`; the app exposes it as a toggle in the sign-out sheet.
+    /// Ask the relays to delete this device's KeyPackage slot, so inviters stop
+    /// selecting a device that is signed out. Other devices of the account
+    /// keep theirs. Defaults to `true`; the app exposes it as a toggle in the
+    /// sign-out sheet.
     pub delete_key_packages: bool,
 }
 
@@ -1142,12 +1155,12 @@ impl Default for SignOutOptions {
 /// sheet.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignOutOutcome {
-    /// Number of relay-published KeyPackage events successfully deleted. Always
-    /// `0` when `delete_key_packages` was `false`.
+    /// `1` when relays accepted the deletion of this device's KeyPackage slot,
+    /// otherwise `0`. Always `0` when `delete_key_packages` was `false`.
     pub key_packages_deleted: u32,
-    /// Per-relay KeyPackage deletion (or discovery) failures. Best-effort: a
-    /// failure here never blocks local cleanup. No durable remote-deletion
-    /// retry is implied by this outcome.
+    /// KeyPackage slot deletion failures. Best-effort: a failure here never
+    /// blocks local cleanup. No durable remote-deletion retry is implied by
+    /// this outcome.
     pub key_package_failures: Vec<RelayFailure>,
     /// Result of the always-run local teardown (worker shutdown, subscription
     /// deactivation, in-memory cache eviction). Unlike a wipe this never
@@ -1166,7 +1179,29 @@ pub struct SignOutOutcome {
 /// wrap transparent transport/storage/IO errors whose `Display` text can embed
 /// exactly those identifiers, so we never interpolate `err` here — we classify
 /// it into a fixed phrase instead.
-fn wipe_failure_reason(err: &AppError) -> String {
+pub(crate) fn wipe_failure_reason(err: &AppError) -> String {
+    if err.as_oversized_event().is_some() {
+        return "relay publish failed".to_owned();
+    }
+    // An engine failure gets one phrase whichever lower-stack layer carried
+    // it (mdk#2602).
+    if let Some(engine) = err.as_engine_error() {
+        let category = match engine {
+            cgka_traits::EngineError::Storage(_) => "local storage error",
+            cgka_traits::EngineError::UnknownGroup(_) => "unknown local group",
+            // A leave refused because the admin list changed after stage 1
+            // read it (mdk#2818): the last admin cannot step down, and an
+            // account that became an admin cannot send a plain Leave.
+            cgka_traits::EngineError::AdminDepletion { .. } => {
+                crate::client::sign_out::SIGN_OUT_LAST_ADMIN
+            }
+            cgka_traits::EngineError::AdminCannotSelfRemove { .. } => {
+                crate::client::sign_out::SIGN_OUT_ADMIN
+            }
+            _ => "session error",
+        };
+        return category.to_owned();
+    }
     let category = match err {
         AppError::RuntimeStopping => "runtime is shutting down",
         AppError::Transport(transport) => {
@@ -1179,13 +1214,12 @@ fn wipe_failure_reason(err: &AppError) -> String {
             return "transport error".to_owned();
         }
         AppError::TransportClosed => "transport error",
-        AppError::Publish(_) => "relay publish failed",
+        AppError::Publish(_) | AppError::EventTooLarge { .. } => "relay publish failed",
         AppError::Storage(_) | AppError::Sqlite(_) | AppError::SqlcipherKeyDerivation(_) => {
             "local storage error"
         }
         AppError::Io(_) => "filesystem error",
         AppError::Account(_) | AppError::AccountHome(_) => "account error",
-        AppError::Session(_) => "session error",
         AppError::UnknownGroup(_) => "unknown local group",
         AppError::MissingKeyPackage { .. } => "no published key package",
         _ => "operation failed",
@@ -1217,27 +1251,6 @@ fn transport_publish_endpoint_failures_app_reason(
         }
     }
     Some(unique.join("; "))
-}
-
-fn relay_failures_from_key_package_deletion_results(
-    results: Vec<KeyPackageDeletionResult>,
-) -> (u32, Vec<RelayFailure>) {
-    let mut deleted = 0;
-    let mut failures = Vec::new();
-    for result in results {
-        match result.result {
-            Ok(accepted) if accepted > 0 => deleted += 1,
-            Ok(_) => failures.push(RelayFailure {
-                event_id_hex: result.event_id_hex,
-                reason: "relay publish failed".to_owned(),
-            }),
-            Err(error) => failures.push(RelayFailure {
-                event_id_hex: result.event_id_hex,
-                reason: wipe_failure_reason(&error),
-            }),
-        }
-    }
-    (deleted, failures)
 }
 
 #[derive(Default, PartialEq, Eq)]
@@ -1316,6 +1329,27 @@ pub struct AccountSetupResult {
     pub readiness: AccountSetupReadiness,
 }
 
+enum ExternalSetupSigner {
+    Host(Arc<dyn crate::ExternalAccountSigner>),
+    Nip46 {
+        session: crate::Nip46Session,
+        generation: u64,
+    },
+}
+
+enum ExternalSetupOrigin {
+    Created,
+    Promoted,
+    Existing,
+}
+
+struct Nip46Binding {
+    session: crate::Nip46Session,
+    generation: u64,
+    previous: marmot_account::Nip46SessionWrite,
+    previous_signer: Option<Arc<dyn crate::ExternalAccountSigner>>,
+}
+
 /// Host-visible readiness for account setup. Local readiness is sufficient
 /// for local reads and profile rendering but is deliberately not evidence that another
 /// user can fetch this account's KeyPackage yet.
@@ -1326,6 +1360,18 @@ pub enum AccountSetupReadiness {
     Publishing,
     NetworkReady,
     RecoveryRequired,
+}
+
+/// Which generated identity a setup request without an identity or nsec
+/// may use.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum GeneratedIdentity<'a> {
+    /// Select a resumable setup, or create a new identity.
+    ResumeOrCreate,
+    /// Admission selected fresh creation; never scan for resumable setup again.
+    Fresh,
+    /// Continue this account's pending setup only; never another identity.
+    Continue(&'a str),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1496,10 +1542,10 @@ pub enum MarmotAppEvent {
     ProjectionUpdated(RuntimeProjectionUpdate),
     GroupEvent(RuntimeGroupEvent),
     AccountError(RuntimeAccountError),
-    /// A confirmed create/invite could not deliver a welcome to `recipient_hex`;
-    /// the member is in the group but unjoinable until the welcome is
-    /// re-delivered (mdk#352). Emitted so a UI/CLI/UniFFI subscriber learns a
-    /// member needs repair without polling `pending_welcome_deliveries`. The
+    /// A canonical create or confirmed Add still owes a Welcome to `recipient_hex`;
+    /// this does not prove whether the recipient received it (mdk#352).
+    /// Emitted so a UI/CLI/UniFFI subscriber learns delivery remains pending
+    /// without polling `pending_welcome_deliveries`. The
     /// durable record backs a later `redeliver_welcome(message_id_hex)`.
     WelcomeDeliveryPending {
         account_id_hex: String,
@@ -1507,6 +1553,10 @@ pub enum MarmotAppEvent {
         group_id: GroupId,
         message_id_hex: String,
         recipient_hex: String,
+        /// Coarse size refusal on the observed attempt; earlier legacy exposure
+        /// can be unknown. None means Unknown, not non-delivery. This notice
+        /// stays once per process/Welcome; query pending deliveries for later causes.
+        size_class: Option<cgka_traits::EventSizeClass>,
     },
     /// This device has armed `arms` epoch-gap backfills for `group_id` without
     /// catching up: it is still stalled at `stalled_epoch` while the group has
@@ -1547,17 +1597,92 @@ pub enum MarmotAppEvent {
         account_id_hex: String,
         account_label: String,
     },
+    /// The account's recovery status may have changed: which groups and
+    /// whether the inbox are still catching up, or its notices. Re-read
+    /// `account_recovery_status`. Carries no group identities, and fires at
+    /// most once per publication seam. Not raised until the recovery runner
+    /// owns history (mdk#2660).
+    RecoveryStatusChanged {
+        account_id_hex: String,
+        account_label: String,
+    },
+    /// The account's linked devices may have changed: re-read
+    /// `linked_devices`. The device group's own events never reach hosts, so
+    /// this is their only cue. Also fires once each time the account's worker
+    /// opens or reconnects. Carries no device or group identities, and may
+    /// fire with no visible change.
+    LinkedDevicesChanged {
+        account_id_hex: String,
+        account_label: String,
+    },
+    /// Whether this device's KeyPackage refresh is overdue may have changed:
+    /// re-read `key_package_refresh_overdue`. Also fires once each time the
+    /// account's worker opens or reconnects, and may fire with no change.
+    KeyPackageRefreshOverdueChanged {
+        account_id_hex: String,
+        account_label: String,
+    },
+    /// The account's unrecognized sign-ins may have changed: re-read
+    /// `unrecognized_sign_ins`. Fires when a check finds a new sign-in or a
+    /// change in one, after an answer, when the device group's roster
+    /// changes, and once each time the account's worker opens or reconnects.
+    /// Carries no slots, and may fire with no visible change.
+    UnrecognizedSignInsChanged {
+        account_id_hex: String,
+        account_label: String,
+    },
+    /// The account's compromise warning may have changed: re-read
+    /// `compromise_warning`. Fires when something new joins it or leaves it
+    /// unseen, after a dismissal, and once each time the account's worker
+    /// opens or reconnects. Carries no slots, and may fire with no visible
+    /// change.
+    CompromiseWarningChanged {
+        account_id_hex: String,
+        account_label: String,
+    },
+    /// Linking a new device may have changed as this device shows it:
+    /// re-read `device_link_snapshot`. Also fires once each time the
+    /// account's worker opens or reconnects. Live comparison sessions are
+    /// lost then; admitted moves resume from durable progress. Carries no
+    /// device, session or group identities, and may fire with no visible
+    /// change.
+    DeviceLinkChanged {
+        account_id_hex: String,
+        account_label: String,
+    },
+    /// `chat_history_imports` answers differently; re-read it. Fires when a
+    /// held chat's delivery from another of this account's devices arrives,
+    /// is imported, first fails to fetch, or goes; when imported rows go, as
+    /// retention prunes them or the chat is deleted; when a source device is
+    /// renamed or removed; and when a chat whose delivery arrived first is
+    /// joined. Also fires once each time the account's worker opens or
+    /// reconnects, whatever the answer. Carries no chat or device identities.
+    ChatHistoryImportsChanged {
+        account_id_hex: String,
+        account_label: String,
+    },
+    /// The account's device group removed this device after its link was
+    /// made, so the account stopped here and is signed out for good: re-read
+    /// `accounts` and show the device-level notice. Fires once, after the
+    /// runtime has signed out the account whose removal the device found;
+    /// `ManagedAccount::unlinked` then says so (mdk#2628 D62, D67).
+    DeviceUnlinked {
+        account_id_hex: String,
+        account_label: String,
+    },
 }
 
 impl MarmotAppRuntime {
     pub fn new(app: MarmotApp) -> Self {
         let (events, _) = broadcast::channel(1024);
         let shared = RuntimeSharedServices::for_app(&app);
-        let accounts = AccountManager::new(app, events.clone(), shared.clone());
+        let setup = onboarding::SetupState::new();
+        let accounts = AccountManager::new(app, events.clone(), shared.clone(), setup.clone());
         Self {
             events,
             shared,
             accounts,
+            setup,
             follow_list_updates: Arc::new(Mutex::new(HashMap::new())),
             initial_directory_sync: Arc::new(Mutex::new(None)),
             #[cfg(test)]
@@ -1618,31 +1743,11 @@ impl MarmotAppRuntime {
         self.accounts.clone()
     }
 
-    #[cfg(any(test, feature = "test-policy-overrides"))]
-    #[doc(hidden)]
-    pub async fn advance_recovery_clock_for_test(&self, account: &str, elapsed: Duration) {
-        let commands = self.accounts.worker_commands(account).await.unwrap();
-        let (respond, response) = oneshot::channel();
-        commands
-            .send(AccountWorkerCommand::AdvanceRecoveryClock { elapsed, respond })
-            .await
-            .unwrap();
-        response.await.unwrap();
-    }
-
-    #[cfg(any(test, feature = "test-policy-overrides"))]
-    #[doc(hidden)]
-    pub async fn recovery_retry_snapshot_for_test(
-        &self,
-        account: &str,
-    ) -> (storage_sqlite::RecoveryRetryState, Duration, bool) {
-        let commands = self.accounts.worker_commands(account).await.unwrap();
-        let (respond, response) = oneshot::channel();
-        commands
-            .send(AccountWorkerCommand::RecoveryRetrySnapshot { respond })
-            .await
-            .unwrap();
-        response.await.unwrap()
+    /// Account setup: interactive onboarding, its recovery and its sign-in
+    /// notices. Generated setup stays on the runtime (`create_identity` and
+    /// the other setup methods).
+    pub fn account_setup(&self) -> AccountSetup<'_> {
+        AccountSetup::new(&self.setup, &self.accounts)
     }
 
     pub fn shared_services(&self) -> RuntimeSharedServices {
@@ -1652,7 +1757,7 @@ impl MarmotAppRuntime {
     /// Record the fixed app-performance sample for the UniFFI
     /// `groupDetails` DTO builder.
     pub fn record_group_details_read(&self, duration: Duration, success: bool) {
-        self.shared.app_performance_telemetry().record(
+        self.shared.observer.performance().record(
             AppPerformanceOperation::GroupDetailsRead,
             duration,
             success,
@@ -1662,7 +1767,7 @@ impl MarmotAppRuntime {
     /// Record the fixed app-performance sample for the UniFFI combined
     /// conversation snapshot builder.
     pub fn record_group_conversation_snapshot_read(&self, duration: Duration, success: bool) {
-        self.shared.app_performance_telemetry().record(
+        self.shared.observer.performance().record(
             AppPerformanceOperation::GroupConversationSnapshotRead,
             duration,
             success,
@@ -1672,7 +1777,7 @@ impl MarmotAppRuntime {
     /// Record the fixed app-performance sample for the UniFFI single chat-list
     /// row read.
     pub fn record_chat_list_row_read(&self, duration: Duration, success: bool) {
-        self.shared.app_performance_telemetry().record(
+        self.shared.observer.performance().record(
             AppPerformanceOperation::ChatListRowRead,
             duration,
             success,
@@ -1682,7 +1787,7 @@ impl MarmotAppRuntime {
     /// Record the fixed app-performance sample for the UniFFI existing
     /// direct-conversation lookup.
     pub fn record_existing_direct_conversation_read(&self, duration: Duration, success: bool) {
-        self.shared.app_performance_telemetry().record(
+        self.shared.observer.performance().record(
             AppPerformanceOperation::ExistingDirectConversationRead,
             duration,
             success,
@@ -1723,7 +1828,8 @@ impl MarmotAppRuntime {
             self.shared.lifecycle().ensure_running()?;
             let app = self.accounts.app.clone();
             blocking_app_task(move || app.warm_directory_storage()).await?;
-            self.shared.product_analytics.telemetry_origin(
+            marmot_observability::wiring::telemetry_origin(
+                self.shared.observer.product(),
                 self.shared
                     .relay_telemetry_runtime_config()
                     .otlp_endpoint
@@ -1743,13 +1849,14 @@ impl MarmotAppRuntime {
                     self.shared.relay_telemetry_runtime_config(),
                     self.shared.service_endpoints(),
                 );
+            self.restore_nip46_sessions().await?;
             self.resume_generated_account_setup().await?;
             self.reconcile_accounts().await?;
             self.shared.lifecycle().mark_running();
             Ok(config)
         }
         .await;
-        self.shared.app_performance_telemetry().record(
+        self.shared.observer.performance().record(
             AppPerformanceOperation::AppStart,
             started_at.elapsed(),
             result.is_ok(),
@@ -1757,13 +1864,16 @@ impl MarmotAppRuntime {
         let config = result?;
         self.shared.configure_relay_telemetry_exporter(config);
         self.restart_product_worker();
+        if let Some(retention) = &self.shared.audit_retention {
+            retention.start(self.shared.lifecycle());
+        }
         self.schedule_user_directory_subscription_sync().await;
         Ok(())
     }
 
     async fn schedule_user_directory_subscription_sync(&self) {
         let directory_sync = self.ensure_directory_sync_worker().await;
-        let telemetry = self.shared.app_performance_telemetry();
+        let telemetry = self.shared.observer.performance().clone();
         let handle = tokio::spawn(async move {
             let started_at = Instant::now();
             let result = directory_sync.request_rebuild_and_wait().await;
@@ -1801,7 +1911,10 @@ impl MarmotAppRuntime {
     }
 
     pub async fn sign_in_account(&self, account_ref: &str) -> Result<ManagedAccount, AppError> {
-        self.accounts.sign_in_account(account_ref).await
+        let account = self.accounts.sign_in_account(account_ref).await?;
+        // A generated setup its sign-out stopped carries on.
+        self.continue_pending_generated_setup(&account.account_id_hex);
+        Ok(account)
     }
 
     pub async fn catch_up_accounts(&self) -> Result<(), AppError> {
@@ -1834,20 +1947,15 @@ impl MarmotAppRuntime {
     /// projection path as ordinary catch-up. It is intended for user- or
     /// diagnostics-directed repair; normal startup remains cursor-based.
     pub async fn repair_full_history(&self, account_ref: &str) -> Result<(), AppError> {
-        let observation = self.shared.product_analytics.begin(
+        let observed = self.shared.observer.product().observed(
             crate::ProductFamily::Sync,
             "full_history",
             crate::ProductUnit::Action,
         );
-        let result = self.repair_full_history_unobserved(account_ref).await;
-        if let Some(observation) = observation {
-            observation.finish(if result.is_ok() { "success" } else { "failure" });
-        }
-        result
-    }
-
-    async fn repair_full_history_unobserved(&self, account_ref: &str) -> Result<(), AppError> {
-        self.accounts.repair_full_history(account_ref).await
+        let work = async move { self.accounts.repair_full_history(account_ref).await };
+        observed
+            .run_async(work, marmot_observability::success_or_failure)
+            .await
     }
 
     pub async fn collect_notifications_after_wake(
@@ -1855,109 +1963,132 @@ impl MarmotAppRuntime {
         max_wait_ms: u32,
         _source: NotificationWakeSource,
     ) -> BackgroundNotificationCollection {
-        let observation = self.shared.product_analytics.begin(
+        let observed = self.shared.observer.product().observed(
             crate::ProductFamily::Notification,
             "schedule",
             crate::ProductUnit::Attempt,
         );
-        let result = self
-            .collect_notifications_after_wake_unobserved(max_wait_ms, _source)
-            .await;
-        if let Some(observation) = observation {
-            observation.finish(if result.error.is_none() {
-                "success"
-            } else {
-                "failure"
-            });
-        }
-        result
-    }
-
-    async fn collect_notifications_after_wake_unobserved(
-        &self,
-        max_wait_ms: u32,
-        _source: NotificationWakeSource,
-    ) -> BackgroundNotificationCollection {
-        let max_wait = Duration::from_millis(u64::from(max_wait_ms.max(1)));
-        let started = Instant::now();
-        let recovery_watermark = notifications::unix_now_seconds();
-        let mut events = self.events.subscribe();
-        let catch_up = timeout(max_wait, self.catch_up_accounts()).await;
-        let remaining = max_wait.saturating_sub(started.elapsed());
-        match catch_up {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
-                // Catch-up failed, but events already published into this
-                // receiver must still be projected so a partial ingest is not
-                // discarded as an empty failure.
-                let drained = drain_wake_notification_events(&mut events, Duration::ZERO).await;
-                let notifications = project_wake_notification_events(
-                    self.accounts.app.clone(),
-                    drained,
-                    Some(recovery_watermark),
-                )
-                .await
-                .unwrap_or_default();
-                if notifications.is_empty() {
+        let work = async move {
+            let max_wait = Duration::from_millis(u64::from(max_wait_ms.max(1)));
+            let started = Instant::now();
+            let recovery_watermark = notifications::unix_now_seconds();
+            let mut events = self.events.subscribe();
+            let catch_up = timeout(max_wait, self.catch_up_accounts()).await;
+            let remaining = max_wait.saturating_sub(started.elapsed());
+            match catch_up {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    // Catch-up failed, but events already published into this
+                    // receiver must still be projected so a partial ingest is not
+                    // discarded as an empty failure.
+                    let drained = drain_wake_notification_events(&mut events, Duration::ZERO).await;
+                    let notifications = project_wake_notification_events(
+                        self.accounts.app.clone(),
+                        drained,
+                        Some(recovery_watermark),
+                    )
+                    .await
+                    .unwrap_or_default();
+                    if notifications.is_empty() {
+                        return BackgroundNotificationCollection {
+                            status: NotificationCollectionStatus::Failed,
+                            notifications: Vec::new(),
+                            error: Some(err.to_string()),
+                        };
+                    }
                     return BackgroundNotificationCollection {
-                        status: NotificationCollectionStatus::Failed,
-                        notifications: Vec::new(),
-                        error: Some(err.to_string()),
+                        status: NotificationCollectionStatus::NewData,
+                        notifications,
+                        error: None,
                     };
                 }
-                return BackgroundNotificationCollection {
-                    status: NotificationCollectionStatus::NewData,
-                    notifications,
-                    error: None,
-                };
+                Err(_) => {
+                    // Catch-up timed out, but events already published into this
+                    // receiver must still be projected. A background wake often
+                    // exhausts its budget on cold sockets after messages have
+                    // already landed.
+                    let drained = drain_wake_notification_events(&mut events, Duration::ZERO).await;
+                    let notifications = project_wake_notification_events(
+                        self.accounts.app.clone(),
+                        drained,
+                        Some(recovery_watermark),
+                    )
+                    .await
+                    .unwrap_or_default();
+                    let timed_out = notifications.is_empty();
+                    return BackgroundNotificationCollection {
+                        status: if timed_out {
+                            NotificationCollectionStatus::Failed
+                        } else {
+                            NotificationCollectionStatus::NewData
+                        },
+                        notifications,
+                        error: timed_out.then(|| "notification wake collection timed out".into()),
+                    };
+                }
             }
-            Err(_) => {
-                // Catch-up timed out, but events already published into this
-                // receiver must still be projected. A background wake often
-                // exhausts its budget on cold sockets after messages have
-                // already landed.
-                let drained = drain_wake_notification_events(&mut events, Duration::ZERO).await;
-                let notifications = project_wake_notification_events(
-                    self.accounts.app.clone(),
-                    drained,
-                    Some(recovery_watermark),
-                )
-                .await
-                .unwrap_or_default();
-                let timed_out = notifications.is_empty();
-                return BackgroundNotificationCollection {
-                    status: if timed_out {
-                        NotificationCollectionStatus::Failed
-                    } else {
-                        NotificationCollectionStatus::NewData
-                    },
-                    notifications,
-                    error: timed_out.then(|| "notification wake collection timed out".into()),
-                };
-            }
-        }
 
-        let drained = drain_wake_notification_events(&mut events, remaining).await;
-        let notifications = project_wake_notification_events(
-            self.accounts.app.clone(),
-            drained,
-            Some(recovery_watermark),
-        )
-        .await
-        .unwrap_or_default();
-        BackgroundNotificationCollection {
-            status: if notifications.is_empty() {
-                NotificationCollectionStatus::NoData
-            } else {
-                NotificationCollectionStatus::NewData
-            },
-            notifications,
-            error: None,
-        }
+            let drained = drain_wake_notification_events(&mut events, remaining).await;
+            let notifications = project_wake_notification_events(
+                self.accounts.app.clone(),
+                drained,
+                Some(recovery_watermark),
+            )
+            .await
+            .unwrap_or_default();
+            BackgroundNotificationCollection {
+                status: if notifications.is_empty() {
+                    NotificationCollectionStatus::NoData
+                } else {
+                    NotificationCollectionStatus::NewData
+                },
+                notifications,
+                error: None,
+            }
+        };
+        observed
+            .run_async(work, |collection: &BackgroundNotificationCollection| {
+                if collection.error.is_none() {
+                    "success"
+                } else {
+                    "failure"
+                }
+            })
+            .await
     }
 
-    /// Create a locally canonical group. A successful return does not imply
-    /// every invitation Welcome was delivered; subscribe for
+    /// Start or reuse a direct conversation with one peer (hex or `npub`).
+    ///
+    /// Lookup and creation run together on the account worker. New unnamed
+    /// groups include both accounts as admins in the founding state and Welcome.
+    /// Reuse follows [`Self::existing_direct_conversation`], including archived
+    /// and pending-confirmation conversations, and never changes admin roles.
+    /// Legacy groups have no immutable direct-conversation provenance, so even
+    /// a creator-side reuse preserves their authoritative admin policy.
+    ///
+    /// Returns the locally canonical MLS group id, not a delivery acknowledgement.
+    /// Once admitted to the worker, cancellation detaches the caller without
+    /// cancelling creation or retained Welcome delivery. Retry re-reads canonical
+    /// state and repairs a missing projection before creating anything. A matching
+    /// canonical group eligible for reuse that cannot hydrate causes an error, not
+    /// a new group. Same-account starts converge locally. Simultaneous starts by
+    /// different accounts can create separate groups, each with both participants
+    /// as admins.
+    /// See [`Self::pending_welcome_deliveries`] for delivery failures.
+    pub async fn start_direct_conversation(
+        &self,
+        account_ref: &str,
+        peer_account_id: &str,
+    ) -> Result<GroupId, AppError> {
+        self.accounts
+            .start_direct_conversation(account_ref, peer_account_id)
+            .await
+    }
+
+    /// Create a locally canonical group from eligible accounts. A nonempty
+    /// request with no eligible accounts returns no operation; an empty roster
+    /// creates a creator-only group. Member outcomes report selection, not
+    /// Welcome delivery; subscribe for
     /// [`MarmotAppEvent::WelcomeDeliveryPending`] or query
     /// [`Self::pending_welcome_deliveries`] before presenting invite success.
     pub async fn create_group(
@@ -1966,7 +2097,7 @@ impl MarmotAppRuntime {
         name: &str,
         members: &[String],
         description: Option<String>,
-    ) -> Result<GroupId, AppError> {
+    ) -> Result<crate::GroupMemberResult<GroupId>, AppError> {
         self.accounts
             .create_group(account_ref, name, members, description)
             .await
@@ -1982,15 +2113,15 @@ impl MarmotAppRuntime {
             .await
     }
 
-    /// Create a locally canonical group and return the exact durable
-    /// chat-list row available at the response boundary.
+    /// Return member selection and, when created, the exact durable chat-list
+    /// row available at the response boundary.
     pub async fn create_group_detailed(
         &self,
         account_ref: &str,
         name: &str,
         members: &[String],
         description: Option<String>,
-    ) -> Result<crate::CreatedGroup, AppError> {
+    ) -> Result<crate::GroupMemberResult<crate::CreatedGroup>, AppError> {
         self.accounts
             .create_group_detailed(account_ref, name, members, description)
             .await
@@ -2003,7 +2134,7 @@ impl MarmotAppRuntime {
         members: &[String],
         description: Option<String>,
         initial_image: Option<crate::AppInitialGroupImage>,
-    ) -> Result<GroupId, AppError> {
+    ) -> Result<crate::GroupMemberResult<GroupId>, AppError> {
         self.accounts
             .create_group_with_initial_image(account_ref, name, members, description, initial_image)
             .await
@@ -2015,7 +2146,7 @@ impl MarmotAppRuntime {
         name: &str,
         members: &[String],
         options: AppCreateGroupOptions,
-    ) -> Result<GroupId, AppError> {
+    ) -> Result<crate::GroupMemberResult<GroupId>, AppError> {
         self.accounts
             .create_group_with_options(account_ref, name, members, options)
             .await
@@ -2091,7 +2222,7 @@ impl MarmotAppRuntime {
         members: &[String],
         description: Option<String>,
         upload_id: String,
-    ) -> Result<GroupId, AppError> {
+    ) -> Result<crate::GroupMemberResult<GroupId>, AppError> {
         self.accounts
             .create_group_with_prepared_initial_image(
                 account_ref,
@@ -2110,7 +2241,7 @@ impl MarmotAppRuntime {
         members: &[String],
         description: Option<String>,
         initial_image: Option<crate::AppInitialGroupImage>,
-    ) -> Result<crate::CreatedGroup, AppError> {
+    ) -> Result<crate::GroupMemberResult<crate::CreatedGroup>, AppError> {
         self.accounts
             .create_group_with_initial_image_detailed(
                 account_ref,
@@ -2128,7 +2259,7 @@ impl MarmotAppRuntime {
         name: &str,
         members: &[String],
         options: AppCreateGroupOptions,
-    ) -> Result<crate::CreatedGroup, AppError> {
+    ) -> Result<crate::GroupMemberResult<crate::CreatedGroup>, AppError> {
         self.accounts
             .create_group_with_options_detailed(account_ref, name, members, options)
             .await
@@ -2174,6 +2305,10 @@ impl MarmotAppRuntime {
     /// group left, declined, or not yet accepted brings nobody. Archived
     /// groups do contribute: archival is a presentation choice, not a change
     /// in who you know.
+    ///
+    /// The groups' saved rows and their members come from one version of the
+    /// worker's published read state, so a group whose row was saved since
+    /// that version is not counted until the next one.
     pub async fn group_co_members(&self, account_ref: &str) -> Result<Vec<String>, AppError> {
         self.accounts.group_co_members(account_ref).await
     }
@@ -2226,7 +2361,7 @@ impl MarmotAppRuntime {
     ) -> Result<AppGroupRoster, AppError> {
         let started_at = Instant::now();
         let result = self.accounts.group_roster(account_ref, group_id).await;
-        self.shared.app_performance_telemetry().record(
+        self.shared.observer.performance().record(
             AppPerformanceOperation::GroupRosterRead,
             started_at.elapsed(),
             result.is_ok(),
@@ -2251,6 +2386,30 @@ impl MarmotAppRuntime {
     ) -> Result<SendSummary, AppError> {
         self.accounts
             .enable_group_disbanding(account_ref, group_id)
+            .await
+    }
+
+    /// Whether this account can turn on account-devices in `group_id` now.
+    /// Aggregate only: never which members or devices hold it back.
+    pub async fn account_devices_activation(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<crate::AppAccountDevicesActivation, AppError> {
+        self.accounts
+            .account_devices_activation(account_ref, group_id)
+            .await
+    }
+
+    /// Turn on account-devices in `group_id` in one admin Commit. Only call
+    /// this when the user asks.
+    pub async fn enable_account_devices(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<SendSummary, AppError> {
+        self.accounts
+            .enable_account_devices(account_ref, group_id)
             .await
     }
 
@@ -2349,9 +2508,15 @@ impl MarmotAppRuntime {
         account_ref: &str,
         group_id: &GroupId,
         members: &[String],
-    ) -> Result<SendSummary, AppError> {
-        self.invite_members_with_initial_admins(account_ref, group_id, members, &[])
-            .await
+    ) -> Result<crate::GroupMemberResult<SendSummary>, AppError> {
+        self.invite_members_with_initial_admins(
+            account_ref,
+            group_id,
+            members,
+            &[],
+            crate::MemberResolutionPolicy::Partial,
+        )
+        .await
     }
 
     pub async fn invite_members_with_initial_admins(
@@ -2360,9 +2525,16 @@ impl MarmotAppRuntime {
         group_id: &GroupId,
         members: &[String],
         initial_admins: &[String],
-    ) -> Result<SendSummary, AppError> {
+        member_resolution: crate::MemberResolutionPolicy,
+    ) -> Result<crate::GroupMemberResult<SendSummary>, AppError> {
         self.accounts
-            .invite_members_with_initial_admins(account_ref, group_id, members, initial_admins)
+            .invite_members_with_initial_admins(
+                account_ref,
+                group_id,
+                members,
+                initial_admins,
+                member_resolution,
+            )
             .await
     }
 
@@ -2383,6 +2555,18 @@ impl MarmotAppRuntime {
         group_id: &GroupId,
     ) -> Result<SendSummary, AppError> {
         self.accounts.leave_group(account_ref, group_id).await
+    }
+
+    /// Cancel this account's blocked leave on this device (mdk#3014). Only a
+    /// leave the engine finds blocked is cancelled; any other state returns
+    /// `EngineError::LeaveNotBlocked`. The chat reads as joined again. A
+    /// shared Decline written by Leave with device groups on is untouched.
+    pub async fn cancel_leave(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<(), AppError> {
+        self.accounts.cancel_leave(account_ref, group_id).await
     }
 
     pub async fn forget_group_local(
@@ -2432,6 +2616,408 @@ impl MarmotAppRuntime {
         self.accounts.history_notices(account_ref).await
     }
 
+    /// The account's recovery status: the groups whose history is still
+    /// being fetched, whether the inbox's is, and every notice as
+    /// `history_notices` lists them. Refresh on `RecoveryStatusChanged`.
+    /// Until the recovery runner owns history (mdk#2660), nothing is ever
+    /// catching up.
+    pub async fn account_recovery_status(
+        &self,
+        account_ref: &str,
+    ) -> Result<crate::AccountRecoveryStatus, AppError> {
+        self.accounts.account_recovery_status(account_ref).await
+    }
+
+    /// This account's own devices, from the roster of the device group this
+    /// device trusts: this device first, then by when each was linked. Empty
+    /// until this device trusts a device group, and without explicit dev
+    /// capability and runtime intent. Refresh on `LinkedDevicesChanged`.
+    /// An unreadable roster is `DeviceGroupRefused("roster_unavailable")`.
+    pub async fn linked_devices(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<crate::LinkedDevice>, AppError> {
+        self.accounts.linked_devices(account_ref).await
+    }
+
+    /// The held chats whose history from another of this account's devices
+    /// is arriving or has arrived (mdk#2628 4.2d): `Receiving` while a
+    /// delivery waits to be imported, with `retrying` once an attempt to
+    /// get its bundle failed, then `Imported` with the device it came from and when.
+    /// Facts only: an empty history sends nothing, and an expired delivery
+    /// leaves nothing. Empty while device groups are off. Refresh on
+    /// `ChatHistoryImportsChanged`; a device's name follows
+    /// `LinkedDevicesChanged`.
+    pub async fn chat_history_imports(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<crate::ChatHistoryImport>, AppError> {
+        self.accounts.chat_history_imports(account_ref).await
+    }
+
+    /// Whether this device's KeyPackage refresh is overdue because its device
+    /// group can't take the announcement that must come first. While it is,
+    /// the device keeps its old KeyPackage in its slot, and after 30 days
+    /// inviters stop treating it as fresh, so a host warns the user. True
+    /// once its publication is a week old with the refresh still held back;
+    /// a routine refresh never shows.
+    /// Always false until this device trusts a device group, and without
+    /// explicit dev capability and runtime intent. Refresh on
+    /// `KeyPackageRefreshOverdueChanged`.
+    pub async fn key_package_refresh_overdue(&self, account_ref: &str) -> Result<bool, AppError> {
+        self.accounts.key_package_refresh_overdue(account_ref).await
+    }
+
+    /// Sign-ins of this account that this device does not recognize, the
+    /// earliest to appear first (mdk#2628 3.2). Each is a fresh, valid
+    /// KeyPackage in a slot neither this device nor its device group's roster
+    /// knows. One that `before_this_device` was signed in before this device
+    /// was; ask whether the user still has it. Any other is new; ask whether
+    /// it was them. Always empty without explicit dev capability and runtime
+    /// intent. Refresh on `UnrecognizedSignInsChanged`.
+    pub async fn unrecognized_sign_ins(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<crate::UnrecognizedSignIn>, AppError> {
+        self.accounts.unrecognized_sign_ins(account_ref).await
+    }
+
+    /// Answer the unrecognized sign-in in `slot_id_hex`. `NotNow` keeps it
+    /// listed without a prompt; `Reject` records it as not the user's in the
+    /// device group's roster, now or once that is possible; `Dismiss` ends a
+    /// prompt another device already answered. Linking one is device
+    /// pairing's. Refusals are `DeviceGroupRefused` with `sign_in_unknown`,
+    /// `sign_in_answered`, `sign_in_answered_elsewhere`, `sign_in_unanswered`
+    /// (Dismiss before any device answered), or `roster_unsupported`.
+    pub async fn answer_sign_in(
+        &self,
+        account_ref: &str,
+        slot_id_hex: &str,
+        response: crate::SignInResponse,
+    ) -> Result<(), AppError> {
+        self.accounts
+            .answer_sign_in(account_ref, slot_id_hex, response)
+            .await
+    }
+
+    /// Check the account's KeyPackage slots for new sign-ins now, rather than
+    /// at the next scheduled check, and return the list after it. A read that
+    /// reached no relay is `DeviceGroupRefused("key_packages_unreachable")`.
+    pub async fn check_sign_ins(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<crate::UnrecognizedSignIn>, AppError> {
+        self.accounts.check_sign_ins(account_ref).await
+    }
+
+    /// Start this device without the devices its first check found (mdk#2628
+    /// 3.7a, "No, start fresh"): every sign-in from before this device is
+    /// answered Not now, now and when one is listed later. It rejects nothing
+    /// and raises no warning, so one of those devices can still link this
+    /// one. Refusals are `DeviceGroupRefused` with `sign_ins_unchecked`
+    /// (before the first check), `device_group_exists` (this device trusts a
+    /// device group), or `roster_unsupported`.
+    pub async fn start_fresh(&self, account_ref: &str) -> Result<(), AppError> {
+        self.accounts.start_fresh(account_ref).await
+    }
+
+    /// Whether this device started fresh and still has no device group, so
+    /// the host can say that only chats it is invited to from now on are
+    /// here. Always false without explicit dev capability and runtime intent.
+    /// Refresh on `UnrecognizedSignInsChanged`.
+    pub async fn started_fresh(&self, account_ref: &str) -> Result<bool, AppError> {
+        self.accounts.started_fresh(account_ref).await
+    }
+
+    /// The account's open compromise warning on this device (mdk#2628 3.7a):
+    /// each rejection the user has not seen here, the earliest gathered
+    /// first, with its reason and when it was made. Empty when no warning is
+    /// open. A rejection means someone holding the account's signing key, or
+    /// a session with its remote signer, published where the account's
+    /// devices did not; the host writes the wording and never says the
+    /// account's devices stopped them. Rejections already in the first
+    /// roster this device trusts count as seen. Always empty without explicit
+    /// dev capability and runtime intent. Refresh on
+    /// `CompromiseWarningChanged`.
+    pub async fn compromise_warning(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<crate::CompromiseWarningItem>, AppError> {
+        self.accounts.compromise_warning(account_ref).await
+    }
+
+    /// Dismiss the compromise warning on this device: everything it gathers
+    /// now is seen here, and it stays closed until something new arrives.
+    /// Other devices' warnings are unchanged. Refused with
+    /// `DeviceGroupRefused("roster_unsupported")` while device groups are off.
+    pub async fn dismiss_compromise_warning(&self, account_ref: &str) -> Result<(), AppError> {
+        self.accounts.dismiss_compromise_warning(account_ref).await
+    }
+
+    /// Rename one of this account's devices, this one included, by its
+    /// `slot_id_hex` from `linked_devices`: one roster commit in the device
+    /// group. Any device may rename any device. The label is at most 64
+    /// bytes of UTF-8; empty clears it. Refused with
+    /// `DeviceGroupRefused`: `roster_unsupported` (device groups are off),
+    /// `label_too_long`, `no_device_group`, `unknown_device`,
+    /// `roster_unavailable`, or `device_group_busy` while the device group
+    /// has an earlier change in flight (retry later). A rename whose commit
+    /// loses a fork is made again on a later maintenance pass, unless another
+    /// user edit of that device won; refresh on `LinkedDevicesChanged`.
+    pub async fn rename_linked_device(
+        &self,
+        account_ref: &str,
+        slot_id_hex: String,
+        label: String,
+    ) -> Result<(), AppError> {
+        self.accounts
+            .rename_linked_device(account_ref, slot_id_hex, label)
+            .await
+    }
+
+    /// Change the supplied settings of any linked device, this one included.
+    /// None leaves a setting unchanged; values are read on the account worker.
+    /// Add-to-all permits the available linked-device Add flow; disabling it
+    /// leaves joined chats alone. History applies to future sibling Adds and
+    /// transfers still owed, without retroactive backfill. Keep-while-inactive
+    /// prevents automatic inactivity removal, not explicit removal or sign-out.
+    /// Earlier lost user edits recover first; retry `device_group_busy` while
+    /// one remains unsettled. Other refusals match `rename_linked_device`,
+    /// except label validation. Refresh on `LinkedDevicesChanged`.
+    pub async fn update_linked_device_settings(
+        &self,
+        account_ref: &str,
+        slot_id_hex: String,
+        add_to_all_chats: Option<bool>,
+        bring_history: Option<bool>,
+        keep_while_inactive: Option<bool>,
+    ) -> Result<(), AppError> {
+        self.accounts
+            .update_linked_device_settings(
+                account_ref,
+                slot_id_hex,
+                add_to_all_chats,
+                bring_history,
+                keep_while_inactive,
+            )
+            .await
+    }
+
+    /// Remove another of this account's devices, by its `slot_id_hex` from
+    /// `linked_devices`, from the device group and every chat, and delete its
+    /// KeyPackage slot so inviters stop adding it (mdk#2628 item 3.6b). The
+    /// decision is recorded at once and carried out as the device group
+    /// allows, so a busy device group only delays it; `linked_devices` shows
+    /// the device with `removal_pending` until the device group takes it.
+    /// Chats that can't take a same-account removal keep the device's leaf;
+    /// `removed_device_leftover_chats` counts them. Refused with
+    /// `DeviceGroupRefused`: `roster_unsupported` (device groups are off),
+    /// `no_device_group`, `unknown_device`, `this_device` (sign out
+    /// instead), `device_link_pending` while the device's link may still
+    /// fail, or `roster_unavailable`. Refresh on `LinkedDevicesChanged`.
+    pub async fn remove_linked_device(
+        &self,
+        account_ref: &str,
+        slot_id_hex: String,
+    ) -> Result<(), AppError> {
+        self.accounts
+            .remove_linked_device(account_ref, slot_id_hex)
+            .await
+    }
+
+    /// How many chats this device is in still hold a device this account no
+    /// longer has, because the chat doesn't take a same-account removal; a
+    /// chat admin can remove it. The device is one this account removed, or
+    /// one its device group stopped listing, as after a failed link. Zero
+    /// until this device trusts a device group, and without explicit dev
+    /// capability and runtime intent. Read it when showing the
+    /// device list; it is not evented.
+    pub async fn removed_device_leftover_chats(&self, account_ref: &str) -> Result<u32, AppError> {
+        self.accounts
+            .removed_device_leftover_chats(account_ref)
+            .await
+    }
+
+    /// How many chats this device is in can't take any device of this
+    /// account, linked or not: they don't require
+    /// `marmot.group.account-devices.v1`, name no relays a sibling Welcome
+    /// can carry, or already hold this account's limit of 20 leaves (mdk#2628
+    /// item 3.5c). Once a link this device approved is made, the new device
+    /// is added to this device's other chats when its "add to all my chats"
+    /// setting is on, for a week after the link. A chat that can take
+    /// this account's devices but whose requirements the new device's
+    /// KeyPackages don't meet is passed over and not counted, so zero
+    /// does not mean the new device reaches every chat. A chat admin can
+    /// turn the component on; removing a device frees its leaves.
+    /// Zero until this device trusts a device group, and without explicit
+    /// dev capability and runtime intent. Read it when
+    /// showing the device list; it is not evented.
+    pub async fn chats_closed_to_linked_devices(&self, account_ref: &str) -> Result<u32, AppError> {
+        self.accounts
+            .chats_closed_to_linked_devices(account_ref)
+            .await
+    }
+
+    /// Make new recovery words for the account's backups (mdk#2628 item
+    /// 4.4a), in place of any not yet confirmed. Show the 12 words once, then
+    /// ask for the words at `confirm_positions` and pass them to
+    /// `confirm_recovery_words`. MDK keeps the words in memory only, so a
+    /// restart starts over with new ones. Refused with `DeviceGroupRefused`:
+    /// `roster_unsupported` (device groups are off).
+    pub async fn begin_recovery_words(&self, account_ref: &str) -> Result<RecoveryWords, AppError> {
+        self.accounts.begin_recovery_words(account_ref).await
+    }
+
+    /// Confirm the words `begin_recovery_words` made with the words the user
+    /// typed at its confirm positions, in order; case and surrounding spaces
+    /// are ignored. Their key becomes the account's recovery key, in its
+    /// device group's roster, or kept by this device until it has one, and
+    /// the words are forgotten once their commit went out. Refused with
+    /// `DeviceGroupRefused`, keeping the words for another try:
+    /// `roster_unsupported` (device groups are off), `recovery_words_not_started`,
+    /// `recovery_words_mismatch`, `device_group_busy` (retry later) or
+    /// `roster_unavailable`. Any other error keeps them too; trying again
+    /// with them commits nothing if the roster already holds their key.
+    pub async fn confirm_recovery_words(
+        &self,
+        account_ref: &str,
+        answers: Vec<String>,
+    ) -> Result<(), AppError> {
+        self.accounts
+            .confirm_recovery_words(account_ref, answers)
+            .await
+    }
+
+    /// Forget recovery words not yet confirmed, if any.
+    pub async fn cancel_recovery_words(&self, account_ref: &str) -> Result<(), AppError> {
+        self.accounts.cancel_recovery_words(account_ref).await
+    }
+
+    /// Turn the account's backups off (mdk#2628 D75): clear the device
+    /// group roster's account entry, its recovery key and backup writer, or,
+    /// with no device group, forget the key this device keeps. Backups
+    /// already written stay until deleted. Turning them on again takes new
+    /// words through `begin_recovery_words`. Off already is not an error.
+    /// Refused with `DeviceGroupRefused`, changing nothing:
+    /// `roster_unsupported` (device groups are off), `device_group_busy` (retry
+    /// later) or `roster_unavailable`.
+    pub async fn turn_off_backups(&self, account_ref: &str) -> Result<(), AppError> {
+        self.accounts.turn_off_backups(account_ref).await
+    }
+
+    /// Report platform facts once for this runtime, including before workers
+    /// exist. Both facts must be true for new background backup admission.
+    /// Reports survive account-worker replacement; a new runtime starts closed.
+    /// Admitted work settles after false. Manual restore is unaffected.
+    /// This performs no account, worker-start or network work.
+    pub fn set_runtime_backup_background_conditions(
+        &self,
+        wifi: bool,
+        charging: bool,
+    ) -> Result<(), AppError> {
+        self.shared
+            .report_backup_background_conditions(wifi, charging)
+    }
+
+    /// Compatibility wrapper for runtime-wide platform facts. The account
+    /// must be active, signable and fully onboarded; validation precedes the
+    /// report and never starts its worker. Prefer the runtime-wide setter.
+    pub async fn set_backup_background_conditions(
+        &self,
+        account_ref: &str,
+        wifi: bool,
+        charging: bool,
+    ) -> Result<(), AppError> {
+        self.accounts
+            .set_backup_background_conditions(account_ref, wifi, charging)
+            .await
+    }
+
+    /// Join an admitted background backup pass or try existing due admission
+    /// once. This waits outside the account worker through serialized finish
+    /// and credit release. It does not force a backup, wait for future due work,
+    /// or prove publication; cancellation detaches only this caller's wait.
+    /// Worker stop/replacement closes the wait with TransportClosed. Disabled
+    /// device-group builds return NotStarted without acquiring a worker.
+    pub async fn run_due_backup_pass(
+        &self,
+        account_ref: &str,
+    ) -> Result<BackgroundBackupOutcome, AppError> {
+        self.accounts.run_due_backup_pass(account_ref).await
+    }
+
+    /// Begin an ephemeral, history-only restore with user-supplied words.
+    /// Completion is observed through the status/watch APIs; secrets are never
+    /// persisted or resumed after reconnect/close. Backups/settings are unchanged.
+    pub async fn begin_backup_restore(
+        &self,
+        account_ref: &str,
+        words: crate::BackupRestoreWords,
+    ) -> Result<crate::BackupRestoreStatus, AppError> {
+        self.accounts.begin_backup_restore(account_ref, words).await
+    }
+
+    /// Stop this operation, dropping its secrets; committed history stays.
+    pub async fn cancel_backup_restore(
+        &self,
+        account_ref: &str,
+        operation: crate::BackupRestoreId,
+    ) -> Result<bool, AppError> {
+        self.accounts
+            .cancel_backup_restore(account_ref, operation)
+            .await
+    }
+
+    pub async fn backup_restore_status(
+        &self,
+        account_ref: &str,
+    ) -> Result<crate::BackupRestoreStatus, AppError> {
+        self.accounts.backup_restore_status(account_ref).await
+    }
+
+    /// Progress and payload-free availability changes, including actual joins.
+    /// Query availability only for the current chat; metadata never joins one.
+    pub async fn watch_backup_restore(
+        &self,
+        account_ref: &str,
+    ) -> Result<crate::BackupRestoreWatch, AppError> {
+        self.accounts.watch_backup_restore(account_ref).await
+    }
+
+    /// The complete source for an application's content-derived event id,
+    /// not its transport id. A backup source never asserts device authorship.
+    pub async fn history_import_provenance(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        event_id: &str,
+    ) -> Result<Option<crate::HistoryImportProvenance>, AppError> {
+        self.accounts
+            .history_import_provenance(account_ref, group_id, event_id)
+            .await
+    }
+
+    pub async fn backup_history_availability(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<Vec<crate::BackupHistoryAvailability>, AppError> {
+        self.accounts
+            .backup_history_availability(account_ref, group_id)
+            .await
+    }
+
+    /// Where the account's backups stand: whether they are on and whether
+    /// this device writes them, as the device group's roster holds them now
+    /// (with no device group, as this device keeps them). A change a fork
+    /// dropped and the engine could not re-issue shows here as not made; the
+    /// user can make it again. Refused with `DeviceGroupRefused`:
+    /// `roster_unsupported` (device groups are off) or `roster_unavailable`. Read it
+    /// when showing backup settings; it is not evented.
+    pub async fn backup_settings(&self, account_ref: &str) -> Result<BackupSettings, AppError> {
+        self.accounts.backup_settings(account_ref).await
+    }
+
     /// Record that the user accepts the risk of changing a group that is still
     /// catching up, after a group change failed with
     /// [`AppError::GroupCatchingUp`] (mdk#2258). The device may be behind its
@@ -2450,14 +3036,17 @@ impl MarmotAppRuntime {
             .await
     }
 
-    /// Record that the user accepts changing a group whose last change has not
-    /// reached every group relay yet, after a group change failed with
-    /// [`AppError::GroupCommitUndelivered`] (mdk#2255). Members who read only
-    /// the owed relays cannot follow the group, and the new change builds on
-    /// a change they lack. Retry the change afterwards. The acknowledgement
-    /// admits one group change attempt, consumed even if that attempt fails,
-    /// and is not persisted. Returns false, recording nothing, when no relay
-    /// is owed the group's last change.
+    /// Record that the user accepts changing a group whose changes have not
+    /// reached every group relay, after a group change failed with
+    /// [`AppError::GroupCommitUndelivered`] (mdk#2255, mdk#2333). Members who
+    /// read only the owed or refusing relays may not have those changes, and
+    /// the new change builds on them. Retry the change afterwards. Every relay
+    /// refusal in the group is dismissed for good: it no longer warns or gates,
+    /// including across restarts. The acknowledgement also admits one group
+    /// change attempt, consumed even if that attempt fails and not persisted,
+    /// while only the changes owed or refused now gate. Returns false,
+    /// recording nothing, when no relay is owed or has refused a change of
+    /// yours.
     pub async fn acknowledge_group_commit_undelivered(
         &self,
         account_ref: &str,
@@ -2468,14 +3057,17 @@ impl MarmotAppRuntime {
             .await
     }
 
-    /// The group's oldest change that some group relays have not accepted yet,
-    /// or `None` once every relay has accepted or definitively rejected it
-    /// (mdk#2255). MDK keeps retrying the owed relays. Owed relays are reported
-    /// immediately, while group changes fail with
-    /// [`AppError::GroupCommitUndelivered`] only once `since` is two minutes old:
-    /// a healthy relay cut off at the first acknowledgement is retried after 30
-    /// seconds. A local read; no event announces delivery completing, so poll
-    /// while showing it.
+    /// The group's oldest change of yours that a group relay refused, until
+    /// the user acknowledges it, or else the oldest one some group relays have
+    /// not accepted yet; `None` once no relay is owed a change of yours and
+    /// every relay refusal has been acknowledged (mdk#2255, mdk#2333). MDK
+    /// keeps retrying the owed relays; a refusal is final, and members who
+    /// read only that relay may not have the change. Both are reported
+    /// immediately. Group changes fail with
+    /// [`AppError::GroupCommitUndelivered`] at once on a refusal, and on an
+    /// owed relay only once `since` is two minutes old: a healthy relay cut
+    /// off at the first acknowledgement is retried after 30 seconds. A local
+    /// read; no event announces delivery completing, so poll while showing it.
     pub async fn group_commit_delivery(
         &self,
         account_ref: &str,
@@ -2825,8 +3417,43 @@ impl MarmotAppRuntime {
         poll_type: cgka_traits::PollType,
         ends_at: Option<u64>,
     ) -> Result<SendSummary, AppError> {
+        self.create_tagged_poll(
+            account_ref,
+            group_id,
+            question,
+            options,
+            poll_type,
+            ends_at,
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// Create a poll with reply, thread, or effect tags. Caller tags cannot
+    /// contain poll fields or `imeta`; the complete poll is limited to 32 tags.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_tagged_poll(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        question: String,
+        options: Vec<String>,
+        poll_type: cgka_traits::PollType,
+        ends_at: Option<u64>,
+        message_tags: Vec<Vec<String>>,
+    ) -> Result<SendSummary, AppError> {
         self.accounts
-            .create_poll(account_ref, group_id, question, options, poll_type, ends_at)
+            .send_app_event(
+                account_ref,
+                group_id,
+                AppMessageIntent::Poll {
+                    question,
+                    options,
+                    poll_type,
+                    ends_at,
+                    message_tags,
+                },
+            )
             .await
     }
 
@@ -3002,15 +3629,10 @@ impl MarmotAppRuntime {
     }
 
     pub fn usage_diagnostics_status(&self) -> crate::UsageDiagnosticsStatus {
-        let mut status = self.shared.product_analytics.status();
-        status.telemetry = if self.shared.product_analytics.permit().is_none() {
+        let mut status = self.shared.observer.product().status();
+        status.telemetry = if self.shared.observer.product().permit().is_none() {
             crate::DiagnosticsExporterStatus::Disabled
-        } else if self
-            .shared
-            .product_analytics
-            .telemetry_rejected
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
+        } else if marmot_observability::wiring::telemetry_rejected(self.shared.observer.product()) {
             crate::DiagnosticsExporterStatus::ConfigurationRejected
         } else if !cfg!(feature = "otlp-export") {
             crate::DiagnosticsExporterStatus::UnsupportedBuild
@@ -3019,12 +3641,12 @@ impl MarmotAppRuntime {
             .app
             .relay_telemetry_settings()
             .is_ok_and(|settings| {
-                settings
-                    .export_config_with_runtime_and_endpoints(
+                transport_nostr::RelayExportGate::export_allowed(
+                    &settings.export_config_with_runtime_and_endpoints(
                         self.shared.relay_telemetry_runtime_config(),
                         self.shared.service_endpoints(),
-                    )
-                    .export_allowed()
+                    ),
+                )
             })
         {
             crate::DiagnosticsExporterStatus::Ready
@@ -3043,18 +3665,16 @@ impl MarmotAppRuntime {
         if let Some(old) = worker.take() {
             old.abort();
         }
-        if self.shared.lifecycle().is_running() && self.shared.product_analytics.permit().is_some()
+        if self.shared.lifecycle().is_running() && self.shared.observer.product().permit().is_some()
         {
             let Some(executor) = self.shared.diagnostics_executor() else {
                 return;
             };
             *worker = Some(
-                executor.spawn(
-                    self.shared
-                        .product_analytics
-                        .clone()
-                        .run(self.shared.relay_plane().clone()),
-                ),
+                executor.spawn(marmot_observability::wiring::delivery_worker(
+                    self.shared.observer.product(),
+                    self.shared.relay_plane().clone(),
+                )),
             );
         }
     }
@@ -3100,7 +3720,7 @@ impl MarmotAppRuntime {
             .and_then(|v| url::Url::parse(v).ok())
             .map(|v| v.origin().ascii_serialization())
             .unwrap_or_default();
-        self.shared.product_analytics.configure(config, origin)?;
+        marmot_observability::wiring::configure(self.shared.observer.product(), config, origin)?;
         if self.shared.lifecycle().is_running() {
             self.accounts.app.restore_usage_diagnostics()?;
         }
@@ -3116,7 +3736,10 @@ impl MarmotAppRuntime {
         if self.is_stopping() {
             return None;
         }
-        self.shared.product_analytics.begin(family, operation, unit)
+        self.shared
+            .observer
+            .product()
+            .begin(family, operation, unit)
     }
 
     pub fn record_product_event(
@@ -3126,7 +3749,7 @@ impl MarmotAppRuntime {
         if self.is_stopping() {
             return Ok(crate::ProductRecordResult::IgnoredDisabled);
         }
-        Ok(self.shared.product_analytics.record(event)?)
+        Ok(self.shared.observer.product().record(event)?)
     }
 
     /// Record an app-defined timing through the consent-gated product exporter.
@@ -3163,17 +3786,17 @@ impl MarmotAppRuntime {
             return;
         }
         let background = activity == crate::ProductAnalyticsActivity::Background;
-        self.shared.product_analytics.activity(activity);
+        self.shared.observer.product().activity(activity);
         if background {
-            self.shared.product_analytics.flush().await;
+            self.shared.observer.product().flush().await;
         }
     }
     pub async fn flush_product_analytics(&self) {
         if self.is_stopping() {
             return;
         }
-        self.shared.product_analytics.seal_partial();
-        self.shared.product_analytics.flush().await;
+        marmot_observability::wiring::seal_partial(self.shared.observer.product());
+        self.shared.observer.product().flush().await;
     }
 
     pub fn relay_telemetry_settings(&self) -> Result<RelayTelemetrySettings, AppError> {
@@ -3193,7 +3816,8 @@ impl MarmotAppRuntime {
         outcome: crate::HostPerformanceOutcome,
     ) {
         self.shared
-            .app_performance_telemetry()
+            .observer
+            .performance()
             .record_host_performance(operation, duration, outcome);
     }
 
@@ -3205,7 +3829,7 @@ impl MarmotAppRuntime {
     /// group, message, relay, URL, pubkey, payload, or key material — the same
     /// posture as the opt-in OTLP export.
     pub fn app_performance_snapshot(&self) -> crate::AppPerformanceSnapshot {
-        self.shared.app_performance_telemetry().snapshot()
+        self.shared.observer.performance().snapshot()
     }
 
     /// Deprecated consent control: use `set_usage_diagnostics_consent` instead.
@@ -3237,12 +3861,12 @@ impl MarmotAppRuntime {
             resource.service_instance_id =
                 self.accounts.app.telemetry_install_id().unwrap_or_default();
         }
-        let config = config
-            .normalize()
+        let config = marmot_observability::wiring::normalize_runtime_config(config)
             .map_err(AppError::InvalidRelayTelemetrySettings)?;
         self.shared
             .set_relay_telemetry_runtime_config(config.clone());
-        self.shared.product_analytics.telemetry_origin(
+        marmot_observability::wiring::telemetry_origin(
+            self.shared.observer.product(),
             config.otlp_endpoint.as_deref().or(self
                 .shared
                 .service_endpoints
@@ -3252,10 +3876,7 @@ impl MarmotAppRuntime {
         if self.shared.lifecycle().is_running() {
             self.accounts.app.restore_usage_diagnostics()?;
         }
-        self.shared
-            .product_analytics
-            .telemetry_rejected
-            .store(false, std::sync::atomic::Ordering::Release);
+        marmot_observability::wiring::clear_telemetry_rejection(self.shared.observer.product());
         self.refresh_diagnostics_exporters()?;
         Ok(self.shared.relay_telemetry_runtime_config())
     }
@@ -3282,23 +3903,39 @@ impl MarmotAppRuntime {
         Ok(stored)
     }
 
+    pub fn audit_log_retention(&self) -> Result<AuditLogRetention, AppError> {
+        self.accounts.app.audit_log_retention()
+    }
+
+    /// Persist the local audit retention policy, clamped to 1-30 days and a
+    /// minimum per-account budget, and sweep under it soon.
+    pub fn set_audit_log_retention(
+        &self,
+        retention: AuditLogRetention,
+    ) -> Result<AuditLogRetention, AppError> {
+        let stored = self.accounts.app.set_audit_log_retention(retention)?;
+        if let Some(worker) = &self.shared.audit_retention {
+            worker.request_sweep();
+        }
+        Ok(stored)
+    }
+
     pub fn audit_log_files(&self) -> Result<Vec<AuditLogFile>, AppError> {
         self.accounts.app.audit_log_files()
     }
 
-    pub async fn post_audit_log_file(
-        &self,
-        path: &str,
-        endpoint: &str,
-    ) -> Result<AuditLogUploadResult, AppError> {
-        self.accounts.app.post_audit_log_file(path, endpoint).await
+    /// Set the non-persisted source metadata (system hardware model,
+    /// platform, app version) recorded in each audit recorder opened after
+    /// this call, and return the stored, trimmed value. Set it before account
+    /// sessions open; already-running recorders keep the source they opened
+    /// with.
+    pub fn set_audit_log_source(&self, source: AuditLogSource) -> Result<AuditLogSource, AppError> {
+        self.accounts.app.set_audit_log_source(source)
     }
 
-    pub fn set_audit_log_tracker_config(
-        &self,
-        config: AuditLogTrackerConfig,
-    ) -> Result<AuditLogTrackerConfig, AppError> {
-        self.accounts.app.set_audit_log_tracker_config(config)
+    /// The audit source metadata later recorder opens will record.
+    pub fn audit_log_source(&self) -> AuditLogSource {
+        self.accounts.app.audit_log_source()
     }
 
     /// Configure a dedicated v5 OTLP audit destination in memory. Recording
@@ -3307,7 +3944,7 @@ impl MarmotAppRuntime {
     /// acknowledge a prepared range under the previous destination.
     pub fn set_audit_otlp_sender(
         &self,
-        sender: Option<crate::audit_otlp_sender::AuditOtlpSender>,
+        sender: Option<marmot_observability::AuditOtlpSender>,
     ) -> Result<(), AppError> {
         self.shared.lifecycle.ensure_running()?;
         let _mutation = self.accounts.app.audit_export_lifecycle.mutate_all();
@@ -3319,19 +3956,36 @@ impl MarmotAppRuntime {
         Ok(())
     }
 
+    /// Run one manual v5 OTLP delivery pass now. `enabled` reports the audit
+    /// switch; `v5` is `None` when no destination is configured. A manual
+    /// pass also retries accounts whose automatic delivery is paused.
     pub async fn post_audit_log_tracker_update(
         &self,
     ) -> Result<AuditLogTrackerUpdateResult, AppError> {
-        let config = self.shared.audit_log_tracker_config();
         let sender = self.shared.audit_otlp_sender();
-        post_audit_log_tracker_update_for_runtime(
+        let result = post_audit_log_tracker_update_for_runtime(
             &self.accounts.app,
-            config,
             sender.as_deref(),
             &self.shared.audit_otlp_sender,
             &self.shared.lifecycle(),
         )
-        .await
+        .await;
+        // Delivered segments are now evictable under the size budget.
+        if let Some(retention) = &self.shared.audit_retention {
+            retention.request_budget_check();
+        }
+        result
+    }
+
+    /// Per-account v5 audit OTLP delivery status: the last success, the last
+    /// typed failure, whether automatic delivery is paused for the configured
+    /// destination, and the last measured backlog. Reads small local files
+    /// only; it never dials or touches the delivery cursor. A paused account
+    /// resumes when the host changes the destination configuration or calls
+    /// [`Self::post_audit_log_tracker_update`].
+    pub fn audit_delivery_status(&self) -> Result<Vec<crate::AuditDeliveryStatus>, AppError> {
+        let sender = self.shared.audit_otlp_sender();
+        audit_delivery_status::audit_delivery_status_for_app(&self.accounts.app, sender.as_deref())
     }
 
     /// Test-only per-runtime window override; production keeps the 30-second default.
@@ -3365,7 +4019,7 @@ impl MarmotAppRuntime {
         account_ref: &str,
         enabled: bool,
     ) -> Result<NotificationSettings, AppError> {
-        let observation = self.shared.product_analytics.begin(
+        let observed = self.shared.observer.product().observed(
             crate::ProductFamily::Notification,
             if enabled {
                 "local_enable"
@@ -3374,21 +4028,12 @@ impl MarmotAppRuntime {
             },
             crate::ProductUnit::Action,
         );
-        let result = self.set_local_notifications_enabled_unobserved(account_ref, enabled);
-        if let Some(observation) = observation {
-            observation.finish(if result.is_ok() { "success" } else { "failure" });
-        }
-        result
-    }
-
-    fn set_local_notifications_enabled_unobserved(
-        &self,
-        account_ref: &str,
-        enabled: bool,
-    ) -> Result<NotificationSettings, AppError> {
-        self.accounts
-            .app
-            .set_local_notifications_enabled(account_ref, enabled)
+        let work = || -> Result<NotificationSettings, AppError> {
+            self.accounts
+                .app
+                .set_local_notifications_enabled(account_ref, enabled)
+        };
+        observed.run(work, marmot_observability::success_or_failure)
     }
 
     pub fn set_chat_muted(
@@ -3397,41 +4042,31 @@ impl MarmotAppRuntime {
         group_id_hex: &str,
         muted_until_ms: Option<i64>,
     ) -> Result<ChatNotificationSettings, AppError> {
-        let observation = self.shared.product_analytics.begin(
+        let observed = self.shared.observer.product().observed(
             crate::ProductFamily::Notification,
             "mute",
             crate::ProductUnit::Action,
         );
-        let result = self.set_chat_muted_unobserved(account_ref, group_id_hex, muted_until_ms);
-        if let Some(observation) = observation {
-            observation.finish(if result.is_ok() { "success" } else { "failure" });
-        }
-        result
-    }
-
-    fn set_chat_muted_unobserved(
-        &self,
-        account_ref: &str,
-        group_id_hex: &str,
-        muted_until_ms: Option<i64>,
-    ) -> Result<ChatNotificationSettings, AppError> {
-        let account = self.accounts.resolve(account_ref)?;
-        let settings =
-            self.accounts
+        let work = || -> Result<ChatNotificationSettings, AppError> {
+            let account = self.accounts.resolve(account_ref)?;
+            let settings =
+                self.accounts
+                    .app
+                    .set_chat_muted(&account.label, group_id_hex, muted_until_ms)?;
+            let row = self
+                .accounts
                 .app
-                .set_chat_muted(&account.label, group_id_hex, muted_until_ms)?;
-        let row = self
-            .accounts
-            .app
-            .refresh_chat_list_row(&account.label, group_id_hex)?;
-        self.publish_chat_list_projection_update(
-            account.account_id_hex,
-            account.label,
-            group_id_hex.to_owned(),
-            row,
-            ChatListUpdateTrigger::MuteChanged,
-        );
-        Ok(settings)
+                .refresh_chat_list_row(&account.label, group_id_hex)?;
+            self.publish_chat_list_projection_update(
+                account.account_id_hex,
+                account.label,
+                group_id_hex.to_owned(),
+                row,
+                ChatListUpdateTrigger::MuteChanged,
+            );
+            Ok(settings)
+        };
+        observed.run(work, marmot_observability::success_or_failure)
     }
 
     pub fn clear_chat_muted(
@@ -3439,40 +4074,31 @@ impl MarmotAppRuntime {
         account_ref: &str,
         group_id_hex: &str,
     ) -> Result<ChatNotificationSettings, AppError> {
-        let observation = self.shared.product_analytics.begin(
+        let observed = self.shared.observer.product().observed(
             crate::ProductFamily::Notification,
             "unmute",
             crate::ProductUnit::Action,
         );
-        let result = self.clear_chat_muted_unobserved(account_ref, group_id_hex);
-        if let Some(observation) = observation {
-            observation.finish(if result.is_ok() { "success" } else { "failure" });
-        }
-        result
-    }
-
-    fn clear_chat_muted_unobserved(
-        &self,
-        account_ref: &str,
-        group_id_hex: &str,
-    ) -> Result<ChatNotificationSettings, AppError> {
-        let account = self.accounts.resolve(account_ref)?;
-        let settings = self
-            .accounts
-            .app
-            .clear_chat_muted(&account.label, group_id_hex)?;
-        let row = self
-            .accounts
-            .app
-            .refresh_chat_list_row(&account.label, group_id_hex)?;
-        self.publish_chat_list_projection_update(
-            account.account_id_hex,
-            account.label,
-            group_id_hex.to_owned(),
-            row,
-            ChatListUpdateTrigger::MuteChanged,
-        );
-        Ok(settings)
+        let work = || -> Result<ChatNotificationSettings, AppError> {
+            let account = self.accounts.resolve(account_ref)?;
+            let settings = self
+                .accounts
+                .app
+                .clear_chat_muted(&account.label, group_id_hex)?;
+            let row = self
+                .accounts
+                .app
+                .refresh_chat_list_row(&account.label, group_id_hex)?;
+            self.publish_chat_list_projection_update(
+                account.account_id_hex,
+                account.label,
+                group_id_hex.to_owned(),
+                row,
+                ChatListUpdateTrigger::MuteChanged,
+            );
+            Ok(settings)
+        };
+        observed.run(work, marmot_observability::success_or_failure)
     }
 
     pub async fn set_native_push_enabled(
@@ -3480,7 +4106,7 @@ impl MarmotAppRuntime {
         account_ref: &str,
         enabled: bool,
     ) -> Result<NotificationSettings, AppError> {
-        let observation = self.shared.product_analytics.begin(
+        let observed = self.shared.observer.product().observed(
             crate::ProductFamily::Notification,
             if enabled {
                 "native_enable"
@@ -3489,22 +4115,13 @@ impl MarmotAppRuntime {
             },
             crate::ProductUnit::Action,
         );
-        let result = self
-            .set_native_push_enabled_unobserved(account_ref, enabled)
-            .await;
-        if let Some(observation) = observation {
-            observation.finish(if result.is_ok() { "success" } else { "failure" });
-        }
-        result
-    }
-
-    async fn set_native_push_enabled_unobserved(
-        &self,
-        account_ref: &str,
-        enabled: bool,
-    ) -> Result<NotificationSettings, AppError> {
-        self.accounts
-            .set_native_push_enabled(account_ref, enabled)
+        let work = async move {
+            self.accounts
+                .set_native_push_enabled(account_ref, enabled)
+                .await
+        };
+        observed
+            .run_async(work, marmot_observability::success_or_failure)
             .await
     }
 
@@ -3595,6 +4212,44 @@ impl MarmotAppRuntime {
             .await
     }
 
+    pub async fn send_sticker(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        sticker_ref: crate::AppStickerRef,
+    ) -> Result<SendSummary, AppError> {
+        self.send_tagged_sticker(account_ref, group_id, sticker_ref, Vec::new())
+            .await
+    }
+
+    /// Send an authorized sticker with reply, thread, or effect tags.
+    /// Additional `sticker` and `imeta` tags are rejected.
+    pub async fn send_tagged_sticker(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        sticker_ref: crate::AppStickerRef,
+        message_tags: Vec<Vec<String>>,
+    ) -> Result<SendSummary, AppError> {
+        let summary = self
+            .accounts
+            .send_app_event(
+                account_ref,
+                group_id,
+                AppMessageIntent::Sticker {
+                    sticker_ref,
+                    message_tags,
+                },
+            )
+            .await?;
+        let _ = self.publish_chat_list_projection_refresh(
+            account_ref,
+            &hex::encode(group_id.as_slice()),
+            ChatListUpdateTrigger::NewLastMessage,
+        );
+        Ok(summary)
+    }
+
     pub async fn unreact_from_message(
         &self,
         account_ref: &str,
@@ -3664,6 +4319,31 @@ impl MarmotAppRuntime {
                     target_message_id: target_message_id.to_owned(),
                 },
             )
+            .await
+    }
+
+    /// Drop a failed own send from this device, publishing nothing. Use this,
+    /// not [`Self::delete_message`], to remove a message that never left the
+    /// device: a delete would tell the group about a message nobody received.
+    ///
+    /// Only a row that reports `local_publish_failed` qualifies; anything else
+    /// returns [`DiscardFailedSendOutcome::NotFailedSend`] and changes nothing.
+    /// While the group still has a send the engine may publish, the call
+    /// returns [`DiscardFailedSendOutcome::StillSending`], because that send
+    /// could be this one. A discarded send's row, edits and media references
+    /// are securely deleted, and subscribers receive the row's removal with
+    /// reason `Cleared`.
+    ///
+    /// [`DiscardFailedSendOutcome::NotFailedSend`]: crate::DiscardFailedSendOutcome::NotFailedSend
+    /// [`DiscardFailedSendOutcome::StillSending`]: crate::DiscardFailedSendOutcome::StillSending
+    pub async fn discard_failed_send(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        message_id_hex: &str,
+    ) -> Result<crate::DiscardFailedSendResult, AppError> {
+        self.accounts
+            .discard_failed_send(account_ref, group_id, message_id_hex)
             .await
     }
 
@@ -3906,6 +4586,121 @@ impl MarmotAppRuntime {
         self.accounts.publish_key_package(account_ref).await
     }
 
+    /// Linking a new device of this account (mdk#2628 item 3.3b), on the new
+    /// device: ask a device already signed in to link this one. When this
+    /// device already trusts a group, the confirmed link moves only this
+    /// device to the answering group, keeping old trust until Made. Refused unless
+    /// the build has `unreleased-device-pairing` and device groups are on.
+    pub async fn start_device_link(
+        &self,
+        account_ref: &str,
+    ) -> Result<crate::DeviceLinkSnapshot, AppError> {
+        self.device_link(account_ref, crate::DeviceLinkOp::Start)
+            .await
+    }
+
+    /// Explicitly discard this device's quiet trusted device-group copy
+    /// before fresh code pairing. Preserves this account's credentials, slot
+    /// and ordinary chat data. Old link-bound preparation is abandoned;
+    /// shared state/security can resync. No removal or membership repair.
+    /// Refuses active pairing/Move or unsettled native work with
+    /// `device_group_busy`; settlement may take indefinitely. Cancellation
+    /// after reset does not restore the discarded copy. Requires device groups.
+    pub async fn reset_device_group_for_repair(
+        &self,
+        account_ref: &str,
+    ) -> Result<crate::DeviceLinkSnapshot, AppError> {
+        self.device_link(account_ref, crate::DeviceLinkOp::ResetForRepair)
+            .await
+    }
+
+    /// On the new device: the user says both screens show the same emoji.
+    pub async fn confirm_device_link_match(
+        &self,
+        account_ref: &str,
+    ) -> Result<crate::DeviceLinkSnapshot, AppError> {
+        self.device_link(account_ref, crate::DeviceLinkOp::ConfirmMatch)
+            .await
+    }
+
+    /// On the new device: cancel the link.
+    pub async fn cancel_device_link(
+        &self,
+        account_ref: &str,
+    ) -> Result<crate::DeviceLinkSnapshot, AppError> {
+        self.device_link(account_ref, crate::DeviceLinkOp::Cancel)
+            .await
+    }
+
+    /// On a device already signed in: Link device, with the new device's
+    /// label and settings.
+    pub async fn link_device(
+        &self,
+        account_ref: &str,
+        prompt_id: &str,
+        choices: crate::DeviceLinkChoices,
+    ) -> Result<crate::DeviceLinkSnapshot, AppError> {
+        self.device_link(
+            account_ref,
+            crate::DeviceLinkOp::Link {
+                prompt_id: prompt_id.to_owned(),
+                choices,
+            },
+        )
+        .await
+    }
+
+    /// On a device already signed in: Not now.
+    pub async fn decline_device_link(
+        &self,
+        account_ref: &str,
+        prompt_id: &str,
+    ) -> Result<crate::DeviceLinkSnapshot, AppError> {
+        self.device_link(
+            account_ref,
+            crate::DeviceLinkOp::Decline {
+                prompt_id: prompt_id.to_owned(),
+            },
+        )
+        .await
+    }
+
+    /// Dismiss one private old-sibling recognition hint from a made move.
+    /// This changes only local presentation; it never links or rejects a slot.
+    pub async fn dismiss_device_group_move_sibling(
+        &self,
+        account_ref: &str,
+        move_id: &str,
+        slot_id_hex: &str,
+    ) -> Result<crate::DeviceLinkSnapshot, AppError> {
+        self.device_link(
+            account_ref,
+            crate::DeviceLinkOp::DismissMoveSibling {
+                move_id: move_id.to_owned(),
+                slot_id_hex: slot_id_hex.to_owned(),
+            },
+        )
+        .await
+    }
+
+    /// Linking as this device shows it now: its own new-device session and
+    /// the prompts for sign-ins it can link.
+    pub async fn device_link_snapshot(
+        &self,
+        account_ref: &str,
+    ) -> Result<crate::DeviceLinkSnapshot, AppError> {
+        self.device_link(account_ref, crate::DeviceLinkOp::Read)
+            .await
+    }
+
+    async fn device_link(
+        &self,
+        account_ref: &str,
+        op: crate::DeviceLinkOp,
+    ) -> Result<crate::DeviceLinkSnapshot, AppError> {
+        self.accounts.device_link(account_ref, op).await
+    }
+
     pub async fn rotate_key_package(&self, account_ref: &str) -> Result<usize, AppError> {
         self.accounts.rotate_key_package(account_ref).await
     }
@@ -4078,83 +4873,45 @@ impl MarmotAppRuntime {
         event_id_hex: &str,
         relays: Vec<TransportEndpoint>,
     ) -> Result<usize, AppError> {
-        let observation = self.shared.product_analytics.begin(
+        let observed = self.shared.observer.product().observed(
             crate::ProductFamily::KeyPackage,
             "retire",
             crate::ProductUnit::Action,
         );
-        let result = self
-            .delete_key_package_unobserved(account_ref, event_id_hex, relays)
-            .await;
-        if let Some(observation) = observation {
-            observation.finish(if result.is_ok() { "success" } else { "failure" });
-        }
-        result
+        let work = async move {
+            self.accounts
+                .delete_key_package(account_ref, event_id_hex, relays)
+                .await
+        };
+        observed
+            .run_async(work, marmot_observability::success_or_failure)
+            .await
     }
 
-    async fn delete_key_package_unobserved(
+    /// Delete this device's KeyPackage slot, and only it, for a sign-out
+    /// (`foundation/key-packages.md`, "Stopping publication"). Counts it as
+    /// deleted only when a relay accepted the request.
+    async fn withdraw_own_key_package_slot(
         &self,
         account_ref: &str,
-        event_id_hex: &str,
-        relays: Vec<TransportEndpoint>,
-    ) -> Result<usize, AppError> {
-        self.accounts
-            .delete_key_package(account_ref, event_id_hex, relays)
-            .await
-    }
-
-    async fn delete_relay_key_packages(
-        &self,
-        account_label: &str,
-        events: Vec<AccountKeyPackageRelayEvent>,
-    ) -> (u32, Vec<RelayFailure>) {
-        let mut seen = std::collections::HashSet::new();
-        let targets = events
-            .into_iter()
-            .filter(|event| seen.insert(event.key_package_event_id.clone()))
-            .map(|event| KeyPackageDeletionTarget {
-                event_id_hex: event.key_package_event_id,
-                source_relays: event
-                    .source_relays
-                    .into_iter()
-                    .map(TransportEndpoint)
-                    .collect(),
-            })
-            .collect::<Vec<_>>();
-        if targets.is_empty() {
-            return (0, Vec::new());
+        deleted: &mut u32,
+        failures: &mut Vec<RelayFailure>,
+    ) {
+        match self.accounts.withdraw_key_package_slot(account_ref).await {
+            Ok(0) => {}
+            Ok(_) => *deleted += 1,
+            Err(err) => failures.push(RelayFailure {
+                event_id_hex: String::new(),
+                reason: format!(
+                    "key package slot deletion failed: {}",
+                    wipe_failure_reason(&err)
+                ),
+            }),
         }
-        let event_ids = targets
-            .iter()
-            .map(|target| target.event_id_hex.clone())
-            .collect::<Vec<_>>();
-        let results = match self
-            .accounts
-            .app
-            .delete_key_package_events(account_label, targets)
-            .await
-        {
-            Ok(results) => results,
-            Err(error) => {
-                let reason = wipe_failure_reason(&error);
-                return (
-                    0,
-                    event_ids
-                        .into_iter()
-                        .map(|event_id_hex| RelayFailure {
-                            event_id_hex,
-                            reason: reason.clone(),
-                        })
-                        .collect(),
-                );
-            }
-        };
-
-        relay_failures_from_key_package_deletion_results(results)
     }
 
     /// Non-destructive sign-out: deactivate the account on this device and
-    /// (optionally) clean up its relay-published KeyPackages, while keeping all
+    /// (optionally) delete this device's KeyPackage slot, while keeping all
     /// local state so the same identity can be signed back in later.
     ///
     /// This is the reversible counterpart to [`sign_out_and_wipe`]. It
@@ -4171,25 +4928,23 @@ impl MarmotAppRuntime {
     ///    the SQL account record, and the secret-store nsec all stay on disk.
     ///    The account remains a live record in the picker and can be
     ///    re-activated with its groups, message history, and drafts intact.
-    /// 2. **KeyPackage hygiene (when `delete_key_packages`).** Enumerate every
-    ///    relay-published KeyPackage for this account and publish a kind:5
-    ///    deletion to each one's source relays, mirroring the
-    ///    [`delete_key_package`](Self::delete_key_package) path. This stops
-    ///    strangers from pulling a stale KeyPackage and gift-wrapping a Welcome
-    ///    into a new group while the account is signed out.
+    /// 2. **KeyPackage hygiene (when `delete_key_packages`).** Ask the relays
+    ///    to delete this device's KeyPackage slot, and only it
+    ///    (`foundation/key-packages.md`, "Stopping publication"), so inviters
+    ///    stop selecting a device that is signed out. The account's other
+    ///    devices keep their slots. Signing back in republishes.
     ///
     /// # Invariants
     /// - The MLS state DB is never touched — that is the "sign back in and
     ///   resume" contract.
-    /// - KeyPackage cleanup is best-effort and per-relay: a failure is recorded
-    ///   in [`SignOutOutcome::key_package_failures`] and never blocks the local
-    ///   teardown. The runtime does not persist a remote-deletion retry queue.
-    /// - A discovery failure (could not enumerate KeyPackages) is recorded as a
-    ///   single failure with an empty `event_id_hex`, not silently treated as
-    ///   "no KeyPackages".
-    /// - The KeyPackage step runs **before** the worker teardown so it can use
-    ///   the account's live state; neither step depends on a running worker for
-    ///   the publish itself.
+    /// - KeyPackage cleanup is best-effort: a deletion no relay accepted is
+    ///   recorded in [`SignOutOutcome::key_package_failures`], never counted as
+    ///   deleted, and never blocks the local teardown. The runtime does not
+    ///   persist a remote-deletion retry queue.
+    /// - The KeyPackage step runs **before** the worker teardown, inside the
+    ///   account worker, so it is ordered with KeyPackage maintenance and the
+    ///   worker publishes nothing into the slot after it. An account already
+    ///   signed out has no worker; its session opens for the step alone.
     /// - The account ref stays valid after this returns (unlike a wipe).
     /// - Every account that can sign — local or external-signer — can sign
     ///   out. Only tracked-only (npub) accounts are rejected.
@@ -4200,90 +4955,86 @@ impl MarmotAppRuntime {
         account_ref: &str,
         options: SignOutOptions,
     ) -> Result<SignOutOutcome, AppError> {
-        let observation = self.shared.product_analytics.begin(
+        let observed = self.shared.observer.product().observed(
             crate::ProductFamily::Account,
             "logout",
             crate::ProductUnit::Action,
         );
-        let result = self.sign_out_unobserved(account_ref, options).await;
-        if let Some(observation) = observation {
-            observation.finish(if result.is_ok() { "success" } else { "failure" });
-        }
-        result
-    }
+        let work = async move {
+            self.shared.lifecycle().ensure_running()?;
+            let account = self.accounts.resolve(account_ref)?;
+            if !account.can_sign() {
+                // Only a tracked-only (npub) account is rejected: it has no signing
+                // key of any kind, never published a KeyPackage from this device,
+                // and never joined a group, so there is nothing to sign out.
+                // External-signer accounts do all three and sign out like local
+                // ones — the kind:5 publish resolves its signer the same way every
+                // other publish does. Surface the same error the worker path uses.
+                return Err(AccountHomeError::SecretNotFound(account.account_id_hex).into());
+            }
 
-    async fn sign_out_unobserved(
-        &self,
-        account_ref: &str,
-        options: SignOutOptions,
-    ) -> Result<SignOutOutcome, AppError> {
-        self.shared.lifecycle().ensure_running()?;
-        let account = self.accounts.resolve(account_ref)?;
-        if !account.can_sign() {
-            // Only a tracked-only (npub) account is rejected: it has no signing
-            // key of any kind, never published a KeyPackage from this device,
-            // and never joined a group, so there is nothing to sign out.
-            // External-signer accounts do all three and sign out like local
-            // ones — the kind:5 publish resolves its signer the same way every
-            // other publish does. Surface the same error the worker path uses.
-            return Err(AccountHomeError::SecretNotFound(account.account_id_hex).into());
-        }
+            // Stop background setup and finish admitted foreground setup
+            // before withdrawing the KeyPackage slot.
+            let _generated_setup_fence = self
+                .setup
+                .fence_generated_teardown(&self.accounts, &account.account_id_hex)
+                .await;
+            self.accounts.resolve_original(&account)?;
+            let mut outcome = SignOutOutcome::default();
 
-        let mut outcome = SignOutOutcome::default();
+            // Step 1 (KeyPackage hygiene): delete this device's slot before
+            // tearing the worker down; the worker does it, and publishes nothing
+            // after. A failure must not abort the sign-out. This mirrors stage 2
+            // of `sign_out_and_wipe`.
+            if options.delete_key_packages {
+                self.withdraw_own_key_package_slot(
+                    account_ref,
+                    &mut outcome.key_packages_deleted,
+                    &mut outcome.key_package_failures,
+                )
+                .await;
+            }
 
-        // Step 1 (KeyPackage hygiene): delete every relay-published KeyPackage
-        // before tearing the worker down, while the account is still fully
-        // live. Discovery itself is network-bound; a discovery failure is
-        // recorded as a single failure (no event id) and must not abort the
-        // sign-out. This mirrors stage 2 of `sign_out_and_wipe`.
-        if options.delete_key_packages {
-            match self
-                .account_key_package_relay_events(account_ref, Vec::new())
-                .await
-            {
-                Ok(events) => {
-                    let (deleted, failures) =
-                        self.delete_relay_key_packages(&account.label, events).await;
-                    outcome.key_packages_deleted += deleted;
-                    outcome.key_package_failures.extend(failures);
+            // Step 2 (local teardown): shut the worker down (deactivating its
+            // subscriptions) and drop in-memory caches. Crucially this does NOT
+            // remove the account directory, so all on-disk state survives for a
+            // later sign-in. Teardown is treated as completed whenever it runs; the
+            // rare error path records a privacy-safe reason without aborting.
+            match self.accounts.deactivate_account(account_ref).await {
+                Ok(()) => {
+                    outcome.local_cleanup = LocalCleanupReport {
+                        completed: true,
+                        reason: None,
+                    };
                 }
-                Err(err) => outcome.key_package_failures.push(RelayFailure {
-                    event_id_hex: String::new(),
-                    reason: format!(
-                        "key package discovery failed: {}",
-                        wipe_failure_reason(&err)
-                    ),
-                }),
+                Err(err) => {
+                    outcome.local_cleanup = LocalCleanupReport {
+                        completed: false,
+                        reason: Some(wipe_failure_reason(&err)),
+                    };
+                }
             }
-        }
 
-        // Step 2 (local teardown): shut the worker down (deactivating its
-        // subscriptions) and drop in-memory caches. Crucially this does NOT
-        // remove the account directory, so all on-disk state survives for a
-        // later sign-in. Teardown is treated as completed whenever it runs; the
-        // rare error path records a privacy-safe reason without aborting.
-        match self.accounts.deactivate_account(account_ref).await {
-            Ok(()) => {
-                outcome.local_cleanup = LocalCleanupReport {
-                    completed: true,
-                    reason: None,
-                };
-            }
-            Err(err) => {
-                outcome.local_cleanup = LocalCleanupReport {
-                    completed: false,
-                    reason: Some(wipe_failure_reason(&err)),
-                };
-            }
-        }
-
-        Ok(outcome)
+            Ok(outcome)
+        };
+        observed
+            .run_async(work, marmot_observability::success_or_failure)
+            .await
     }
 
     /// Destructive sign-out: fully remove the account's footprint from this
     /// device and from the relays the engine controls publishing to.
     ///
     /// Stages run in the order the spec (mdk#478) mandates:
+    /// 0. Signing out through siblings (mdk#2628 D67), when this device
+    ///    trusts a device group, its link is made and another device that is
+    ///    not leaving is listed: commit its own roster entry as `leaving` and
+    ///    wait about 30 seconds for that commit to be confirmed. Once it is,
+    ///    stage 1 skips each chat a sibling takes this device out of
+    ///    (`groups_left_to_siblings`); if it is not, stage 1 leaves every
+    ///    chat and `siblings_not_reached` is set. From here on a removal
+    ///    from the device group does not unlink this device, and no
+    ///    maintenance pass or pairing drive runs.
     /// 1. Best-effort leave for every active MLS group. Failures are collected
     ///    per group and do not abort the wipe. This MUST happen while MLS state
     ///    still exists — once the session DB is wiped the engine can no longer
@@ -4293,8 +5044,17 @@ impl MarmotAppRuntime {
     ///    pending invite is a real committed membership this device must leave
     ///    (the decline path leaves such groups too). Group-enumeration failures
     ///    are surfaced as a recorded failure rather than silently dropped.
-    /// 2. Best-effort delete of every relay-published KeyPackage event, always
-    ///    (no toggle), mirroring the `delete_key_package` path.
+    ///    In a chat its account administers with another account, where no
+    ///    other of its devices has a leaf, it sends `StepDownAndLeave`: the
+    ///    engine records the leave, steps the account down and then leaves.
+    ///    A chat this device is already leaving gets nothing new and joins
+    ///    them. One more wait of about 30 seconds covers all such chats, and
+    ///    each counts as left only once this device sees the commit that
+    ///    removes it (mdk#2818). It keeps its leaf, and reports why, in any
+    ///    other chat its account is an active admin of.
+    /// 2. Best-effort deletion of this device's KeyPackage slot, always (no
+    ///    toggle): one kind 5 naming only that slot, so the account's other
+    ///    devices keep theirs.
     /// 3. Local cleanup (stages 3-5 of the spec): tear down the managed worker
     ///    and in-memory caches, then remove the account directory. In mdk
     ///    `remove_account` first **atomically renames** the live account
@@ -4319,6 +5079,10 @@ impl MarmotAppRuntime {
     /// - Stages 1 and 2 are network-bound; their per-target failures are
     ///   surfaced for the app's partial-failure sheet and never block local
     ///   cleanup.
+    /// - An unlinked account (`ManagedAccount::unlinked`) skips stages 0, 1
+    ///   and 2: its device group already removed this device.
+    /// - This device never leaves its device group: its account is that
+    ///   group's only admin, so a sibling removes it there.
     /// - Every account that can sign — local or external-signer — can be
     ///   wiped. Only tracked-only (npub) accounts are rejected. An external
     ///   signer that is unavailable at wipe time degrades stages 1 and 2 to
@@ -4339,80 +5103,129 @@ impl MarmotAppRuntime {
             return Err(AccountHomeError::SecretNotFound(account.account_id_hex).into());
         }
 
+        // Finish foreground setup as well as fencing background attempts
+        // before stage 2 withdraws the slot (whitenoise-ios#1302).
+        let generated_setup_fence = self
+            .setup
+            .fence_generated_teardown(&self.accounts, &account.account_id_hex)
+            .await;
+        let account = self.accounts.resolve_original(&account)?;
         let mut outcome = WipeOutcome::default();
 
-        // Stage 1: best-effort leave for every active MLS group. We read the
-        // group set directly from the in-memory account state (no relay round
-        // trip). We attempt the leave for *every* group with local MLS
-        // membership, including ones still marked `pending_confirmation`: in
-        // mdk an incoming Welcome auto-joins MLS state while the app
-        // keeps the invite pending until the user accepts, so a
-        // pending-confirmation group is already a committed MLS member this
-        // device can — and must — leave before its state is wiped (mirroring
-        // `decline_group_invite`, which leaves the group before archiving). If
-        // we skipped them, signing out before accepting an invite would wipe
-        // the local MLS state without ever publishing a leave, and the engine
-        // could never sign one afterwards. A failure to enumerate groups is a
-        // recorded failure, not a silent "no groups" — it must not let the wipe
-        // skip remote leaves without surfacing why.
-        let groups = match self.accounts.app.groups(&account.label) {
-            Ok(groups) => groups,
-            Err(err) => {
-                outcome.group_leave_failures.push(GroupLeaveFailure {
-                    group_id_hex: String::new(),
-                    reason: format!("group discovery failed: {}", wipe_failure_reason(&err)),
-                });
-                Vec::new()
-            }
-        };
-        for group in groups {
-            let group_id_hex = group.group_id_hex.clone();
-            let group_id = match hex::decode(&group_id_hex) {
-                Ok(bytes) => GroupId::new(bytes),
-                Err(_) => {
+        // From here until the wipe returns, the device group's removal of
+        // this device does not unlink it: the sign-out finishes what it has
+        // left. The mark drops with this future, finished or cancelled.
+        let _signing_out = (!account.unlinked)
+            .then(|| self.accounts.app.begin_signing_out(&account.account_id_hex));
+
+        // An unlinked device skips stages 0 to 2. Its device group removed
+        // it: its siblings took its leaves out of the chats that allow it and
+        // deleted its slot, and the account stays in every chat through them,
+        // so a leave here would speak for an account that is not leaving
+        // (mdk#2628 D67).
+        if !account.unlinked {
+            // Stage 0: ask the siblings to take this device out of the chats
+            // they can, and of its device group.
+            let left_to_siblings = self
+                .sign_out_through_siblings(account_ref, &mut outcome)
+                .await;
+
+            // Stage 1: best-effort leave for every active MLS group. We read the
+            // group set directly from the in-memory account state (no relay round
+            // trip). We attempt the leave for *every* group with local MLS
+            // membership, including ones still marked `pending_confirmation`: in
+            // mdk an incoming Welcome auto-joins MLS state while the app
+            // keeps the invite pending until the user accepts, so a
+            // pending-confirmation group is already a committed MLS member this
+            // device can — and must — leave before its state is wiped (mirroring
+            // `decline_group_invite`, which leaves the group before archiving). If
+            // we skipped them, signing out before accepting an invite would wipe
+            // the local MLS state without ever publishing a leave, and the engine
+            // could never sign one afterwards. A failure to enumerate groups is a
+            // recorded failure, not a silent "no groups" — it must not let the wipe
+            // skip remote leaves without surfacing why.
+            let groups = match self.accounts.app.groups(&account.label) {
+                Ok(groups) => groups,
+                Err(err) => {
                     outcome.group_leave_failures.push(GroupLeaveFailure {
-                        group_id_hex,
-                        reason: "invalid group id".to_owned(),
+                        group_id_hex: String::new(),
+                        reason: format!("group discovery failed: {}", wipe_failure_reason(&err)),
                     });
-                    continue;
+                    Vec::new()
                 }
             };
-            match self.leave_group(account_ref, &group_id).await {
-                Ok(_) => outcome.groups_left += 1,
-                Err(err) => outcome.group_leave_failures.push(GroupLeaveFailure {
-                    group_id_hex,
-                    reason: wipe_failure_reason(&err),
-                }),
+            let storage = self.accounts.app.account_storage(&account.label).ok();
+            let mut waiting = Vec::new();
+            for group in groups {
+                let group_id_hex = group.group_id_hex.clone();
+                if left_to_siblings.contains(&group_id_hex) {
+                    outcome.groups_left_to_siblings += 1;
+                    continue;
+                }
+                let group_id = match hex::decode(&group_id_hex) {
+                    Ok(bytes) => GroupId::new(bytes),
+                    Err(_) => {
+                        outcome.group_leave_failures.push(GroupLeaveFailure {
+                            group_id_hex,
+                            reason: "invalid group id".to_owned(),
+                        });
+                        continue;
+                    }
+                };
+                // A chat whose copy here is removed or disbanded holds no
+                // leaf of this device to leave: a sibling or an admin
+                // already took it out, maybe while this sign-out waited.
+                if storage.as_ref().is_some_and(|storage| {
+                    cgka_traits::storage::GroupStorage::get_group(storage, &group_id)
+                        .is_ok_and(|group| group.is_terminal())
+                }) {
+                    continue;
+                }
+                // In a chat its account is an active admin of, an admin's
+                // SelfRemove is refused: it steps down first where another
+                // account is an admin too, and keeps its leaf otherwise
+                // (mdk#2818).
+                match self
+                    .accounts
+                    .leave_group_for_sign_out(account_ref, &group_id)
+                    .await
+                {
+                    Ok(SignOutLeave::Left) => outcome.groups_left += 1,
+                    Ok(SignOutLeave::Recorded) => waiting.push((group_id, group_id_hex)),
+                    Ok(SignOutLeave::Kept(kept)) => {
+                        outcome.group_leave_failures.push(GroupLeaveFailure {
+                            group_id_hex,
+                            reason: kept.reason().to_owned(),
+                        });
+                    }
+                    Err(err) => outcome.group_leave_failures.push(GroupLeaveFailure {
+                        group_id_hex,
+                        reason: wipe_failure_reason(&err),
+                    }),
+                }
             }
-        }
+            self.finish_admin_sign_out_leaves(account_ref, waiting, &mut outcome)
+                .await;
 
-        // Stage 2: delete every relay-published KeyPackage. Discovery itself is
-        // network-bound; a discovery failure is recorded as a single failure
-        // (no event id) and must not abort the wipe.
-        match self
-            .account_key_package_relay_events(account_ref, Vec::new())
-            .await
-        {
-            Ok(events) => {
-                let (deleted, failures) =
-                    self.delete_relay_key_packages(&account.label, events).await;
-                outcome.key_packages_deleted += deleted;
-                outcome.key_package_failures.extend(failures);
-            }
-            Err(err) => outcome.key_package_failures.push(RelayFailure {
-                event_id_hex: String::new(),
-                reason: format!(
-                    "key package discovery failed: {}",
-                    wipe_failure_reason(&err)
-                ),
-            }),
+            // Stage 2: delete this device's KeyPackage slot while its private
+            // material still exists. A failure must not abort the wipe.
+            self.withdraw_own_key_package_slot(
+                account_ref,
+                &mut outcome.key_packages_deleted,
+                &mut outcome.key_package_failures,
+            )
+            .await;
         }
 
         // Stages 3-5: local cleanup. `remove_account` shuts the worker down,
         // drops in-memory caches, and removes the account directory (MLS DB,
         // media, KeyPackage material, SQL row) plus the secret-store nsec in a
         // single all-or-nothing step.
-        match self.accounts.remove_account(account_ref).await {
+        match self
+            .accounts
+            .remove_account_fenced(&account, &generated_setup_fence)
+            .await
+        {
             Ok(()) => {
                 outcome.local_cleanup = LocalCleanupReport {
                     completed: true,
@@ -4428,6 +5241,184 @@ impl MarmotAppRuntime {
         }
 
         Ok(outcome)
+    }
+
+    /// Wait for the chats whose leave stage 1 recorded, or found already in
+    /// progress, to remove this device (mdk#2818). One deadline, the
+    /// sign-out's `leaving` wait, covers them all and is polled first, as in
+    /// signing out through siblings: the account worker keeps receiving and
+    /// draining between polls, so the engine stages each step-down and then
+    /// its SelfRemove from the leave request, and a member's commit of it
+    /// removes this device. A chat counts in `groups_left` only once a poll
+    /// reads that commit; any other is reported with where its leave stood
+    /// when last read. A runtime shutdown also ends the wait, at once: a chat
+    /// no poll read yet is reported as not accepted in time, whatever its
+    /// state, since the device wipes either way.
+    async fn finish_admin_sign_out_leaves(
+        &self,
+        account_ref: &str,
+        chats: Vec<(GroupId, String)>,
+        outcome: &mut WipeOutcome,
+    ) {
+        if chats.is_empty() {
+            return;
+        }
+        let deadline = tokio::time::Instant::now() + self.accounts.app.sign_out_leaving_wait();
+        let mut stopping = self.shared.lifecycle().subscribe_shutdown();
+        let mut pending = chats
+            .into_iter()
+            .map(|(group_id, group_id_hex)| {
+                (group_id, group_id_hex, SignOutAdminLeave::SteppingDown)
+            })
+            .collect::<Vec<_>>();
+        let mut settled = Vec::new();
+        tokio::select! {
+            biased;
+            () = tokio::time::sleep_until(deadline) => {}
+            () = wait_for_runtime_shutdown(&mut stopping) => {}
+            () = self.poll_admin_sign_out_leaves(account_ref, &mut pending, &mut settled) => {}
+        }
+        for (_, group_id_hex, leave) in settled.into_iter().chain(pending) {
+            match leave.failure_reason() {
+                None => outcome.groups_left += 1,
+                Some(reason) => outcome.group_leave_failures.push(GroupLeaveFailure {
+                    group_id_hex,
+                    reason: reason.to_owned(),
+                }),
+            }
+        }
+    }
+
+    /// Poll each pending admin chat until all have settled, moving each
+    /// settled one to `settled`; the caller's deadline ends it otherwise. A
+    /// chat whose poll fails keeps its last answer and is polled again.
+    async fn poll_admin_sign_out_leaves(
+        &self,
+        account_ref: &str,
+        pending: &mut Vec<(GroupId, String, SignOutAdminLeave)>,
+        settled: &mut Vec<(GroupId, String, SignOutAdminLeave)>,
+    ) {
+        let mut logged = false;
+        loop {
+            let mut index = 0;
+            while index < pending.len() {
+                match self
+                    .accounts
+                    .sign_out_admin_leave(account_ref, &pending[index].0)
+                    .await
+                {
+                    Ok(leave) if leave.settled() => {
+                        let mut chat = pending.swap_remove(index);
+                        chat.2 = leave;
+                        settled.push(chat);
+                        continue;
+                    }
+                    Ok(leave) => pending[index].2 = leave,
+                    Err(err) => {
+                        if !logged {
+                            tracing::warn!(
+                                target: "marmot_app::runtime",
+                                method = "poll_admin_sign_out_leaves",
+                                error_kind = err.privacy_safe_kind(),
+                                "could not read an admin chat's sign-out leave; retrying"
+                            );
+                            logged = true;
+                        }
+                    }
+                }
+                index += 1;
+            }
+            if pending.is_empty() {
+                return;
+            }
+            sleep(SIGN_OUT_LEAVING_POLL).await;
+        }
+    }
+
+    /// Ask this device's siblings to take it out of the account's groups
+    /// (mdk#2628 D67): commit its own roster entry as `leaving`, and wait
+    /// about 30 seconds for that commit to be confirmed. Returns the chats a
+    /// sibling takes it out of, as hex group ids, which stage 1 does not
+    /// leave. Empty when it signs out on its own, and when the commit was not
+    /// confirmed in time, which `siblings_not_reached` reports.
+    ///
+    /// One deadline covers all of it, the worker's start included, and it is
+    /// polled first: once it has passed, no answer is taken, a confirmation
+    /// included, however busy the worker is. Dropping the attempt there is
+    /// safe at each await. A worker start left unsettled is reaped and
+    /// replaced by the next lookup. A step in flight runs to its end on the
+    /// worker, ahead of stage 1's leaves, and stores nothing when it
+    /// confirms; its only network wait is its `leaving` commit's publish,
+    /// which the Nostr relay plane gives up on after 20 seconds.
+    async fn sign_out_through_siblings(
+        &self,
+        account_ref: &str,
+        outcome: &mut WipeOutcome,
+    ) -> HashSet<String> {
+        // Without device groups no sibling can take this device out.
+        if !self.accounts.app.device_groups_enabled() {
+            return HashSet::new();
+        }
+        let deadline = tokio::time::Instant::now() + self.accounts.app.sign_out_leaving_wait();
+        let mut stopping = self.shared.lifecycle().subscribe_shutdown();
+        tokio::select! {
+            biased;
+            () = tokio::time::sleep_until(deadline) => {
+                outcome.siblings_not_reached = true;
+                HashSet::new()
+            }
+            () = wait_for_runtime_shutdown(&mut stopping) => {
+                outcome.siblings_not_reached = true;
+                HashSet::new()
+            }
+            left_to_siblings = self.ask_siblings_to_sign_out(account_ref) => left_to_siblings,
+        }
+    }
+
+    /// Take steps of signing out through siblings until one confirms the
+    /// `leaving` commit or finds this device signs out on its own; the
+    /// caller's deadline ends it otherwise. A step that fails is taken
+    /// again, so a passing error does not cost the sibling path. An account
+    /// that reconciliation excludes from running a worker signs out on its
+    /// own at once, as does unfinished onboarding that permits setup traffic
+    /// but refuses ordinary commands. Other failures to acquire an eligible
+    /// worker retry within the same deadline as a failed step (mdk#2839).
+    async fn ask_siblings_to_sign_out(&self, account_ref: &str) -> HashSet<String> {
+        let mut logged = false;
+        loop {
+            match async {
+                let account = self.accounts.resolve(account_ref)?;
+                if !self.accounts.account_worker_eligible(&account)? {
+                    return Ok(SiblingSignOut::OnItsOwn);
+                }
+                self.accounts
+                    .sign_out_through_siblings_step(account_ref)
+                    .await
+            }
+            .await
+            {
+                Ok(SiblingSignOut::Confirmed { left_to_siblings }) => {
+                    return left_to_siblings.into_iter().collect();
+                }
+                Ok(SiblingSignOut::OnItsOwn) => return HashSet::new(),
+                // A setup worker may be admitted while ordinary commands
+                // remain permanently gated on the user's onboarding action.
+                Err(AppError::OnboardingRequired) => return HashSet::new(),
+                Ok(SiblingSignOut::Pending) => {}
+                Err(err) => {
+                    if !logged {
+                        tracing::warn!(
+                            target: "marmot_app::runtime",
+                            method = "ask_siblings_to_sign_out",
+                            error_kind = err.privacy_safe_kind(),
+                            "could not take a sign-out step; retrying"
+                        );
+                        logged = true;
+                    }
+                }
+            }
+            sleep(SIGN_OUT_LEAVING_POLL).await;
+        }
     }
 
     /// Read the selected account's current published kind-0 profile through the
@@ -4694,18 +5685,28 @@ impl MarmotAppRuntime {
     /// stale, then return its local state. An event-ID preview never refetches
     /// once every relay answered the fetch that cached it; otherwise, and for
     /// `naddr` previews, it refetches after 30 minutes. Repeat calls within
-    /// 30 seconds of a finished fetch return local state.
+    /// 30 seconds of a finished fetch return local state. A reference the
+    /// operational relays miss is looked up once more on the deployment's
+    /// discovery indexers and the author's NIP-65 write relays.
     pub async fn resolve_public_event_preview(
         &self,
         account_ref: &str,
         reference: &str,
     ) -> Result<crate::PublicEventPreviewRead, AppError> {
         let account = self.accounts.resolve(account_ref)?;
+        // The deployment's discovery indexers reach public notes the
+        // operational relays do not carry. They feed this lookup only, never
+        // the directory relays block-list, backup, sync and KeyPackage reads use.
+        let discovery_indexers = self.accounts.app.discovery_indexer_relays();
         Ok(self
             .accounts
             .app
             .directory()
-            .resolve_public_event_preview(&directory_account(&account), reference)
+            .resolve_public_event_preview(
+                &directory_account(&account),
+                reference,
+                &discovery_indexers,
+            )
             .await?)
     }
 
@@ -4728,26 +5729,17 @@ impl MarmotAppRuntime {
         account_ref: &str,
         user_account_id_hex: &str,
     ) -> Result<Vec<String>, AppError> {
-        let observation = self.shared.product_analytics.begin(
+        let observed = self.shared.observer.product().observed(
             crate::ProductFamily::Directory,
             "follow",
             crate::ProductUnit::Action,
         );
-        let result = self
-            .follow_user_unobserved(account_ref, user_account_id_hex)
-            .await;
-        if let Some(observation) = observation {
-            observation.finish(if result.is_ok() { "success" } else { "failure" });
-        }
-        result
-    }
-
-    async fn follow_user_unobserved(
-        &self,
-        account_ref: &str,
-        user_account_id_hex: &str,
-    ) -> Result<Vec<String>, AppError> {
-        self.set_following(account_ref, user_account_id_hex, true)
+        let work = async move {
+            self.set_following(account_ref, user_account_id_hex, true)
+                .await
+        };
+        observed
+            .run_async(work, marmot_observability::success_or_failure)
             .await
     }
 
@@ -4758,26 +5750,17 @@ impl MarmotAppRuntime {
         account_ref: &str,
         user_account_id_hex: &str,
     ) -> Result<Vec<String>, AppError> {
-        let observation = self.shared.product_analytics.begin(
+        let observed = self.shared.observer.product().observed(
             crate::ProductFamily::Directory,
             "unfollow",
             crate::ProductUnit::Action,
         );
-        let result = self
-            .unfollow_user_unobserved(account_ref, user_account_id_hex)
-            .await;
-        if let Some(observation) = observation {
-            observation.finish(if result.is_ok() { "success" } else { "failure" });
-        }
-        result
-    }
-
-    async fn unfollow_user_unobserved(
-        &self,
-        account_ref: &str,
-        user_account_id_hex: &str,
-    ) -> Result<Vec<String>, AppError> {
-        self.set_following(account_ref, user_account_id_hex, false)
+        let work = async move {
+            self.set_following(account_ref, user_account_id_hex, false)
+                .await
+        };
+        observed
+            .run_async(work, marmot_observability::success_or_failure)
             .await
     }
 
@@ -5163,6 +6146,15 @@ impl MarmotAppRuntime {
             }
             group_ids.push(GroupId::new(bytes));
         }
+        // The candidates are stored rows and their members come from A, so
+        // the read first waits for a version that holds every candidate: a
+        // group whose row committed before the read began, such as a create
+        // still sending its sibling Welcomes or a catch-up between
+        // publishes, then answers its members rather than failing as
+        // unknown, and is never skipped into a miss (mdk#3273 PR 4).
+        self.accounts
+            .wait_for_published_groups(account_ref, &group_ids)
+            .await?;
         let mut memberships = HashMap::new();
         for chunk in group_ids.chunks(crate::MAX_GROUP_MEMBER_IDS_PAGE_SIZE) {
             let page = self
@@ -5307,14 +6299,12 @@ impl MarmotAppRuntime {
         let account = self.accounts.resolve(account_ref)?;
         let group_id_hex = normalize_group_id_hex_app(group_id_hex)?;
         let group_id = GroupId::new(hex::decode(&group_id_hex)?);
-        // Route the archive toggle through the account worker so the
-        // long-lived in-memory `AccountState` is updated in place. A direct
-        // `MarmotApp::set_group_archived` would only touch the database; the
-        // worker's stale snapshot (archived = false) would then silently revert
-        // it on the next inbound delivery's `save_state`. See mdk#178.
-        let group = self
+        // An account that signs on a worker archives through it, so the
+        // worker's in-memory `AccountState` changes in place (mdk#178,
+        // mdk#3318); only an account that runs none writes storage directly.
+        let (group, unpublished) = self
             .accounts
-            .set_group_archived(account_ref, &group_id, archived)
+            .set_group_archived_on_worker(account_ref, &group_id, archived)
             .await?;
         let chat_list_row = self
             .accounts
@@ -5328,6 +6318,7 @@ impl MarmotAppRuntime {
             ChatListUpdateTrigger::ArchiveChanged,
         );
         publish_app_runtime_group_state_updated(
+            Emit::Unpublished(unpublished),
             &self.events,
             &account.account_id_hex,
             &account.label,
@@ -5456,8 +6447,13 @@ impl MarmotAppRuntime {
     ) -> Result<AccountSetupResult, AppError> {
         validate_account_setup_request(&request, AccountSetupOperation::CreateIdentityOnly)?;
         request.identity = None;
-        self.create_generated_account_local_ready(request, true, None)
-            .await
+        self.create_generated_account_local_ready(
+            request,
+            true,
+            None,
+            GeneratedIdentity::ResumeOrCreate,
+        )
+        .await
     }
 
     /// Create a generated identity whose first public kind-0 is `profile`.
@@ -5474,8 +6470,13 @@ impl MarmotAppRuntime {
     ) -> Result<AccountSetupResult, AppError> {
         validate_account_setup_request(&request, AccountSetupOperation::CreateIdentityOnly)?;
         request.identity = None;
-        self.create_generated_account_local_ready(request, true, Some(profile))
-            .await
+        self.create_generated_account_local_ready(
+            request,
+            true,
+            Some(profile),
+            GeneratedIdentity::ResumeOrCreate,
+        )
+        .await
     }
 
     pub async fn login(
@@ -5535,7 +6536,7 @@ impl MarmotAppRuntime {
     ) -> Result<AccountSetupReadiness, AppError> {
         let account = self.accounts.resolve(account_ref)?;
         if self
-            .accounts
+            .account_setup()
             .onboarding_snapshot(account_ref)?
             .is_some_and(|s| !s.ready || s.cancellation_pending)
         {
@@ -5566,389 +6567,6 @@ impl MarmotAppRuntime {
                 AccountSetupReadiness::Publishing
             }
         })
-    }
-
-    async fn resume_generated_account_setup(&self) -> Result<(), AppError> {
-        let Some(account) = self
-            .accounts
-            .app
-            .account_home()
-            .resumable_generated_account_setup()?
-        else {
-            return Ok(());
-        };
-        let Some(bytes) = self
-            .accounts
-            .app
-            .account_home()
-            .account_setup_context(&account.label)?
-        else {
-            self.report_generated_setup_resume_deferred(&account, "setup_context_missing");
-            return Ok(());
-        };
-        let context = match serde_json::from_slice::<GeneratedAccountSetupContext>(&bytes) {
-            Ok(context) => context,
-            Err(_) => {
-                self.report_generated_setup_resume_deferred(&account, "setup_context_unreadable");
-                return Ok(());
-            }
-        };
-        if let Err(error) = self
-            .create_generated_account_local_ready(context.request(), true, None)
-            .await
-        {
-            self.report_generated_setup_resume_deferred(&account, error.privacy_safe_kind());
-        }
-        Ok(())
-    }
-
-    fn report_generated_setup_resume_deferred(
-        &self,
-        account: &AccountSummary,
-        error_kind: &'static str,
-    ) {
-        tracing::warn!(
-            target: "marmot_app::runtime",
-            method = "resume_generated_account_setup",
-            error_kind,
-            "generated account setup resume deferred"
-        );
-        let _ = self
-            .events
-            .send(MarmotAppEvent::AccountError(RuntimeAccountError {
-                account_id_hex: account.account_id_hex.clone(),
-                account_label: account.label.clone(),
-                message: format!("generated account setup resume deferred: {error_kind}"),
-            }));
-    }
-
-    async fn create_generated_account_local_ready(
-        &self,
-        request: AccountSetupRequest,
-        schedule_background: bool,
-        initial_profile: Option<UserProfileMetadata>,
-    ) -> Result<AccountSetupResult, AppError> {
-        let observation = self.shared.product_analytics.begin(
-            crate::ProductFamily::Account,
-            "local_ready",
-            crate::ProductUnit::Attempt,
-        );
-        let result = self
-            .create_generated_account_local_ready_unobserved(
-                request,
-                schedule_background,
-                initial_profile,
-            )
-            .await;
-        if let Some(observation) = observation {
-            observation.finish(if result.is_ok() { "success" } else { "failure" });
-        }
-        result
-    }
-
-    async fn create_generated_account_local_ready_unobserved(
-        &self,
-        request: AccountSetupRequest,
-        schedule_background: bool,
-        initial_profile: Option<UserProfileMetadata>,
-    ) -> Result<AccountSetupResult, AppError> {
-        self.shared.lifecycle().ensure_running()?;
-        let _generated_setup_transaction =
-            self.accounts.generated_setup_local_transaction.lock().await;
-        validate_account_setup_request(&request, AccountSetupOperation::CreateOrImport)?;
-
-        let resumable = self
-            .accounts
-            .app
-            .account_home()
-            .resumable_generated_account_setup()?;
-        // Persisted relays win on resume so every retry retains the exact
-        // locally prepared initial KeyPackage and its publication targets.
-        let context = match resumable.as_ref() {
-            Some(account) => match self
-                .accounts
-                .app
-                .account_home()
-                .account_setup_context(&account.label)?
-            {
-                Some(bytes) => serde_json::from_slice::<GeneratedAccountSetupContext>(&bytes)?,
-                None => GeneratedAccountSetupContext::from_request(&request),
-            },
-            None => GeneratedAccountSetupContext::from_request(&request),
-        };
-        let effective_request = context.request();
-        let bootstrap = AccountRelayListBootstrap::new(
-            effective_request.default_relays.clone(),
-            effective_request.bootstrap_relays.clone(),
-        )
-        .with_inbox_relays(effective_request.inbox_relays.clone());
-        if bootstrap.default_relays.is_empty() {
-            return Err(AppError::MissingDefaultRelays);
-        }
-        self.accounts
-            .app
-            .validate_account_relay_list_declarations(&bootstrap, None)?;
-
-        let identity_started = Instant::now();
-        let identity_result = self
-            .accounts
-            .create_nostr_account_from_setup(&effective_request);
-        self.shared.app_performance_telemetry().record(
-            AppPerformanceOperation::AccountSetupIdentityLocal,
-            identity_started.elapsed(),
-            identity_result.is_ok(),
-        );
-        let (account, _) = identity_result?;
-        if self
-            .accounts
-            .app
-            .account_home()
-            .account_setup_context(&account.label)?
-            .is_none()
-        {
-            self.accounts
-                .app
-                .account_home()
-                .set_account_setup_context(&account.label, &serde_json::to_vec(&context)?)?;
-        }
-        let storage_started = Instant::now();
-        let storage_result = self.accounts.app.account_storage(&account.label);
-        self.shared.app_performance_telemetry().record(
-            AppPerformanceOperation::AccountSetupStorageLocal,
-            storage_started.elapsed(),
-            storage_result.is_ok(),
-        );
-        storage_result?;
-        let phase = self
-            .accounts
-            .app
-            .account_home()
-            .account_setup_state(&account.label)?
-            .map(|state| state.phase)
-            .ok_or(AppError::AccountSetupRetryRequired)?;
-
-        let profile_started = Instant::now();
-        let profile_result = (|| {
-            let cached = self
-                .accounts
-                .app
-                .directory()
-                .directory_entry_for_account_id(&account.account_id_hex)?
-                .and_then(|entry| entry.profile);
-            let (profile, store) = generated_setup_profile(
-                &account.account_id_hex,
-                phase,
-                cached,
-                initial_profile,
-                unix_now_seconds(),
-            );
-            if store {
-                self.accounts
-                    .app
-                    .directory()
-                    .remember_directory_profile(&account.account_id_hex, &profile)?;
-            }
-            Ok::<_, AppError>(profile)
-        })();
-        self.shared.app_performance_telemetry().record(
-            AppPerformanceOperation::AccountSetupProfileLocal,
-            profile_started.elapsed(),
-            profile_result.is_ok(),
-        );
-        let profile = profile_result?;
-
-        let key_package_started = Instant::now();
-        let key_package_result = async {
-            if phase == AccountSetupPhase::LocalStateCreated {
-                let mut client = self
-                    .accounts
-                    .app
-                    .local_client_with_relay_plane(
-                        &account.label,
-                        self.shared.relay_plane(),
-                        Some(self.shared.lifecycle()),
-                    )
-                    .await?;
-                let key_package = client
-                    .prepare_initial_key_package(effective_request.default_relays.to_vec())
-                    .await?;
-                let bytes = key_package.bytes().len();
-                drop(client);
-                self.accounts
-                    .app
-                    .account_home()
-                    .set_account_setup_phase(&account.label, AccountSetupPhase::LocalReady)?;
-                self.accounts.app.presentation_signals.catalog_changed();
-                Ok(bytes)
-            } else {
-                let lifecycle = self
-                    .accounts
-                    .app
-                    .account_storage(&account.label)?
-                    .key_package_lifecycle()?
-                    .ok_or(AppError::AccountSetupRetryRequired)?;
-                lifecycle
-                    .pending_replacement
-                    .as_ref()
-                    .map(|pending| pending.key_package.bytes().len())
-                    .or_else(|| {
-                        lifecycle
-                            .current_key_package
-                            .as_ref()
-                            .map(|key_package| key_package.bytes().len())
-                    })
-                    .ok_or(AppError::AccountSetupRetryRequired)
-            }
-        }
-        .await;
-        self.shared.app_performance_telemetry().record(
-            AppPerformanceOperation::AccountSetupKeyPackageLocal,
-            key_package_started.elapsed(),
-            key_package_result.is_ok(),
-        );
-        let key_package_bytes = key_package_result?;
-        if phase == AccountSetupPhase::LocalStateCreated && !schedule_background {
-            self.accounts
-                .reset_startup_retry(&account.account_id_hex)
-                .await;
-        }
-
-        let relay_lists = self
-            .accounts
-            .app
-            .account_relay_list_status(&account.label)?;
-        let readiness = self.account_setup_readiness(&account.label)?;
-        if schedule_background {
-            let handoff_started_at = Instant::now();
-            let handoff_result = if phase == AccountSetupPhase::LocalStateCreated {
-                self.accounts
-                    .retry_and_reconcile_for_account(&account.account_id_hex)
-                    .await
-            } else {
-                self.accounts
-                    .reconcile_for_account(&account.account_id_hex)
-                    .await
-            };
-            self.shared.app_performance_telemetry().record(
-                AppPerformanceOperation::AccountSetupLocalReadyHandoff,
-                handoff_started_at.elapsed(),
-                handoff_result.is_ok(),
-            );
-            handoff_result?;
-            self.schedule_generated_account_setup(account.clone(), context);
-        }
-        Ok(AccountSetupResult {
-            account,
-            relay_lists,
-            key_package_bytes: effective_request
-                .publish_initial_key_package
-                .then_some(key_package_bytes),
-            profile: Some(profile),
-            readiness,
-        })
-    }
-
-    async fn create_generated_account_network_ready(
-        &self,
-        request: AccountSetupRequest,
-    ) -> Result<AccountSetupResult, AppError> {
-        let local = self
-            .create_generated_account_local_ready(request, false, None)
-            .await?;
-        let context = self
-            .accounts
-            .app
-            .account_home()
-            .account_setup_context(&local.account.label)?
-            .ok_or(AppError::AccountSetupRetryRequired)
-            .and_then(|bytes| {
-                serde_json::from_slice::<GeneratedAccountSetupContext>(&bytes)
-                    .map_err(AppError::from)
-            })?;
-        let started_at = Instant::now();
-        let result = self
-            .create_or_import_account_network_ready(context.request())
-            .await;
-        self.shared.app_performance_telemetry().record(
-            AppPerformanceOperation::AccountSetupNetworkReady,
-            started_at.elapsed(),
-            result.is_ok(),
-        );
-        let mut result = result?;
-        if result.profile.is_none() {
-            result.profile = local.profile;
-        }
-        Ok(result)
-    }
-
-    fn schedule_generated_account_setup(
-        &self,
-        account: AccountSummary,
-        context: GeneratedAccountSetupContext,
-    ) {
-        let mut tasks = self
-            .accounts
-            .generated_setup_tasks
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        tasks.handles.retain(|handle| !handle.is_finished());
-        if !tasks.accepting || !tasks.active_accounts.insert(account.account_id_hex.clone()) {
-            return;
-        }
-        let manager = self.clone();
-        let active = self.accounts.generated_setup_tasks.clone();
-        let account_id_hex = account.account_id_hex.clone();
-        let account_label = account.label.clone();
-        let handle = tokio::spawn(async move {
-            for attempt in 0..GENERATED_SETUP_BACKGROUND_MAX_ATTEMPTS {
-                let started_at = Instant::now();
-                let result = manager
-                    .create_or_import_account_network_ready(context.request())
-                    .await;
-                manager.shared.app_performance_telemetry().record(
-                    AppPerformanceOperation::AccountSetupNetworkReady,
-                    started_at.elapsed(),
-                    result.is_ok(),
-                );
-                match result {
-                    Ok(_) => break,
-                    Err(error) => {
-                        let final_attempt = attempt + 1 == GENERATED_SETUP_BACKGROUND_MAX_ATTEMPTS;
-                        let status = if final_attempt {
-                            "deferred"
-                        } else {
-                            "retry scheduled"
-                        };
-                        let _ = manager.events.send(MarmotAppEvent::AccountError(
-                            RuntimeAccountError {
-                                account_id_hex: account_id_hex.clone(),
-                                account_label: account_label.clone(),
-                                message: format!(
-                                    "generated account publication {status}: {}",
-                                    error.privacy_safe_kind()
-                                ),
-                            },
-                        ));
-                        if final_attempt {
-                            break;
-                        }
-                        let multiplier = 1_u32
-                            .checked_shl(u32::try_from(attempt).unwrap_or(u32::MAX))
-                            .unwrap_or(u32::MAX);
-                        tokio::time::sleep(
-                            GENERATED_SETUP_BACKGROUND_RETRY_BASE_DELAY.saturating_mul(multiplier),
-                        )
-                        .await;
-                    }
-                }
-            }
-            active
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .active_accounts
-                .remove(&account_id_hex);
-        });
-        tasks.handles.push(handle);
     }
 
     async fn create_or_import_account_network_ready(
@@ -6050,11 +6668,15 @@ impl MarmotAppRuntime {
     pub async fn shutdown(&self) {
         let started_at = Instant::now();
         self.shared.lifecycle().begin_shutdown();
+        self.accounts
+            .finish_nip46_adoptions(nip46::Nip46AdoptionScope::Runtime)
+            .await;
         self.shared
             .local_submission_queue
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
+        self.accounts.app.stop_emoji_set_installs();
         for task in self.accounts.app.abort_all_public_indexer_copies() {
             let _ = task.await;
         }
@@ -6097,16 +6719,16 @@ impl MarmotAppRuntime {
                 APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT.saturating_sub(started_at.elapsed()),
             )
             .await;
-        self.shared.product_analytics.observe(
+        self.shared.observer.product().observe(
             crate::ProductFamily::Runtime,
             "shutdown",
             "success",
             crate::ProductUnit::Attempt,
             Some(started_at.elapsed()),
         );
-        self.shared.product_analytics.seal_partial();
-        self.shared.product_analytics.flush().await;
-        self.shared.product_analytics.revoke_memory();
+        marmot_observability::wiring::seal_partial(self.shared.observer.product());
+        self.shared.observer.product().flush().await;
+        marmot_observability::wiring::revoke_memory(self.shared.observer.product());
         self.restart_product_worker();
         tracing::debug!(
             target: "marmot_app::runtime",
@@ -6116,8 +6738,8 @@ impl MarmotAppRuntime {
         );
     }
 
-    /// Stop admitting runtime work, close every SQLite database and release the
-    /// root runtime lease, then make a bounded attempt to drain graceful
+    /// Stop admitting runtime work, settle NIP-46 adoption, close every SQLite
+    /// database and release the root runtime lease, then drain graceful
     /// shutdown work. When this returns, nothing this process owns holds a file
     /// lock inside the Marmot root.
     ///
@@ -6133,7 +6755,8 @@ impl MarmotAppRuntime {
     /// App Group container).
     ///
     /// Ordering is the point of this method: the lifecycle stop latch closes
-    /// admission first, then storage closure takes priority over graceful
+    /// admission first. NIP-46 network waits are interrupted and local credential
+    /// mutations settle before storage closes. Closure takes priority over graceful
     /// draining. This is deliberately different from [`Self::shutdown`]. A
     /// host suspension deadline cannot safely sit behind directory, worker,
     /// relay, or audit cleanup that may be awaiting network or task progress.
@@ -6167,6 +6790,10 @@ impl MarmotAppRuntime {
 
     async fn run_terminal_shutdown_and_close(self) -> Result<(), AppError> {
         self.shared.lifecycle().begin_shutdown();
+        // Finish Native local rollback before storage and its root lease close.
+        self.accounts
+            .finish_nip46_adoptions(nip46::Nip46AdoptionScope::App)
+            .await;
         self.shared
             .local_submission_queue
             .lock()
@@ -6181,7 +6808,7 @@ impl MarmotAppRuntime {
         // clones after its deadline, but terminal storage closure makes those
         // clones inert and releases the suspension-sensitive root lease.
         let app = self.accounts.app.clone();
-        let close_observation = self.shared.product_analytics.begin(
+        let close_observation = self.shared.observer.product().begin(
             crate::ProductFamily::Storage,
             "close",
             crate::ProductUnit::Attempt,
@@ -6198,9 +6825,9 @@ impl MarmotAppRuntime {
             });
         }
 
-        self.shared.product_analytics.seal_partial();
-        self.shared.product_analytics.flush().await;
-        self.shared.product_analytics.revoke_memory();
+        marmot_observability::wiring::seal_partial(self.shared.observer.product());
+        self.shared.observer.product().flush().await;
+        marmot_observability::wiring::revoke_memory(self.shared.observer.product());
         self.restart_product_worker();
         let graceful_wait = self.shutdown_grace_wait();
         if timeout(graceful_wait, self.shutdown()).await.is_err() {
@@ -6334,11 +6961,71 @@ async fn catch_up_account_commands_with_retry(
     }
 }
 
+impl MarmotApp {
+    fn onboarding_transaction(&self, id: &str) -> Arc<Mutex<()>> {
+        let mut locks = self
+            .onboarding_transactions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(id).and_then(std::sync::Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(id.to_owned(), Arc::downgrade(&lock));
+        lock
+    }
+}
+
+// Account setup reaches the workers only through this surface. The worker
+// transaction is a tokio `Mutex` and not reentrant, so every call keeps the lock
+// state it had when onboarding lived on this type, and each says which it is:
+// - takes the worker transaction: `lock_worker_transaction`,
+//   `reconcile_for_account`, `retry_and_reconcile_for_account`,
+//   `reset_startup_retry`;
+// - assumes its caller holds it: `clear_startup_retry`,
+//   `reconcile_locked_report_for`, `set_account_tearing_down`,
+//   `take_worker_locked`.
+// A worker setup takes out of the map is reaped through setup's own cancellation
+// registry, which shutdown's second phase joins, never through `worker_reapers`.
+impl AccountManager {
+    /// Takes the worker transaction and hands back its guard.
+    async fn lock_worker_transaction(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.worker_transactions.lock().await
+    }
+
+    /// Assumes the worker transaction is held. Takes the account's worker out
+    /// of the map and hands it back; the caller registers its reap before any
+    /// await.
+    async fn take_worker_locked(&self, account_id: &str) -> Option<ManagedAccountWorker> {
+        self.workers.lock().await.remove(account_id)
+    }
+
+    /// Setup's durable records, which hold the worker gate. Reading them never
+    /// touches setup's in-memory state.
+    fn setup_records(&self) -> onboarding::SetupRecords<'_> {
+        onboarding::SetupRecords::new(&self.app)
+    }
+
+    /// Account setup paired with this manager, for unit tests that reach
+    /// setup's private helpers. Hosts use `MarmotAppRuntime::account_setup`.
+    #[cfg(test)]
+    pub(crate) fn account_setup(&self) -> onboarding::AccountSetup<'_> {
+        onboarding::AccountSetup::new(&self.setup, self)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn onboarding_worker_tracked(&self, account_id: &str) -> bool {
+        self.workers.lock().await.contains_key(account_id)
+    }
+}
+
 impl AccountManager {
     fn new(
         app: MarmotApp,
         events: broadcast::Sender<MarmotAppEvent>,
         shared: RuntimeSharedServices,
+        setup: onboarding::SetupState,
     ) -> Self {
         Self {
             app,
@@ -6351,30 +7038,14 @@ impl AccountManager {
             startup_retries: Arc::new(StdMutex::new(
                 worker_startup::WorkerStartupRetries::default(),
             )),
-            generated_setup_local_transaction: Arc::new(Mutex::new(())),
-            onboarding_transactions: Arc::new(StdMutex::new(HashMap::new())),
-            onboarding_state: Arc::new(StdMutex::new(HashMap::new())),
-            onboarding_updates: Arc::new(StdMutex::new(HashMap::new())),
-            onboarding_cancellations: Arc::new(StdMutex::new(OnboardingCancellationTasks {
-                accepting: true,
-                inflight: HashMap::new(),
-                handles: Vec::new(),
-                reaping: HashMap::new(),
-            })),
-            onboarding_retirements: Arc::new(StdMutex::new(HashMap::new())),
-            #[cfg(test)]
-            onboarding_test_holds: Arc::new(OnboardingTestHolds::default()),
+            setup,
             #[cfg(test)]
             reconcile_invocations: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             invite_catch_up_tasks: Arc::new(StdMutex::new(InviteCatchUpTasks {
                 accepting: true,
                 handles: Vec::new(),
             })),
-            generated_setup_tasks: Arc::new(StdMutex::new(GeneratedSetupTasks {
-                accepting: true,
-                active_accounts: HashSet::new(),
-                handles: Vec::new(),
-            })),
+            nip46_adoption_owner: Arc::new(()),
         }
     }
 
@@ -6391,6 +7062,8 @@ impl AccountManager {
         &self.app
     }
 
+    /// Called with the worker transaction held, which reconcile reads the marks
+    /// under.
     fn set_account_tearing_down(&self, account_id_hex: &str, tearing_down: bool) {
         let mut accounts = self
             .tearing_down
@@ -6565,6 +7238,7 @@ impl AccountManager {
                 local_signing: account.local_signing,
                 external_signing: account.external_signing,
                 signed_out: account.signed_out,
+                unlinked: account.unlinked,
             })
             .collect())
     }
@@ -6573,24 +7247,82 @@ impl AccountManager {
         Ok(self.app.account_home().account(account_ref)?)
     }
 
+    fn resolve_original(&self, expected: &AccountSummary) -> Result<AccountSummary, AppError> {
+        let account = self.app.account_home().account(&expected.label)?;
+        if account.account_id_hex != expected.account_id_hex {
+            return Err(AccountHomeError::UnknownAccount(expected.account_id_hex.clone()).into());
+        }
+        Ok(account)
+    }
+
     fn schedule_audit_log_tracker_update(&self, trigger: &'static str) {
         self.shared.schedule_audit_log_tracker_update(trigger);
     }
 
+    async fn lock_nip46_removal(
+        &self,
+        gate: Arc<Mutex<()>>,
+        account_id: &str,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        let user = PublicKey::from_hex(account_id).ok();
+        let acquisition = gate.lock_owned();
+        tokio::pin!(acquisition);
+        let ready = {
+            let adoptions = self
+                .app
+                .nip46_adoptions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Queue before releasing admission: later adoptions must wait behind teardown.
+            let ready = futures::FutureExt::now_or_never(acquisition.as_mut());
+            for adoption in &adoptions.active {
+                if Some(adoption.user) == user {
+                    adoption.session.cancel();
+                }
+            }
+            ready
+        };
+        match ready {
+            Some(guard) => guard,
+            None => acquisition.await,
+        }
+    }
+
     pub async fn remove_account(&self, account_ref: &str) -> Result<(), AppError> {
+        let account = self.app.account_home().account(account_ref)?;
+        self.finish_nip46_account(&account).await;
+        let fence = self
+            .setup
+            .fence_generated_teardown(self, &account.account_id_hex)
+            .await;
+        self.remove_account_fenced(&account, &fence).await
+    }
+
+    // Wipe already owns the account's foreground fence before its network
+    // stages. Reuse it rather than taking that non-reentrant transaction again.
+    async fn remove_account_fenced(
+        &self,
+        expected: &AccountSummary,
+        fence: &onboarding::GeneratedTeardownFence,
+    ) -> Result<(), AppError> {
+        // A label may have been reused while foreground setup finished.
+        // Check before purging reports and after taking the worker transaction.
+        self.resolve_original(expected)?;
         // Stop and delete the account's moderation reports, and admit none
         // until the removal below has committed (every removal entry point).
         // Fenced before the global lock: the purge may open account storage.
         // Removing the directory deletes the rows even if this purge fails.
-        let (_report_fence, _) = self.fence_moderation_reports(account_ref).await;
+        let (_report_fence, _) = self.fence_moderation_reports(&expected.label).await;
+        let _preparation = self.setup.fence_generated_removal(fence).await;
         let lock_wait = self
             .shared
-            .app_performance_telemetry()
+            .observer
+            .performance()
             .observe(RuntimeOp::LifecycleLockWait);
         let _worker_transaction = self.worker_transactions.lock().await;
         lock_wait.finish(TelemetryOutcome::Success);
         self.shared.lifecycle().ensure_running()?;
-        let account = self.app.account_home().account(account_ref)?;
+        let account = self.resolve_original(expected)?;
         for task in self
             .app
             .abort_public_indexer_copies_for_account(&account.account_id_hex)
@@ -6624,6 +7356,7 @@ impl AccountManager {
                 // or async cleanup runs while this account gate is held.
                 let gate = self.shared.local_submission_gate(&account.account_id_hex);
                 let _admission = gate.lock().await;
+                self.erase_nip46_session(&account.label, Nip46Removal::Recorded)?;
                 self.app.drop_account_caches(&account.label);
                 self.app
                     .remove_account_key_package_artifacts(&account.label)?;
@@ -6642,6 +7375,10 @@ impl AccountManager {
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .cancel_account(&account.account_id_hex);
+                    // Nor does a removed account keep its publish stop, so a
+                    // new link under this id publishes.
+                    self.app
+                        .forget_unlinked_publish_stop(&account.account_id_hex);
                 }
                 removed?;
             }
@@ -6658,10 +7395,7 @@ impl AccountManager {
             // account live, and a live external-signer account still needs its
             // signer to reconcile.
             self.app.forget_external_signer(&account.account_id_hex);
-            self.onboarding_updates
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .remove(&account.account_id_hex);
+            self.setup.account_removed(&account.account_id_hex);
             Ok(())
         }
         .await
@@ -6682,7 +7416,8 @@ impl AccountManager {
     ) -> Result<(), AppError> {
         let lock_wait = self
             .shared
-            .app_performance_telemetry()
+            .observer
+            .performance()
             .observe(RuntimeOp::LifecycleLockWait);
         let _worker_transaction = self.worker_transactions.lock().await;
         lock_wait.finish(TelemetryOutcome::Success);
@@ -6795,16 +7530,52 @@ impl AccountManager {
         (Some(fence), purged.map(|_| ()))
     }
 
+    /// Stop `account_ref`'s generated setup for a teardown, before the
+    /// worker transaction: no background attempt is in flight once this
+    /// returns, and none starts while the fence is held. Only an account
+    /// known to be unknown goes unfenced; the teardown reports that itself.
+    /// Any other lookup failure fails the teardown rather than letting it
+    /// run beside an attempt.
+    async fn fence_generated_setup(
+        &self,
+        account_ref: &str,
+    ) -> Result<Option<onboarding::GeneratedSetupFence>, AppError> {
+        let account = match self.app.account_home().account(account_ref) {
+            Ok(account) => account,
+            Err(AccountHomeError::UnknownAccount(_)) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        Ok(Some(
+            self.setup
+                .fence_generated_setup(&account.account_id_hex)
+                .await,
+        ))
+    }
+
     pub async fn deactivate_account(&self, account_ref: &str) -> Result<(), AppError> {
+        self.deactivate_account_marking(account_ref, false).await
+    }
+
+    /// [`Self::deactivate_account`], which also marks the account unlinked,
+    /// in the same write that signs it out, when `unlinked` (D67).
+    async fn deactivate_account_marking(
+        &self,
+        account_ref: &str,
+        unlinked: bool,
+    ) -> Result<(), AppError> {
+        let account = self.resolve(account_ref)?;
+        self.finish_nip46_account(&account).await;
         // Queued moderation reports never outlive a sign-out: stop and delete
         // them, and admit none until the sign-out below has committed. Fenced
         // before the global lock: the purge may open account storage. A failed
         // purge does not stop the sign-out, but it is reported: reports left on
         // disk would be retried at the next sign-in.
         let (_report_fence, report_purge) = self.fence_moderation_reports(account_ref).await;
+        let _generated_setup_fence = self.fence_generated_setup(account_ref).await?;
         let lock_wait = self
             .shared
-            .app_performance_telemetry()
+            .observer
+            .performance()
             .observe(RuntimeOp::LifecycleLockWait);
         let _worker_transaction = self.worker_transactions.lock().await;
         lock_wait.finish(TelemetryOutcome::Success);
@@ -6818,9 +7589,13 @@ impl AccountManager {
                 self.register_worker_reapers(vec![(account.account_id_hex.clone(), worker)]);
                 self.ensure_worker_reaped(&account.account_id_hex).await?;
             }
-            self.app
-                .account_home()
-                .set_account_signed_out(&account.label, true)?;
+            let home = self.app.account_home();
+            if unlinked {
+                home.mark_account_unlinked(&account.label)?;
+            } else {
+                home.set_account_signed_out(&account.label, true)?;
+            }
+            self.erase_nip46_session(&account.label, Nip46Removal::Recorded)?;
             self.clear_startup_retry(&account.account_id_hex);
             self.shared
                 .attachment_permissions
@@ -6831,6 +7606,44 @@ impl AccountManager {
         }
         .await?;
         report_purge
+    }
+
+    /// Deactivate the account once its worker reports that the device group
+    /// unlinked this device, then tell hosts. The worker stopped and tried to
+    /// mark the account unlinked; deactivation reaps it, makes the mark again
+    /// as it signs the account out, so a failed mark never leaves a plain
+    /// sign-out, and drops what the account holds in memory. Hosts hear
+    /// `DeviceUnlinked` only after that, so a host that wipes the account and
+    /// signs in again on hearing it never races this deactivation into the
+    /// new record. A worker that ends any other way drops the sender, and
+    /// this task ends with it.
+    fn deactivate_when_unlinked(
+        &self,
+        account_id_hex: String,
+        account_label: String,
+        unlinked: oneshot::Receiver<()>,
+    ) {
+        let accounts = self.clone();
+        tokio::spawn(async move {
+            if unlinked.await.is_err() {
+                return;
+            }
+            if let Err(error) = accounts
+                .deactivate_account_marking(&account_label, true)
+                .await
+            {
+                tracing::warn!(
+                    target: "marmot_app::runtime",
+                    method = "deactivate_when_unlinked",
+                    error_kind = error.privacy_safe_kind(),
+                    "could not deactivate an unlinked account; its next start stops it again"
+                );
+            }
+            let _ = accounts.events.send(MarmotAppEvent::DeviceUnlinked {
+                account_id_hex,
+                account_label,
+            });
+        });
     }
 
     async fn restore_signed_out_after_key_package_failure(&self, account_ref: &str) {
@@ -6846,50 +7659,49 @@ impl AccountManager {
 
     /// Explicitly re-activate a reversibly signed-out local account.
     pub async fn sign_in_account(&self, account_ref: &str) -> Result<ManagedAccount, AppError> {
-        let observation = self.shared.product_analytics.begin(
+        let account = self.resolve(account_ref)?;
+        let gate = self.app.onboarding_transaction(&account.account_id_hex);
+        let _transaction = gate.lock().await;
+        let observed = self.shared.observer.product().observed(
             crate::ProductFamily::Account,
             "login",
             crate::ProductUnit::Action,
         );
-        let result = self.sign_in_account_unobserved(account_ref).await;
-        if let Some(observation) = observation {
-            observation.finish(if result.is_ok() { "success" } else { "failure" });
-        }
-        result
-    }
-
-    async fn sign_in_account_unobserved(
-        &self,
-        account_ref: &str,
-    ) -> Result<ManagedAccount, AppError> {
-        let lock_wait = self
-            .shared
-            .app_performance_telemetry()
-            .observe(RuntimeOp::LifecycleLockWait);
-        let _worker_transaction = self.worker_transactions.lock().await;
-        lock_wait.finish(TelemetryOutcome::Success);
-        self.shared.lifecycle().ensure_running()?;
-        let account = self
-            .app
-            .account_home()
-            .set_account_signed_out(account_ref, false)?;
-        self.clear_startup_retry(&account.account_id_hex);
-        self.reconcile_locked_report_for(Some(&account.account_id_hex))
-            .await?
-            .for_account(&account.account_id_hex)?;
-        let running = self
-            .workers
-            .lock()
+        let work = async move {
+            let lock_wait = self
+                .shared
+                .observer
+                .performance()
+                .observe(RuntimeOp::LifecycleLockWait);
+            let _worker_transaction = self.worker_transactions.lock().await;
+            lock_wait.finish(TelemetryOutcome::Success);
+            self.shared.lifecycle().ensure_running()?;
+            let account = self
+                .app
+                .account_home()
+                .set_account_signed_out(account_ref, false)?;
+            self.clear_startup_retry(&account.account_id_hex);
+            self.reconcile_locked_report_for(Some(&account.account_id_hex))
+                .await?
+                .for_account(&account.account_id_hex)?;
+            let running = self
+                .workers
+                .lock()
+                .await
+                .contains_key(&account.account_id_hex);
+            Ok(ManagedAccount {
+                label: account.label,
+                account_id_hex: account.account_id_hex,
+                local_signing: account.local_signing,
+                external_signing: account.external_signing,
+                signed_out: account.signed_out,
+                running,
+                unlinked: account.unlinked,
+            })
+        };
+        observed
+            .run_async(work, marmot_observability::success_or_failure)
             .await
-            .contains_key(&account.account_id_hex);
-        Ok(ManagedAccount {
-            label: account.label,
-            account_id_hex: account.account_id_hex,
-            local_signing: account.local_signing,
-            external_signing: account.external_signing,
-            signed_out: account.signed_out,
-            running,
-        })
     }
 
     pub async fn reconcile(&self) -> Result<(), AppError> {
@@ -6898,17 +7710,21 @@ impl AccountManager {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let lock_wait = self
             .shared
-            .app_performance_telemetry()
+            .observer
+            .performance()
             .observe(RuntimeOp::LifecycleLockWait);
         let _worker_transaction = self.worker_transactions.lock().await;
         lock_wait.finish(TelemetryOutcome::Success);
         self.reconcile_locked().await
     }
 
+    /// Takes the worker transaction and reconciles one account.
     async fn reconcile_for_account(&self, account_id: &str) -> Result<(), AppError> {
         self.reconcile_for_account_inner(account_id, false).await
     }
 
+    /// Takes the worker transaction, resets the account's startup retry and
+    /// reconciles it.
     async fn retry_and_reconcile_for_account(&self, account_id: &str) -> Result<(), AppError> {
         self.reconcile_for_account_inner(account_id, true).await
     }
@@ -6920,7 +7736,8 @@ impl AccountManager {
     ) -> Result<(), AppError> {
         let lock_wait = self
             .shared
-            .app_performance_telemetry()
+            .observer
+            .performance()
             .observe(RuntimeOp::LifecycleLockWait);
         let _worker_transaction = self.worker_transactions.lock().await;
         lock_wait.finish(TelemetryOutcome::Success);
@@ -6932,11 +7749,13 @@ impl AccountManager {
             .for_account(account_id)
     }
 
+    /// Takes the worker transaction and resets the account's startup retry.
     async fn reset_startup_retry(&self, account_id: &str) {
         let _worker_transaction = self.worker_transactions.lock().await;
         self.clear_startup_retry(account_id);
     }
 
+    /// Assumes the worker transaction is held.
     fn clear_startup_retry(&self, account_id: &str) {
         self.startup_retries
             .lock()
@@ -6952,6 +7771,72 @@ impl AccountManager {
         self.reconcile_locked_report_for(None).await
     }
 
+    /// Share worker admission with sibling sign-out, separately from ordinary
+    /// command permission. An eligible account's temporary startup failure
+    /// must not mean it has no worker.
+    fn account_worker_eligible(&self, account: &AccountSummary) -> Result<bool, AppError> {
+        if self.account_is_tearing_down(&account.account_id_hex) || !self.signs_on_worker(account) {
+            return Ok(false);
+        }
+        self.setup_records()
+            .onboarding_worker_allowed(&account.label)
+    }
+
+    /// Whether `account` signs on a worker: an active local signer, or a
+    /// signed-in external signer whose signer is registered. Its group writes
+    /// go through that worker, which keeps the account's state in memory and
+    /// saves each dirty group's whole record (mdk#178, mdk#3318).
+    pub(super) fn signs_on_worker(&self, account: &AccountSummary) -> bool {
+        account.is_active_local_signing()
+            || (account.external_signing
+                && !account.signed_out
+                && self.app.has_external_signer(&account.account_id_hex))
+    }
+
+    /// Run `write` on the storage of an account that signs on no worker, with
+    /// the worker transaction held, and hand back the account it read. `None`,
+    /// with nothing written, if the account signs on a worker by then: the
+    /// caller goes through that worker instead.
+    ///
+    /// A write beside a running, starting or retiring worker is undone by
+    /// that worker's next save and leaves its reads stale (mdk#178,
+    /// mdk#3318). Every worker start, sign-in and sign-out takes the worker
+    /// transaction, so no worker starts during `write`. A worker kept from
+    /// before the account stopped signing on one is retired first, as
+    /// reconcile would, and any worker still retiring is reaped first; one
+    /// onboarding is still reaping fails the call with nothing written.
+    pub(super) async fn write_without_worker<T>(
+        &self,
+        account_ref: &str,
+        write: impl FnOnce(&AccountSummary) -> Result<T, AppError>,
+    ) -> Result<Option<(AccountSummary, T)>, AppError> {
+        let lock_wait = self
+            .shared
+            .observer
+            .performance()
+            .observe(RuntimeOp::LifecycleLockWait);
+        let _worker_transaction = self.worker_transactions.lock().await;
+        lock_wait.finish(TelemetryOutcome::Success);
+        self.shared.lifecycle().ensure_running()?;
+        let account = self.resolve(account_ref)?;
+        if self.signs_on_worker(&account) {
+            return Ok(None);
+        }
+        if let Some(worker) = self.take_worker_locked(&account.account_id_hex).await {
+            self.register_worker_reapers(vec![(account.account_id_hex.clone(), worker)]);
+        }
+        self.ensure_worker_reaped(&account.account_id_hex).await?;
+        self.setup
+            .ensure_worker_reap_settled(self, &account.account_id_hex)
+            .await
+            .map_err(|_| {
+                AppError::BlockingTask("account worker cleanup still in progress".into())
+            })?;
+        let written = write(&account)?;
+        Ok(Some((account, written)))
+    }
+
+    /// Assumes the worker transaction is held.
     async fn reconcile_locked_report_for(
         &self,
         target_account_id: Option<&str>,
@@ -6960,33 +7845,21 @@ impl AccountManager {
         let started_at = Instant::now();
         let result = async {
             self.shared.lifecycle().ensure_running()?;
-            self.finish_pending_onboarding_cancellations().await;
+            self.setup.reconcile_locked(self).await;
             let accounts = self
                 .app
                 .account_home()
                 .accounts()?
                 .into_iter()
-                .filter(|account| {
-                    !self.account_is_tearing_down(&account.account_id_hex)
-                        && (account.is_active_local_signing()
-                            || (account.external_signing
-                                && !account.signed_out
-                                && self.app.has_external_signer(&account.account_id_hex)))
-                })
-                .collect::<Vec<_>>();
-            let accounts = accounts
-                .into_iter()
-                .filter(
-                    |account| match self.onboarding_worker_allowed(&account.label) {
-                        Ok(allowed) => allowed,
-                        Err(error) => {
-                            tracing::warn!(target: "marmot_app::runtime", method = "reconcile",
+                .filter(|account| match self.account_worker_eligible(account) {
+                    Ok(allowed) => allowed,
+                    Err(error) => {
+                        tracing::warn!(target: "marmot_app::runtime", method = "reconcile",
                                 error_kind = error.privacy_safe_kind(),
                                 "gated one account with an unreadable onboarding checkpoint");
-                            false
-                        }
-                    },
-                )
+                        false
+                    }
+                })
                 .collect::<Vec<_>>();
             let active_account_ids = accounts
                 .iter()
@@ -7074,7 +7947,7 @@ impl AccountManager {
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .allows(&account.account_id_hex, tokio::time::Instant::now())
                     {
-                        self.shared.app_performance_telemetry().record_runtime(
+                        self.shared.observer.performance().record_runtime(
                             RuntimeOp::AccountStartupRetrySuppressed,
                             Duration::ZERO,
                             TelemetryOutcome::NotReady,
@@ -7098,10 +7971,20 @@ impl AccountManager {
                     }
                     let account_id = account.account_id_hex.clone();
                     let (ready_tx, ready_rx) = oneshot::channel();
-                    let startup_progress =
-                        AccountStartupProgress::new(self.shared.app_performance_telemetry());
+                    let startup_progress = AccountStartupProgress::new(
+                        self.shared.observer.performance().clone(),
+                        self.app.account_open_progress(&account.label),
+                    );
                     let (shutdown_tx, shutdown_rx) = oneshot::channel();
                     let (command_tx, command_rx) = mpsc::channel(8);
+                    let unit = Arc::new(WorkerUnitGauge::default());
+                    let (read_state_tx, read_state) = read_state_channel();
+                    let (unlinked_tx, unlinked_rx) = oneshot::channel();
+                    self.deactivate_when_unlinked(
+                        account.account_id_hex.clone(),
+                        account.label.clone(),
+                        unlinked_rx,
+                    );
                     let handle = spawn_app_runtime_account_worker(
                         AccountWorkerRuntime {
                             app: self.app.clone(),
@@ -7111,6 +7994,9 @@ impl AccountManager {
                             events: self.events.clone(),
                             lifecycle: self.shared.lifecycle(),
                             shared: self.shared.clone(),
+                            unlinked: unlinked_tx,
+                            unit: unit.clone(),
+                            read_state: read_state_tx,
                         },
                         command_tx.clone(),
                         command_rx,
@@ -7126,6 +8012,8 @@ impl AccountManager {
                             commands: command_tx,
                             media_admission: Arc::new(Semaphore::new(MEDIA_COMMAND_QUEUE_LIMIT)),
                             shutdown: shutdown_tx,
+                            unit,
+                            read_state,
                         },
                     );
                     ready_receivers.push((account_id, Instant::now(), ready_rx, startup_progress));
@@ -7134,7 +8022,11 @@ impl AccountManager {
             let mut ready_waits = FuturesUnordered::new();
             for (account_id, account_started_at, ready, startup_progress) in ready_receivers {
                 ready_waits.push(async move {
-                    let ready_result = timeout(APP_RUNTIME_ACCOUNT_READY_WAIT, ready).await;
+                    // A startup gives up after a whole wait with no progress,
+                    // not a whole wait in total (mdk#3145).
+                    let ready_result = startup_progress
+                        .wait_ready(ready, APP_RUNTIME_ACCOUNT_READY_WAIT)
+                        .await;
                     (
                         account_id,
                         account_started_at.elapsed(),
@@ -7166,7 +8058,7 @@ impl AccountManager {
                             SyncErrorClass::TransportClosed,
                         )),
                     ),
-                    Err(_) => {
+                    Err(account_worker::StartupStalled) => {
                         // Name the pre-ready step the worker is blocked in
                         // (mdk#1911); the stage is the only context exported.
                         let stage = startup_progress.expire();
@@ -7205,13 +8097,11 @@ impl AccountManager {
                         }
                     }
                 }
-                self.shared
-                    .app_performance_telemetry()
-                    .record_classified_result(
-                        AppPerformanceOperation::AccountOpen,
-                        account_open_elapsed,
-                        classification,
-                    );
+                self.shared.observer.performance().record_classified_result(
+                    AppPerformanceOperation::AccountOpen,
+                    account_open_elapsed,
+                    classification,
+                );
                 if let Err(error) = outcome {
                     self.startup_retries
                         .lock()
@@ -7230,7 +8120,7 @@ impl AccountManager {
             Ok(report)
         }
         .await;
-        self.shared.app_performance_telemetry().record(
+        self.shared.observer.performance().record(
             AppPerformanceOperation::AccountReconcile,
             started_at.elapsed(),
             result
@@ -7243,7 +8133,8 @@ impl AccountManager {
     pub async fn restart_account(&self, account_id_hex: &str) -> Result<(), AppError> {
         let lock_wait = self
             .shared
-            .app_performance_telemetry()
+            .observer
+            .performance()
             .observe(RuntimeOp::LifecycleLockWait);
         let _worker_transaction = self.worker_transactions.lock().await;
         lock_wait.finish(TelemetryOutcome::Success);
@@ -7272,7 +8163,8 @@ impl AccountManager {
     pub async fn catch_up_accounts(&self) -> Result<CatchUpAccountsSummary, AppError> {
         let observation = self
             .shared
-            .app_performance_telemetry()
+            .observer
+            .performance()
             .observe(RuntimeOp::CatchUpRequested);
         let started_at = Instant::now();
         let result = async {
@@ -7288,16 +8180,14 @@ impl AccountManager {
             })
         }
         .await;
-        self.shared
-            .app_performance_telemetry()
-            .record_classified_result(
-                AppPerformanceOperation::AccountCatchUp,
-                started_at.elapsed(),
-                result
-                    .as_ref()
-                    .err()
-                    .map(account_catch_up_metric_classification),
-            );
+        self.shared.observer.performance().record_classified_result(
+            AppPerformanceOperation::AccountCatchUp,
+            started_at.elapsed(),
+            result
+                .as_ref()
+                .err()
+                .map(account_catch_up_metric_classification),
+        );
         observation.finish_app(&result);
         result
     }
@@ -7525,19 +8415,47 @@ impl AccountManager {
         &self,
         account_ref: &str,
     ) -> Result<mpsc::Sender<AccountWorkerCommand>, AppError> {
+        self.worker_lane(account_ref)
+            .await
+            .map(|lane| lane.commands)
+    }
+
+    /// The account's worker lane: its commands, with the gauge host reads
+    /// sample when they are enqueued (mdk#3273 PR 0).
+    pub(super) async fn worker_lane(&self, account_ref: &str) -> Result<WorkerLane, AppError> {
         self.shared.lifecycle().ensure_running()?;
         let account = self.resolve(account_ref)?;
-        self.require_onboarding_complete_for(&account)?;
+        self.setup_records()
+            .require_onboarding_complete_for(&account)?;
         self.worker_commands_for_account(account)
             .await
-            .map(|(commands, _)| commands)
+            .map(|(lane, _)| lane)
+    }
+
+    /// The worker lane for one host read of `class`, and that read's reply,
+    /// whose wait on the worker starts now.
+    pub(super) async fn read_command<T>(
+        &self,
+        account_ref: &str,
+        class: ReadClass,
+    ) -> Result<
+        (
+            mpsc::Sender<AccountWorkerCommand>,
+            ReadReply<T>,
+            oneshot::Receiver<T>,
+        ),
+        AppError,
+    > {
+        let lane = self.worker_lane(account_ref).await?;
+        let (respond, response) = lane.read_reply(self.shared.observer.performance(), class);
+        Ok((lane.commands, respond, response))
     }
 
     /// Look up an already-running worker without starting or reconciling one.
     async fn existing_worker_commands(
         &self,
         account_ref: &str,
-    ) -> Result<Option<mpsc::Sender<AccountWorkerCommand>>, AppError> {
+    ) -> Result<Option<WorkerLane>, AppError> {
         self.shared.lifecycle().ensure_running()?;
         let account = self.resolve(account_ref)?;
         if !account.can_sign() {
@@ -7549,7 +8467,7 @@ impl AccountManager {
         let workers = self.workers.lock().await;
         Ok(workers
             .get(&account.account_id_hex)
-            .map(|worker| worker.commands.clone()))
+            .map(ManagedAccountWorker::lane))
     }
 
     async fn worker_commands_for_setup(
@@ -7560,7 +8478,7 @@ impl AccountManager {
         let account = self.resolve(account_ref)?;
         self.worker_commands_for_account(account)
             .await
-            .map(|(commands, _)| commands)
+            .map(|(lane, _)| lane.commands)
     }
 
     async fn media_worker_commands(
@@ -7569,8 +8487,10 @@ impl AccountManager {
     ) -> Result<(mpsc::Sender<AccountWorkerCommand>, OwnedSemaphorePermit), AppError> {
         self.shared.lifecycle().ensure_running()?;
         let account = self.resolve(account_ref)?;
-        self.require_onboarding_complete_for(&account)?;
-        let (commands, admission) = self.worker_commands_for_account(account).await?;
+        self.setup_records()
+            .require_onboarding_complete_for(&account)?;
+        let (lane, admission) = self.worker_commands_for_account(account).await?;
+        let commands = lane.commands;
         // Wait outside the shared command lane, without holding the worker map lock.
         let permit = tokio::select! {
             _ = commands.closed() => return Err(AppError::TransportClosed),
@@ -7586,9 +8506,10 @@ impl AccountManager {
     async fn worker_commands_for_account(
         &self,
         account: AccountSummary,
-    ) -> Result<(mpsc::Sender<AccountWorkerCommand>, Arc<Semaphore>), AppError> {
+    ) -> Result<(WorkerLane, Arc<Semaphore>), AppError> {
         self.shared
-            .app_performance_telemetry()
+            .observer
+            .performance()
             .measure_app(RuntimeOp::WorkerAcquire, async {
                 if !account.can_sign() {
                     return Err(AccountHomeError::SecretNotFound(account.account_id_hex).into());
@@ -7606,9 +8527,11 @@ impl AccountManager {
                         && !self.account_is_tearing_down(&account.account_id_hex)
                         && (!account.external_signing
                             || self.app.has_external_signer(&account.account_id_hex))
-                        && self.onboarding_worker_allowed(&account.label)?
+                        && self
+                            .setup_records()
+                            .onboarding_worker_allowed(&account.label)?
                     {
-                        return Ok((worker.commands.clone(), worker.media_admission.clone()));
+                        return Ok((worker.lane(), worker.media_admission.clone()));
                     }
                 }
                 self.reconcile_for_account(&account.account_id_hex).await?;
@@ -7624,7 +8547,7 @@ impl AccountManager {
                             && (!account.external_signing
                                 || self.app.has_external_signer(&account.account_id_hex))
                     })
-                    .map(|worker| (worker.commands.clone(), worker.media_admission.clone()))
+                    .map(|worker| (worker.lane(), worker.media_admission.clone()))
                     .ok_or_else(|| {
                         AppError::RelayDirectory(
                             "managed account worker is not running for local signing account"
@@ -7639,7 +8562,53 @@ impl AccountManager {
         &self,
         request: AccountSetupRequest,
     ) -> Result<AccountSetupResult, AppError> {
-        let observation = self.shared.product_analytics.begin(
+        self.create_or_import_account_as(request, GeneratedIdentity::ResumeOrCreate)
+            .await
+    }
+
+    /// Continue the pending generated setup of `account_id_hex`, and only
+    /// that account's: it fails with `UnknownAccount` once the account is
+    /// removed, signed out or set up, instead of resuming or creating another
+    /// identity (whitenoise-ios#1302).
+    pub(super) fn continue_generated_account_setup<'a>(
+        &'a self,
+        account_id_hex: &'a str,
+        request: AccountSetupRequest,
+    ) -> impl Future<Output = Result<AccountSetupResult, AppError>> + Send + 'a {
+        self.create_or_import_account_as(request, GeneratedIdentity::Continue(account_id_hex))
+    }
+
+    /// `account_id_hex` while its generated setup is still pending and may
+    /// publish: present, signed in and journaled as a generated identity.
+    pub(super) fn pending_generated_account(
+        &self,
+        account_id_hex: &str,
+    ) -> Result<Option<AccountSummary>, AppError> {
+        let home = self.app.account_home();
+        let account = match home.account(account_id_hex) {
+            Ok(account) => account,
+            Err(AccountHomeError::UnknownAccount(_)) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        if account.account_id_hex != account_id_hex
+            || account.signed_out
+            || account.unlinked
+            || !account.local_signing
+        {
+            return Ok(None);
+        }
+        Ok(home
+            .account_setup_state(&account.label)?
+            .filter(|state| state.kind == AccountSetupKind::GeneratedIdentity)
+            .map(|_| account))
+    }
+
+    async fn create_or_import_account_as(
+        &self,
+        request: AccountSetupRequest,
+        generated: GeneratedIdentity<'_>,
+    ) -> Result<AccountSetupResult, AppError> {
+        let observed = self.shared.observer.product().observed(
             crate::ProductFamily::Account,
             if request.import_nsec.is_some() {
                 "import"
@@ -7650,151 +8619,206 @@ impl AccountManager {
             },
             crate::ProductUnit::Attempt,
         );
-        let result = self.create_or_import_account_unobserved(request).await;
-        self.app.presentation_signals.catalog_changed();
-        if let Some(observation) = observation {
-            observation.finish(if result.is_ok() { "success" } else { "failure" });
-        }
-        result
-    }
-
-    async fn create_or_import_account_unobserved(
-        &self,
-        request: AccountSetupRequest,
-    ) -> Result<AccountSetupResult, AppError> {
-        self.shared.lifecycle().ensure_running()?;
-        validate_account_setup_request(&request, AccountSetupOperation::CreateOrImport)?;
-        let imports_private_key = request.import_nsec.is_some();
-        let creates_new_private_key = request.identity.is_none() && request.import_nsec.is_none();
-        let directory_bootstrap_relays = directory_bootstrap_relays_for_setup(&request);
-        if let Some(nsec) = request.import_nsec.as_deref()
-            && self.legacy_incomplete_account_for_import(nsec)?
-        {
-            return Err(AppError::AccountSetupRecoveryRequired);
-        }
-        let identity_key: Option<&str> = request
-            .import_nsec
-            .as_ref()
-            .map(|value| value.as_str())
-            .or(request.identity.as_deref());
-        let (mut account, private_key_import) = if let Some(identity) = identity_key {
-            let account_id = if crate::is_nostr_secret(identity) {
-                AccountHome::account_id_for_secret(identity)?
-            } else {
-                AccountHome::account_id_for_public_key(identity)?
-            };
-            match self.app.account_home().account(&account_id) {
-                Ok(account) => self.require_onboarding_complete(&account.label)?,
-                Err(AccountHomeError::UnknownAccount(_)) => {}
-                Err(error) => return Err(error.into()),
-            }
-            match self.signed_out_account_for_identity(identity)? {
-                Some(account) => (account, None),
-                None => self.create_nostr_account_from_setup(&request)?,
-            }
-        } else {
-            self.create_nostr_account_from_setup(&request)?
-        };
-        let reactivating_existing = account.signed_out;
-        let recent_relay_lists =
-            if imports_private_key || reactivating_existing || !account.local_signing {
-                // Resolve a pre-existing identity's profile from public indexers, not
-                // the app's own messaging relays, where its outbox metadata does not
-                // live. Runs before the relay-list setup below so discovery never
-                // clobbers, or is clobbered by, the publish-missing-relay-lists step.
-                // Advisory: bounded so a stalled indexer cannot hang import or
-                // reactivation, exactly like the external-signer login path.
-                bounded_advisory_step(
-                    &self.shared.app_performance_telemetry(),
-                    ACCOUNT_DIRECTORY_PREFLIGHT_WAIT,
-                    "import_directory_preflight",
-                    self.preflight_existing_account_directory(
-                        &account.account_id_hex,
-                        directory_discovery_relays_for_setup(&request),
-                    ),
-                )
-                .await
-                .flatten()
-            } else {
-                None
-            };
-
-        let (relay_lists, profile) = if creates_new_private_key && account.local_signing {
-            match self
-                .setup_generated_account_bootstrap(&account, &request)
-                .await
-            {
-                Ok(result) => result,
-                Err(err) => {
-                    if self.setup_failure_can_roll_back(&account, reactivating_existing)? {
-                        return self.rollback_import_after_setup_failure(
-                            &account,
-                            private_key_import.as_ref(),
-                            err,
-                        );
-                    }
-                    // Once the helper records publication intent, a relay may
-                    // hold one replaceable bootstrap record. Retain the
-                    // journaled identity and retry instead of deleting it.
-                    return Err(err);
+        let work = async move {
+            let result = async {
+                self.shared.lifecycle().ensure_running()?;
+                validate_account_setup_request(&request, AccountSetupOperation::CreateOrImport)?;
+                let imports_private_key = request.import_nsec.is_some();
+                let creates_new_private_key =
+                    request.identity.is_none() && request.import_nsec.is_none();
+                let directory_bootstrap_relays = directory_bootstrap_relays_for_setup(&request);
+                if let Some(nsec) = request.import_nsec.as_deref()
+                    && self.legacy_incomplete_account_for_import(nsec)?
+                {
+                    return Err(AppError::AccountSetupRecoveryRequired);
                 }
-            }
-        } else {
-            let relay_lists = match self
-                .setup_relay_lists_for_account(
-                    &account,
-                    &request,
-                    imports_private_key,
-                    creates_new_private_key,
-                    recent_relay_lists,
-                )
-                .await
-            {
-                Ok(relay_lists) => relay_lists,
-                Err(err) => {
-                    if self.setup_failure_can_roll_back(&account, reactivating_existing)? {
-                        return self.rollback_import_after_setup_failure(
-                            &account,
-                            private_key_import.as_ref(),
-                            err,
-                        );
+                let identity_key: Option<&str> = request
+                    .import_nsec
+                    .as_ref()
+                    .map(|value| value.as_str())
+                    .or(request.identity.as_deref());
+                let (mut account, private_key_import) = if let Some(identity) = identity_key {
+                    let account_id = if crate::is_nostr_secret(identity) {
+                        AccountHome::account_id_for_secret(identity)?
+                    } else {
+                        AccountHome::account_id_for_public_key(identity)?
+                    };
+                    match self.app.account_home().account(&account_id) {
+                        Ok(account) => {
+                            refuse_unlinked(&account)?;
+                            self.setup_records()
+                                .require_onboarding_complete(&account.label)?;
+                        }
+                        Err(AccountHomeError::UnknownAccount(_)) => {}
+                        Err(error) => return Err(error.into()),
                     }
-                    return Err(err);
-                }
-            };
-            (relay_lists, None)
-        };
+                    match self.signed_out_account_for_identity(identity)? {
+                        Some(account) => (account, None),
+                        None => self.create_nostr_account_from_setup(&request, generated)?,
+                    }
+                } else {
+                    self.create_nostr_account_from_setup(&request, generated)?
+                };
+                let reactivating_existing = account.signed_out;
+                let recent_relay_lists =
+                    if imports_private_key || reactivating_existing || !account.local_signing {
+                        // Resolve a pre-existing identity's profile from public indexers, not
+                        // the app's own messaging relays, where its outbox metadata does not
+                        // live. Runs before the relay-list setup below so discovery never
+                        // clobbers, or is clobbered by, the publish-missing-relay-lists step.
+                        // Advisory: bounded so a stalled indexer cannot hang import or
+                        // reactivation, exactly like the external-signer login path.
+                        bounded_advisory_step(
+                            self.shared.observer.performance(),
+                            ACCOUNT_DIRECTORY_PREFLIGHT_WAIT,
+                            "import_directory_preflight",
+                            self.preflight_existing_account_directory(
+                                &account.account_id_hex,
+                                directory_discovery_relays_for_setup(&request),
+                            ),
+                        )
+                        .await
+                        .flatten()
+                    } else {
+                        None
+                    };
 
-        let key_package_bytes = if request.publish_initial_key_package && account.local_signing {
-            let setup_phase = self
-                .app
-                .account_home()
-                .account_setup_state(&account.label)?
-                .map(|state| state.phase);
-            let confirmed_bytes =
-                if setup_phase == Some(AccountSetupPhase::KeyPackagePublicationConfirmed) {
-                    self.confirmed_setup_key_package_bytes(&account.label)?
+                let (relay_lists, profile) = if creates_new_private_key && account.local_signing {
+                    match self
+                        .setup_generated_account_bootstrap(&account, &request)
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(err) => {
+                            if self.setup_failure_can_roll_back(&account, reactivating_existing)? {
+                                return self.rollback_import_after_setup_failure(
+                                    &account,
+                                    private_key_import.as_ref(),
+                                    err,
+                                );
+                            }
+                            // Once the helper records publication intent, a relay may
+                            // hold one replaceable bootstrap record. Retain the
+                            // journaled identity and retry instead of deleting it.
+                            return Err(err);
+                        }
+                    }
+                } else {
+                    let relay_lists = match self
+                        .setup_relay_lists_for_account(
+                            &account,
+                            &request,
+                            imports_private_key,
+                            creates_new_private_key,
+                            recent_relay_lists,
+                        )
+                        .await
+                    {
+                        Ok(relay_lists) => relay_lists,
+                        Err(err) => {
+                            if self.setup_failure_can_roll_back(&account, reactivating_existing)? {
+                                return self.rollback_import_after_setup_failure(
+                                    &account,
+                                    private_key_import.as_ref(),
+                                    err,
+                                );
+                            }
+                            return Err(err);
+                        }
+                    };
+                    (relay_lists, None)
+                };
+
+                let key_package_bytes = if request.publish_initial_key_package
+                    && account.local_signing
+                {
+                    let setup_phase = self
+                        .app
+                        .account_home()
+                        .account_setup_state(&account.label)?
+                        .map(|state| state.phase);
+                    let confirmed_bytes =
+                        if setup_phase == Some(AccountSetupPhase::KeyPackagePublicationConfirmed) {
+                            self.confirmed_setup_key_package_bytes(&account.label)?
+                        } else {
+                            None
+                        };
+                    if let Some(bytes) = confirmed_bytes {
+                        Some(bytes)
+                    } else {
+                        self.shared.lifecycle().ensure_running()?;
+                        if setup_phase.is_some()
+                            && let Err(err) = self.app.account_home().set_account_setup_phase(
+                                &account.label,
+                                AccountSetupPhase::KeyPackagePublicationStarted,
+                            )
+                        {
+                            if self.setup_failure_can_roll_back(&account, reactivating_existing)? {
+                                return self.rollback_import_after_setup_failure(
+                                    &account,
+                                    private_key_import.as_ref(),
+                                    err.into(),
+                                );
+                            }
+                            return Err(err.into());
+                        }
+                        if account.signed_out {
+                            account = self
+                                .app
+                                .account_home()
+                                .set_account_signed_out(&account.label, false)?;
+                            self.app.presentation_signals.catalog_changed();
+                        }
+                        let publication =
+                            self.publish_initial_key_package_for_account(&account).await;
+                        match publication {
+                            Ok(bytes) => {
+                                if setup_phase.is_some() {
+                                    self.app.account_home().set_account_setup_phase(
+                                        &account.label,
+                                        AccountSetupPhase::KeyPackagePublicationConfirmed,
+                                    )?;
+                                }
+                                Some(bytes)
+                            }
+                            Err(err) => {
+                                // Publication-started state plus the SQLCipher lifecycle
+                                // is sufficient to retry safely after any ordinary error
+                                // or task cancellation. Never delete possibly exposed
+                                // exact bytes/private material here.
+                                // A reactivation has no setup journal, so restore its
+                                // durable signed-out state and stop the just-started
+                                // worker. The same nsec can then resume this exact
+                                // lifecycle attempt instead of failing AccountExists.
+                                if reactivating_existing {
+                                    self.restore_signed_out_after_key_package_failure(
+                                        &account.label,
+                                    )
+                                    .await;
+                                }
+                                return Err(err);
+                            }
+                        }
+                    }
                 } else {
                     None
                 };
-            if let Some(bytes) = confirmed_bytes {
-                Some(bytes)
-            } else {
+
                 self.shared.lifecycle().ensure_running()?;
-                if setup_phase.is_some()
-                    && let Err(err) = self.app.account_home().set_account_setup_phase(
-                        &account.label,
-                        AccountSetupPhase::KeyPackagePublicationStarted,
+                if !creates_new_private_key {
+                    // Generated setup already persisted the just-acknowledged empty
+                    // follow list and profile locally. Only imported/existing accounts
+                    // need a directory refresh here.
+                    let _ = bounded_advisory_step(
+                        self.shared.observer.performance(),
+                        ACCOUNT_SETUP_ADVISORY_WAIT,
+                        "import_directory_refresh",
+                        self.app.directory().refresh_user_directory_for_account_id(
+                            &account.account_id_hex,
+                            directory_bootstrap_relays.clone(),
+                        ),
                     )
-                {
-                    if self.setup_failure_can_roll_back(&account, reactivating_existing)? {
-                        return self.rollback_import_after_setup_failure(
-                            &account,
-                            private_key_import.as_ref(),
-                            err.into(),
-                        );
-                    }
-                    return Err(err.into());
+                    .await;
                 }
                 if account.signed_out {
                     account = self
@@ -7803,73 +8827,26 @@ impl AccountManager {
                         .set_account_signed_out(&account.label, false)?;
                     self.app.presentation_signals.catalog_changed();
                 }
-                let publication = self.publish_initial_key_package_for_account(&account).await;
-                match publication {
-                    Ok(bytes) => {
-                        if setup_phase.is_some() {
-                            self.app.account_home().set_account_setup_phase(
-                                &account.label,
-                                AccountSetupPhase::KeyPackagePublicationConfirmed,
-                            )?;
-                        }
-                        Some(bytes)
-                    }
-                    Err(err) => {
-                        // Publication-started state plus the SQLCipher lifecycle
-                        // is sufficient to retry safely after any ordinary error
-                        // or task cancellation. Never delete possibly exposed
-                        // exact bytes/private material here.
-                        // A reactivation has no setup journal, so restore its
-                        // durable signed-out state and stop the just-started
-                        // worker. The same nsec can then resume this exact
-                        // lifecycle attempt instead of failing AccountExists.
-                        if reactivating_existing {
-                            self.restore_signed_out_after_key_package_failure(&account.label)
-                                .await;
-                        }
-                        return Err(err);
-                    }
-                }
+                self.retry_and_reconcile_for_account(&account.account_id_hex)
+                    .await?;
+                self.app
+                    .account_home()
+                    .complete_account_setup(&account.label)?;
+                Ok(AccountSetupResult {
+                    account,
+                    relay_lists,
+                    key_package_bytes,
+                    profile,
+                    readiness: AccountSetupReadiness::NetworkReady,
+                })
             }
-        } else {
-            None
-        };
-
-        self.shared.lifecycle().ensure_running()?;
-        if !creates_new_private_key {
-            // Generated setup already persisted the just-acknowledged empty
-            // follow list and profile locally. Only imported/existing accounts
-            // need a directory refresh here.
-            let _ = bounded_advisory_step(
-                &self.shared.app_performance_telemetry(),
-                ACCOUNT_SETUP_ADVISORY_WAIT,
-                "import_directory_refresh",
-                self.app.directory().refresh_user_directory_for_account_id(
-                    &account.account_id_hex,
-                    directory_bootstrap_relays.clone(),
-                ),
-            )
             .await;
-        }
-        if account.signed_out {
-            account = self
-                .app
-                .account_home()
-                .set_account_signed_out(&account.label, false)?;
             self.app.presentation_signals.catalog_changed();
-        }
-        self.retry_and_reconcile_for_account(&account.account_id_hex)
-            .await?;
-        self.app
-            .account_home()
-            .complete_account_setup(&account.label)?;
-        Ok(AccountSetupResult {
-            account,
-            relay_lists,
-            key_package_bytes,
-            profile,
-            readiness: AccountSetupReadiness::NetworkReady,
-        })
+            result
+        };
+        observed
+            .run_async(work, marmot_observability::success_or_failure)
+            .await
     }
 
     async fn wait_for_account_network_startup_to_settle(
@@ -7900,119 +8877,341 @@ impl AccountManager {
     where
         S: crate::ExternalAccountSigner + 'static,
     {
-        let observation = self.shared.product_analytics.begin(
+        self.login_with_external(
+            public_key,
+            ExternalSetupSigner::Host(Arc::new(signer)),
+            request,
+        )
+        .await
+    }
+
+    async fn login_with_external(
+        &self,
+        public_key: String,
+        signer: ExternalSetupSigner,
+        request: AccountSetupRequest,
+    ) -> Result<AccountSetupResult, AppError> {
+        let observed = self.shared.observer.product().observed(
             crate::ProductFamily::Account,
             "external_signer",
             crate::ProductUnit::Attempt,
         );
-        let result = self
-            .login_external_signer_unobserved(public_key, signer, request)
+        let work = async move {
+            let result = async {
+                self.shared.lifecycle().ensure_running()?;
+                let signer_public_key = match &signer {
+                    ExternalSetupSigner::Host(signer) => signer
+                        .get_public_key()
+                        .await
+                        .map_err(crate::external_signer_public_key_error)?,
+                    ExternalSetupSigner::Nip46 { session, .. } => session.public_key()?,
+                };
+                let account_id_hex = AccountHome::account_id_for_public_key(&public_key)?;
+                if signer_public_key.to_hex() != account_id_hex {
+                    return Err(AppError::ExternalSignerMismatch);
+                }
+                let native_adoption = match &signer {
+                    ExternalSetupSigner::Nip46 {
+                        session,
+                        generation,
+                    } => Some((session.clone(), *generation)),
+                    ExternalSetupSigner::Host(_) => None,
+                };
+                let gate = self.app.onboarding_transaction(&account_id_hex);
+                let _transaction =
+                    crate::Nip46Session::during_adoption(native_adoption.as_ref(), async {
+                        Ok(gate.lock().await)
+                    })
+                    .await?;
+                if native_adoption.is_some() {
+                    self.shared.lifecycle().ensure_running()?;
+                    self.app.ensure_storage_open("NIP-46 adoption")?;
+                }
+                let (existing_account, previous_setup) =
+                    match self.app.account_home().account(&account_id_hex).ok() {
+                        Some(account) => {
+                            refuse_unlinked(&account)?;
+                            self.setup_records()
+                                .require_onboarding_complete(&account.label)?;
+                            let setup = self
+                                .app
+                                .account_home()
+                                .account_setup_state(&account.label)?;
+                            if account.external_signing && !account.local_signing && setup.is_none()
+                            {
+                                return self
+                                    .rebind_external_account(
+                                        account,
+                                        signer_public_key,
+                                        signer,
+                                        request,
+                                    )
+                                    .await;
+                            }
+                            (Some(account), setup)
+                        }
+                        None => (None, None),
+                    };
+                let origin = match existing_account {
+                    None => ExternalSetupOrigin::Created,
+                    Some(account) if !account.external_signing && !account.local_signing => {
+                        ExternalSetupOrigin::Promoted
+                    }
+                    Some(_) => ExternalSetupOrigin::Existing,
+                };
+                let mut account = self
+                    .app
+                    .account_home()
+                    .add_external_signer_account(&public_key)?;
+                self.app.presentation_signals.catalog_changed();
+                let reactivating_existing = account.signed_out;
+                let mut binding = None;
+                let mut readiness = AccountSetupReadiness::Initializing;
+                let setup = async {
+                    binding = self
+                        .bind_external_signer(&account, signer_public_key, signer)
+                        .await?;
+                    if previous_setup.is_none() {
+                        self.app.account_home().begin_account_setup_with(
+                            &account,
+                            false,
+                            AccountSetupKind::ExternalSigner,
+                            AccountSetupPhase::LocalStateCreated,
+                        )?;
+                    }
+                    let network = async {
+                        let directory_bootstrap_relays =
+                            directory_bootstrap_relays_for_setup(&request);
+                        let relay_lists = self.resolve_external_relays(&account, &request).await?;
+
+                        let key_package_bytes = if request.publish_initial_key_package {
+                            if account.signed_out {
+                                account = self
+                                    .app
+                                    .account_home()
+                                    .set_account_signed_out(&account.label, false)?;
+                                self.app.presentation_signals.catalog_changed();
+                            }
+                            self.app.account_home().set_account_setup_phase(
+                                &account.label,
+                                AccountSetupPhase::KeyPackagePublicationStarted,
+                            )?;
+                            match self.publish_initial_key_package_for_account(&account).await {
+                                Ok(bytes) => {
+                                    self.app.account_home().set_account_setup_phase(
+                                        &account.label,
+                                        AccountSetupPhase::KeyPackagePublicationConfirmed,
+                                    )?;
+                                    Some(bytes)
+                                }
+                                Err(err) => {
+                                    // Session lifecycle state owns exact signed bytes and
+                                    // private material before network exposure. Once
+                                    // KeyPackage setup has started, deleting a freshly-added
+                                    // external account could orphan an ambiguously accepted
+                                    // publication; keep it for an exact-byte retry instead.
+                                    // A previously signed-out account is different: restore
+                                    // that durable state while retaining its setup journal.
+                                    if reactivating_existing && native_adoption.is_none() {
+                                        self.restore_signed_out_after_key_package_failure(
+                                            &account.label,
+                                        )
+                                        .await;
+                                    }
+                                    return Err(err);
+                                }
+                            }
+                        } else {
+                            None
+                        };
+
+                        // Single-hop advisory refresh keeps the shorter profile-refresh bound.
+                        let _ = bounded_advisory_step(
+                            self.shared.observer.performance(),
+                            ACCOUNT_SETUP_ADVISORY_WAIT,
+                            "login_directory_refresh",
+                            self.app.directory().refresh_user_directory_for_account_id(
+                                &account.account_id_hex,
+                                directory_bootstrap_relays,
+                            ),
+                        )
+                        .await;
+                        if account.signed_out {
+                            account = self
+                                .app
+                                .account_home()
+                                .set_account_signed_out(&account.label, false)?;
+                            self.app.presentation_signals.catalog_changed();
+                        }
+                        self.retry_and_reconcile_for_account(&account.account_id_hex)
+                            .await?;
+                        // Journal cleanup may remove its first file before failing.
+                        // A network-ready account and signer are already committed.
+                        readiness = AccountSetupReadiness::NetworkReady;
+                        self.app
+                            .account_home()
+                            .complete_account_setup(&account.label)?;
+
+                        Ok((relay_lists, key_package_bytes))
+                    };
+                    crate::Nip46Session::during_adoption(native_adoption.as_ref(), network).await
+                }
+                .await;
+                match setup {
+                    Ok((relay_lists, key_package_bytes)) => Ok(AccountSetupResult {
+                        account,
+                        relay_lists,
+                        key_package_bytes,
+                        profile: None,
+                        readiness,
+                    }),
+                    Err(error) => {
+                        let restored = if native_adoption.is_some()
+                            && reactivating_existing
+                            && !account.signed_out
+                            && readiness != AccountSetupReadiness::NetworkReady
+                        {
+                            self.app
+                                .account_home()
+                                .set_account_signed_out(&account.label, true)
+                                .map(drop)
+                        } else {
+                            Ok(())
+                        };
+                        let durable_account = self.app.account_home().account(&account.label);
+                        let setup_state =
+                            self.app.account_home().account_setup_state(&account.label);
+                        let credential_existed = binding.as_ref().is_some_and(|binding| {
+                            matches!(
+                                &binding.previous,
+                                marmot_account::Nip46SessionWrite::Existing(_)
+                            )
+                        });
+                        let unpublished = readiness != AccountSetupReadiness::NetworkReady
+                            && setup_state.as_ref().is_ok_and(|state| {
+                                state.as_ref().is_none_or(|state| {
+                                    state.phase == AccountSetupPhase::LocalStateCreated
+                                })
+                            });
+                        let rollback_account =
+                            !reactivating_existing && unpublished && !credential_existed;
+                        if let Some(binding) = binding {
+                            let restore_signer = binding.previous_signer.is_some();
+                            let signed_out = durable_account
+                                .as_ref()
+                                .is_ok_and(|account| account.signed_out);
+                            if readiness != AccountSetupReadiness::NetworkReady
+                                && (restore_signer || signed_out || rollback_account)
+                            {
+                                // Setup owns the handoff: retain committed retry material,
+                                // otherwise restore the prior callback and credential record.
+                                let cleanup = blocking_app_task(move || {
+                                    binding
+                                        .session
+                                        .unbind_account(
+                                            &binding.previous,
+                                            binding.previous_signer,
+                                            binding.generation,
+                                        )
+                                        .map_err(AppError::from)
+                                })
+                                .await;
+                                let reconciliation =
+                                    self.reconcile_nip46_cleanup(&account.account_id_hex).await;
+                                cleanup?;
+                                reconciliation?;
+                            }
+                        }
+                        restored?;
+                        durable_account?;
+                        setup_state?;
+                        if rollback_account {
+                            return self.rollback_external_signer_setup(
+                                &account.label,
+                                origin,
+                                error,
+                            );
+                        }
+                        Err(error)
+                    }
+                }
+            }
             .await;
-        self.app.presentation_signals.catalog_changed();
-        if let Some(observation) = observation {
-            observation.finish(if result.is_ok() { "success" } else { "failure" });
-        }
-        result
+            self.app.presentation_signals.catalog_changed();
+            result
+        };
+        observed
+            .run_async(work, marmot_observability::success_or_failure)
+            .await
     }
 
-    async fn login_external_signer_unobserved<S>(
+    async fn bind_external_signer(
         &self,
-        public_key: String,
-        signer: S,
-        request: AccountSetupRequest,
-    ) -> Result<AccountSetupResult, AppError>
-    where
-        S: crate::ExternalAccountSigner + 'static,
-    {
-        self.shared.lifecycle().ensure_running()?;
-        let signer_public_key = signer
-            .get_public_key()
-            .await
-            .map_err(crate::external_signer_public_key_error)?;
-        let account_id_hex = AccountHome::account_id_for_public_key(&public_key)?;
-        if signer_public_key.to_hex() != account_id_hex {
-            return Err(AppError::ExternalSignerMismatch);
+        account: &AccountSummary,
+        public_key: nostr::prelude::PublicKey,
+        signer: ExternalSetupSigner,
+    ) -> Result<Option<Nip46Binding>, AppError> {
+        match signer {
+            ExternalSetupSigner::Nip46 {
+                session,
+                generation,
+            } => {
+                let accounts = self.clone();
+                let label = account.label.clone();
+                blocking_app_task(move || accounts.track_nip46_session(&label, session, generation))
+                    .await
+            }
+            ExternalSetupSigner::Host(signer) => {
+                self.app
+                    .pin_external_signer(&account.account_id_hex, public_key, signer);
+                Ok(None)
+            }
         }
-        let existing_account = self.app.account_home().account(&account_id_hex).ok();
-        if let Some(account) = existing_account.as_ref() {
-            self.require_onboarding_complete(&account.label)?;
-        }
-        let created_account = existing_account.is_none();
-        // add_external_signer_account below promotes a pre-existing tracked
-        // (public) account to external_signing, so a later setup failure must
-        // revert that promotion — not skip cleanup and leave a torn account.
-        // Created accounts are deleted, already-external accounts are left as-is.
-        let upgraded_public_account = existing_account
-            .is_some_and(|account| !account.external_signing && !account.local_signing);
-        let mut account = self
-            .app
-            .account_home()
-            .add_external_signer_account(&public_key)?;
-        self.app.presentation_signals.catalog_changed();
-        let reactivating_existing = account.signed_out;
-        if let Err(err) = self
-            .app
-            .register_external_signer(&account.account_id_hex, signer)
-            .await
-        {
-            return self.rollback_external_signer_setup(
-                &account.label,
-                created_account,
-                upgraded_public_account,
-                err,
-            );
-        }
-        if self
-            .app
-            .account_home()
-            .account_setup_state(&account.label)?
-            .is_none()
-        {
-            self.app.account_home().begin_account_setup_with(
-                &account,
-                false,
-                AccountSetupKind::ExternalSigner,
-                AccountSetupPhase::LocalStateCreated,
-            )?;
-        }
-        let directory_bootstrap_relays = directory_bootstrap_relays_for_setup(&request);
-        // An external-signer account is pre-existing by definition, so resolve
-        // its profile from public indexers (its outbox metadata does not live on
-        // the app's messaging relays). Runs before the relay-list setup so
-        // discovery keeps its anti-clobber ordering.
-        // Discovery is advisory (its error path already proceeds without it),
-        // so a stalled indexer must not hold the whole login hostage.
-        let recent_relay_lists = bounded_advisory_step(
-            &self.shared.app_performance_telemetry(),
+    }
+
+    async fn resolve_external_relays(
+        &self,
+        account: &AccountSummary,
+        request: &AccountSetupRequest,
+    ) -> Result<AccountRelayListStatus, AppError> {
+        // Discovery precedes default publication so existing relay lists are not clobbered.
+        let recent = bounded_advisory_step(
+            self.shared.observer.performance(),
             ACCOUNT_DIRECTORY_PREFLIGHT_WAIT,
             "login_directory_preflight",
             self.preflight_existing_account_directory(
                 &account.account_id_hex,
-                directory_discovery_relays_for_setup(&request),
+                directory_discovery_relays_for_setup(request),
             ),
         )
         .await
         .flatten();
-
-        let relay_lists = match self
-            .setup_relay_lists_for_account(&account, &request, true, false, recent_relay_lists)
+        self.setup_relay_lists_for_account(account, request, true, false, recent)
             .await
-        {
-            Ok(relay_lists) => relay_lists,
-            Err(err) => {
-                if !self.setup_failure_can_roll_back(&account, account.signed_out)? {
-                    return Err(err);
-                }
-                return self.rollback_external_signer_setup(
-                    &account.label,
-                    created_account,
-                    upgraded_public_account,
-                    err,
-                );
-            }
-        };
+    }
 
-        let key_package_bytes = if request.publish_initial_key_package {
+    async fn rebind_external_account(
+        &self,
+        mut account: AccountSummary,
+        public_key: nostr::prelude::PublicKey,
+        signer: ExternalSetupSigner,
+        request: AccountSetupRequest,
+    ) -> Result<AccountSetupResult, AppError> {
+        let reactivating = account.signed_out;
+        let native_adoption = match &signer {
+            ExternalSetupSigner::Nip46 {
+                session,
+                generation,
+            } => Some((session.clone(), *generation)),
+            ExternalSetupSigner::Host(_) => None,
+        };
+        let binding = self
+            .bind_external_signer(&account, public_key, signer)
+            .await?;
+        // A completed account owns no setup journal. Relay repair and signer adoption
+        // must not turn its maintenance work into first-time provisioning.
+        let adoption = async {
+            let relay_lists = self.resolve_external_relays(&account, &request).await?;
             if account.signed_out {
                 account = self
                     .app
@@ -8020,68 +9219,73 @@ impl AccountManager {
                     .set_account_signed_out(&account.label, false)?;
                 self.app.presentation_signals.catalog_changed();
             }
-            self.app.account_home().set_account_setup_phase(
-                &account.label,
-                AccountSetupPhase::KeyPackagePublicationStarted,
-            )?;
-            match self.publish_initial_key_package_for_account(&account).await {
-                Ok(bytes) => {
-                    self.app.account_home().set_account_setup_phase(
-                        &account.label,
-                        AccountSetupPhase::KeyPackagePublicationConfirmed,
-                    )?;
-                    Some(bytes)
-                }
-                Err(err) => {
-                    // Session lifecycle state owns exact signed bytes and
-                    // private material before network exposure. Once
-                    // KeyPackage setup has started, deleting a freshly-added
-                    // external account could orphan an ambiguously accepted
-                    // publication; keep it for an exact-byte retry instead.
-                    // A previously signed-out account is different: restore
-                    // that durable state while retaining its setup journal.
-                    if reactivating_existing {
-                        self.restore_signed_out_after_key_package_failure(&account.label)
-                            .await;
-                    }
-                    return Err(err);
-                }
-            }
-        } else {
-            None
+            let key_package_bytes = if request.publish_initial_key_package {
+                Some(
+                    self.publish_initial_key_package_for_account(&account)
+                        .await?,
+                )
+            } else {
+                None
+            };
+            let _ = bounded_advisory_step(
+                self.shared.observer.performance(),
+                ACCOUNT_SETUP_ADVISORY_WAIT,
+                "login_directory_refresh",
+                self.app.directory().refresh_user_directory_for_account_id(
+                    &account.account_id_hex,
+                    directory_bootstrap_relays_for_setup(&request),
+                ),
+            )
+            .await;
+            self.retry_and_reconcile_for_account(&account.account_id_hex)
+                .await?;
+            Ok((relay_lists, key_package_bytes))
         };
-
-        // Single-hop advisory refresh keeps the shorter profile-refresh bound.
-        let _ = bounded_advisory_step(
-            &self.shared.app_performance_telemetry(),
-            ACCOUNT_SETUP_ADVISORY_WAIT,
-            "login_directory_refresh",
-            self.app.directory().refresh_user_directory_for_account_id(
-                &account.account_id_hex,
-                directory_bootstrap_relays,
-            ),
-        )
-        .await;
-        if account.signed_out {
-            account = self
-                .app
-                .account_home()
-                .set_account_signed_out(&account.label, false)?;
-            self.app.presentation_signals.catalog_changed();
+        let adoption =
+            crate::Nip46Session::during_adoption(native_adoption.as_ref(), adoption).await;
+        match adoption {
+            Ok((relay_lists, key_package_bytes)) => Ok(AccountSetupResult {
+                account,
+                relay_lists,
+                key_package_bytes,
+                profile: None,
+                readiness: AccountSetupReadiness::NetworkReady,
+            }),
+            Err(error) => {
+                let restored = if reactivating && !account.signed_out {
+                    self.app
+                        .account_home()
+                        .set_account_signed_out(&account.label, true)
+                        .map(drop)
+                } else {
+                    Ok(())
+                };
+                let cleanup = if let Some(binding) = binding {
+                    blocking_app_task(move || {
+                        binding
+                            .session
+                            .unbind_account(
+                                &binding.previous,
+                                binding.previous_signer,
+                                binding.generation,
+                            )
+                            .map_err(AppError::from)
+                    })
+                    .await
+                } else {
+                    Ok(())
+                };
+                let reconciliation = if native_adoption.is_some() {
+                    self.reconcile_nip46_cleanup(&account.account_id_hex).await
+                } else {
+                    self.reconcile_for_account(&account.account_id_hex).await
+                };
+                restored?;
+                cleanup?;
+                reconciliation?;
+                Err(error)
+            }
         }
-        self.retry_and_reconcile_for_account(&account.account_id_hex)
-            .await?;
-        self.app
-            .account_home()
-            .complete_account_setup(&account.label)?;
-
-        Ok(AccountSetupResult {
-            account,
-            relay_lists,
-            key_package_bytes,
-            profile: None,
-            readiness: AccountSetupReadiness::NetworkReady,
-        })
     }
 
     pub async fn register_external_signer<S>(
@@ -8256,12 +9460,12 @@ impl AccountManager {
             .await
         {
             Ok(publication) => {
-                self.shared.app_performance_telemetry().record(
+                self.shared.observer.performance().record(
                     AppPerformanceOperation::AccountBootstrapRelayAndFollowPublish,
                     publication.relay_and_follow_duration,
                     true,
                 );
-                self.shared.app_performance_telemetry().record(
+                self.shared.observer.performance().record(
                     AppPerformanceOperation::AccountDefaultProfilePublish,
                     publication.default_profile_duration,
                     true,
@@ -8270,12 +9474,12 @@ impl AccountManager {
             }
             Err(error) => {
                 let elapsed = publish_started_at.elapsed();
-                self.shared.app_performance_telemetry().record(
+                self.shared.observer.performance().record(
                     AppPerformanceOperation::AccountBootstrapRelayAndFollowPublish,
                     elapsed,
                     false,
                 );
-                self.shared.app_performance_telemetry().record(
+                self.shared.observer.performance().record(
                     AppPerformanceOperation::AccountDefaultProfilePublish,
                     elapsed,
                     false,
@@ -8337,7 +9541,7 @@ impl AccountManager {
                     status
                 } else {
                     match bounded_advisory_step(
-                        &self.shared.app_performance_telemetry(),
+                        self.shared.observer.performance(),
                         ACCOUNT_DIRECTORY_PREFLIGHT_WAIT,
                         "import_relay_list_status",
                         self.app
@@ -8587,8 +9791,9 @@ impl AccountManager {
     fn create_nostr_account_from_setup(
         &self,
         request: &AccountSetupRequest,
+        generated: GeneratedIdentity<'_>,
     ) -> Result<(AccountSummary, Option<NostrAccountImport>), AppError> {
-        let result = self.create_nostr_account_from_setup_inner(request);
+        let result = self.create_nostr_account_from_setup_inner(request, generated);
         self.app.presentation_signals.catalog_changed();
         result
     }
@@ -8596,6 +9801,7 @@ impl AccountManager {
     fn create_nostr_account_from_setup_inner(
         &self,
         request: &AccountSetupRequest,
+        generated: GeneratedIdentity<'_>,
     ) -> Result<(AccountSummary, Option<NostrAccountImport>), AppError> {
         let account_home = self.app.account_home();
         if let Some(nsec) = request.import_nsec.as_deref() {
@@ -8617,27 +9823,19 @@ impl AccountManager {
                 Ok((account, None))
             }
             None => {
-                let account = match account_home.resumable_generated_account_setup()? {
-                    Some(account) => account,
-                    None => {
-                        let account = account_home.create_nostr_account_for_setup()?;
-                        // This identity did not exist before this process and
-                        // therefore cannot have a legacy kind-30443 event to
-                        // retire. Persist that proof before its first session
-                        // open so startup never pays a guaranteed-empty relay
-                        // scan (mdk#1436).
-                        if let Err(error) = self
-                            .app
-                            .mark_key_package_cutover_scan_complete(&account.label)
-                        {
-                            let _ = self
-                                .app
-                                .remove_account_key_package_artifacts(&account.label);
-                            let _ = account_home.remove_account(&account.label);
-                            return Err(error);
+                let account = match generated {
+                    GeneratedIdentity::ResumeOrCreate => {
+                        match account_home.resumable_generated_account_setup()? {
+                            Some(account) => account,
+                            None => account_home.create_nostr_account_for_setup()?,
                         }
-                        account
                     }
+                    GeneratedIdentity::Fresh => account_home.create_nostr_account_for_setup()?,
+                    GeneratedIdentity::Continue(account_id_hex) => self
+                        .pending_generated_account(account_id_hex)?
+                        .ok_or_else(|| {
+                            AccountHomeError::UnknownAccount(account_id_hex.to_owned())
+                        })?,
                 };
                 Ok((account, None))
             }
@@ -8652,19 +9850,21 @@ impl AccountManager {
     fn rollback_external_signer_setup<T>(
         &self,
         label: &str,
-        created_account: bool,
-        upgraded_public_account: bool,
+        origin: ExternalSetupOrigin,
         err: AppError,
     ) -> Result<T, AppError> {
-        if created_account {
-            return self.rollback_account_after_setup_failure(label, err);
-        }
-        if upgraded_public_account {
-            let _ = self.app.account_home().complete_account_setup(label);
-            let _ = self
-                .app
-                .account_home()
-                .revert_external_signer_upgrade(label);
+        match origin {
+            ExternalSetupOrigin::Created => {
+                return self.rollback_account_after_setup_failure(label, err);
+            }
+            ExternalSetupOrigin::Promoted => {
+                self.erase_nip46_session(label, Nip46Removal::Recorded)?;
+                self.app.account_home().complete_account_setup(label)?;
+                self.app
+                    .account_home()
+                    .revert_external_signer_upgrade(label)?;
+            }
+            ExternalSetupOrigin::Existing => {}
         }
         Err(err)
     }
@@ -8678,6 +9878,7 @@ impl AccountManager {
         // storage/directory handles. Evict them before the directory is deleted
         // so a later re-import does not reuse a handle bound to the now-unlinked
         // inode. See `drop_account_caches` and mdk#220.
+        self.erase_nip46_session(account, Nip46Removal::Recorded)?;
         self.app.drop_account_caches(account);
         if let Err(rollback) = self.app.remove_account_key_package_artifacts(account) {
             return Err(AppError::RelayDirectory(format!(
@@ -8756,37 +9957,13 @@ impl AccountManager {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
+        self.finish_nip46_adoptions(nip46::Nip46AdoptionScope::Runtime)
+            .await;
+        self.app.stop_emoji_set_installs();
         for task in self.app.abort_all_public_indexer_copies() {
             let _ = task.await;
         }
-        self.onboarding_updates
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clear();
-        let onboarding_cancellation_tasks = {
-            let mut tasks = self
-                .onboarding_cancellations
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            tasks.accepting = false;
-            std::mem::take(&mut tasks.handles)
-        };
-        for task in onboarding_cancellation_tasks {
-            let _ = task.await;
-        }
-        let generated_setup_tasks = {
-            let mut tasks = self
-                .generated_setup_tasks
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            tasks.accepting = false;
-            tasks.active_accounts.clear();
-            std::mem::take(&mut tasks.handles)
-        };
-        for task in generated_setup_tasks {
-            task.abort();
-            let _ = task.await;
-        }
+        self.setup.shutdown_first_phase().await;
         let invite_catch_up_tasks = {
             let mut tasks = self
                 .invite_catch_up_tasks
@@ -8807,7 +9984,8 @@ impl AccountManager {
         }
         let lock_wait = self
             .shared
-            .app_performance_telemetry()
+            .observer
+            .performance()
             .observe(RuntimeOp::LifecycleLockWait);
         let _worker_transaction = self.worker_transactions.lock().await;
         lock_wait.finish(TelemetryOutcome::Success);
@@ -8816,16 +9994,7 @@ impl AccountManager {
         // after the first handle snapshot. Cancellation tasks have now joined,
         // and this lock excludes every remaining reaper producer. Reapers do
         // not acquire worker_transactions, so they can safely be joined here.
-        let onboarding_reapers = {
-            let mut tasks = self
-                .onboarding_cancellations
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            std::mem::take(&mut tasks.handles)
-        };
-        for task in onboarding_reapers {
-            let _ = task.await;
-        }
+        self.setup.shutdown_second_phase().await;
         let workers = {
             let mut workers = self.workers.lock().await;
             workers.drain().collect::<Vec<_>>()
@@ -8884,6 +10053,18 @@ fn validate_account_setup_request(
         }
     }
 
+    Ok(())
+}
+
+/// Refuse to set up, import or log in to an account whose device group
+/// unlinked this device, before anything is read, written or sent for it:
+/// coming back is a wipe and a new link (D67).
+fn refuse_unlinked(account: &AccountSummary) -> Result<(), AppError> {
+    if account.unlinked {
+        return Err(AppError::AccountHome(AccountHomeError::AccountUnlinked(
+            account.label.clone(),
+        )));
+    }
     Ok(())
 }
 
@@ -9153,7 +10334,7 @@ mod tests;
 /// invite you have not accepted is not a relationship yet, and one you left or
 /// were removed from has stopped being one. A group the engine froze cannot
 /// answer for its membership at all.
-fn group_contributes_co_members(group: &AppGroupRecord) -> bool {
+pub(crate) fn group_contributes_co_members(group: &AppGroupRecord) -> bool {
     !group.pending_confirmation
         && !group.unrecoverable
         && matches!(group.self_membership, crate::SelfMembership::Member)

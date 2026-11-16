@@ -49,6 +49,142 @@ fn inbound(sender: &str, id: &str) -> Value {
     json!({"marmot_agent_control":"marmot.agent-control.v2","type":"inbound_message","account_id_hex":"aa".repeat(32),"group_id_hex":"bb".repeat(16),"message":{"message_id_hex":id,"sender":{"account_id_hex":sender},"text":"test prompt","recorded_at":u64::MAX}})
 }
 
+#[tokio::test]
+async fn native_opencode_prompt_persists_id_before_post_and_never_types_a_fallback() {
+    use tokio::io::AsyncReadExt;
+    for (lose_response, pending_inbox) in [(false, false), (true, false), (true, true)] {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = config(root.path());
+        config.auto_forwarding = true;
+        let http = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let file = root.path().join("service.json");
+        std::fs::write(
+            &file,
+            json!({"url":format!("http://{}",http.local_addr().unwrap()),"pid":1}).to_string(),
+        )
+        .unwrap();
+        config.opencode_service_file = Some(file);
+        let state_path = config.state_path.clone();
+        let posts = Arc::new(Mutex::new(Vec::new()));
+        let seen = posts.clone();
+        let native_server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = http.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                loop {
+                    bytes.push(socket.read_u8().await.unwrap());
+                    if bytes.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let headers = String::from_utf8(bytes).unwrap();
+                let line = headers.lines().next().unwrap();
+                let length = headers
+                    .lines()
+                    .find_map(|s| {
+                        s.to_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|s| s.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                let mut body = vec![0; length];
+                socket.read_exact(&mut body).await.unwrap();
+                if pending_inbox && line.contains("/message/msg_codr_") {
+                    socket.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").await.unwrap();
+                    continue;
+                }
+                let response = if line.starts_with("POST ") {
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    let saved = BridgeState::load(&state_path).unwrap();
+                    assert_eq!(
+                        saved.mappings[&agent().key()].submissions[0]
+                            .native_message_id
+                            .as_deref(),
+                        body["id"].as_str()
+                    );
+                    seen.lock().unwrap().push(body.clone());
+                    if lose_response {
+                        continue;
+                    }
+                    json!({"data":{"id":body["id"],"sessionID":"ses_1","type":"user","payload":{"text":body["text"]}}}).to_string()
+                } else if line.contains("/message/msg_codr_") {
+                    let sent = seen.lock().unwrap();
+                    json!({"data":{"id":sent[0]["id"],"type":"user","text":sent[0]["text"]}})
+                        .to_string()
+                } else if line.contains("/inbox") {
+                    let sent = seen.lock().unwrap();
+                    json!({"data":[{"id":sent[0]["id"],"sessionID":"ses_1","type":"user","payload":{"text":sent[0]["text"]}}]}).to_string()
+                } else if line.contains("/log?") {
+                    "data: {\"type\":\"log.synced\",\"aggregateID\":\"ses_1\",\"seq\":1}\n\n".into()
+                } else if line.contains("/message?") {
+                    json!({"data":[],"cursor":{"next":null}}).to_string()
+                } else {
+                    json!({"data":[]}).to_string()
+                };
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",response.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let calls = Arc::new(Mutex::new(vec![]));
+        let mdk = peer(&config.wn_agent_socket, true, calls.clone()).await;
+        let herdr = peer_for_agent(&config.herdr_socket, false, calls.clone(), agent()).await;
+        let mut bridge = Bridge::open(config.clone()).unwrap();
+        bridge.herdr_available = true;
+        bridge.agents.insert(agent().key(), agent());
+        bridge
+            .state
+            .mappings
+            .insert(agent().key(), activity_mapping(agent(), &"bb".repeat(16)));
+        bridge.inbound(&inbound(HEX, "native-phone")).await.unwrap();
+        bridge.inbound(&inbound(HEX, "native-phone")).await.unwrap();
+        assert_eq!(
+            posts.lock().unwrap().len(),
+            1,
+            "Duplicate delivery must not POST again"
+        );
+        assert!(
+            !calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|call| call["method"] == "agent.prompt")
+        );
+        assert_eq!(
+            bridge.state.mappings[&agent().key()].submissions.len(),
+            usize::from(lose_response)
+        );
+        drop(bridge);
+        let mut restored = Bridge::open(config).unwrap();
+        assert_eq!(
+            restored.state.mappings[&agent().key()].submissions.len(),
+            usize::from(lose_response)
+        );
+        restored.reconcile(vec![agent()]).await.unwrap();
+        assert!(
+            restored.state.mappings[&agent().key()]
+                .submissions
+                .is_empty()
+        );
+        let mapping = &restored.state.mappings[&agent().key()];
+        assert!(
+            mapping.queue_flight.as_ref().unwrap().confirmed,
+            "Recovered admission must confirm its flight"
+        );
+        let activity = serde_json::to_value(&mapping.activity).unwrap();
+        assert!(
+            activity["phone"][0]["confirmed"] == true,
+            "Recovered admission must keep phone attribution"
+        );
+        assert_eq!(
+            posts.lock().unwrap().len(),
+            1,
+            "Restart reconciliation must never POST again"
+        );
+        native_server.abort();
+        herdr.abort();
+        mdk.abort();
+    }
+}
+
 #[test]
 fn state_save_skips_unchanged_snapshots_but_persists_delivery_changes_immediately() {
     use std::os::unix::fs::MetadataExt;

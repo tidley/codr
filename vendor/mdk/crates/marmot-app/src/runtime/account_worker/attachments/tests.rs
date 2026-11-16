@@ -217,6 +217,18 @@ async fn offline_fixture() -> (
     SqliteAccountStorage,
     crate::MediaAttachmentReference,
 ) {
+    offline_fixture_with(b"retained worker bytes").await
+}
+
+/// [`offline_fixture`] with a received attachment of `plaintext`.
+async fn offline_fixture_with(
+    plaintext: &[u8],
+) -> (
+    tempfile::TempDir,
+    AppClient,
+    SqliteAccountStorage,
+    crate::MediaAttachmentReference,
+) {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
         .create_account("alice")
@@ -232,8 +244,7 @@ async fn offline_fixture() -> (
     .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
     let storage = app.account_storage("alice").unwrap();
-    let (mut reference, _) =
-        crate::media::tests::attachment_worker_fixture(b"retained worker bytes");
+    let (mut reference, _) = crate::media::tests::attachment_worker_fixture(plaintext);
     reference.locators = vec![crate::MediaLocator {
         kind: "blossom-v1".into(),
         value: format!("https://media.example/{}", reference.ciphertext_sha256),
@@ -252,10 +263,236 @@ fn context() -> (MediaHttpContext, mpsc::UnboundedReceiver<MediaHttpDone>) {
             tx,
             permits: Arc::new(Semaphore::new(4)),
             prepared_group_image_uploads: Arc::new(Mutex::new(HashSet::new())),
+            history_blobs: Default::default(),
+            backup_background_conditions: watch::channel(
+                crate::runtime::BackupBackgroundConditions::default(),
+            )
+            .0,
             worker_lifetime: watch::channel(()).0,
         },
         rx,
     )
+}
+
+/// Build a two-worker runtime with one blocking thread, so blocking tasks run
+/// one at a time in the order they were spawned.
+fn one_blocking_thread_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_stack_size(8 * 1024 * 1024)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .unwrap()
+}
+
+/// Reserve an outgoing upload in [`GROUP`] and stage its body as a media file.
+fn stage_upload(app: &SqliteAppStorage, media: &AccountMediaStore) -> Vec<u8> {
+    let body = b"retained worker bytes";
+    let token = app
+        .reserve_attachment_upload(GROUP, 3, crate::unix_now_seconds())
+        .unwrap()
+        .unwrap();
+    crate::media::outgoing::stage_body(
+        media,
+        &app.attachment_upload_stage(&token),
+        &mut body.as_slice(),
+        body.len() as u64,
+        &|| false,
+    )
+    .unwrap();
+    token
+}
+
+/// Bind `token` to the fixture's attachment `reference`.
+fn bind_upload(app: &SqliteAppStorage, token: &[u8], reference: &crate::MediaAttachmentReference) {
+    app.bind_attachment_uploads(
+        &[token.to_vec()],
+        &[(
+            serde_json::to_value(reference.imeta_tag()).unwrap(),
+            crate::media::media_hash_from_reference(reference).unwrap(),
+        )],
+    )
+    .unwrap();
+}
+
+/// Record a sent message in [`GROUP`] carrying `tag`, and protect the upload
+/// it names, which makes that upload a promotion owner.
+fn record_sent(
+    app: &SqliteAppStorage,
+    message: &str,
+    tag: &[String],
+    retention: Option<crate::AppMessageRetentionDecision>,
+) {
+    app.record_app_event_with_retention(
+        &StoredAppEvent {
+            group_id_hex: GROUP.into(),
+            message_id_hex: message.into(),
+            source_message_id_hex: Some(message.into()),
+            source_epoch: Some(3),
+            direction: "sent".into(),
+            sender: "33".repeat(32),
+            plaintext: String::new(),
+            kind: 9,
+            tags: vec![tag.to_vec()],
+            recorded_at: 10,
+            received_at: 10,
+            origin_commit_id: None,
+            moderation_grant: false,
+        },
+        retention,
+    )
+    .unwrap();
+    app.protect_attachment_uploads(GROUP, message, &[tag.to_vec()])
+        .unwrap();
+}
+
+/// Assert the sent `message`'s first slot is Ready.
+fn assert_sent_slot_ready(app: &SqliteAppStorage, message: &str) {
+    let status = app
+        .attachment_transfer_status(GROUP, message, message, 0, crate::unix_now_seconds(), true)
+        .unwrap();
+    assert_eq!(
+        status.map(|status| status.state),
+        Some(storage_sqlite::AttachmentTransferState::Ready)
+    );
+}
+
+#[test]
+fn promotion_resumes_after_skip() {
+    one_blocking_thread_runtime().block_on(async {
+        let (_dir, client, storage, reference) = offline_fixture().await;
+        let app = storage.app_storage();
+        let media = client.app.account_media_store("alice", &storage).unwrap();
+        let token = stage_upload(&app, &media);
+        // One unbound upload keeps the final empty pass reachable.
+        stage_upload(&app, &media);
+        let tag = reference.imeta_tag();
+        bind_upload(&app, &token, &reference);
+        let staged = app.attachment_upload_file(&token).unwrap().unwrap();
+        // Expired sources fill the first page without promoting a body.
+        // Only the next page can publish the final source.
+        for index in 0..=crate::media::outgoing::UPLOAD_PROMOTION_BATCH {
+            let retention = (index < crate::media::outgoing::UPLOAD_PROMOTION_BATCH)
+                .then(|| crate::AppMessageRetentionDecision::new(10, 1));
+            record_sent(&app, &format!("{index:064x}"), &tag, retention);
+        }
+        let shared = RuntimeSharedServices::default();
+        let mut admission = Admission::default();
+        let (release, held) = std::sync::mpsc::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            held.recv().unwrap();
+        });
+        let spawn = |admission: &mut Admission| {
+            spawn_upload_promotion(
+                admission,
+                storage.clone(),
+                media.clone(),
+                shared.attachment_updates.clone(),
+                shared.observer.performance(),
+            )
+        };
+        spawn(&mut admission);
+        // The only blocking thread is held, so this pass must skip the batch.
+        spawn(&mut admission);
+        assert!(!admission.upload_promotion.as_ref().unwrap().is_finished());
+        release.send(()).unwrap();
+        blocker.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            for (index, expected) in [true, true, false].into_iter().enumerate() {
+                assert!(
+                    admission.is_waiting(),
+                    "promotion completion was not observed"
+                );
+                let more = admission.ready().await;
+                assert_eq!(more, expected);
+                if index == 0 {
+                    assert_eq!(
+                        media.file_state(&staged).unwrap(),
+                        Some(media_store::FileState::Staged)
+                    );
+                }
+                if more {
+                    spawn(&mut admission);
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !admission.is_waiting(),
+            "an idle batch must stop rescheduling"
+        );
+        assert_sent_slot_ready(
+            &app,
+            &format!("{:064x}", crate::media::outgoing::UPLOAD_PROMOTION_BATCH),
+        );
+    });
+}
+
+/// A pass that skips a batch whose owner read came before a new owner gets a
+/// follow-up pass, even when that batch promoted nothing and left no page
+/// (mdk#3378). The follow-up ends once a batch no pass skipped finds nothing.
+#[test]
+fn promotion_skipped_while_its_batch_ends_idle_runs_a_follow_up_pass() {
+    one_blocking_thread_runtime().block_on(async {
+        let (_dir, client, storage, reference) = offline_fixture().await;
+        let app = storage.app_storage();
+        let media = client.app.account_media_store("alice", &storage).unwrap();
+        let token = stage_upload(&app, &media);
+        // One unbound upload keeps the final empty pass reachable.
+        stage_upload(&app, &media);
+        bind_upload(&app, &token, &reference);
+        let staged = app.attachment_upload_file(&token).unwrap().unwrap();
+        let shared = RuntimeSharedServices::default();
+        let mut admission = Admission::default();
+        let spawn = |admission: &mut Admission| {
+            spawn_upload_promotion(
+                admission,
+                storage.clone(),
+                media.clone(),
+                shared.attachment_updates.clone(),
+                shared.observer.performance(),
+            )
+        };
+        // No message is sent yet, so this batch reads no owner.
+        spawn(&mut admission);
+        // The only blocking thread runs tasks in order: once this one ran,
+        // the batch has read its owners and finished.
+        tokio::task::spawn_blocking(|| ()).await.unwrap();
+        assert!(admission.upload_promotion.as_ref().unwrap().is_finished());
+        // The send makes the upload an owner. Its pass finds the batch not
+        // yet consumed by the worker, so it skips it.
+        let message = "44".repeat(32);
+        record_sent(&app, &message, &reference.imeta_tag(), None);
+        spawn(&mut admission);
+        assert_eq!(
+            media.file_state(&staged).unwrap(),
+            Some(media_store::FileState::Staged)
+        );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            // The idle batch still owes the skipped pass; the follow-up
+            // promotes; the next batch, skipped by no pass, finds nothing.
+            for (index, expected) in [true, true, false].into_iter().enumerate() {
+                assert!(
+                    admission.is_waiting(),
+                    "promotion completion was not observed"
+                );
+                let more = admission.ready().await;
+                assert_eq!(more, expected, "worker wakeup after batch {index}");
+                if more {
+                    spawn(&mut admission);
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !admission.is_waiting(),
+            "a follow-up that finds nothing must stop rescheduling"
+        );
+        assert_sent_slot_ready(&app, &message);
+    });
 }
 
 /// Count loopback response bytes once, then prove the retained asset survives a client restart.
@@ -312,6 +549,14 @@ async fn download_without_engine_and_retain(
         }
     });
     let dir = tempfile::tempdir().unwrap();
+    // Room for concurrent transfers, so only explicit work runs alone.
+    crate::media::attachment_resume::test_free_space::set(dir.path(), 1 << 40);
+    // An explicit download runs alone, holding every global permit.
+    let held = if explicit {
+        crate::runtime::ATTACHMENT_TRANSFER_LIMIT
+    } else {
+        1
+    };
     AccountHome::open(dir.path())
         .create_account("alice")
         .unwrap();
@@ -505,7 +750,10 @@ async fn download_without_engine_and_retain(
     }
     admission.ready().await;
     schedule(&client, &shared, &http, &mut admission).unwrap();
-    assert_eq!(shared.attachment_transfer.available_permits(), 0);
+    assert_eq!(
+        shared.attachment_transfer.available_permits(),
+        crate::runtime::ATTACHMENT_TRANSFER_LIMIT - held
+    );
     assert_eq!(http.permits.available_permits(), 3);
     let done = tokio::time::timeout(Duration::from_secs(5), completions.recv())
         .await
@@ -513,7 +761,7 @@ async fn download_without_engine_and_retain(
         .unwrap();
     assert_eq!(
         shared.attachment_transfer.available_permits(),
-        0,
+        crate::runtime::ATTACHMENT_TRANSFER_LIMIT - held,
         "queued plaintext still owns global capacity"
     );
     let asset = match &done.completion {
@@ -536,7 +784,10 @@ async fn download_without_engine_and_retain(
         );
     }
     complete_and_settle(&mut client, done, &shared, &http, &mut completions).await;
-    assert_eq!(shared.attachment_transfer.available_permits(), 1);
+    assert_eq!(
+        shared.attachment_transfer.available_permits(),
+        crate::runtime::ATTACHMENT_TRANSFER_LIMIT
+    );
     assert_eq!(
         &*read_retained(
             &storage,
@@ -589,6 +840,7 @@ async fn download_without_engine_and_retain(
         served_body_bytes.load(std::sync::atomic::Ordering::SeqCst),
         expected_body_bytes,
     );
+    crate::media::attachment_resume::test_free_space::clear(dir.path());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -615,7 +867,10 @@ async fn attachment_worker_exit_cancels_transfer_and_releases_global_capacity() 
         |completion| completion,
     );
     ready.await.unwrap();
-    assert_eq!(shared.attachment_transfer.available_permits(), 0);
+    assert_eq!(
+        shared.attachment_transfer.available_permits(),
+        crate::runtime::ATTACHMENT_TRANSFER_LIMIT - 1
+    );
     drop(http);
     assert!(
         tokio::time::timeout(Duration::from_secs(1), completions.recv())
@@ -623,7 +878,23 @@ async fn attachment_worker_exit_cancels_transfer_and_releases_global_capacity() 
             .unwrap()
             .is_none()
     );
-    assert_eq!(shared.attachment_transfer.available_permits(), 1);
+    // The cancelled task drops its completion sender and its permits as it
+    // ends, in no promised order, so wait for the capacity to come back
+    // before counting it. The bound only catches a hang.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let _global = shared
+            .attachment_transfer
+            .acquire_many(crate::runtime::ATTACHMENT_TRANSFER_LIMIT as u32)
+            .await
+            .unwrap();
+        let _http = permits.acquire_many(4).await.unwrap();
+    })
+    .await
+    .expect("the cancelled transfer releases global and HTTP capacity");
+    assert_eq!(
+        shared.attachment_transfer.available_permits(),
+        crate::runtime::ATTACHMENT_TRANSFER_LIMIT
+    );
     assert_eq!(permits.available_permits(), 4);
 }
 
@@ -695,7 +966,10 @@ async fn attachment_missing_secret_does_not_claim_or_back_off_a_page_of_siblings
         );
     }
     assert!(completions.try_recv().is_err());
-    assert_eq!(shared.attachment_transfer.available_permits(), 1);
+    assert_eq!(
+        shared.attachment_transfer.available_permits(),
+        crate::runtime::ATTACHMENT_TRANSFER_LIMIT
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -794,7 +1068,12 @@ fn attachment_explicit_retry_derives_an_uncached_source_epoch_key() {
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
         let storage = app.account_storage("alice").unwrap();
-        let group_id = client.create_group("retry media", &[]).await.unwrap();
+        let group_id = client
+            .create_group("retry media", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let group_hex = hex::encode(group_id.as_slice());
         // Group creation caches its founding epoch; the source epoch is the
         // next one, and the group has left it by the time the row exists.
@@ -1107,7 +1386,8 @@ mod storage_block;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attachment_worker_disk_pause_does_not_consume_attempts() {
-    let (_dir, mut client, store, _reference) = offline_fixture().await;
+    let (dir, mut client, store, _reference) = offline_fixture().await;
+    crate::media::attachment_resume::test_free_space::set(dir.path(), 1 << 40);
     let now = crate::unix_now_seconds();
     admit_demands(&store.app_storage(), now, false).unwrap();
     let asset = store
@@ -1135,7 +1415,9 @@ async fn attachment_worker_disk_pause_does_not_consume_attempts() {
         .unwrap()
         .unwrap();
     assert_eq!(status.attempts, 0);
-    assert!(status.due.unwrap() > now);
+    // A disk refusal parks the job for storage, with no timer: readmission
+    // releases it once free space covers its target (mdk#3414).
+    assert_eq!(status.due, None);
     let progress = store
         .app_storage()
         .attachment_transfer_status(GROUP, &"11".repeat(32), &"22".repeat(32), 0, now, true)
@@ -1143,13 +1425,46 @@ async fn attachment_worker_disk_pause_does_not_consume_attempts() {
         .unwrap();
     assert_eq!(
         progress.state,
-        storage_sqlite::AttachmentTransferState::RetryScheduled
+        storage_sqlite::AttachmentTransferState::StorageBlocked
     );
-    assert_eq!(progress.retry_at, status.due);
-    assert_eq!(shared.attachment_transfer.available_permits(), 1);
+    assert_eq!(
+        shared.attachment_transfer.available_permits(),
+        crate::runtime::ATTACHMENT_TRANSFER_LIMIT
+    );
+    // Its target is what admission needs, so it is released exactly when the
+    // device can fund it: once the reserve comes back within reach.
+    let policy = super::super::super::attachment_controls::default_policy(&client.app.config);
+    let target: i64 = retention_fault_connection(&client.app)
+        .query_row(
+            "SELECT storage_blocked_headroom FROM attachment_acquisition WHERE state=4",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(target as u64, admission_need(policy.transfer_limit, None));
+    client
+        .app
+        .config
+        .attachment_acquisition
+        .as_mut()
+        .unwrap()
+        .minimum_free_disk_bytes = 0;
+    schedule(&client, &shared, &http, &mut admission).unwrap();
+    assert_ne!(
+        store
+            .app_storage()
+            .attachment_transfer_status(GROUP, &"11".repeat(32), &"22".repeat(32), 0, now, true)
+            .unwrap()
+            .unwrap()
+            .state,
+        storage_sqlite::AttachmentTransferState::StorageBlocked,
+        "readmitted once free space covers its target"
+    );
+    crate::media::attachment_resume::test_free_space::clear(dir.path());
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// A single thread lets the watch-loop proof freeze time after real database setup.
+#[tokio::test(flavor = "current_thread")]
 async fn attachment_cancellation_observation_error_is_not_cancellation() {
     let (_dir, _client, store, _reference) = offline_fixture().await;
     let now = crate::unix_now_seconds();
@@ -1164,17 +1479,57 @@ async fn attachment_cancellation_observation_error_is_not_cancellation() {
         .claim_attachment_acquisition(&asset, now, now + LEASE_SECONDS)
         .unwrap()
         .unwrap();
-    let (_updates, watch) = watch::channel(());
     store.close().unwrap();
+    // Only bound a stuck read: the completed observation, not elapsed time,
+    // proves an unavailable store did not become a cancellation.
+    let observed = tokio::time::timeout(
+        Duration::from_secs(5),
+        cancellation_observed(&store, &job, None),
+    )
+    .await
+    .expect("cancellation observation must complete");
     assert!(
-        tokio::time::timeout(
-            Duration::from_millis(100),
-            cancelled(store, job, watch, None)
-        )
-        .await
-        .is_err(),
+        !observed,
         "an unobservable store must not masquerade as a durable cancel"
     );
+
+    // A closed read fails before the explicit-request lookup, so each failed
+    // connection attempt comes from a fresh observation of this isolated store.
+    let (observations, mut reads) = mpsc::unbounded_channel();
+    store.set_timing_observer(Some(Arc::new(move |operation, _, success| {
+        if operation == storage_sqlite::SqliteTimingOperation::ConnectionWait && !success {
+            let _ = observations.send(());
+        }
+    })));
+    let (wake, updates) = watch::channel(());
+    tokio::time::pause();
+    let frozen_at = tokio::time::Instant::now();
+    crate::media::tests::drive_with_manual_time(async {
+        let watcher = cancelled(store.clone(), job, updates, None);
+        tokio::pin!(watcher);
+        let reobserved = async {
+            reads
+                .recv()
+                .await
+                .expect("the watcher must attempt its first read");
+            wake.send(()).expect("the watcher must remain subscribed");
+            reads.recv().await.expect("a wake must recheck storage");
+        };
+        // The second real read proves a wake did not finish the watcher.
+        // Frozen time excludes the one-second recheck as an alternative cause.
+        tokio::select! {
+            biased;
+            _ = &mut watcher => panic!("a wake without durable cancellation must keep watching"),
+            _ = reobserved => {},
+        }
+    })
+    .await;
+    assert_eq!(
+        tokio::time::Instant::now(),
+        frozen_at,
+        "the notification, not the periodic timer, must cause the second read"
+    );
+    store.set_timing_observer(None);
 }
 
 fn automatic_target() -> crate::AttachmentLocalTarget {
@@ -1403,7 +1758,8 @@ async fn attachment_host_managed_requires_demand_and_fences_permission_generatio
 
 /// Explicit promotion detaches automatic permission while retaining the same
 /// transport lease; later deliberate cancellation still stops that attempt.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// A single thread lets the watcher proof freeze time after real database setup.
+#[tokio::test(flavor = "current_thread")]
 async fn promoted_attempt_survives_automatic_revocation_without_extending_lease() {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
@@ -1481,30 +1837,64 @@ async fn promoted_attempt_survives_automatic_revocation_without_extending_lease(
         .await
         .unwrap();
     assert!(!permission.allowed());
-    let (_, updates) = watch::channel(());
-    assert!(
-        tokio::time::timeout(
-            Duration::from_millis(50),
-            cancelled(storage.clone(), job.clone(), updates, Some(permission))
-        )
-        .await
-        .is_err()
-    );
-    assert_eq!(
-        app.attachment_acquisition_status(&asset)
-            .unwrap()
-            .unwrap()
-            .due,
-        deadline
-    );
-    app.cancel_attachment_acquisition(&asset).unwrap();
-    let (_, updates) = watch::channel(());
-    tokio::time::timeout(
-        Duration::from_secs(1),
-        cancelled(storage, job, updates, None),
+    // Await the actual read and classification; a timer cannot prove that
+    // the promoted attempt was observed after automatic permission revoked.
+    let observed = tokio::time::timeout(
+        Duration::from_secs(5),
+        cancellation_observed(&storage, &job, Some(&permission)),
     )
     .await
-    .unwrap();
+    .expect("promoted attempt cancellation observation must complete");
+    assert!(
+        !observed,
+        "revoking automatic permission must not cancel an explicit attempt"
+    );
+
+    let (observations, mut reads) = mpsc::unbounded_channel();
+    storage.set_timing_observer(Some(Arc::new(move |operation, _, success| {
+        if operation == storage_sqlite::SqliteTimingOperation::ConnectionWait && success {
+            let _ = observations.send(());
+        }
+    })));
+    let (wake, updates) = watch::channel(());
+    tokio::time::pause();
+    let frozen_at = tokio::time::Instant::now();
+    crate::media::tests::drive_with_manual_time(async {
+        // Keep the original revoked lease on this same watcher through the
+        // spurious notification, lease check, and final durable cancellation.
+        let watcher = cancelled(storage.clone(), job, updates, Some(permission));
+        tokio::pin!(watcher);
+        let reobserved = async {
+            // Each successful observation locks once for active state and once
+            // for explicit demand. A third lock must follow the watch wake.
+            reads.recv().await.expect("the watcher must read active state");
+            reads.recv().await.expect("the watcher must read explicit demand");
+            wake.send(()).expect("the promoted watcher must remain subscribed");
+            reads.recv().await.expect("a wake must recheck the promoted attempt");
+        };
+        tokio::select! {
+            biased;
+            _ = &mut watcher => panic!("revoked automatic permission must not end the promoted watcher"),
+            _ = reobserved => {},
+        }
+        storage.set_timing_observer(None);
+        assert_eq!(
+            tokio::time::Instant::now(),
+            frozen_at,
+            "the watch wake, not the periodic timer, must cause the third read"
+        );
+        assert_eq!(
+            app.attachment_acquisition_status(&asset)
+                .unwrap()
+                .unwrap()
+                .due,
+            deadline
+        );
+        app.cancel_attachment_acquisition(&asset).unwrap();
+        wake.send(()).expect("durable cancellation must wake the same watcher");
+        watcher.await;
+    })
+    .await;
 }
 
 /// Keep the real incoming GET and verified local read independent of outgoing SQL failures.
@@ -1520,6 +1910,7 @@ fn retention_fault_connection(app: &MarmotApp) -> rusqlite::Connection {
     let key = app
         .sqlcipher_key("alice", &keys, &path, crate::SqlcipherDatabaseKind::Session)
         .unwrap();
+    storage_sqlite::expect_uncounted_writes_for_test(&path);
     let connection = rusqlite::Connection::open(path).unwrap();
     storage_sqlite::open_hardened_sqlcipher(
         &connection,
@@ -1908,7 +2299,8 @@ async fn keep_media_skips_automatic_demand_past_the_window() {
 }
 
 /// The maintenance batch at worker start applies "Keep media" to retained
-/// attachments, then waits an hour before sweeping again.
+/// attachments, waking observers with a state change, then waits an hour
+/// before sweeping again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_maintenance_batch_cleans_past_the_keep_media_window() {
     let (_dir, client, store, _reference) = offline_fixture().await;
@@ -1948,6 +2340,10 @@ async fn the_maintenance_batch_cleans_past_the_keep_media_window() {
     );
     assert!(updates.has_changed().unwrap(), "observers are woken");
     assert!(
+        *updates.borrow() > 0,
+        "leaving Ready for CleanedBySetting is a state change"
+    );
+    assert!(
         admission.keep_media_due.unwrap()
             > std::time::Instant::now() + KEEP_MEDIA_SWEEP_INTERVAL - Duration::from_secs(60)
     );
@@ -1955,5 +2351,926 @@ async fn the_maintenance_batch_cleans_past_the_keep_media_window() {
         !admission
             .keep_media_more
             .load(std::sync::atomic::Ordering::Acquire)
+    );
+}
+
+/// Starts nothing new until the media sweep task this admission holds, if
+/// any, has finished.
+async fn finish_media_sweep(admission: &mut Admission) {
+    if let Some(task) = admission.media_sweep.take() {
+        task.await.unwrap();
+    }
+}
+
+/// The media sweep runs to completion when a worker takes ownership, then
+/// again only once something may have left work for it: here, a deleted
+/// media row. With nothing changed it starts no batch at all (mdk#2923 §4).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_media_sweep_runs_again_only_once_a_media_row_was_deleted() {
+    use media_store::MediaCatalog;
+    let (_dir, client, storage, _) = offline_fixture().await;
+    let telemetry = marmot_observability::PerformanceRecorder::default();
+    let app_storage = storage.app_storage();
+    let media = client.app.account_media_store("alice", &storage).unwrap();
+    let mut admission = Admission::default();
+    let sweeps = || {
+        telemetry
+            .snapshot()
+            .runtime_operations
+            .into_iter()
+            .find(|snapshot| snapshot.operation == RuntimeOp::WorkerMediaSweep)
+            .unwrap()
+            .completed
+    };
+    spawn_media_sweep(
+        &mut admission,
+        &app_storage,
+        media.clone(),
+        true,
+        &telemetry,
+    );
+    finish_media_sweep(&mut admission).await;
+    assert_eq!(sweeps(), 1, "the ownership sweep runs");
+    for _ in 0..3 {
+        spawn_media_sweep(
+            &mut admission,
+            &app_storage,
+            media.clone(),
+            false,
+            &telemetry,
+        );
+        finish_media_sweep(&mut admission).await;
+    }
+    assert_eq!(sweeps(), 1, "nothing changed, so no batch starts");
+
+    let catalog = storage_sqlite::SqliteMediaCatalog::new(app_storage.clone());
+    let id = media_store::FileId([7; 16]);
+    catalog
+        .insert_pending(&media_store::NewFile {
+            id,
+            key: media_store::FileKey::from_bytes([1; 32]),
+            category: Category::Retained,
+            byte_len: 1,
+            digest: [2; 32],
+            created_at: 1,
+        })
+        .unwrap();
+    assert!(catalog.abandon_pending(id).unwrap());
+    // The deletion owes batches until one reaches the end of the store.
+    let mut batches = 0;
+    loop {
+        let before = sweeps();
+        spawn_media_sweep(
+            &mut admission,
+            &app_storage,
+            media.clone(),
+            false,
+            &telemetry,
+        );
+        finish_media_sweep(&mut admission).await;
+        if sweeps() == before {
+            break;
+        }
+        batches += 1;
+        assert!(batches < 1000, "the sweep settles");
+    }
+    assert!(batches >= 1, "a deleted media row owes a sweep");
+}
+
+/// What housekeeping derived from one opened database is dropped when the
+/// account's database is another one: a reopened, reset or replaced
+/// database starts unlatched (mdk#2923 §4).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn housekeeping_latches_reset_for_another_opened_database() {
+    use std::sync::atomic::Ordering;
+    let (_dir, client, stale, _) = offline_fixture().await;
+    let app = &client.app;
+    let mut latches = HousekeepingLatches::default();
+    latches.bind(&stale.app_storage());
+    latches.legacy_bodies_done.store(true, Ordering::Release);
+    latches.database_avatars_done.store(true, Ordering::Release);
+    latches.compaction_settled.store(true, Ordering::Release);
+    latches.sweep_cleanup_seen = Some(0);
+    latches.bind(&stale.app_storage());
+    assert!(
+        latches.legacy_bodies_done.load(Ordering::Acquire),
+        "same database keeps them"
+    );
+
+    app.drop_account_caches("alice");
+    let reopened = app.account_storage("alice").unwrap();
+    latches.bind(&reopened.app_storage());
+    assert!(!latches.legacy_bodies_done.load(Ordering::Acquire));
+    assert!(!latches.database_avatars_done.load(Ordering::Acquire));
+    assert!(!latches.compaction_settled.load(Ordering::Acquire));
+    assert_eq!(latches.sweep_cleanup_seen, None, "a sweep is owed again");
+}
+
+/// The housekeeping batch spawns while any part of it is owed and not
+/// otherwise (mdk#2923 §4). Finished one-time work (no legacy bodies or
+/// database-held avatars on a fresh account, an incremental database, the
+/// startup truncate) latches; a deferred outcome never does: keep-media
+/// `more`, the hourly recheck and a deletion each owe another batch. An owed
+/// WAL truncate waits for the recheck, so a reader that keeps blocking it
+/// costs one batch per recheck, not one per tick.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_housekeeping_batch_runs_only_while_a_part_is_owed() {
+    use media_store::MediaCatalog;
+    use std::sync::atomic::Ordering;
+    let (_dir, client, storage, _) = offline_fixture().await;
+    let runtime = crate::MarmotAppRuntime::new(client.app.clone());
+    let shared = runtime.shared_services();
+    let mut admission = Admission::default();
+    let batches = || {
+        shared
+            .observer
+            .performance()
+            .snapshot()
+            .runtime_operations
+            .into_iter()
+            .find(|snapshot| snapshot.operation == RuntimeOp::WorkerMaintenanceHousekeepingBatch)
+            .unwrap()
+            .completed
+    };
+    let run = async |admission: &mut Admission| {
+        spawn_legacy_migration(&client, &shared, admission);
+        if let Some(task) = admission.legacy_migration.take() {
+            task.await.unwrap();
+        }
+    };
+    run(&mut admission).await;
+    assert_eq!(batches(), 1, "the first batch derives everything");
+    assert!(admission.latches.legacy_bodies_done.load(Ordering::Acquire));
+    assert!(
+        admission
+            .latches
+            .database_avatars_done
+            .load(Ordering::Acquire)
+    );
+    assert!(admission.latches.compaction_settled.load(Ordering::Acquire));
+    for _ in 0..3 {
+        run(&mut admission).await;
+    }
+    assert_eq!(batches(), 1, "nothing owed, so no batch");
+
+    admission.keep_media_more.store(true, Ordering::Release);
+    run(&mut admission).await;
+    run(&mut admission).await;
+    assert_eq!(batches(), 2, "keep-media more owes one batch");
+
+    admission.latches.recheck_due = Some(std::time::Instant::now() - Duration::from_secs(1));
+    run(&mut admission).await;
+    run(&mut admission).await;
+    assert_eq!(batches(), 3, "the deferred recheck owes one batch");
+
+    let catalog = storage_sqlite::SqliteMediaCatalog::new(storage.app_storage());
+    let id = media_store::FileId([9; 16]);
+    catalog
+        .insert_pending(&media_store::NewFile {
+            id,
+            key: media_store::FileKey::from_bytes([1; 32]),
+            category: Category::Retained,
+            byte_len: 1,
+            digest: [3; 32],
+            created_at: 1,
+        })
+        .unwrap();
+    assert!(catalog.abandon_pending(id).unwrap());
+    run(&mut admission).await;
+    run(&mut admission).await;
+    assert_eq!(
+        batches(),
+        4,
+        "a deletion frees pages, so reclaim checks once"
+    );
+
+    // A reader on another connection holds a snapshot of a non-empty WAL,
+    // so the truncate stays owed.
+    catalog
+        .insert_pending(&media_store::NewFile {
+            id: media_store::FileId([10; 16]),
+            key: media_store::FileKey::from_bytes([1; 32]),
+            category: Category::Retained,
+            byte_len: 1,
+            digest: [4; 32],
+            created_at: 1,
+        })
+        .unwrap();
+    let reader = retention_fault_connection(&client.app);
+    reader.execute_batch("BEGIN").unwrap();
+    let _: i64 = reader
+        .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
+        .unwrap();
+    let app_storage = storage.app_storage();
+    assert!(!app_storage.truncate_wal().unwrap(), "the reader blocks it");
+    assert!(app_storage.wal_truncate_pending());
+    for _ in 0..3 {
+        run(&mut admission).await;
+    }
+    assert_eq!(batches(), 4, "an owed truncate alone owes no batch");
+
+    reader.execute_batch("COMMIT").unwrap();
+    admission.latches.recheck_due = Some(std::time::Instant::now() - Duration::from_secs(1));
+    run(&mut admission).await;
+    assert_eq!(batches(), 5, "the recheck retries it");
+    assert!(!app_storage.wal_truncate_pending(), "and it truncates");
+    runtime.shutdown().await;
+}
+
+/// A sweep batch that fails on a row has already moved its cursor past it,
+/// so the rest of that pass would skip the row. A full rescan from the start
+/// is owed instead, on the hourly recheck, and finishing the pass does not
+/// clear it: the row is visited again then. A row that keeps failing costs
+/// one pass per recheck, never one per tick (mdk#2923).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_sweep_row_is_revisited_by_the_hourly_rescan_not_every_tick() {
+    use media_store::{FileState, MediaCatalog};
+    let (_dir, client, storage, _) = offline_fixture().await;
+    let telemetry = marmot_observability::PerformanceRecorder::default();
+    let app_storage = storage.app_storage();
+    let media = client.app.account_media_store("alice", &storage).unwrap();
+    let mut admission = Admission::default();
+    let sweeps = || {
+        telemetry
+            .snapshot()
+            .runtime_operations
+            .into_iter()
+            .find(|snapshot| snapshot.operation == RuntimeOp::WorkerMediaSweep)
+            .unwrap()
+            .completed
+    };
+    // A pending row is one the sweep removes: whether it is still there
+    // shows whether a pass got to it.
+    let catalog = storage_sqlite::SqliteMediaCatalog::new(app_storage.clone());
+    let id = media_store::FileId([6; 16]);
+    catalog
+        .insert_pending(&media_store::NewFile {
+            id,
+            key: media_store::FileKey::from_bytes([1; 32]),
+            category: Category::Retained,
+            byte_len: 1,
+            digest: [4; 32],
+            created_at: 1,
+        })
+        .unwrap();
+    media.fail_sweep_row_for_test(Some(id));
+    let sweep = async |admission: &mut Admission, until_complete: bool| {
+        spawn_media_sweep(
+            admission,
+            &app_storage,
+            media.clone(),
+            until_complete,
+            &telemetry,
+        );
+        finish_media_sweep(admission).await;
+    };
+    let recheck_now = |admission: &mut Admission| {
+        admission.latches.sweep_rescan_due =
+            Some(std::time::Instant::now() - Duration::from_secs(1));
+    };
+
+    sweep(&mut admission, true).await;
+    assert_eq!(sweeps(), 1);
+    assert_eq!(catalog.file_state(id).unwrap(), Some(FileState::Pending));
+    for _ in 0..5 {
+        sweep(&mut admission, false).await;
+    }
+    assert_eq!(sweeps(), 1, "a failure is not retried every tick");
+    assert!(
+        admission.latches.sweep_rescan_due.is_some(),
+        "a rescan is owed"
+    );
+
+    // Another deletion owes the sweep again, and it finishes the current
+    // pass. That pass resumes past the failed row, so it does not settle
+    // the rescan.
+    let other = media_store::FileId([8; 16]);
+    catalog
+        .insert_pending(&media_store::NewFile {
+            id: other,
+            key: media_store::FileKey::from_bytes([1; 32]),
+            category: Category::Retained,
+            byte_len: 1,
+            digest: [5; 32],
+            created_at: 1,
+        })
+        .unwrap();
+    assert!(catalog.abandon_pending(other).unwrap());
+    for _ in 0..1000 {
+        let before = sweeps();
+        sweep(&mut admission, false).await;
+        if sweeps() == before {
+            break;
+        }
+    }
+    assert!(sweeps() > 1, "the deletion owed a batch");
+    assert_eq!(catalog.file_state(id).unwrap(), Some(FileState::Pending));
+    assert!(
+        admission
+            .latches
+            .sweep_rescan
+            .load(std::sync::atomic::Ordering::Acquire),
+        "finishing the pass leaves the rescan owed"
+    );
+    let base = sweeps();
+
+    // A row that keeps failing: one pass per recheck.
+    for round in 1..=2 {
+        recheck_now(&mut admission);
+        sweep(&mut admission, false).await;
+        assert_eq!(sweeps(), base + round, "one rescan on the recheck");
+        for _ in 0..3 {
+            sweep(&mut admission, false).await;
+        }
+        assert_eq!(sweeps(), base + round, "and nothing until the next");
+    }
+
+    // Once the row no longer fails, the next recheck's rescan reaches it.
+    media.fail_sweep_row_for_test(None);
+    recheck_now(&mut admission);
+    for _ in 0..1000 {
+        let before = sweeps();
+        sweep(&mut admission, false).await;
+        if sweeps() == before {
+            break;
+        }
+    }
+    assert_eq!(
+        catalog.file_state(id).unwrap(),
+        None,
+        "the rescan removed it"
+    );
+}
+
+/// Every media store call runs on the blocking pool: the sweep lock may be
+/// held by an earlier batch (for example one waiting on a compacting
+/// connection), so starting a sweep, even one that restarts the cursor,
+/// never takes it on the async worker (mdk#2923).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn starting_a_sweep_never_waits_for_the_store_sweep_lock() {
+    let (_dir, client, storage, _) = offline_fixture().await;
+    let telemetry = marmot_observability::PerformanceRecorder::default();
+    let app_storage = storage.app_storage();
+    let media = client.app.account_media_store("alice", &storage).unwrap();
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let holder = {
+        let media = media.clone();
+        std::thread::spawn(move || {
+            let _hold = media.hold_sweep_for_test();
+            held_tx.send(()).unwrap();
+            // Released after 3 s, so a call that blocks shows as slow
+            // instead of hanging the test.
+            std::thread::sleep(Duration::from_secs(3));
+        })
+    };
+    held_rx.recv().unwrap();
+    let mut admission = Admission::default();
+    let started = std::time::Instant::now();
+    // An ownership sweep restarts the cursor from the start.
+    spawn_media_sweep(
+        &mut admission,
+        &app_storage,
+        media.clone(),
+        true,
+        &telemetry,
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "starting the sweep waited for the held lock: {:?}",
+        started.elapsed()
+    );
+    holder.join().unwrap();
+    finish_media_sweep(&mut admission).await;
+}
+
+/// A file a failed best-effort unlink leaves behind may lie behind the
+/// cursor of a pass already in progress, so resuming that pass would never
+/// reach it. The store reporting it owes a pass from the start, which
+/// removes it (mdk#2923).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_file_left_behind_mid_pass_is_reached_by_a_restarted_sweep() {
+    use media_store::MediaCatalog;
+    let (_dir, client, storage, _) = offline_fixture().await;
+    let telemetry = marmot_observability::PerformanceRecorder::default();
+    let app_storage = storage.app_storage();
+    let media = client.app.account_media_store("alice", &storage).unwrap();
+    let mut admission = Admission::default();
+    let sweep = async |admission: &mut Admission, until_complete: bool| {
+        spawn_media_sweep(
+            admission,
+            &app_storage,
+            media.clone(),
+            until_complete,
+            &telemetry,
+        );
+        finish_media_sweep(admission).await;
+    };
+    let plant = |id: media_store::FileId| {
+        let path = media.path(&id);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"orphan").unwrap();
+    };
+    sweep(&mut admission, true).await;
+
+    // More orphans in a late shard than one batch takes, so a pass stops
+    // part-way through that shard, past every earlier one.
+    for index in 0..(MEDIA_SWEEP_BATCH + 40) as u16 {
+        let mut id = [0xf0; 16];
+        id[1..3].copy_from_slice(&index.to_be_bytes());
+        plant(media_store::FileId(id));
+    }
+    let catalog = storage_sqlite::SqliteMediaCatalog::new(app_storage.clone());
+    let deleted = media_store::FileId([0x30; 16]);
+    catalog
+        .insert_pending(&media_store::NewFile {
+            id: deleted,
+            key: media_store::FileKey::from_bytes([1; 32]),
+            category: Category::Retained,
+            byte_len: 1,
+            digest: [6; 32],
+            created_at: 1,
+        })
+        .unwrap();
+    assert!(catalog.abandon_pending(deleted).unwrap());
+    sweep(&mut admission, false).await;
+    assert!(
+        admission
+            .latches
+            .sweep_unfinished
+            .load(std::sync::atomic::Ordering::Acquire),
+        "the pass stopped part-way"
+    );
+
+    // An early-shard file is left behind, and a failed unlink reports it.
+    let left = media_store::FileId([0x01; 16]);
+    plant(left);
+    let blocked = media_store::FileId([0x02; 16]);
+    std::fs::create_dir_all(media.path(&blocked).join("held")).unwrap();
+    media.unlink_released(&[blocked]);
+    std::fs::remove_dir_all(media.path(&blocked)).unwrap();
+
+    for _ in 0..1000 {
+        sweep(&mut admission, false).await;
+        if !admission
+            .latches
+            .sweep_unfinished
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            break;
+        }
+    }
+    assert!(
+        !media.path(&left).exists(),
+        "the restarted pass reached the file behind the old cursor"
+    );
+}
+
+/// The default policy's disk figures: the reserve, and what one download at
+/// the automatic limit may write.
+fn default_disk() -> (storage_sqlite::AttachmentDownloadPolicy, u64) {
+    let policy =
+        super::super::super::attachment_controls::default_policy(&MarmotAppConfig::white_noise());
+    let need = media_store::DiskPolicy::download_need(policy.transfer_limit, 0);
+    (policy, need)
+}
+
+/// One account's backlog runs [`crate::runtime::ATTACHMENT_TRANSFER_LIMIT`]
+/// downloads at once when free space covers them all: each pass starts one
+/// and asks for another while candidates remain, the global permits bound the
+/// total, and the per-account HTTP slot reserved for foreground work stays
+/// free.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attachment_worker_runs_the_transfer_limit_concurrently() {
+    let limit = crate::runtime::ATTACHMENT_TRANSFER_LIMIT;
+    let (policy, need) = default_disk();
+    let mut backlog = HeldBacklog::new(policy.disk_reserve + limit as u64 * need).await;
+    backlog.drive().await;
+    backlog.expect_started(limit).await;
+    assert_eq!(backlog.shared.attachment_transfer.available_permits(), 0);
+    assert_eq!(
+        backlog.http.permits.available_permits(),
+        1,
+        "the foreground slot stays free"
+    );
+    assert_eq!(backlog.still_due(), 1);
+}
+
+/// Below room for every concurrent transfer, the worker runs one at a time,
+/// as with a single slot: that transfer holds every global permit, and the
+/// rest stay queued and due rather than taking a retry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attachment_worker_runs_one_transfer_at_a_time_on_a_tight_disk() {
+    let limit = crate::runtime::ATTACHMENT_TRANSFER_LIMIT;
+    let (policy, need) = default_disk();
+    let mut backlog = HeldBacklog::new(policy.disk_reserve + limit as u64 * need - 1).await;
+    backlog.drive().await;
+    backlog.expect_started(1).await;
+    assert_eq!(backlog.shared.attachment_transfer.available_permits(), 0);
+    assert_eq!(backlog.still_due(), limit, "the rest wait queued and due");
+}
+
+/// On a tight disk, a transfer in flight elsewhere (another account's) is
+/// waited for in the semaphore's queue, with every candidate left queued and
+/// due; the next starts alone as soon as it finishes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tight_disk_waits_for_transfers_in_flight_then_runs_alone() {
+    let limit = crate::runtime::ATTACHMENT_TRANSFER_LIMIT;
+    let (policy, need) = default_disk();
+    let mut backlog = HeldBacklog::new(policy.disk_reserve + need).await;
+    let other = backlog
+        .shared
+        .attachment_transfer
+        .clone()
+        .try_acquire_owned()
+        .unwrap();
+    assert!(
+        backlog.drive().await <= 2,
+        "it waits in the queue instead of passing again"
+    );
+    backlog.expect_started(0).await;
+    assert!(backlog.admission.is_waiting(), "it waits for every permit");
+    assert_eq!(backlog.still_due(), limit + 1);
+    drop(other);
+    backlog.drive().await;
+    backlog.expect_started(1).await;
+    assert_eq!(backlog.shared.attachment_transfer.available_permits(), 0);
+}
+
+/// The concurrent-room rule prices transfers at the largest limit any account
+/// admitted under: another account's larger limit makes this one's disk
+/// tight where its own limit alone would not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_room_uses_the_largest_account_limit() {
+    let limit = crate::runtime::ATTACHMENT_TRANSFER_LIMIT;
+    let (policy, need) = default_disk();
+    let mut backlog = HeldBacklog::new(policy.disk_reserve + limit as u64 * need).await;
+    backlog.shared.attachment_limit_bound.store(
+        4 * policy.transfer_limit,
+        std::sync::atomic::Ordering::Release,
+    );
+    backlog.drive().await;
+    backlog.expect_started(1).await;
+    assert_eq!(backlog.still_due(), limit);
+}
+
+/// An explicit download may be far larger than the automatic limit the
+/// concurrent-room rule prices, so it runs alone even with room for four
+/// automatic ones; the rest stay queued and due behind it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_download_runs_alone_even_with_concurrent_room() {
+    let limit = crate::runtime::ATTACHMENT_TRANSFER_LIMIT;
+    let (policy, need) = default_disk();
+    let mut backlog = HeldBacklog::new(policy.disk_reserve + limit as u64 * need).await;
+    let now = crate::unix_now_seconds();
+    while admit_demands(&backlog.storage.app_storage(), now, true).unwrap() {}
+    let tapped = backlog
+        .storage
+        .app_storage()
+        .attachment_transfer_candidates(now, 1, true)
+        .unwrap()
+        .remove(0);
+    assert!(
+        backlog
+            .storage
+            .app_storage()
+            .explicitly_retry_attachment(&tapped, now)
+            .unwrap()
+    );
+    backlog.drive().await;
+    backlog.expect_started(1).await;
+    assert_eq!(backlog.shared.attachment_transfer.available_permits(), 0);
+    assert_eq!(backlog.still_due(), limit, "the rest wait queued and due");
+}
+
+/// One more attachment than the transfer limit, against a server that holds
+/// every request open so each admitted transfer stays in flight, with free
+/// space pinned for the account.
+struct HeldBacklog {
+    dir: tempfile::TempDir,
+    client: AppClient,
+    storage: SqliteAccountStorage,
+    shared: RuntimeSharedServices,
+    http: MediaHttpContext,
+    _completions: mpsc::UnboundedReceiver<MediaHttpDone>,
+    admission: Admission,
+    requests: mpsc::UnboundedReceiver<()>,
+    /// Transfers the test has seen start so far.
+    started: usize,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for HeldBacklog {
+    fn drop(&mut self) {
+        crate::media::attachment_resume::test_free_space::clear(self.dir.path());
+        self.server.abort();
+    }
+}
+
+impl HeldBacklog {
+    async fn new(free: u64) -> Self {
+        use tokio::io::AsyncReadExt;
+        let limit = crate::runtime::ATTACHMENT_TRANSFER_LIMIT;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (requested, requests) = mpsc::unbounded_channel::<()>();
+        // Hold every request open, so each admitted transfer stays in flight.
+        let server = tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                assert!(socket.read(&mut request).await.unwrap() > 0);
+                requested.send(()).unwrap();
+                held.push(socket);
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        crate::media::attachment_resume::test_free_space::set(dir.path(), free);
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay_and_config(
+            dir.path(),
+            "wss://relay.example",
+            MarmotAppConfig {
+                attachment_acquisition: Some(crate::AttachmentAcquisitionPolicy::default()),
+                allow_loopback_blob_endpoints: true,
+                ..MarmotAppConfig::white_noise()
+            },
+        )
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = app.client("alice").await.unwrap();
+        let storage = app.account_storage("alice").unwrap();
+        let mut first = None;
+        for message in 0..=limit {
+            let (mut reference, _) = crate::media::tests::attachment_worker_fixture(
+                format!("image {message}").as_bytes(),
+            );
+            reference.locators = vec![crate::MediaLocator {
+                kind: "blossom-v1".into(),
+                value: format!("http://{address}/{}", reference.ciphertext_sha256),
+            }];
+            if message == 0 {
+                // The accepted group plus its first attachment message.
+                seed_direction(&storage.app_storage(), &reference, false, "received");
+                first = Some(reference);
+                continue;
+            }
+            let id = format!("{:02x}", 0x40 + message).repeat(32);
+            storage
+                .app_storage()
+                .record_app_event(&StoredAppEvent {
+                    group_id_hex: GROUP.into(),
+                    message_id_hex: id.clone(),
+                    source_message_id_hex: Some(id),
+                    source_epoch: Some(3),
+                    direction: "received".into(),
+                    sender: "33".repeat(32),
+                    plaintext: String::new(),
+                    kind: 9,
+                    tags: vec![reference.imeta_tag()],
+                    recorded_at: 10,
+                    received_at: 10 + message as u64,
+                    origin_commit_id: None,
+                    moderation_grant: false,
+                })
+                .unwrap();
+        }
+        client.state.groups.push(projection(&first.unwrap()));
+        storage
+            .app_storage()
+            .remember_encrypted_media_epoch_secret(
+                GROUP,
+                crate::GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+                3,
+                &[7; 32],
+            )
+            .unwrap();
+        let (mut http, completions) = context();
+        http.permits = Arc::new(Semaphore::new(super::super::MEDIA_HTTP_IN_FLIGHT_LIMIT));
+        Self {
+            dir,
+            client,
+            storage,
+            shared: RuntimeSharedServices::default(),
+            http,
+            _completions: completions,
+            admission: Admission::default(),
+            requests,
+            started: 0,
+            server,
+        }
+    }
+
+    /// Drive the worker loop: run a pass while one is asked for, and take
+    /// the next permits when a pass parked on global capacity and they are
+    /// free now (a wait still pending is the loop going idle). Returns the
+    /// passes run.
+    async fn drive(&mut self) -> usize {
+        let mut due = true;
+        let mut passes = 0;
+        for _ in 0..64 {
+            if due {
+                passes += 1;
+                due =
+                    schedule(&self.client, &self.shared, &self.http, &mut self.admission).unwrap();
+            } else if self.admission.is_waiting() {
+                match futures::FutureExt::now_or_never(self.admission.ready()) {
+                    Some(more) => due = more,
+                    None => break,
+                }
+            } else {
+                break;
+            }
+        }
+        passes
+    }
+
+    /// Exactly `expected` more transfers start: their requests reach the
+    /// server, and the worker has claimed no transfer beyond them (claims
+    /// happen inside the pass, before any request is sent).
+    async fn expect_started(&mut self, expected: usize) {
+        for started in 0..expected {
+            tokio::time::timeout(Duration::from_secs(5), self.requests.recv())
+                .await
+                .unwrap_or_else(|_| panic!("transfer {} of {expected} never started", started + 1))
+                .unwrap();
+        }
+        self.started += expected;
+        let claimed: i64 = retention_fault_connection(&self.client.app)
+            .query_row(
+                "SELECT count(*) FROM attachment_acquisition WHERE state=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            claimed as usize, self.started,
+            "a transfer past {expected} started"
+        );
+    }
+
+    /// Candidates still queued and due: none took a retry.
+    fn still_due(&self) -> usize {
+        self.storage
+            .app_storage()
+            .due_attachment_acquisitions(crate::unix_now_seconds(), 32)
+            .unwrap()
+            .len()
+    }
+}
+
+/// A pass whose candidate stays due must not ask for another pass. Deferral
+/// moves only queued rows, so an expired lease whose preparation fails stays
+/// first on the due page; asking again would select it at once, forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attachment_pass_does_not_repeat_a_candidate_that_stays_due() {
+    let (_dir, client, storage, reference) = offline_fixture().await;
+    let entry = storage
+        .app_storage()
+        .attachment_history_page(GROUP, 100, None)
+        .unwrap()
+        .entries
+        .remove(0);
+    // A sibling, so the page holds a candidate after the stuck one.
+    storage
+        .app_storage()
+        .record_app_event(&StoredAppEvent {
+            group_id_hex: GROUP.into(),
+            message_id_hex: "44".repeat(32),
+            source_message_id_hex: Some("45".repeat(32)),
+            source_epoch: Some(3),
+            direction: "received".into(),
+            sender: "33".repeat(32),
+            plaintext: String::new(),
+            kind: 9,
+            tags: vec![serde_json::from_value(entry.slot.clone()).unwrap()],
+            recorded_at: 10,
+            received_at: 10,
+            origin_commit_id: None,
+            moderation_grant: false,
+        })
+        .unwrap();
+    // Create the demand without caching a source-epoch secret, so
+    // preparation fails for every candidate.
+    assert!(
+        client
+            .prepare_background_attachment_download(&GroupId::new(vec![0xab; 16]), reference, 1024)
+            .unwrap()
+            .is_none()
+    );
+    let now = crate::unix_now_seconds();
+    while admit_demands(&storage.app_storage(), now, false).unwrap() {}
+    let shared = RuntimeSharedServices::default();
+    let (http, _completions) = context();
+    let mut admission = Admission::default();
+    schedule(&client, &shared, &http, &mut admission).unwrap();
+    // After the worker's one resume of leases (first pass): the first
+    // message's job holds a lease that has expired, still due, ordered first.
+    let connection = retention_fault_connection(&client.app);
+    let leased = connection
+        .execute(
+            "UPDATE attachment_acquisition SET state=1,attempt=randomblob(16),due=?1,priority_at=?2
+             WHERE message_id_hex=?3",
+            rusqlite::params![now as i64 - 1, now as i64 + 1000, "11".repeat(32)],
+        )
+        .unwrap();
+    assert_eq!(leased, 1);
+    admission.ready().await;
+    assert!(
+        !schedule(&client, &shared, &http, &mut admission).unwrap(),
+        "a candidate that stayed due asked for another pass"
+    );
+    let state: i64 = connection
+        .query_row(
+            "SELECT state FROM attachment_acquisition WHERE message_id_hex=?1 AND due<=?2",
+            rusqlite::params!["11".repeat(32), now as i64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, 1, "the stuck candidate is still due");
+}
+
+/// A request that moves queued work ahead wakes the worker, whose next pass
+/// may start it at once (an idle worker with free slots gets no completion to
+/// run one), without reporting a transfer state change. A request that
+/// changes nothing wakes nothing, so a screen re-requesting what it shows
+/// cannot loop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reordering_queued_work_wakes_the_worker_only_when_the_order_changes() {
+    let (_dir, mut client, storage, _reference) = offline_fixture().await;
+    let entry = storage
+        .app_storage()
+        .attachment_history_page(GROUP, 100, None)
+        .unwrap()
+        .entries
+        .remove(0);
+    storage
+        .app_storage()
+        .record_app_event(&StoredAppEvent {
+            group_id_hex: GROUP.into(),
+            message_id_hex: "44".repeat(32),
+            source_message_id_hex: Some("45".repeat(32)),
+            source_epoch: Some(3),
+            direction: "received".into(),
+            sender: "33".repeat(32),
+            plaintext: String::new(),
+            kind: 9,
+            tags: vec![serde_json::from_value(entry.slot.clone()).unwrap()],
+            recorded_at: 10,
+            received_at: 10,
+            origin_commit_id: None,
+            moderation_grant: false,
+        })
+        .unwrap();
+    client.app.config.attachment_acquisition_mode = crate::AttachmentAcquisitionMode::HostManaged;
+    let runtime = client.app.runtime();
+    let group = GroupId::new(vec![0xab; 16]);
+    let generation = runtime
+        .begin_attachment_permission_update("alice")
+        .await
+        .unwrap();
+    assert!(
+        runtime
+            .set_attachment_automatic_permission("alice", generation, all_attachment_permission())
+            .await
+            .unwrap()
+    );
+    let sibling = crate::AttachmentLocalTarget {
+        message_id_hex: "44".repeat(32),
+        source_message_id_hex: "45".repeat(32),
+        attachment_index: 0,
+    };
+    // Both queued; the sibling, requested last, leads.
+    for target in [automatic_target(), sibling] {
+        assert!(
+            runtime
+                .request_automatic_attachment("alice", &group, target)
+                .await
+                .unwrap()
+                .newly_queued
+        );
+    }
+    let mut work = client.app.presentation_signals.subscribe_work();
+    work.mark_unchanged();
+    let updates = runtime.shared.attachment_updates.subscribe();
+    let moved = runtime
+        .request_automatic_attachment("alice", &group, automatic_target())
+        .await
+        .unwrap();
+    assert!(!moved.newly_queued);
+    assert!(work.has_changed().unwrap(), "the reorder wakes the worker");
+    assert!(
+        !updates.has_changed().unwrap(),
+        "a reorder is not a transfer state change"
+    );
+    work.mark_unchanged();
+    runtime
+        .request_automatic_attachment("alice", &group, automatic_target())
+        .await
+        .unwrap();
+    assert!(
+        !work.has_changed().unwrap(),
+        "repeating the leading request changes nothing and wakes nothing"
     );
 }

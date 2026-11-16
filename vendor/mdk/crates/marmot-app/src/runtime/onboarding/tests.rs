@@ -23,6 +23,12 @@ struct Network {
     block_publish: AtomicBool,
     publishing: Notify,
     release_publish: Notify,
+    /// Publishes waiting on `release_publish` whose caller is still waiting
+    /// for them. A cancelled caller drops its publish and leaves this count.
+    held_publishes: Arc<std::sync::atomic::AtomicUsize>,
+    /// What its relays send the plane: an EOSE for each accepted REQ on each
+    /// relay.
+    messages: Arc<transport_nostr::test_support::ScriptedRelayMessages>,
 }
 #[async_trait]
 impl DirectoryRelayFetcher for Network {
@@ -108,7 +114,11 @@ impl DirectoryRelayFetcher for Network {
 async fn onboarding_older_checkpoint_restores_retry_hints_and_conservative_package_validity() {
     let (directory, first, network, _keys, id) = fixture().await;
     let manager = first.accounts();
-    let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let mut c = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
     let legacy_finding: OnboardingFinding = serde_json::from_value(serde_json::json!({
         "issue": "TimedOut", "endpoint": "wss://index.example"
     }))
@@ -128,6 +138,14 @@ async fn onboarding_older_checkpoint_restores_retry_hints_and_conservative_packa
         vec![legacy_finding],
     );
     c.set(OnboardingStep::Follows, OnboardingStatus::Skipped, vec![]);
+    c.set(
+        OnboardingStep::SingleDevice,
+        OnboardingStatus::NeedsInput,
+        vec![
+            finding(OnboardingIssue::MultiDeviceUnsupported),
+            finding(OnboardingIssue::OtherInstallationPossible),
+        ],
+    );
     c.snapshot.single_device_notice = Some(OnboardingSingleDeviceNotice {
         discovery: OnboardingDeviceDiscovery::OtherInstallationPossible,
         other_packages: vec![OnboardingDevicePackage {
@@ -141,6 +159,8 @@ async fn onboarding_older_checkpoint_restores_retry_hints_and_conservative_packa
         discovery_complete: true,
         acknowledged_at: None,
     });
+    let revision = c.snapshot.revision;
+    let recovery_epoch = c.snapshot.recovery_epoch.clone();
     let mut old = serde_json::to_value(&c).unwrap();
     let legacy = old["snapshot"]["steps"][0]["findings"][0]
         .as_object_mut()
@@ -162,15 +182,62 @@ async fn onboarding_older_checkpoint_restores_retry_hints_and_conservative_packa
         .as_object_mut()
         .unwrap()
         .remove("usable");
+    let retained_bytes = serde_json::to_vec(&old).unwrap();
     manager
         .app
         .account_home()
-        .set_account_onboarding(&id, &serde_json::to_vec(&old).unwrap())
+        .set_account_onboarding(&id, &retained_bytes)
         .unwrap();
     first.shutdown_and_close().await.unwrap();
     let reopened = runtime(directory.path(), network);
     let manager = reopened.accounts();
-    let snapshot = manager.onboarding_snapshot(&id).unwrap().unwrap();
+    let snapshot = manager
+        .account_setup()
+        .onboarding_snapshot(&id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        manager
+            .app
+            .account_home()
+            .account_onboarding(&id)
+            .unwrap()
+            .unwrap(),
+        retained_bytes,
+        "projecting the old notice does not rewrite retained evidence"
+    );
+    assert_eq!(snapshot.revision, revision);
+    assert_eq!(snapshot.recovery_epoch, recovery_epoch);
+    assert!(!snapshot.ready);
+    let device_step = &snapshot.steps[OnboardingStep::SingleDevice.index()];
+    assert_eq!(device_step.status, OnboardingStatus::NeedsInput);
+    assert!(
+        device_step
+            .actions
+            .contains(&OnboardingAction::ContinueAnyway)
+    );
+    assert!(
+        device_step
+            .actions
+            .contains(&OnboardingAction::CancelOnboarding)
+    );
+    assert_eq!(
+        device_step
+            .findings
+            .iter()
+            .map(|finding| finding.issue)
+            .collect::<Vec<_>>(),
+        vec![OnboardingIssue::OtherInstallationPossible],
+        "legacy projection retires only the obsolete capability claim"
+    );
+    let notice = snapshot.single_device_notice.as_ref().unwrap();
+    assert_eq!(
+        notice.discovery,
+        OnboardingDeviceDiscovery::OtherInstallationPossible
+    );
+    assert!(notice.discovery_complete);
+    assert_eq!(notice.acknowledged_at, None);
+    assert_eq!(notice.other_packages[0].slot_id, "foreign");
     let legacy = &snapshot.steps[0].findings[0];
     assert_eq!(legacy.issue, OnboardingIssue::TimedOut);
     assert_eq!(legacy.context, OnboardingFindingContext::Unknown);
@@ -184,6 +251,7 @@ async fn onboarding_older_checkpoint_restores_retry_hints_and_conservative_packa
         assert!(step.actions.contains(&OnboardingAction::Retry));
     }
     let retried = manager
+        .account_setup()
         .retry_onboarding_step(&id, OnboardingStep::Profile)
         .await
         .unwrap();
@@ -191,8 +259,18 @@ async fn onboarding_older_checkpoint_restores_retry_hints_and_conservative_packa
         retried.steps[OnboardingStep::Follows.index()].status,
         OnboardingStatus::Skipped
     );
-    manager.cancel_onboarding(&id).await.unwrap();
-    assert!(manager.onboarding_snapshot(&id).unwrap().is_none());
+    manager
+        .account_setup()
+        .cancel_onboarding(&id)
+        .await
+        .unwrap();
+    assert!(
+        manager
+            .account_setup()
+            .onboarding_snapshot(&id)
+            .unwrap()
+            .is_none()
+    );
     reopened.shutdown_and_close().await.unwrap();
 }
 
@@ -208,7 +286,11 @@ async fn single_device_ignores_unusable_owned_slots_but_preserves_foreign_eviden
             "owned-slot".into(),
         ))
         .unwrap();
-    let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let mut c = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
     for published_at in [
         unix_now_seconds(),
         unix_now_seconds() + FUTURE_CLOCK_SKEW + 1,
@@ -221,6 +303,7 @@ async fn single_device_ignores_unusable_owned_slots_but_preserves_foreign_eviden
             published_at,
         )];
         manager
+            .account_setup()
             .check_onboarding_single_device(&mut c)
             .await
             .unwrap();
@@ -235,6 +318,7 @@ async fn single_device_ignores_unusable_owned_slots_but_preserves_foreign_eviden
             published_at,
         ));
         manager
+            .account_setup()
             .check_onboarding_single_device(&mut c)
             .await
             .unwrap();
@@ -266,7 +350,7 @@ async fn onboarding_legacy_setup_admission_does_not_mutate_account() {
         .clone();
     assert!(
         runtime
-            .accounts()
+            .account_setup()
             .begin_onboarding(Zeroizing::new(secret), options())
             .await
             .is_err()
@@ -274,7 +358,7 @@ async fn onboarding_legacy_setup_admission_does_not_mutate_account() {
     assert_eq!(runtime.accounts().resolve(&account.label).unwrap(), account);
     assert!(
         runtime
-            .accounts()
+            .account_setup()
             .onboarding_snapshot(&account.label)
             .unwrap()
             .is_none()
@@ -312,11 +396,96 @@ async fn onboarding_legacy_import_rejects_before_reactivating_the_identity() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
+/// An account its device group unlinked comes back only through a wipe and
+/// a new link (D67). Importing its key, logging in, an external-signer login
+/// and both onboarding starts refuse it as unlinked, before anything else:
+/// before the logins' onboarding check, and before the onboarding starts
+/// reset a finished checkpoint. Nothing is written or sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unlinked_account_is_refused_every_way_back_in() {
+    fn unlinked<T>(result: Result<T, AppError>) -> bool {
+        matches!(
+            result,
+            Err(AppError::AccountHome(AccountHomeError::AccountUnlinked(_)))
+        )
+    }
+    let (_dir, runtime, network, keys, id) = fixture().await;
+    let home = runtime.accounts().app.account_home();
+    let before = home.mark_account_unlinked(&id).unwrap();
+    let setup = home.account_setup_state(&id).unwrap();
+    let checkpoint = home.account_onboarding(&id).unwrap();
+    let attempts = network.attempts.lock().len();
+    let nsec = || Zeroizing::new(keys.secret_key().to_bech32().unwrap());
+    let signer = || BlockingSigner {
+        keys: keys.clone(),
+        block: Arc::new(AtomicBool::new(false)),
+        started: Arc::new(Notify::new()),
+    };
+
+    assert!(unlinked(
+        runtime
+            .create_or_import_account(AccountSetupRequest {
+                import_nsec: Some(nsec()),
+                ..AccountSetupRequest::default()
+            })
+            .await
+    ));
+    assert!(unlinked(
+        runtime
+            .login(
+                keys.public_key().to_bech32().unwrap(),
+                AccountSetupRequest::default()
+            )
+            .await
+    ));
+    assert!(unlinked(
+        runtime
+            .login_external_signer(id.clone(), signer(), AccountSetupRequest::default())
+            .await
+    ));
+    assert_eq!(home.account_onboarding(&id).unwrap(), checkpoint);
+
+    let manager = runtime.accounts();
+    let mut finished = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
+    finished.snapshot.ready = true;
+    manager
+        .account_setup()
+        .save_onboarding(&mut finished)
+        .unwrap();
+    let checkpoint = home.account_onboarding(&id).unwrap();
+    assert!(unlinked(
+        manager
+            .account_setup()
+            .begin_onboarding(nsec(), options())
+            .await
+    ));
+    assert!(unlinked(
+        manager
+            .account_setup()
+            .begin_external_signer_onboarding(id.clone(), signer(), options())
+            .await
+    ));
+
+    assert_eq!(home.account(&id).unwrap(), before);
+    assert_eq!(home.account_setup_state(&id).unwrap(), setup);
+    assert_eq!(home.account_onboarding(&id).unwrap(), checkpoint);
+    assert_eq!(network.attempts.lock().len(), attempts);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn onboarding_retry_preserves_declined_steps_and_invalidates_device_evidence() {
     let (_directory, runtime, _network, _keys, id) = fixture().await;
     let manager = runtime.accounts();
-    let pending = manager.onboarding_snapshot(&id).unwrap().unwrap();
+    let pending = manager
+        .account_setup()
+        .onboarding_snapshot(&id)
+        .unwrap()
+        .unwrap();
     let now = tokio::time::Instant::now();
     manager
         .startup_retries
@@ -325,13 +494,25 @@ async fn onboarding_retry_preserves_declined_steps_and_invalidates_device_eviden
         .fail(id.clone(), now);
     assert!(
         manager
+            .account_setup()
             .retry_onboarding_step(&id, OnboardingStep::Follows)
             .await
             .is_err()
     );
-    assert_eq!(manager.onboarding_snapshot(&id).unwrap().unwrap(), pending);
+    assert_eq!(
+        manager
+            .account_setup()
+            .onboarding_snapshot(&id)
+            .unwrap()
+            .unwrap(),
+        pending
+    );
     assert!(!manager.startup_retries.lock().unwrap().allows(&id, now));
-    let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let mut c = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
     c.set(OnboardingStep::Profile, OnboardingStatus::Passed, vec![]);
     c.set(OnboardingStep::Follows, OnboardingStatus::Skipped, vec![]);
     c.set(
@@ -346,8 +527,9 @@ async fn onboarding_retry_preserves_declined_steps_and_invalidates_device_eviden
         discovery_complete: false,
         acknowledged_at: Some(1),
     });
-    manager.save_onboarding(&mut c).unwrap();
+    manager.account_setup().save_onboarding(&mut c).unwrap();
     let retried = manager
+        .account_setup()
         .retry_onboarding_step(&id, OnboardingStep::Profile)
         .await
         .unwrap();
@@ -363,19 +545,21 @@ async fn onboarding_retry_preserves_declined_steps_and_invalidates_device_eviden
     assert!(retried.single_device_notice.is_none());
     assert!(
         !manager
+            .setup_records()
             .onboarding_checkpoint(&id)
             .unwrap()
             .unwrap()
             .single_device_acknowledged
     );
     // Changing sources invalidates even an already acknowledged notice.
-    manager.save_onboarding(&mut c).unwrap();
+    manager.account_setup().save_onboarding(&mut c).unwrap();
     manager
         .startup_retries
         .lock()
         .unwrap()
         .fail(id.clone(), now);
     let changed = manager
+        .account_setup()
         .set_onboarding_discovery_relays(&id, vec!["wss://alternate.example".into()])
         .await
         .unwrap();
@@ -392,7 +576,11 @@ async fn onboarding_retry_preserves_declined_steps_and_invalidates_device_eviden
 async fn onboarding_partial_discovery_and_off_filter_noise_have_distinct_results() {
     let (_directory, runtime, network, keys, id) = fixture().await;
     let manager = runtime.accounts();
-    let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let mut c = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
     c.options
         .discovery_relays
         .push("wss://healthy.example".into());
@@ -402,6 +590,7 @@ async fn onboarding_partial_discovery_and_off_filter_noise_have_distinct_results
         .push(signed(&keys, 0, vec![], "{}", unix_now_seconds()));
     network.fail_index_only.store(true, Ordering::SeqCst);
     let (status, findings, _) = manager
+        .account_setup()
         .check_onboarding_step(&c, OnboardingStep::Profile)
         .await;
     assert_eq!(status, OnboardingStatus::Passed);
@@ -423,6 +612,7 @@ async fn onboarding_partial_discovery_and_off_filter_noise_have_distinct_results
         .return_off_filter_events
         .store(true, Ordering::SeqCst);
     manager
+        .account_setup()
         .check_onboarding_single_device(&mut c)
         .await
         .unwrap();
@@ -437,7 +627,11 @@ async fn onboarding_partial_discovery_and_off_filter_noise_have_distinct_results
 async fn mixed_health_relay_declarations_pass_without_rewriting_signed_metadata() {
     let (_directory, runtime, network, keys, id) = fixture().await;
     let manager = runtime.accounts();
-    let c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let c = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
     for (step, kind, tags, expected_issue) in [
         (
             OnboardingStep::Relays,
@@ -469,7 +663,10 @@ async fn mixed_health_relay_declarations_pass_without_rewriting_signed_metadata(
     ] {
         let declaration = signed(&keys, kind, tags, "unchanged", unix_now_seconds());
         *network.events.lock() = vec![declaration.clone()];
-        let (status, findings, observed) = manager.check_onboarding_step(&c, step).await;
+        let (status, findings, observed) = manager
+            .account_setup()
+            .check_onboarding_step(&c, step)
+            .await;
         assert_eq!(status, OnboardingStatus::Passed, "step {step:?}");
         assert!(findings.iter().any(|finding| {
             finding.issue == expected_issue
@@ -499,10 +696,14 @@ async fn mixed_health_relay_declarations_pass_without_rewriting_signed_metadata(
 async fn mixed_health_relay_steps_advance_the_checkpoint_without_publication() {
     let (_directory, runtime, network, keys, id) = fixture().await;
     let manager = runtime.accounts();
-    let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let mut c = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
     c.set(OnboardingStep::Profile, OnboardingStatus::Passed, vec![]);
     c.set(OnboardingStep::Follows, OnboardingStatus::Passed, vec![]);
-    manager.save_onboarding(&mut c).unwrap();
+    manager.account_setup().save_onboarding(&mut c).unwrap();
     *network.events.lock() = vec![
         signed(
             &keys,
@@ -525,7 +726,7 @@ async fn mixed_health_relay_steps_advance_the_checkpoint_without_publication() {
             unix_now_seconds(),
         ),
     ];
-    let snapshot = manager.run_onboarding(&id).await.unwrap();
+    let snapshot = manager.account_setup().run_onboarding(&id).await.unwrap();
     for step in [OnboardingStep::Relays, OnboardingStep::InboxRelays] {
         let state = &snapshot.steps[step.index()];
         assert_eq!(state.status, OnboardingStatus::Passed);
@@ -557,7 +758,11 @@ async fn transient_endpoint_failures_are_warnings_when_another_declared_route_co
 
     let (_directory, runtime, network, keys, id) = fixture().await;
     let manager = runtime.accounts();
-    let c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let c = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
     *network.events.lock() = vec![signed(
         &keys,
         10002,
@@ -595,6 +800,7 @@ async fn transient_endpoint_failures_are_warnings_when_another_declared_route_co
             .lock()
             .insert("degraded.example".into(), error);
         let (status, findings, _) = manager
+            .account_setup()
             .check_onboarding_step(&c, OnboardingStep::Relays)
             .await;
         assert_eq!(status, OnboardingStatus::Passed, "error {error:?}");
@@ -610,7 +816,11 @@ async fn a_completed_read_route_can_prove_inspection_when_the_declared_write_rou
 
     let (_directory, runtime, network, keys, id) = fixture().await;
     let manager = runtime.accounts();
-    let c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let c = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
     let declaration = signed(
         &keys,
         10002,
@@ -628,6 +838,7 @@ async fn a_completed_read_route_can_prove_inspection_when_the_declared_write_rou
         .insert("write.example".into(), DirectoryInspectionError::TimedOut);
 
     let (status, findings, observed) = manager
+        .account_setup()
         .check_onboarding_step(&c, OnboardingStep::Relays)
         .await;
     assert_eq!(status, OnboardingStatus::Passed);
@@ -663,6 +874,7 @@ async fn a_completed_read_route_can_prove_inspection_when_the_declared_write_rou
     assert!(network.attempts.lock().is_empty());
     network.inspection_errors.lock().remove("write.example");
     let (status, recovered, _) = manager
+        .account_setup()
         .check_onboarding_step(&c, OnboardingStep::Relays)
         .await;
     assert_eq!(status, OnboardingStatus::Passed);
@@ -692,10 +904,17 @@ async fn contextual_timeout_roles() {
     ] {
         let (_directory, runtime, network, keys, id) = fixture().await;
         let manager = runtime.accounts();
-        let mut checkpoint = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+        let mut checkpoint = manager
+            .setup_records()
+            .onboarding_checkpoint(&id)
+            .unwrap()
+            .unwrap();
         checkpoint.set(OnboardingStep::Profile, OnboardingStatus::Skipped, vec![]);
         checkpoint.set(OnboardingStep::Follows, OnboardingStatus::Skipped, vec![]);
-        manager.save_onboarding(&mut checkpoint).unwrap();
+        manager
+            .account_setup()
+            .save_onboarding(&mut checkpoint)
+            .unwrap();
         *network.events.lock() = vec![signed(
             &keys,
             10002,
@@ -710,7 +929,7 @@ async fn contextual_timeout_roles() {
             .inspection_errors
             .lock()
             .insert(failed.into(), DirectoryInspectionError::TimedOut);
-        let snapshot = manager.run_onboarding(&id).await.unwrap();
+        let snapshot = manager.account_setup().run_onboarding(&id).await.unwrap();
         let state = &snapshot.steps[OnboardingStep::Relays.index()];
         assert_eq!(state.status, OnboardingStatus::Passed);
         assert!(!snapshot.ready);
@@ -774,6 +993,7 @@ async fn contextual_timeout_roles() {
                 && finding.outcome == OnboardingCheckOutcome::Success
         }));
         let retried = manager
+            .account_setup()
             .retry_onboarding_step(&id, OnboardingStep::Relays)
             .await
             .unwrap();
@@ -792,10 +1012,17 @@ async fn contextual_timeout_roles() {
 async fn observations_survive_resume() {
     let (directory, first, network, keys, id) = fixture().await;
     let manager = first.accounts();
-    let mut checkpoint = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let mut checkpoint = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
     checkpoint.set(OnboardingStep::Profile, OnboardingStatus::Skipped, vec![]);
     checkpoint.set(OnboardingStep::Follows, OnboardingStatus::Skipped, vec![]);
-    manager.save_onboarding(&mut checkpoint).unwrap();
+    manager
+        .account_setup()
+        .save_onboarding(&mut checkpoint)
+        .unwrap();
     *network.events.lock() = vec![signed(
         &keys,
         10002,
@@ -803,7 +1030,7 @@ async fn observations_survive_resume() {
         "",
         unix_now_seconds(),
     )];
-    let initial = manager.run_onboarding(&id).await.unwrap();
+    let initial = manager.account_setup().run_onboarding(&id).await.unwrap();
     let evidence = initial.steps[OnboardingStep::Relays.index()].clone();
     assert!(!evidence.findings.is_empty());
     for finding in &evidence.findings {
@@ -814,6 +1041,7 @@ async fn observations_survive_resume() {
         );
     }
     let retried = manager
+        .account_setup()
         .retry_onboarding_step(&id, OnboardingStep::InboxRelays)
         .await
         .unwrap();
@@ -823,9 +1051,14 @@ async fn observations_survive_resume() {
     first.shutdown_and_close().await.unwrap();
     let reopened = runtime(directory.path(), network.clone());
     let manager = reopened.accounts();
-    let restored = manager.onboarding_snapshot(&id).unwrap().unwrap();
+    let restored = manager
+        .account_setup()
+        .onboarding_snapshot(&id)
+        .unwrap()
+        .unwrap();
     assert_eq!(restored.steps[OnboardingStep::Relays.index()], evidence);
     let rechecked = manager
+        .account_setup()
         .retry_onboarding_step(&id, OnboardingStep::Relays)
         .await
         .unwrap();
@@ -847,7 +1080,11 @@ async fn relay_directionality_and_inconclusive_checks_never_produce_false_readin
 
     let (_directory, runtime, network, keys, id) = fixture().await;
     let manager = runtime.accounts();
-    let c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let c = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
     for (step, kind, tags, expected) in [
         (
             OnboardingStep::Relays,
@@ -905,7 +1142,10 @@ async fn relay_directionality_and_inconclusive_checks_never_produce_false_readin
         ),
     ] {
         *network.events.lock() = vec![signed(&keys, kind, tags, "", unix_now_seconds())];
-        let (status, _, _) = manager.check_onboarding_step(&c, step).await;
+        let (status, _, _) = manager
+            .account_setup()
+            .check_onboarding_step(&c, step)
+            .await;
         assert_eq!(status, expected);
     }
     *network.events.lock() = vec![signed(
@@ -920,6 +1160,7 @@ async fn relay_directionality_and_inconclusive_checks_never_produce_false_readin
         DirectoryInspectionError::Unreachable,
     );
     let (status, findings, _) = manager
+        .account_setup()
         .check_onboarding_step(&c, OnboardingStep::Relays)
         .await;
     assert_eq!(status, OnboardingStatus::RetryableFailure);
@@ -937,6 +1178,7 @@ async fn relay_directionality_and_inconclusive_checks_never_produce_false_readin
         unix_now_seconds(),
     )];
     let (status, _, _) = manager
+        .account_setup()
         .check_onboarding_step(&c, OnboardingStep::InboxRelays)
         .await;
     assert_eq!(status, OnboardingStatus::RetryableFailure);
@@ -979,16 +1221,39 @@ fn relay_status_keeps_the_inspection_cap_advisory_only_after_a_completed_check()
 async fn onboarding_cancellation_retries_local_intent_and_allows_explicit_restart() {
     let (directory, runtime, network, keys, id) = fixture().await;
     let manager = runtime.accounts();
-    let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let mut c = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
     // Simulate interruption after the cancellation intent, before sign-out.
     c.snapshot.cancellation_pending = true;
-    manager.save_onboarding(&mut c).unwrap();
-    assert!(manager.run_onboarding(&id).await.is_err());
-    manager.cancel_onboarding(&id).await.unwrap();
-    manager.cancel_onboarding(&id).await.unwrap();
+    manager.account_setup().save_onboarding(&mut c).unwrap();
+    assert!(manager.account_setup().run_onboarding(&id).await.is_err());
+    manager
+        .account_setup()
+        .cancel_onboarding(&id)
+        .await
+        .unwrap();
+    manager
+        .account_setup()
+        .cancel_onboarding(&id)
+        .await
+        .unwrap();
     assert!(manager.resolve(&id).unwrap().signed_out);
-    assert!(manager.onboarding_snapshot(&id).unwrap().is_none());
-    assert!(manager.require_onboarding_complete(&id).is_ok());
+    assert!(
+        manager
+            .account_setup()
+            .onboarding_snapshot(&id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        manager
+            .setup_records()
+            .require_onboarding_complete(&id)
+            .is_ok()
+    );
     assert!(
         manager
             .app
@@ -1001,7 +1266,7 @@ async fn onboarding_cancellation_retries_local_intent_and_allows_explicit_restar
     runtime.shutdown_and_close().await.unwrap();
     let reopened = super::tests::runtime(directory.path(), network);
     let resumed = reopened
-        .accounts()
+        .account_setup()
         .begin_onboarding(
             Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
             options(),
@@ -1017,11 +1282,15 @@ async fn onboarding_cancellation_retries_local_intent_and_allows_explicit_restar
 async fn onboarding_completed_checkpoint_does_not_hide_or_clear_later_setup() {
     let (_dir, runtime, _network, keys, id) = fixture().await;
     let manager = runtime.accounts();
-    let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let mut c = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
     for step in c.snapshot.steps.clone() {
         c.set(step.step, OnboardingStatus::Passed, vec![]);
     }
-    manager.save_onboarding(&mut c).unwrap();
+    manager.account_setup().save_onboarding(&mut c).unwrap();
     let account = manager.resolve(&id).unwrap();
     manager
         .app
@@ -1039,9 +1308,10 @@ async fn onboarding_completed_checkpoint_does_not_hide_or_clear_later_setup() {
     );
     for cleanup_pending in [false, true] {
         c.setup_cleanup_pending = cleanup_pending;
-        manager.save_onboarding(&mut c).unwrap();
+        manager.account_setup().save_onboarding(&mut c).unwrap();
         assert!(
             manager
+                .account_setup()
                 .begin_onboarding(
                     Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
                     options(),
@@ -1049,7 +1319,14 @@ async fn onboarding_completed_checkpoint_does_not_hide_or_clear_later_setup() {
                 .await
                 .is_err()
         );
-        assert!(manager.run_onboarding(&id).await.unwrap().ready);
+        assert!(
+            manager
+                .account_setup()
+                .run_onboarding(&id)
+                .await
+                .unwrap()
+                .ready
+        );
         assert_eq!(
             runtime.account_setup_readiness(&id).unwrap(),
             AccountSetupReadiness::Publishing
@@ -1079,7 +1356,27 @@ async fn onboarding_completed_checkpoint_does_not_hide_or_clear_later_setup() {
 }
 #[async_trait]
 impl NostrRelayClient for Network {
-    async fn subscribe(&self, _: NostrSubscription) -> Result<(), TransportAdapterError> {
+    fn relay_notification_source(
+        &self,
+    ) -> Option<Arc<dyn transport_nostr_adapter::NostrRelayNotificationSource>> {
+        Some(self.messages.clone())
+    }
+    async fn reply_sent_nothing(
+        &self,
+        _: Option<&MemberId>,
+        _: &TransportEndpoint,
+        subscription_id: &str,
+    ) -> bool {
+        self.messages.reply_sent_nothing(subscription_id)
+    }
+    async fn subscribe(
+        &self,
+        subscription: NostrSubscription,
+    ) -> Result<(), TransportAdapterError> {
+        let id = subscription.subscription_id();
+        for endpoint in subscription.endpoints() {
+            self.messages.eose(endpoint, &id);
+        }
         Ok(())
     }
     async fn unsubscribe(&self, _: NostrSubscription) -> Result<(), TransportAdapterError> {
@@ -1111,9 +1408,24 @@ impl NostrRelayClient for Network {
                 .map(|endpoint| endpoint.0.clone())
                 .collect(),
         );
-        self.publishing.notify_one();
         if self.block_publish.load(Ordering::SeqCst) {
-            self.release_publish.notified().await;
+            struct Held(Arc<std::sync::atomic::AtomicUsize>);
+            impl Drop for Held {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, Ordering::SeqCst);
+                }
+            }
+            // Wait for the release before announcing the hold, so
+            // `notify_waiters` always reaches it.
+            let release = self.release_publish.notified();
+            tokio::pin!(release);
+            release.as_mut().enable();
+            self.held_publishes.fetch_add(1, Ordering::SeqCst);
+            let _held = Held(self.held_publishes.clone());
+            self.publishing.notify_one();
+            release.await;
+        } else {
+            self.publishing.notify_one();
         }
         if self.zero_acks.load(Ordering::SeqCst) {
             return Ok(NostrPublishOutcome::default());
@@ -1163,7 +1475,7 @@ async fn fixture() -> (
     let keys = nostr::prelude::Keys::generate();
     let id = keys.public_key().to_hex();
     runtime
-        .accounts()
+        .account_setup()
         .begin_onboarding(
             Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
             options(),
@@ -1201,7 +1513,7 @@ async fn minimal_relay_repair_retains_a_currently_allowed_damus_declaration() {
     let (_dir, runtime, _network, keys, _id) = fixture().await;
     let tags = vec![vec!["r".into(), "wss://relay.damus.io".into()]];
     let event = signed(&keys, 10002, tags.clone(), "opaque", unix_now_seconds() - 1);
-    let (repair, _, _) = runtime.accounts().minimal_relay_repair(
+    let (repair, _, _) = runtime.accounts().account_setup().minimal_relay_repair(
         OnboardingStep::Relays,
         Some(&event),
         &["wss://public.example".into()],
@@ -1235,7 +1547,7 @@ async fn minimal_relay_repair_preserves_exact_custom_tags_and_removes_only_polic
         "opaque content",
         unix_now_seconds() - 1,
     );
-    let (repair, read, write) = runtime.accounts().minimal_relay_repair(
+    let (repair, read, write) = runtime.accounts().account_setup().minimal_relay_repair(
         OnboardingStep::Relays,
         Some(&event),
         &["wss://default.example".into()],
@@ -1278,7 +1590,7 @@ async fn minimal_relay_repair_retains_unsafe_routes_while_removing_retired_route
         vec!["r".into(), retired_relay_fixture_endpoint()],
     ];
     let event = signed(&keys, 10002, tags.clone(), "opaque", unix_now_seconds() - 1);
-    let (repair, _, _) = runtime.accounts().minimal_relay_repair(
+    let (repair, _, _) = runtime.accounts().account_setup().minimal_relay_repair(
         OnboardingStep::Relays,
         Some(&event),
         &["wss://public.example".into()],
@@ -1319,7 +1631,7 @@ async fn minimal_relay_repair_matches_default_by_normalized_relay_key() {
         "",
         unix_now_seconds() - 1,
     );
-    let (repair, _, _) = runtime.accounts().minimal_relay_repair(
+    let (repair, _, _) = runtime.accounts().account_setup().minimal_relay_repair(
         OnboardingStep::Relays,
         Some(&event),
         &["wss://other.example".into(), "wss://custom.example".into()],
@@ -1345,7 +1657,7 @@ async fn minimal_relay_repair_adds_only_missing_role_and_preserves_unmarked_dupl
         "",
         unix_now_seconds() - 1,
     );
-    let (repair, read, write) = runtime.accounts().minimal_relay_repair(
+    let (repair, read, write) = runtime.accounts().account_setup().minimal_relay_repair(
         OnboardingStep::Relays,
         Some(&read_only),
         &["wss://custom.example".into()],
@@ -1370,7 +1682,7 @@ async fn minimal_relay_repair_adds_only_missing_role_and_preserves_unmarked_dupl
         "preserve",
         unix_now_seconds() - 1,
     );
-    let (repair, _, _) = runtime.accounts().minimal_relay_repair(
+    let (repair, _, _) = runtime.accounts().account_setup().minimal_relay_repair(
         OnboardingStep::Relays,
         Some(&unmarked),
         &["wss://default.example".into()],
@@ -1394,7 +1706,7 @@ async fn minimal_relay_repair_falls_back_to_unapprovable_manual_review() {
         "opaque",
         unix_now_seconds() - 1,
     );
-    let (repair, _, _) = runtime.accounts().minimal_relay_repair(
+    let (repair, _, _) = runtime.accounts().account_setup().minimal_relay_repair(
         OnboardingStep::Relays,
         Some(&malformed),
         &["wss://default.example".into()],
@@ -1409,15 +1721,20 @@ async fn minimal_relay_repair_falls_back_to_unapprovable_manual_review() {
     );
     let mut checkpoint = runtime
         .accounts()
+        .setup_records()
         .onboarding_checkpoint(&id)
         .unwrap()
         .unwrap();
     checkpoint.set(OnboardingStep::Relays, OnboardingStatus::NeedsInput, vec![]);
     checkpoint.records[OnboardingStep::Relays.index()] = Some(malformed);
     checkpoint.append_relays = true;
-    runtime.accounts().save_onboarding(&mut checkpoint).unwrap();
-    let snapshot = runtime
+    runtime
         .accounts()
+        .account_setup()
+        .save_onboarding(&mut checkpoint)
+        .unwrap();
+    let snapshot = runtime
+        .account_setup()
         .propose_onboarding_relay_repair(&id, OnboardingStep::Relays)
         .await
         .unwrap();
@@ -1439,7 +1756,7 @@ async fn minimal_relay_repair_falls_back_to_unapprovable_manual_review() {
     );
     assert!(
         runtime
-            .accounts()
+            .account_setup()
             .approve_onboarding_repair(&id, snapshot.revision)
             .await
             .is_err()
@@ -1447,6 +1764,7 @@ async fn minimal_relay_repair_falls_back_to_unapprovable_manual_review() {
     assert!(
         !runtime
             .accounts()
+            .setup_records()
             .onboarding_checkpoint(&id)
             .unwrap()
             .unwrap()
@@ -1455,6 +1773,7 @@ async fn minimal_relay_repair_falls_back_to_unapprovable_manual_review() {
     assert!(
         !runtime
             .accounts()
+            .setup_records()
             .onboarding_checkpoint(&id)
             .unwrap()
             .unwrap()
@@ -1475,6 +1794,7 @@ async fn inspection_failures_never_select_allowed_endpoints_for_removal() {
     );
     let mut checkpoint = runtime
         .accounts()
+        .setup_records()
         .onboarding_checkpoint(&id)
         .unwrap()
         .unwrap();
@@ -1490,9 +1810,13 @@ async fn inspection_failures_never_select_allowed_endpoints_for_removal() {
         ],
     );
     checkpoint.records[OnboardingStep::Relays.index()] = Some(source.clone());
-    runtime.accounts().save_onboarding(&mut checkpoint).unwrap();
-    let snapshot = runtime
+    runtime
         .accounts()
+        .account_setup()
+        .save_onboarding(&mut checkpoint)
+        .unwrap();
+    let snapshot = runtime
+        .account_setup()
         .propose_onboarding_relay_repair(&id, OnboardingStep::Relays)
         .await
         .unwrap();
@@ -1530,16 +1854,25 @@ async fn mixed_case_additive_repair() {
             unix_now_seconds() - 1,
         );
         *network.events.lock() = vec![source.clone()];
-        let mut checkpoint = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+        let mut checkpoint = manager
+            .setup_records()
+            .onboarding_checkpoint(&id)
+            .unwrap()
+            .unwrap();
         let (status, findings, record) = manager
+            .account_setup()
             .check_onboarding_step(&checkpoint, OnboardingStep::Relays)
             .await;
         assert_eq!(status, OnboardingStatus::NeedsInput);
         checkpoint.set(OnboardingStep::Relays, status, findings);
         checkpoint.records[OnboardingStep::Relays.index()] = record;
-        manager.save_onboarding(&mut checkpoint).unwrap();
+        manager
+            .account_setup()
+            .save_onboarding(&mut checkpoint)
+            .unwrap();
 
         let preview = manager
+            .account_setup()
             .propose_onboarding_relay_repair(&id, OnboardingStep::Relays)
             .await
             .unwrap();
@@ -1575,6 +1908,7 @@ async fn mixed_case_additive_repair() {
 
         network.zero_acks.store(true, Ordering::SeqCst);
         manager
+            .account_setup()
             .approve_onboarding_repair(&id, preview.revision)
             .await
             .unwrap();
@@ -1602,8 +1936,13 @@ async fn passed_relay_step_with_retired_finding_offers_consent_gated_removal_onl
         unix_now_seconds() - 1,
     );
     *network.events.lock() = vec![source.clone()];
-    let mut checkpoint = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let mut checkpoint = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
     let (status, findings, record) = manager
+        .account_setup()
         .check_onboarding_step(&checkpoint, OnboardingStep::Relays)
         .await;
     assert_eq!(status, OnboardingStatus::Passed);
@@ -1614,8 +1953,15 @@ async fn passed_relay_step_with_retired_finding_offers_consent_gated_removal_onl
     );
     checkpoint.set(OnboardingStep::Relays, status, findings);
     checkpoint.records[OnboardingStep::Relays.index()] = record;
-    manager.save_onboarding(&mut checkpoint).unwrap();
-    let saved = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    manager
+        .account_setup()
+        .save_onboarding(&mut checkpoint)
+        .unwrap();
+    let saved = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
     assert!(!saved.approved);
     assert_eq!(
         saved.snapshot.steps[OnboardingStep::Relays.index()].status,
@@ -1629,6 +1975,7 @@ async fn passed_relay_step_with_retired_finding_offers_consent_gated_removal_onl
     );
 
     let preview = manager
+        .account_setup()
         .propose_onboarding_relay_repair(&id, OnboardingStep::Relays)
         .await
         .unwrap();
@@ -1663,6 +2010,7 @@ async fn passed_relay_step_with_retired_finding_offers_consent_gated_removal_onl
     assert!(network.attempts.lock().is_empty());
     assert!(
         manager
+            .account_setup()
             .approve_onboarding_repair(&id, preview.revision - 1)
             .await
             .is_err()
@@ -1670,6 +2018,7 @@ async fn passed_relay_step_with_retired_finding_offers_consent_gated_removal_onl
     assert!(network.attempts.lock().is_empty());
     network.zero_acks.store(true, Ordering::SeqCst);
     let failed_publication = manager
+        .account_setup()
         .approve_onboarding_repair(&id, preview.revision)
         .await
         .unwrap();
@@ -1698,30 +2047,47 @@ async fn cancel_removal_only_cleanup_preserves_readiness() {
 async fn typed_relay_preview_preserves_another_steps_pending_proposal() {
     let (_directory, runtime, network, _keys, id) = fixture().await;
     let manager = runtime.accounts();
-    let mut checkpoint = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let mut checkpoint = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
     checkpoint.set(
         OnboardingStep::Follows,
         OnboardingStatus::NeedsInput,
         vec![],
     );
     checkpoint.set(OnboardingStep::Relays, OnboardingStatus::NeedsInput, vec![]);
-    manager.save_onboarding(&mut checkpoint).unwrap();
+    manager
+        .account_setup()
+        .save_onboarding(&mut checkpoint)
+        .unwrap();
     let original = manager
+        .account_setup()
         .propose_onboarding_follows(&id, vec![])
         .await
         .unwrap();
     assert!(
         manager
+            .account_setup()
             .propose_onboarding_relay_repair(&id, OnboardingStep::Relays)
             .await
             .is_err()
     );
-    let after = manager.onboarding_snapshot(&id).unwrap().unwrap();
+    let after = manager
+        .account_setup()
+        .onboarding_snapshot(&id)
+        .unwrap()
+        .unwrap();
     assert_eq!(after.proposal, original.proposal);
     assert_eq!(after.revision, original.revision);
     assert_eq!(after.steps, original.steps);
     assert!(network.attempts.lock().is_empty());
-    let canceled = manager.cancel_onboarding_repair(&id).await.unwrap();
+    let canceled = manager
+        .account_setup()
+        .cancel_onboarding_repair(&id)
+        .await
+        .unwrap();
     assert_eq!(
         canceled.steps[OnboardingStep::Follows.index()].status,
         OnboardingStatus::NeedsInput
@@ -1735,16 +2101,25 @@ async fn cancel_required_relay_repair_remains_pending() {
     let (_directory, runtime, network, _keys, id) = fixture().await;
     missing_relays(&runtime, &id).await;
     let manager = runtime.accounts();
-    let before = manager.onboarding_snapshot(&id).unwrap().unwrap();
+    let before = manager
+        .account_setup()
+        .onboarding_snapshot(&id)
+        .unwrap()
+        .unwrap();
     assert_eq!(
         before.steps[OnboardingStep::Relays.index()].status,
         OnboardingStatus::NeedsInput
     );
     manager
+        .account_setup()
         .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
         .await
         .unwrap();
-    let canceled = manager.cancel_onboarding_repair(&id).await.unwrap();
+    let canceled = manager
+        .account_setup()
+        .cancel_onboarding_repair(&id)
+        .await
+        .unwrap();
     assert!(canceled.proposal.is_none());
     assert!(!canceled.ready);
     let step = &canceled.steps[OnboardingStep::Relays.index()];
@@ -1752,7 +2127,12 @@ async fn cancel_required_relay_repair_remains_pending() {
     assert_eq!(step.status, OnboardingStatus::NeedsInput);
     assert_eq!(step.findings, original.findings);
     assert_eq!(step.actions, original.actions);
-    assert!(manager.require_onboarding_complete(&id).is_err());
+    assert!(
+        manager
+            .setup_records()
+            .require_onboarding_complete(&id)
+            .is_err()
+    );
     assert!(network.attempts.lock().is_empty());
     runtime.shutdown_and_close().await.unwrap();
 }
@@ -1773,7 +2153,11 @@ async fn unsigned_cleanup_is_cleared_on_signed_out_reimport() {
         );
         *network.events.lock() = vec![source.clone()];
         let manager = first.accounts();
-        let mut checkpoint = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+        let mut checkpoint = manager
+            .setup_records()
+            .onboarding_checkpoint(&id)
+            .unwrap()
+            .unwrap();
         for step in &mut checkpoint.snapshot.steps {
             step.status = OnboardingStatus::Passed;
         }
@@ -1783,8 +2167,12 @@ async fn unsigned_cleanup_is_cleared_on_signed_out_reimport() {
             vec![finding(OnboardingIssue::RetiredRelay)],
         );
         checkpoint.records[OnboardingStep::Relays.index()] = Some(source);
-        manager.save_onboarding(&mut checkpoint).unwrap();
+        manager
+            .account_setup()
+            .save_onboarding(&mut checkpoint)
+            .unwrap();
         let preview = manager
+            .account_setup()
             .propose_onboarding_relay_repair(&id, OnboardingStep::Relays)
             .await
             .unwrap();
@@ -1802,7 +2190,7 @@ async fn unsigned_cleanup_is_cleared_on_signed_out_reimport() {
             first
         };
         let reset = active
-            .accounts()
+            .account_setup()
             .begin_onboarding(
                 Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
                 options(),
@@ -1818,7 +2206,7 @@ async fn unsigned_cleanup_is_cleared_on_signed_out_reimport() {
                 .iter()
                 .all(|step| step.status == OnboardingStatus::Pending)
         );
-        let checked = active.accounts().run_onboarding(&id).await.unwrap();
+        let checked = active.account_setup().run_onboarding(&id).await.unwrap();
         assert!(checked.proposal.is_none());
         assert!(
             checked.steps[OnboardingStep::Profile.index()]
@@ -1849,8 +2237,13 @@ async fn cancel_removal_only_cleanup(restart: bool) {
     );
     *network.events.lock() = vec![source.clone()];
     let manager = first.accounts();
-    let mut checkpoint = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let mut checkpoint = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
     let (status, findings, record) = manager
+        .account_setup()
         .check_onboarding_step(&checkpoint, OnboardingStep::Relays)
         .await;
     assert_eq!(status, OnboardingStatus::Passed);
@@ -1864,9 +2257,13 @@ async fn cancel_removal_only_cleanup(restart: bool) {
     }
     checkpoint.set(OnboardingStep::Relays, status, findings);
     checkpoint.records[OnboardingStep::Relays.index()] = record;
-    manager.save_onboarding(&mut checkpoint).unwrap();
+    manager
+        .account_setup()
+        .save_onboarding(&mut checkpoint)
+        .unwrap();
     let evidence = checkpoint.snapshot.steps[OnboardingStep::Relays.index()].clone();
     let preview = manager
+        .account_setup()
         .propose_onboarding_relay_repair(&id, OnboardingStep::Relays)
         .await
         .unwrap();
@@ -1888,10 +2285,14 @@ async fn cancel_removal_only_cleanup(restart: bool) {
     } else {
         first
     };
-    let restored = active.accounts().onboarding_snapshot(&id).unwrap().unwrap();
+    let restored = active
+        .account_setup()
+        .onboarding_snapshot(&id)
+        .unwrap()
+        .unwrap();
     assert_eq!(restored.proposal, preview.proposal);
     let canceled = active
-        .accounts()
+        .account_setup()
         .cancel_onboarding_repair(&id)
         .await
         .unwrap();
@@ -1903,10 +2304,17 @@ async fn cancel_removal_only_cleanup(restart: bool) {
     assert_eq!(step.checked_at, evidence.checked_at);
     assert!(!step.actions.contains(&OnboardingAction::ApproveRepair));
     assert!(network.attempts.lock().is_empty());
-    assert!(active.accounts().require_onboarding_complete(&id).is_ok());
+    assert!(
+        active
+            .accounts()
+            .setup_records()
+            .require_onboarding_complete(&id)
+            .is_ok()
+    );
     assert_eq!(
         active
             .accounts()
+            .setup_records()
             .onboarding_checkpoint(&id)
             .unwrap()
             .unwrap()
@@ -1920,7 +2328,7 @@ async fn cancel_removal_only_cleanup(restart: bool) {
     let reopened = runtime(directory.path(), network.clone());
     assert!(
         reopened
-            .accounts()
+            .account_setup()
             .onboarding_snapshot(&id)
             .unwrap()
             .unwrap()
@@ -1945,6 +2353,7 @@ async fn removal_only_preview_is_unapprovable_when_no_route_completed_inspection
     );
     let mut checkpoint = runtime
         .accounts()
+        .setup_records()
         .onboarding_checkpoint(&id)
         .unwrap()
         .unwrap();
@@ -1957,10 +2366,14 @@ async fn removal_only_preview_is_unapprovable_when_no_route_completed_inspection
         ],
     );
     checkpoint.records[OnboardingStep::Relays.index()] = Some(source.clone());
-    runtime.accounts().save_onboarding(&mut checkpoint).unwrap();
+    runtime
+        .accounts()
+        .account_setup()
+        .save_onboarding(&mut checkpoint)
+        .unwrap();
 
     let snapshot = runtime
-        .accounts()
+        .account_setup()
         .propose_onboarding_relay_repair(&id, OnboardingStep::Relays)
         .await
         .unwrap();
@@ -1980,21 +2393,23 @@ async fn removal_only_preview_is_unapprovable_when_no_route_completed_inspection
     );
     assert!(
         runtime
-            .accounts()
+            .account_setup()
             .approve_onboarding_repair(&id, revision)
             .await
             .is_err()
     );
     // A removal-only preview saved by an older build must not bypass the
     // no-usable-route gate when the account resumes on this build.
-    let (old_repair, read_relays, write_relays) = runtime.accounts().minimal_relay_repair(
-        OnboardingStep::Relays,
-        Some(&source),
-        &checkpoint.options.default_relays,
-    );
+    let (old_repair, read_relays, write_relays) =
+        runtime.accounts().account_setup().minimal_relay_repair(
+            OnboardingStep::Relays,
+            Some(&source),
+            &checkpoint.options.default_relays,
+        );
     assert_eq!(old_repair.mode, OnboardingRelayRepairMode::RemovalOnly);
     let mut stale = runtime
         .accounts()
+        .setup_records()
         .onboarding_checkpoint(&id)
         .unwrap()
         .unwrap();
@@ -2003,10 +2418,14 @@ async fn removal_only_preview_is_unapprovable_when_no_route_completed_inspection
     proposal.read_relays = read_relays;
     proposal.write_relays = write_relays;
     proposal.revision = stale.snapshot.revision + 1;
-    runtime.accounts().save_onboarding(&mut stale).unwrap();
+    runtime
+        .accounts()
+        .account_setup()
+        .save_onboarding(&mut stale)
+        .unwrap();
     assert!(
         runtime
-            .accounts()
+            .account_setup()
             .approve_onboarding_repair(&id, stale.snapshot.revision)
             .await
             .is_err()
@@ -2019,7 +2438,11 @@ async fn removal_only_preview_is_unapprovable_when_no_route_completed_inspection
 async fn typed_relay_repair_checkpoint_fences_pre_preview_readers() {
     let (_dir, runtime, _network, keys, id) = fixture().await;
     let manager = runtime.accounts();
-    let mut checkpoint = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let mut checkpoint = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
     checkpoint.records[OnboardingStep::Relays.index()] = Some(signed(
         &keys,
         10002,
@@ -2032,8 +2455,12 @@ async fn typed_relay_repair_checkpoint_fences_pre_preview_readers() {
         OnboardingStatus::NeedsInput,
         Vec::new(),
     );
-    manager.save_onboarding(&mut checkpoint).unwrap();
     manager
+        .account_setup()
+        .save_onboarding(&mut checkpoint)
+        .unwrap();
+    manager
+        .account_setup()
         .propose_onboarding_relay_repair(&id, OnboardingStep::Relays)
         .await
         .unwrap();
@@ -2088,14 +2515,19 @@ async fn minimal_relay_repair_restart_preserves_preview_and_retries_exact_signed
     *network.events.lock() = vec![source.clone()];
     let mut checkpoint = first
         .accounts()
+        .setup_records()
         .onboarding_checkpoint(&id)
         .unwrap()
         .unwrap();
     checkpoint.set(OnboardingStep::Relays, OnboardingStatus::NeedsInput, vec![]);
     checkpoint.records[OnboardingStep::Relays.index()] = Some(source.clone());
-    first.accounts().save_onboarding(&mut checkpoint).unwrap();
-    let preview = first
+    first
         .accounts()
+        .account_setup()
+        .save_onboarding(&mut checkpoint)
+        .unwrap();
+    let preview = first
+        .account_setup()
         .propose_onboarding_relay_repair(&id, OnboardingStep::Relays)
         .await
         .unwrap();
@@ -2111,11 +2543,15 @@ async fn minimal_relay_repair_restart_preserves_preview_and_retries_exact_signed
     first.shutdown_and_close().await.unwrap();
 
     let second = runtime(directory.path(), network.clone());
-    let restored = second.accounts().onboarding_snapshot(&id).unwrap().unwrap();
+    let restored = second
+        .account_setup()
+        .onboarding_snapshot(&id)
+        .unwrap()
+        .unwrap();
     assert_eq!(restored.proposal, preview.proposal);
     assert!(
         second
-            .accounts()
+            .account_setup()
             .approve_onboarding_repair(&id, preview.revision - 1)
             .await
             .is_err()
@@ -2123,7 +2559,7 @@ async fn minimal_relay_repair_restart_preserves_preview_and_retries_exact_signed
     assert!(network.attempts.lock().is_empty());
     network.zero_acks.store(true, Ordering::SeqCst);
     second
-        .accounts()
+        .account_setup()
         .approve_onboarding_repair(&id, preview.revision)
         .await
         .unwrap();
@@ -2137,7 +2573,7 @@ async fn minimal_relay_repair_restart_preserves_preview_and_retries_exact_signed
 
     let third = runtime(directory.path(), network.clone());
     third
-        .accounts()
+        .account_setup()
         .retry_onboarding_step(&id, OnboardingStep::Relays)
         .await
         .unwrap();
@@ -2164,19 +2600,25 @@ async fn minimal_relay_repair_rejects_modified_preview_without_publication() {
     *network.events.lock() = vec![source.clone()];
     let mut checkpoint = runtime
         .accounts()
+        .setup_records()
         .onboarding_checkpoint(&id)
         .unwrap()
         .unwrap();
     checkpoint.set(OnboardingStep::Relays, OnboardingStatus::NeedsInput, vec![]);
     checkpoint.records[OnboardingStep::Relays.index()] = Some(source);
-    runtime.accounts().save_onboarding(&mut checkpoint).unwrap();
-    let preview = runtime
+    runtime
         .accounts()
+        .account_setup()
+        .save_onboarding(&mut checkpoint)
+        .unwrap();
+    let preview = runtime
+        .account_setup()
         .propose_onboarding_relay_repair(&id, OnboardingStep::Relays)
         .await
         .unwrap();
     let original = runtime
         .accounts()
+        .setup_records()
         .onboarding_checkpoint(&id)
         .unwrap()
         .unwrap();
@@ -2203,7 +2645,7 @@ async fn minimal_relay_repair_rejects_modified_preview_without_publication() {
             .unwrap();
         assert!(
             runtime
-                .accounts()
+                .account_setup()
                 .approve_onboarding_repair(&id, preview.revision)
                 .await
                 .is_err()
@@ -2229,19 +2671,25 @@ async fn approved_unsigned_relay_repair_rejects_modified_checkpoint_before_signi
     *network.events.lock() = vec![source.clone()];
     let mut checkpoint = runtime
         .accounts()
+        .setup_records()
         .onboarding_checkpoint(&id)
         .unwrap()
         .unwrap();
     checkpoint.set(OnboardingStep::Relays, OnboardingStatus::NeedsInput, vec![]);
     checkpoint.records[OnboardingStep::Relays.index()] = Some(source);
-    runtime.accounts().save_onboarding(&mut checkpoint).unwrap();
     runtime
         .accounts()
+        .account_setup()
+        .save_onboarding(&mut checkpoint)
+        .unwrap();
+    runtime
+        .account_setup()
         .propose_onboarding_relay_repair(&id, OnboardingStep::Relays)
         .await
         .unwrap();
     let original = runtime
         .accounts()
+        .setup_records()
         .onboarding_checkpoint(&id)
         .unwrap()
         .unwrap();
@@ -2271,10 +2719,11 @@ async fn approved_unsigned_relay_repair_rejects_modified_checkpoint_before_signi
             .account_home()
             .set_account_onboarding(&id, &serde_json::to_vec(&changed).unwrap())
             .unwrap();
-        assert!(runtime.accounts().run_onboarding(&id).await.is_err());
+        assert!(runtime.account_setup().run_onboarding(&id).await.is_err());
         assert!(network.attempts.lock().is_empty());
         let rejected = runtime
             .accounts()
+            .setup_records()
             .onboarding_checkpoint(&id)
             .unwrap()
             .unwrap();
@@ -2317,7 +2766,7 @@ async fn minimal_inbox_relay_repair_uses_separate_defaults_through_approval_and_
             .cloned()
             .unwrap_or_else(|| "wss://default.example".into());
         first
-            .accounts()
+            .account_setup()
             .begin_onboarding(
                 Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
                 OnboardingOptions {
@@ -2339,7 +2788,11 @@ async fn minimal_inbox_relay_repair_uses_separate_defaults_through_approval_and_
         );
         *network.events.lock() = vec![source.clone()];
         let manager = first.accounts();
-        let mut checkpoint = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+        let mut checkpoint = manager
+            .setup_records()
+            .onboarding_checkpoint(&id)
+            .unwrap()
+            .unwrap();
         checkpoint.set(OnboardingStep::Relays, OnboardingStatus::Passed, vec![]);
         checkpoint.set(
             OnboardingStep::InboxRelays,
@@ -2347,8 +2800,12 @@ async fn minimal_inbox_relay_repair_uses_separate_defaults_through_approval_and_
             vec![],
         );
         checkpoint.records[OnboardingStep::InboxRelays.index()] = Some(source.clone());
-        manager.save_onboarding(&mut checkpoint).unwrap();
+        manager
+            .account_setup()
+            .save_onboarding(&mut checkpoint)
+            .unwrap();
         let preview = manager
+            .account_setup()
             .propose_onboarding_relay_repair(&id, OnboardingStep::InboxRelays)
             .await
             .unwrap();
@@ -2379,6 +2836,7 @@ async fn minimal_inbox_relay_repair_uses_separate_defaults_through_approval_and_
         assert!(network.attempts.lock().is_empty());
         network.zero_acks.store(true, Ordering::SeqCst);
         manager
+            .account_setup()
             .approve_onboarding_repair(&id, preview.revision)
             .await
             .unwrap();
@@ -2386,14 +2844,19 @@ async fn minimal_inbox_relay_repair_uses_separate_defaults_through_approval_and_
         assert_eq!(published.tags, expected_tags);
         assert_eq!(published.content, source.content);
         assert_eq!(
-            manager.onboarding_checkpoint(&id).unwrap().unwrap().version,
+            manager
+                .setup_records()
+                .onboarding_checkpoint(&id)
+                .unwrap()
+                .unwrap()
+                .version,
             LOSSLESS_RELAY_REPAIR_ONBOARDING_VERSION
         );
         first.shutdown_and_close().await.unwrap();
 
         let second = runtime(directory.path(), network.clone());
         second
-            .accounts()
+            .account_setup()
             .retry_onboarding_step(&id, OnboardingStep::InboxRelays)
             .await
             .unwrap();
@@ -2404,6 +2867,7 @@ async fn minimal_inbox_relay_repair_uses_separate_defaults_through_approval_and_
         assert_eq!(
             second
                 .accounts()
+                .setup_records()
                 .onboarding_checkpoint(&id)
                 .unwrap()
                 .unwrap()
@@ -2434,6 +2898,7 @@ async fn minimal_relay_repair_rejects_changed_source_without_publication() {
     *network.events.lock() = vec![source.clone()];
     let mut checkpoint = runtime
         .accounts()
+        .setup_records()
         .onboarding_checkpoint(&id)
         .unwrap()
         .unwrap();
@@ -2443,9 +2908,13 @@ async fn minimal_relay_repair_rejects_changed_source_without_publication() {
         vec![],
     );
     checkpoint.records[OnboardingStep::InboxRelays.index()] = Some(source);
-    runtime.accounts().save_onboarding(&mut checkpoint).unwrap();
-    let preview = runtime
+    runtime
         .accounts()
+        .account_setup()
+        .save_onboarding(&mut checkpoint)
+        .unwrap();
+    let preview = runtime
+        .account_setup()
         .propose_onboarding_relay_repair(&id, OnboardingStep::InboxRelays)
         .await
         .unwrap();
@@ -2462,7 +2931,7 @@ async fn minimal_relay_repair_rejects_changed_source_without_publication() {
     );
     *network.events.lock() = vec![newer];
     let result = runtime
-        .accounts()
+        .account_setup()
         .approve_onboarding_repair(&id, preview.revision)
         .await
         .unwrap();
@@ -2489,12 +2958,14 @@ async fn minimal_relay_repair_rejects_changed_source_without_publication() {
 }
 async fn missing_relays(runtime: &MarmotAppRuntime, id: &str) {
     let manager = runtime.accounts();
-    manager.run_onboarding(id).await.unwrap();
+    manager.account_setup().run_onboarding(id).await.unwrap();
     manager
+        .account_setup()
         .continue_onboarding_without(id, OnboardingStep::Profile)
         .await
         .unwrap();
     let snapshot = manager
+        .account_setup()
         .continue_onboarding_without(id, OnboardingStep::Follows)
         .await
         .unwrap();
@@ -2526,7 +2997,11 @@ async fn defaults_append_relay_roles() {
         };
         let event = signed(&keys, step.kind() as u16, tags, "", unix_now_seconds());
         let manager = runtime.accounts();
-        let mut checkpoint = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+        let mut checkpoint = manager
+            .setup_records()
+            .onboarding_checkpoint(&id)
+            .unwrap()
+            .unwrap();
         checkpoint.snapshot.proposal = None;
         checkpoint.records[step.index()] = Some(event.clone());
         if step == OnboardingStep::Relays {
@@ -2540,8 +3015,12 @@ async fn defaults_append_relay_roles() {
             .default_relays
             .push("wss://new.example".into());
         checkpoint.set(step, OnboardingStatus::NeedsInput, Vec::new());
-        manager.save_onboarding(&mut checkpoint).unwrap();
+        manager
+            .account_setup()
+            .save_onboarding(&mut checkpoint)
+            .unwrap();
         let snapshot = manager
+            .account_setup()
             .propose_onboarding_relays(&id, step, None)
             .await
             .unwrap();
@@ -2577,7 +3056,11 @@ async fn defaults_append_relay_roles() {
             );
             assert!(proposal.write_relays.is_empty());
         }
-        let checkpoint = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+        let checkpoint = manager
+            .setup_records()
+            .onboarding_checkpoint(&id)
+            .unwrap()
+            .unwrap();
         let (tags, _, _) = relay_repair_event(&checkpoint, &proposal);
         assert!(tags.starts_with(&event.tags));
         assert_eq!(
@@ -2586,6 +3069,7 @@ async fn defaults_append_relay_roles() {
         );
         // Explicit edits replace known endpoint roles but retain opaque tags.
         let replaced = manager
+            .account_setup()
             .propose_onboarding_relays(
                 &id,
                 step,
@@ -2604,7 +3088,11 @@ async fn defaults_append_relay_roles() {
             replaced.proposal.unwrap().read_relays,
             ["wss://edit.example"]
         );
-        let checkpoint = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+        let checkpoint = manager
+            .setup_records()
+            .onboarding_checkpoint(&id)
+            .unwrap()
+            .unwrap();
         let (tags, _, _) =
             relay_repair_event(&checkpoint, checkpoint.snapshot.proposal.as_ref().unwrap());
         let mut expected = if step == OnboardingStep::Relays {
@@ -2635,6 +3123,7 @@ async fn recommended_inbox_relays_use_the_separate_inbox_defaults() {
     let id = keys.public_key().to_hex();
     let manager = runtime.accounts();
     manager
+        .account_setup()
         .begin_onboarding(
             Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
             OnboardingOptions {
@@ -2646,6 +3135,7 @@ async fn recommended_inbox_relays_use_the_separate_inbox_defaults() {
         .unwrap();
     missing_relays(&runtime, &id).await;
     let nip65 = manager
+        .account_setup()
         .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
         .await
         .unwrap()
@@ -2653,17 +3143,26 @@ async fn recommended_inbox_relays_use_the_separate_inbox_defaults() {
         .unwrap();
     assert_eq!(nip65.read_relays, ["wss://default.example"]);
     assert_eq!(nip65.write_relays, ["wss://default.example"]);
-    manager.cancel_onboarding_repair(&id).await.unwrap();
+    manager
+        .account_setup()
+        .cancel_onboarding_repair(&id)
+        .await
+        .unwrap();
 
-    let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let mut c = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
     c.set(OnboardingStep::Relays, OnboardingStatus::Passed, vec![]);
     c.set(
         OnboardingStep::InboxRelays,
         OnboardingStatus::NeedsInput,
         vec![finding(OnboardingIssue::Missing)],
     );
-    manager.save_onboarding(&mut c).unwrap();
+    manager.account_setup().save_onboarding(&mut c).unwrap();
     let inbox = manager
+        .account_setup()
         .propose_onboarding_relays(&id, OnboardingStep::InboxRelays, None)
         .await
         .unwrap()
@@ -2681,7 +3180,7 @@ async fn onboarding_rejects_unsafe_inbox_defaults() {
     let runtime = runtime(dir.path(), Arc::new(Network::default()));
     let keys = nostr::prelude::Keys::generate();
     let result = runtime
-        .accounts()
+        .account_setup()
         .begin_onboarding(
             Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
             OnboardingOptions {
@@ -2746,11 +3245,18 @@ async fn defaults_preserve_relay_tags() {
             unix_now_seconds(),
         );
         network.events.lock().push(event.clone());
-        let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+        let mut c = manager
+            .setup_records()
+            .onboarding_checkpoint(&id)
+            .unwrap()
+            .unwrap();
         c.records[step.index()] = Some(event);
         c.set(step, OnboardingStatus::NeedsInput, Vec::new());
-        manager.save_onboarding(&mut c).unwrap();
-        let (status, findings, _) = manager.check_onboarding_step(&c, step).await;
+        manager.account_setup().save_onboarding(&mut c).unwrap();
+        let (status, findings, _) = manager
+            .account_setup()
+            .check_onboarding_step(&c, step)
+            .await;
         assert_eq!(status, OnboardingStatus::RetryableFailure);
         assert!(
             findings
@@ -2759,15 +3265,22 @@ async fn defaults_preserve_relay_tags() {
         );
 
         manager
+            .account_setup()
             .propose_onboarding_relays(&id, step, None)
             .await
             .unwrap();
-        let revision = manager.onboarding_snapshot(&id).unwrap().unwrap().revision;
+        let revision = manager
+            .account_setup()
+            .onboarding_snapshot(&id)
+            .unwrap()
+            .unwrap()
+            .revision;
         assert!(network.attempts.lock().is_empty());
         runtime.shutdown_and_close().await.unwrap();
         let runtime = super::tests::runtime(dir.path(), network.clone());
         let manager = runtime.accounts();
         let result = manager
+            .account_setup()
             .approve_onboarding_repair(&id, revision)
             .await
             .unwrap();
@@ -2779,7 +3292,11 @@ async fn defaults_preserve_relay_tags() {
             );
             assert!(result.proposal.is_none());
             assert!(network.attempts.lock().is_empty());
-            let c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+            let c = manager
+                .setup_records()
+                .onboarding_checkpoint(&id)
+                .unwrap()
+                .unwrap();
             assert_eq!(c.records[step.index()].as_ref().unwrap().tags, tags);
             runtime.shutdown_and_close().await.unwrap();
             continue;
@@ -2787,8 +3304,15 @@ async fn defaults_preserve_relay_tags() {
         let published = network.attempts.lock().last().unwrap().clone();
         assert!(published.tags.starts_with(&tags));
         assert_eq!(published.tags.len(), tags.len() + 1);
-        let c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
-        let (status, findings, _) = manager.check_onboarding_step(&c, step).await;
+        let c = manager
+            .setup_records()
+            .onboarding_checkpoint(&id)
+            .unwrap()
+            .unwrap();
+        let (status, findings, _) = manager
+            .account_setup()
+            .check_onboarding_step(&c, step)
+            .await;
         // A completed recommended route permits continuation without rewriting
         // the existing declaration; the local dial cap remains visible.
         assert_eq!(status, OnboardingStatus::Passed, "{findings:?}");
@@ -2820,7 +3344,11 @@ async fn append_checkpoint_fences_old() {
             "ws://private.onion".into(),
             "future-role".into(),
         ]];
-        let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+        let mut c = manager
+            .setup_records()
+            .onboarding_checkpoint(&id)
+            .unwrap()
+            .unwrap();
         c.version = if epoch.is_some() {
             RECOVERED_ONBOARDING_VERSION
         } else {
@@ -2840,13 +3368,18 @@ async fn append_checkpoint_fences_old() {
             .set_account_onboarding(&id, &serde_json::to_vec(&c).unwrap())
             .unwrap();
         manager
+            .account_setup()
             .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
             .await
             .unwrap();
-        let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+        let mut c = manager
+            .setup_records()
+            .onboarding_checkpoint(&id)
+            .unwrap()
+            .unwrap();
         // The crash boundary after approval but before signing must also be fenced.
         c.approved = true;
-        manager.save_onboarding(&mut c).unwrap();
+        manager.account_setup().save_onboarding(&mut c).unwrap();
         let bytes = manager
             .app
             .account_home()
@@ -2870,7 +3403,7 @@ async fn append_checkpoint_fences_old() {
         );
         runtime.shutdown_and_close().await.unwrap();
         let reopened = super::tests::runtime(dir.path(), network.clone());
-        reopened.accounts().run_onboarding(&id).await.unwrap();
+        reopened.account_setup().run_onboarding(&id).await.unwrap();
         assert!(
             network
                 .attempts
@@ -2900,7 +3433,11 @@ async fn inherited_roles_offer_edit() {
         ));
         missing_relays(&runtime, &id).await;
         let manager = runtime.accounts();
-        let snapshot = manager.onboarding_snapshot(&id).unwrap().unwrap();
+        let snapshot = manager
+            .account_setup()
+            .onboarding_snapshot(&id)
+            .unwrap()
+            .unwrap();
         let step = &snapshot.steps[OnboardingStep::Relays.index()];
         assert!(
             step.findings
@@ -2915,23 +3452,36 @@ async fn inherited_roles_offer_edit() {
         assert!(step.actions.contains(&OnboardingAction::EditRelays));
         assert!(
             manager
+                .account_setup()
                 .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
                 .await
                 .is_err()
         );
         // Older checkpoints may still advertise the impossible append action.
-        let mut checkpoint = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+        let mut checkpoint = manager
+            .setup_records()
+            .onboarding_checkpoint(&id)
+            .unwrap()
+            .unwrap();
         checkpoint.snapshot.steps[OnboardingStep::Relays.index()]
             .actions
             .push(OnboardingAction::UseRecommendedRelays);
-        manager.save_onboarding(&mut checkpoint).unwrap();
-        let restored = manager.onboarding_snapshot(&id).unwrap().unwrap();
+        manager
+            .account_setup()
+            .save_onboarding(&mut checkpoint)
+            .unwrap();
+        let restored = manager
+            .account_setup()
+            .onboarding_snapshot(&id)
+            .unwrap()
+            .unwrap();
         assert!(
             !restored.steps[OnboardingStep::Relays.index()]
                 .actions
                 .contains(&OnboardingAction::UseRecommendedRelays)
         );
         manager
+            .account_setup()
             .propose_onboarding_relays(
                 &id,
                 OnboardingStep::Relays,
@@ -2961,8 +3511,13 @@ async fn proposal_requires_route() {
         "",
         unix_now_seconds(),
     ));
-    let c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let c = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
     let (status, findings, _) = manager
+        .account_setup()
         .check_onboarding_step(&c, OnboardingStep::Relays)
         .await;
     assert_eq!(status, OnboardingStatus::NeedsInput);
@@ -2972,9 +3527,13 @@ async fn proposal_requires_route() {
             .any(|f| f.issue == OnboardingIssue::NoUsableRoute)
     );
     for step in [OnboardingStep::Relays, OnboardingStep::InboxRelays] {
-        let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+        let mut c = manager
+            .setup_records()
+            .onboarding_checkpoint(&id)
+            .unwrap()
+            .unwrap();
         c.set(step, OnboardingStatus::NeedsInput, Vec::new());
-        manager.save_onboarding(&mut c).unwrap();
+        manager.account_setup().save_onboarding(&mut c).unwrap();
         for unsupported in [
             "ws://relay.onion",
             "wss://relay.onion",
@@ -2988,6 +3547,7 @@ async fn proposal_requires_route() {
             };
             assert!(
                 manager
+                    .account_setup()
                     .propose_onboarding_relays(&id, step, Some((reads, writes)))
                     .await
                     .is_err()
@@ -3009,6 +3569,7 @@ async fn proposal_requires_route() {
             } {
                 assert!(
                     manager
+                        .account_setup()
                         .propose_onboarding_relays(&id, step, Some((reads, writes)))
                         .await
                         .is_err()
@@ -3016,6 +3577,7 @@ async fn proposal_requires_route() {
             }
             assert!(
                 manager
+                    .account_setup()
                     .onboarding_snapshot(&id)
                     .unwrap()
                     .unwrap()
@@ -3043,20 +3605,26 @@ async fn partial_lookup_is_not_fresh() {
         );
         network.events.lock().push(old.clone());
         network.index_events.lock().push(newer.clone());
-        let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+        let mut c = manager
+            .setup_records()
+            .onboarding_checkpoint(&id)
+            .unwrap()
+            .unwrap();
         c.options
             .discovery_relays
             .push("wss://healthy.example".into());
         c.records[step.index()] = Some(old);
         for fail_index in [true, false] {
             c.set(step, OnboardingStatus::NeedsInput, vec![]);
-            manager.save_onboarding(&mut c).unwrap();
+            manager.account_setup().save_onboarding(&mut c).unwrap();
             let proposal = manager
+                .account_setup()
                 .propose_onboarding_relays(&id, step, None)
                 .await
                 .unwrap();
             network.fail_index_only.store(fail_index, Ordering::SeqCst);
             let result = manager
+                .account_setup()
                 .approve_onboarding_repair(&id, proposal.revision)
                 .await
                 .unwrap();
@@ -3101,7 +3669,11 @@ async fn partial_lookup_is_not_fresh() {
                     .contains(&OnboardingAction::ApproveRepair)
             );
             if !fail_index {
-                let current = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+                let current = manager
+                    .setup_records()
+                    .onboarding_checkpoint(&id)
+                    .unwrap()
+                    .unwrap();
                 assert_eq!(current.records[step.index()].as_ref().unwrap().id, newer.id);
             }
         }
@@ -3141,19 +3713,24 @@ async fn declared_lookup_is_not_fresh() {
         );
         network.events.lock().push(old.clone());
         network.index_events.lock().push(newer.clone());
-        let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+        let mut c = manager
+            .setup_records()
+            .onboarding_checkpoint(&id)
+            .unwrap()
+            .unwrap();
         c.options.discovery_relays = vec!["wss://healthy.example".into()];
         c.records[OnboardingStep::Relays.index()] = Some(declaration);
         c.records[step.index()] = Some(old);
         for fail_index in [true, false] {
             c.set(step, OnboardingStatus::NeedsInput, vec![]);
-            manager.save_onboarding(&mut c).unwrap();
+            manager.account_setup().save_onboarding(&mut c).unwrap();
             let writes = if step == OnboardingStep::Relays {
                 vec!["wss://default.example".into()]
             } else {
                 Vec::new()
             };
             let proposal = manager
+                .account_setup()
                 .propose_onboarding_relays(
                     &id,
                     step,
@@ -3163,6 +3740,7 @@ async fn declared_lookup_is_not_fresh() {
                 .unwrap();
             network.fail_index_only.store(fail_index, Ordering::SeqCst);
             let result = manager
+                .account_setup()
                 .approve_onboarding_repair(&id, proposal.revision)
                 .await
                 .unwrap();
@@ -3176,7 +3754,11 @@ async fn declared_lookup_is_not_fresh() {
                 OnboardingIssue::RecordChanged
             };
             assert!(state.findings.iter().any(|f| f.issue == issue));
-            let current = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+            let current = manager
+                .setup_records()
+                .onboarding_checkpoint(&id)
+                .unwrap()
+                .unwrap();
             let diagnostic = state
                 .findings
                 .iter()
@@ -3222,17 +3804,23 @@ async fn partial_lookup_is_not_absence() {
     let (_dir, runtime, network, _keys, id) = fixture().await;
     missing_relays(&runtime, &id).await;
     let manager = runtime.accounts();
-    let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let mut c = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
     c.options
         .discovery_relays
         .push("wss://healthy.example".into());
-    manager.save_onboarding(&mut c).unwrap();
+    manager.account_setup().save_onboarding(&mut c).unwrap();
     let proposal = manager
+        .account_setup()
         .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
         .await
         .unwrap();
     network.fail_index_only.store(true, Ordering::SeqCst);
     let result = manager
+        .account_setup()
         .approve_onboarding_repair(&id, proposal.revision)
         .await
         .unwrap();
@@ -3266,12 +3854,14 @@ async fn relay_lists_published_only_on_public_indexers_are_not_missing() {
     );
     *network.public_indexer_events.lock() = vec![nip65.clone(), inbox.clone()];
     let manager = runtime.accounts();
-    manager.run_onboarding(&id).await.unwrap();
+    manager.account_setup().run_onboarding(&id).await.unwrap();
     manager
+        .account_setup()
         .continue_onboarding_without(&id, OnboardingStep::Profile)
         .await
         .unwrap();
     let snapshot = manager
+        .account_setup()
         .continue_onboarding_without(&id, OnboardingStep::Follows)
         .await
         .unwrap();
@@ -3287,7 +3877,11 @@ async fn relay_lists_published_only_on_public_indexers_are_not_missing() {
                 .iter()
                 .any(|finding| finding.issue == OnboardingIssue::Missing)
         );
-        let checkpoint = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+        let checkpoint = manager
+            .setup_records()
+            .onboarding_checkpoint(&id)
+            .unwrap()
+            .unwrap();
         assert_eq!(checkpoint.records[step.index()], Some(declaration));
     }
     assert!(network.attempts.lock().is_empty());
@@ -3314,7 +3908,11 @@ async fn public_indexers_are_dialed_outside_the_inspection_cap() {
         .public_indexer_events
         .lock()
         .push(signed(&keys, 0, vec![], "{}", unix_now_seconds()));
-    let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let mut c = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
     for (host, declared) in [(15, 1), (2, 10), (16, 1)] {
         c.options.discovery_relays = (0..host)
             .map(|n| format!("wss://host{n}.example"))
@@ -3333,6 +3931,7 @@ async fn public_indexers_are_dialed_outside_the_inspection_cap() {
             unix_now_seconds(),
         ));
         let sources = manager
+            .account_setup()
             .onboarding_sources(&c, OnboardingStep::Profile)
             .await;
         assert_eq!(sources[..host], c.options.discovery_relays[..]);
@@ -3345,6 +3944,7 @@ async fn public_indexers_are_dialed_outside_the_inspection_cap() {
         );
         network.inspected_endpoints.lock().clear();
         let (status, findings, observed) = manager
+            .account_setup()
             .check_onboarding_step(&c, OnboardingStep::Profile)
             .await;
         assert_eq!(status, OnboardingStatus::Passed, "{host}+{declared}");
@@ -3386,11 +3986,16 @@ async fn unanswered_public_indexer_blocks_repair_approval() {
         );
         network.events.lock().push(old.clone());
         network.public_indexer_events.lock().push(newer);
-        let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+        let mut c = manager
+            .setup_records()
+            .onboarding_checkpoint(&id)
+            .unwrap()
+            .unwrap();
         c.records[step.index()] = Some(old);
         c.set(step, OnboardingStatus::NeedsInput, vec![]);
-        manager.save_onboarding(&mut c).unwrap();
+        manager.account_setup().save_onboarding(&mut c).unwrap();
         let proposal = manager
+            .account_setup()
             .propose_onboarding_relays(&id, step, None)
             .await
             .unwrap();
@@ -3398,6 +4003,7 @@ async fn unanswered_public_indexer_blocks_repair_approval() {
         // indexer, which holds a newer one, times out.
         fail_public_indexers(&network);
         let result = manager
+            .account_setup()
             .approve_onboarding_repair(&id, proposal.revision)
             .await
             .unwrap();
@@ -3420,12 +4026,14 @@ async fn explicit_discovery_relays_bypass_unreachable_public_indexers() {
     let (_dir, runtime, network, _keys, id) = fixture().await;
     fail_public_indexers(&network);
     let manager = runtime.accounts();
-    manager.run_onboarding(&id).await.unwrap();
+    manager.account_setup().run_onboarding(&id).await.unwrap();
     manager
+        .account_setup()
         .continue_onboarding_without(&id, OnboardingStep::Profile)
         .await
         .unwrap();
     let blocked = manager
+        .account_setup()
         .continue_onboarding_without(&id, OnboardingStep::Follows)
         .await
         .unwrap();
@@ -3434,6 +4042,7 @@ async fn explicit_discovery_relays_bypass_unreachable_public_indexers() {
         OnboardingStatus::RetryableFailure
     );
     let snapshot = manager
+        .account_setup()
         .set_onboarding_discovery_relays(&id, vec!["wss://index.example".into()])
         .await
         .unwrap();
@@ -3454,14 +4063,14 @@ async fn repairs_publish_to_host_and_declared_relays_never_to_indexers() {
     let (dir, first, network, _keys, id) = fixture().await;
     missing_relays(&first, &id).await;
     let proposal = first
-        .accounts()
+        .account_setup()
         .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
         .await
         .unwrap();
     // The approval searches the indexers; the repair is not sent to them.
     network.zero_acks.store(true, Ordering::SeqCst);
     first
-        .accounts()
+        .account_setup()
         .approve_onboarding_repair(&id, proposal.revision)
         .await
         .unwrap();
@@ -3470,6 +4079,7 @@ async fn repairs_publish_to_host_and_declared_relays_never_to_indexers() {
     let second = runtime(dir.path(), network.clone());
     let mut c = second
         .accounts()
+        .setup_records()
         .onboarding_checkpoint(&id)
         .unwrap()
         .unwrap();
@@ -3477,6 +4087,7 @@ async fn repairs_publish_to_host_and_declared_relays_never_to_indexers() {
     assert!(
         second
             .accounts()
+            .account_setup()
             .publish_onboarding_repair(&mut c)
             .await
             .unwrap()
@@ -3547,22 +4158,22 @@ fn public_indexers_join_discovery_except_on_loopback_routes() {
 async fn failed_discovery_never_authorizes_default_replacement() {
     let (_dir, runtime, network, _keys, id) = fixture().await;
     network.fail_reads.store(true, Ordering::SeqCst);
-    let result = runtime.accounts().run_onboarding(&id).await.unwrap();
+    let result = runtime.account_setup().run_onboarding(&id).await.unwrap();
     assert_eq!(result.steps[0].status, OnboardingStatus::RetryableFailure);
     runtime
-        .accounts()
+        .account_setup()
         .continue_onboarding_without(&id, OnboardingStep::Profile)
         .await
         .unwrap();
     let result = runtime
-        .accounts()
+        .account_setup()
         .continue_onboarding_without(&id, OnboardingStep::Follows)
         .await
         .unwrap();
     assert_eq!(result.steps[2].status, OnboardingStatus::RetryableFailure);
     assert!(
         runtime
-            .accounts()
+            .account_setup()
             .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
             .await
             .is_err()
@@ -3570,7 +4181,7 @@ async fn failed_discovery_never_authorizes_default_replacement() {
     assert!(network.attempts.lock().is_empty());
     network.fail_reads.store(false, Ordering::SeqCst);
     let missing = runtime
-        .accounts()
+        .account_setup()
         .retry_onboarding_step(&id, OnboardingStep::Relays)
         .await
         .unwrap();
@@ -3603,7 +4214,7 @@ async fn newest_malformed_profile_is_not_hidden_by_older_valid_metadata() {
         ),
         signed(&keys, 0, vec![], "[]", unix_now_seconds() - 1),
     ]);
-    let result = runtime.accounts().run_onboarding(&id).await.unwrap();
+    let result = runtime.account_setup().run_onboarding(&id).await.unwrap();
     assert_eq!(
         result.steps[0].findings[0].issue,
         OnboardingIssue::Malformed
@@ -3618,7 +4229,7 @@ async fn future_dated_record_is_inconclusive_and_cannot_be_repaired_automaticall
         .events
         .lock()
         .push(signed(&keys, 0, vec![], "{}", unix_now_seconds() + 3600));
-    let result = runtime.accounts().run_onboarding(&id).await.unwrap();
+    let result = runtime.account_setup().run_onboarding(&id).await.unwrap();
     assert_eq!(
         result.steps[0].findings[0].issue,
         OnboardingIssue::FutureDated
@@ -3636,13 +4247,13 @@ async fn zero_ack_repair_survives_restart_and_retries_exact_signed_bytes() {
     let (dir, first, network, _keys, id) = fixture().await;
     missing_relays(&first, &id).await;
     let proposal = first
-        .accounts()
+        .account_setup()
         .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
         .await
         .unwrap();
     network.zero_acks.store(true, Ordering::SeqCst);
     let result = first
-        .accounts()
+        .account_setup()
         .approve_onboarding_repair(&id, proposal.revision)
         .await
         .unwrap();
@@ -3660,6 +4271,7 @@ async fn zero_ack_repair_survives_restart_and_retries_exact_signed_bytes() {
     let second = runtime(dir.path(), network.clone());
     let mut c = second
         .accounts()
+        .setup_records()
         .onboarding_checkpoint(&id)
         .unwrap()
         .unwrap();
@@ -3669,6 +4281,7 @@ async fn zero_ack_repair_survives_restart_and_retries_exact_signed_bytes() {
     assert!(
         second
             .accounts()
+            .account_setup()
             .publish_onboarding_repair(&mut c)
             .await
             .unwrap()
@@ -3685,7 +4298,7 @@ async fn cancelled_publication_retains_approval_and_signed_bytes() {
     let (_dir, runtime, network, _keys, id) = fixture().await;
     missing_relays(&runtime, &id).await;
     let proposal = runtime
-        .accounts()
+        .account_setup()
         .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
         .await
         .unwrap();
@@ -3694,6 +4307,7 @@ async fn cancelled_publication_retains_approval_and_signed_bytes() {
     let account = id.clone();
     let task = tokio::spawn(async move {
         manager
+            .account_setup()
             .approve_onboarding_repair(&account, proposal.revision)
             .await
     });
@@ -3702,6 +4316,7 @@ async fn cancelled_publication_retains_approval_and_signed_bytes() {
     let _ = task.await;
     let c = runtime
         .accounts()
+        .setup_records()
         .onboarding_checkpoint(&id)
         .unwrap()
         .unwrap();
@@ -3709,7 +4324,7 @@ async fn cancelled_publication_retains_approval_and_signed_bytes() {
     assert_eq!(c.signed_repair, Some(network.attempts.lock()[0].clone()));
     assert!(
         runtime
-            .accounts()
+            .account_setup()
             .cancel_onboarding_repair(&id)
             .await
             .is_err()
@@ -3721,6 +4336,7 @@ async fn optional_repairs_preserve_unknown_profile_fields_and_follow_tag_metadat
     let (_dir, runtime, _network, keys, id) = fixture().await;
     let mut c = runtime
         .accounts()
+        .setup_records()
         .onboarding_checkpoint(&id)
         .unwrap()
         .unwrap();
@@ -3780,14 +4396,18 @@ async fn optional_repairs_preserve_unknown_profile_fields_and_follow_tag_metadat
 async fn corrupt_or_future_checkpoint_fails_closed() {
     let (_dir, runtime, _network, _keys, id) = fixture().await;
     let manager = runtime.accounts();
-    let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let mut c = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
     c.version += 1;
     manager
         .app
         .account_home()
         .set_account_onboarding(&id, &serde_json::to_vec(&c).unwrap())
         .unwrap();
-    assert!(manager.onboarding_snapshot(&id).is_err());
+    assert!(manager.account_setup().onboarding_snapshot(&id).is_err());
     assert!(manager.reconcile().await.is_ok());
     assert!(!manager.managed_accounts().unwrap()[0].running);
     runtime.shutdown_and_close().await.unwrap();
@@ -3807,13 +4427,25 @@ async fn interactive_import_without_detailed_checkpoint_remains_gated() {
         .account_home()
         .import_nostr_account_for_onboarding(&secret)
         .unwrap();
-    assert!(manager.onboarding_snapshot(&id).unwrap().is_none());
-    assert!(!manager.onboarding_worker_allowed(&id).unwrap());
+    assert!(
+        manager
+            .account_setup()
+            .onboarding_snapshot(&id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !manager
+            .setup_records()
+            .onboarding_worker_allowed(&id)
+            .unwrap()
+    );
     assert!(matches!(
-        manager.require_onboarding_complete(&id),
+        manager.setup_records().require_onboarding_complete(&id),
         Err(AppError::OnboardingRequired)
     ));
     let resumed = manager
+        .account_setup()
         .begin_onboarding(Zeroizing::new(secret), options())
         .await
         .unwrap();
@@ -3827,7 +4459,11 @@ async fn interactive_import_without_detailed_checkpoint_remains_gated() {
 async fn completed_checkpoint_resumes_interrupted_journal_cleanup() {
     let (_directory, runtime, _network, _keys, id) = fixture().await;
     let manager = runtime.accounts();
-    let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let mut c = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
     for step in [
         OnboardingStep::Profile,
         OnboardingStep::Follows,
@@ -3844,7 +4480,7 @@ async fn completed_checkpoint_resumes_interrupted_journal_cleanup() {
         .account_home()
         .set_account_setup_phase(&id, AccountSetupPhase::KeyPackagePublicationConfirmed)
         .unwrap();
-    manager.save_onboarding(&mut c).unwrap();
+    manager.account_setup().save_onboarding(&mut c).unwrap();
     assert!(
         manager
             .app
@@ -3857,7 +4493,14 @@ async fn completed_checkpoint_resumes_interrupted_journal_cleanup() {
         runtime.account_setup_readiness(&id).unwrap(),
         AccountSetupReadiness::Publishing
     );
-    assert!(manager.run_onboarding(&id).await.unwrap().ready);
+    assert!(
+        manager
+            .account_setup()
+            .run_onboarding(&id)
+            .await
+            .unwrap()
+            .ready
+    );
     assert!(
         manager
             .app
@@ -3874,6 +4517,7 @@ async fn profile_url_validation_and_explicit_clear_preserve_unrelated_fields() {
     let (_directory, runtime, _network, keys, id) = fixture().await;
     let mut c = runtime
         .accounts()
+        .setup_records()
         .onboarding_checkpoint(&id)
         .unwrap()
         .unwrap();
@@ -3888,7 +4532,47 @@ async fn profile_url_validation_and_explicit_clear_preserve_unrelated_fields() {
         validate_onboarding_record(&record),
         vec![finding(OnboardingIssue::Malformed)]
     );
-    c.records[0] = Some(record);
+    for unsafe_link in [
+        "mailto:me@example.com",
+        "javascript:alert(1)",
+        "javascript:1",
+        "javascript:/alert(1)",
+        "file:/etc/passwd",
+        "localhost:3000",
+        "https://example.com:bad",
+        "//file:/etc/passwd",
+        "//javascript:1",
+        "\\\\javascript:1",
+        "\u{00a0}javascript:1",
+        "example.com:/x",
+        "https://user:secret@example.com",
+    ] {
+        let content = serde_json::json!({ "website": unsafe_link }).to_string();
+        assert_eq!(
+            validate_onboarding_record(&signed(&keys, 0, vec![], &content, unix_now_seconds())),
+            vec![finding(OnboardingIssue::Malformed)],
+            "{unsafe_link}"
+        );
+    }
+    // A bare host, as other clients publish it, reads as https.
+    let schemeless = signed(
+        &keys,
+        0,
+        vec![],
+        "{\"website\":\"www.example.com\",\"banner\":\"cdn.example.com:8443/b.png\",\"picture\":\"file:///private/avatar\",\"custom\":true}",
+        unix_now_seconds(),
+    );
+    assert_eq!(
+        validate_onboarding_record(&signed(
+            &keys,
+            0,
+            vec![],
+            "{\"website\":\"www.example.com\",\"banner\":\"cdn.example.com:8443/b.png\"}",
+            unix_now_seconds(),
+        )),
+        Vec::new()
+    );
+    c.records[0] = Some(schemeless);
     let proposal = OnboardingRepairProposal {
         step: OnboardingStep::Profile,
         revision: 1,
@@ -3906,6 +4590,8 @@ async fn profile_url_validation_and_explicit_clear_preserve_unrelated_fields() {
     let json: serde_json::Value = serde_json::from_str(&content).unwrap();
     assert!(json.get("picture").is_none());
     assert_eq!(json["custom"], true);
+    assert_eq!(json["website"], "https://www.example.com");
+    assert_eq!(json["banner"], "https://cdn.example.com:8443/b.png");
     runtime.shutdown_and_close().await.unwrap();
 }
 
@@ -3914,22 +4600,32 @@ async fn single_device_notice_distinguishes_empty_failed_and_invalid_discovery_w
 {
     let (_directory, runtime, network, keys, id) = fixture().await;
     let manager = runtime.accounts();
-    let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let mut c = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
+    let assert_no_capability_claim = |checkpoint: &OnboardingCheckpoint| {
+        assert!(
+            checkpoint.snapshot.steps[OnboardingStep::SingleDevice.index()]
+                .findings
+                .iter()
+                .all(|finding| finding.issue != OnboardingIssue::MultiDeviceUnsupported)
+        );
+    };
     manager
+        .account_setup()
         .check_onboarding_single_device(&mut c)
         .await
         .unwrap();
     let notice = c.snapshot.single_device_notice.as_ref().unwrap();
     assert_eq!(notice.discovery, OnboardingDeviceDiscovery::NoneFound);
     assert!(notice.discovery_complete);
+    assert_no_capability_claim(&c);
     assert_eq!(
         c.snapshot.steps[OnboardingStep::SingleDevice.index()].status,
         OnboardingStatus::NeedsInput
     );
-    manager.save_onboarding(&mut c).unwrap();
-    for finding in &c.snapshot.steps[OnboardingStep::SingleDevice.index()].findings {
-        assert_eq!(finding.observed_revision, Some(c.snapshot.revision));
-    }
     assert!(
         c.snapshot.steps[OnboardingStep::SingleDevice.index()]
             .actions
@@ -3937,12 +4633,14 @@ async fn single_device_notice_distinguishes_empty_failed_and_invalid_discovery_w
     );
     network.fail_reads.store(true, Ordering::SeqCst);
     manager
+        .account_setup()
         .check_onboarding_single_device(&mut c)
         .await
         .unwrap();
     let notice = c.snapshot.single_device_notice.as_ref().unwrap();
     assert_eq!(notice.discovery, OnboardingDeviceDiscovery::Unknown);
     assert!(!notice.discovery_complete);
+    assert_no_capability_claim(&c);
     network.fail_reads.store(false, Ordering::SeqCst);
     network.events.lock().push(signed(
         &keys,
@@ -3952,6 +4650,7 @@ async fn single_device_notice_distinguishes_empty_failed_and_invalid_discovery_w
         unix_now_seconds(),
     ));
     manager
+        .account_setup()
         .check_onboarding_single_device(&mut c)
         .await
         .unwrap();
@@ -3965,6 +4664,11 @@ async fn single_device_notice_distinguishes_empty_failed_and_invalid_discovery_w
             .iter()
             .any(|f| f.issue == OnboardingIssue::Malformed)
     );
+    assert_no_capability_claim(&c);
+    manager.account_setup().save_onboarding(&mut c).unwrap();
+    for finding in &c.snapshot.steps[OnboardingStep::SingleDevice.index()].findings {
+        assert_eq!(finding.observed_revision, Some(c.snapshot.revision));
+    }
     network.events.lock().clear();
     network.events.lock().push(signed(
         &keys,
@@ -3974,6 +4678,7 @@ async fn single_device_notice_distinguishes_empty_failed_and_invalid_discovery_w
         unix_now_seconds() + 600,
     ));
     manager
+        .account_setup()
         .check_onboarding_single_device(&mut c)
         .await
         .unwrap();
@@ -3987,6 +4692,7 @@ async fn single_device_notice_distinguishes_empty_failed_and_invalid_discovery_w
             .iter()
             .any(|f| f.issue == OnboardingIssue::FutureDated)
     );
+    assert_no_capability_claim(&c);
     assert!(network.attempts.lock().is_empty());
     runtime.shutdown_and_close().await.unwrap();
 }
@@ -3996,7 +4702,11 @@ async fn pre_notice_checkpoint_upgrade_gates_incomplete_publication_and_preserve
  {
     let (_directory, runtime, _network, _keys, id) = fixture().await;
     let manager = runtime.accounts();
-    let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let mut c = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
     c.version = 1;
     c.snapshot.steps.remove(4);
     c.records.remove(4);
@@ -4009,14 +4719,23 @@ async fn pre_notice_checkpoint_upgrade_gates_incomplete_publication_and_preserve
         .account_home()
         .set_account_onboarding(&id, &serde_json::to_vec(&c).unwrap())
         .unwrap();
-    let upgraded = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let upgraded = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
     assert_eq!(upgraded.version, ONBOARDING_VERSION);
     assert_eq!(
         upgraded.snapshot.steps[4].step,
         OnboardingStep::SingleDevice
     );
     assert_eq!(upgraded.snapshot.steps[5].status, OnboardingStatus::Pending);
-    assert!(!manager.onboarding_worker_allowed(&id).unwrap());
+    assert!(
+        !manager
+            .setup_records()
+            .onboarding_worker_allowed(&id)
+            .unwrap()
+    );
     c.snapshot.ready = true;
     c.snapshot.steps[4].status = OnboardingStatus::Passed;
     manager
@@ -4024,8 +4743,20 @@ async fn pre_notice_checkpoint_upgrade_gates_incomplete_publication_and_preserve
         .account_home()
         .set_account_onboarding(&id, &serde_json::to_vec(&c).unwrap())
         .unwrap();
-    assert!(manager.onboarding_snapshot(&id).unwrap().unwrap().ready);
-    assert!(manager.onboarding_worker_allowed(&id).unwrap());
+    assert!(
+        manager
+            .account_setup()
+            .onboarding_snapshot(&id)
+            .unwrap()
+            .unwrap()
+            .ready
+    );
+    assert!(
+        manager
+            .setup_records()
+            .onboarding_worker_allowed(&id)
+            .unwrap()
+    );
     runtime.shutdown_and_close().await.unwrap();
 }
 
@@ -4044,24 +4775,30 @@ async fn approved_repair_cancellation_preserves_evidence_and_requires_fresh_appr
     let (dir, first, network, keys, id) = fixture().await;
     missing_relays(&first, &id).await;
     let proposal = first
-        .accounts()
+        .account_setup()
         .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
         .await
         .unwrap();
     network.zero_acks.store(true, Ordering::SeqCst);
     first
-        .accounts()
+        .account_setup()
         .approve_onboarding_repair(&id, proposal.revision)
         .await
         .unwrap();
     let signed = network.attempts.lock()[0].clone();
-    let mut subscription = first.accounts().subscribe_onboarding(&id).unwrap();
-    first.accounts().cancel_onboarding(&id).await.unwrap();
+    let mut subscription = first.account_setup().subscribe_onboarding(&id).unwrap();
+    first.account_setup().cancel_onboarding(&id).await.unwrap();
     let terminal = subscription.recv().await.unwrap();
     assert!(terminal.cancellation_pending && !terminal.ready);
     assert!(subscription.recv().await.is_none());
     assert!(first.accounts().resolve(&id).unwrap().signed_out);
-    assert!(first.accounts().onboarding_snapshot(&id).unwrap().is_none());
+    assert!(
+        first
+            .account_setup()
+            .onboarding_snapshot(&id)
+            .unwrap()
+            .is_none()
+    );
     assert!(!first.accounts().managed_accounts().unwrap()[0].running);
     let archives = repair_archive_bytes(dir.path(), &id);
     assert_eq!(archives.len(), 1);
@@ -4071,7 +4808,7 @@ async fn approved_repair_cancellation_preserves_evidence_and_requires_fresh_appr
     first.shutdown_and_close().await.unwrap();
     let reopened = runtime(dir.path(), network.clone());
     let resumed = reopened
-        .accounts()
+        .account_setup()
         .begin_onboarding(
             Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
             options(),
@@ -4081,11 +4818,12 @@ async fn approved_repair_cancellation_preserves_evidence_and_requires_fresh_appr
     assert!(!resumed.ready && !resumed.cancellation_pending);
     assert!(resumed.proposal.is_none());
     assert!(resumed.revision > archived.snapshot.revision);
-    reopened.accounts().run_onboarding(&id).await.unwrap();
+    reopened.account_setup().run_onboarding(&id).await.unwrap();
     assert_eq!(network.attempts.lock().len(), 1);
     assert!(
         reopened
             .accounts()
+            .setup_records()
             .onboarding_checkpoint(&id)
             .unwrap()
             .unwrap()
@@ -4099,17 +4837,84 @@ async fn approved_repair_cancellation_preserves_evidence_and_requires_fresh_appr
 async fn ready_onboarding_can_be_cancelled_before_open_chats() {
     let (_dir, runtime, _network, _keys, id) = fixture().await;
     let manager = runtime.accounts();
-    let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let mut c = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
     for step in c.snapshot.steps.clone() {
         c.set(step.step, OnboardingStatus::Passed, vec![]);
     }
-    manager.save_onboarding(&mut c).unwrap();
-    assert!(manager.onboarding_snapshot(&id).unwrap().unwrap().ready);
-    manager.cancel_onboarding(&id).await.unwrap();
-    manager.cancel_onboarding(&id).await.unwrap();
+    manager.account_setup().save_onboarding(&mut c).unwrap();
+    assert!(
+        manager
+            .account_setup()
+            .onboarding_snapshot(&id)
+            .unwrap()
+            .unwrap()
+            .ready
+    );
+    manager
+        .account_setup()
+        .cancel_onboarding(&id)
+        .await
+        .unwrap();
+    manager
+        .account_setup()
+        .cancel_onboarding(&id)
+        .await
+        .unwrap();
     assert!(manager.resolve(&id).unwrap().signed_out);
-    assert!(manager.onboarding_snapshot(&id).unwrap().is_none());
+    assert!(
+        manager
+            .account_setup()
+            .onboarding_snapshot(&id)
+            .unwrap()
+            .is_none()
+    );
     assert!(!manager.managed_accounts().unwrap()[0].running);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn committed_removal_drops_the_update_channel_and_a_failed_one_keeps_it() {
+    let (_dir, runtime, _network, _keys, id) = fixture().await;
+    let manager = runtime.accounts();
+    let mut subscription = manager.account_setup().subscribe_onboarding(&id).unwrap();
+    let has_channel = || {
+        manager
+            .setup
+            .onboarding_updates
+            .lock()
+            .unwrap()
+            .contains_key(&id)
+    };
+    assert!(has_channel());
+    // The tombstone namespace is a file, so the account directory cannot move
+    // into it: the removal fails before its commit point.
+    let obstruction = manager
+        .app_for_test()
+        .account_home()
+        .root()
+        .join(".wipe-tombstones");
+    fs_private::write_private(&obstruction, b"synthetic pre-commit failure").unwrap();
+    assert!(manager.remove_account(&id).await.is_err());
+    assert!(manager.resolve(&id).is_ok());
+    assert!(has_channel());
+    let mut c = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
+    manager.account_setup().save_onboarding(&mut c).unwrap();
+    assert_eq!(
+        subscription.recv().await.unwrap().revision,
+        c.snapshot.revision
+    );
+    std::fs::remove_file(&obstruction).unwrap();
+    manager.remove_account(&id).await.unwrap();
+    assert!(!has_channel());
+    assert!(subscription.recv().await.is_none());
     runtime.shutdown_and_close().await.unwrap();
 }
 
@@ -4118,21 +4923,25 @@ async fn successive_cancellations_replace_latest_even_if_publication_is_uncertai
     let (dir, runtime, network, keys, id) = fixture().await;
     missing_relays(&runtime, &id).await;
     let first = runtime
-        .accounts()
+        .account_setup()
         .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
         .await
         .unwrap();
     network.zero_acks.store(true, Ordering::SeqCst);
     runtime
-        .accounts()
+        .account_setup()
         .approve_onboarding_repair(&id, first.revision)
         .await
         .unwrap();
-    runtime.accounts().cancel_onboarding(&id).await.unwrap();
+    runtime
+        .account_setup()
+        .cancel_onboarding(&id)
+        .await
+        .unwrap();
     let after_first = repair_archive_bytes(dir.path(), &id);
     assert_eq!(after_first.len(), 1);
     runtime
-        .accounts()
+        .account_setup()
         .begin_onboarding(
             Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
             options(),
@@ -4141,28 +4950,36 @@ async fn successive_cancellations_replace_latest_even_if_publication_is_uncertai
         .unwrap();
     missing_relays(&runtime, &id).await;
     let second = runtime
-        .accounts()
+        .account_setup()
         .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
         .await
         .unwrap();
     runtime
-        .accounts()
+        .account_setup()
         .approve_onboarding_repair(&id, second.revision)
         .await
         .unwrap();
-    runtime.accounts().cancel_onboarding(&id).await.unwrap();
+    runtime
+        .account_setup()
+        .cancel_onboarding(&id)
+        .await
+        .unwrap();
     let latest = repair_archive_bytes(dir.path(), &id);
     assert_eq!(latest.len(), 1);
     assert_ne!(latest, after_first);
     runtime
-        .accounts()
+        .account_setup()
         .begin_onboarding(
             Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
             options(),
         )
         .await
         .unwrap();
-    runtime.accounts().cancel_onboarding(&id).await.unwrap();
+    runtime
+        .account_setup()
+        .cancel_onboarding(&id)
+        .await
+        .unwrap();
     let latest = repair_archive_bytes(dir.path(), &id);
     assert_eq!(latest.len(), 1);
     assert_ne!(latest, after_first);
@@ -4174,7 +4991,7 @@ async fn cancel_during_blocked_publish_does_not_start_another_send() {
     let (_dir, runtime, network, _keys, id) = fixture().await;
     missing_relays(&runtime, &id).await;
     let proposal = runtime
-        .accounts()
+        .account_setup()
         .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
         .await
         .unwrap();
@@ -4184,14 +5001,29 @@ async fn cancel_during_blocked_publish_does_not_start_another_send() {
     let revision = proposal.revision;
     let task = tokio::spawn({
         let manager = manager.clone();
-        async move { manager.approve_onboarding_repair(&account, revision).await }
+        async move {
+            manager
+                .account_setup()
+                .approve_onboarding_repair(&account, revision)
+                .await
+        }
     });
     network.publishing.notified().await;
-    manager.cancel_onboarding(&id).await.unwrap();
+    manager
+        .account_setup()
+        .cancel_onboarding(&id)
+        .await
+        .unwrap();
     task.abort();
     let _ = task.await;
     assert_eq!(network.attempts.lock().len(), 1);
-    assert!(manager.onboarding_snapshot(&id).unwrap().is_none());
+    assert!(
+        manager
+            .account_setup()
+            .onboarding_snapshot(&id)
+            .unwrap()
+            .is_none()
+    );
     assert!(manager.resolve(&id).unwrap().signed_out);
     runtime.shutdown_and_close().await.unwrap();
 }
@@ -4200,11 +5032,16 @@ async fn cancel_during_blocked_publish_does_not_start_another_send() {
 async fn pending_cancellation_blocks_begin_until_cleanup_finishes() {
     let (_dir, runtime, _network, keys, id) = fixture().await;
     let manager = runtime.accounts();
-    let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let mut c = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
     c.snapshot.cancellation_pending = true;
-    manager.save_onboarding(&mut c).unwrap();
+    manager.account_setup().save_onboarding(&mut c).unwrap();
     assert!(
         manager
+            .account_setup()
             .begin_onboarding(
                 Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
                 options(),
@@ -4212,9 +5049,14 @@ async fn pending_cancellation_blocks_begin_until_cleanup_finishes() {
             .await
             .is_err()
     );
-    manager.cancel_onboarding(&id).await.unwrap();
+    manager
+        .account_setup()
+        .cancel_onboarding(&id)
+        .await
+        .unwrap();
     assert!(
         manager
+            .account_setup()
             .begin_onboarding(
                 Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
                 options(),
@@ -4228,7 +5070,7 @@ async fn pending_cancellation_blocks_begin_until_cleanup_finishes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelled_account_is_not_auto_signed_in_on_reopen() {
     let (dir, first, network, _keys, id) = fixture().await;
-    first.accounts().cancel_onboarding(&id).await.unwrap();
+    first.account_setup().cancel_onboarding(&id).await.unwrap();
     first.shutdown_and_close().await.unwrap();
     let reopened = runtime(dir.path(), network);
     reopened.reconcile_accounts().await.unwrap();
@@ -4250,8 +5092,9 @@ async fn approve_blocked_repair(
     let manager = runtime.accounts();
     let proposal = match step {
         OnboardingStep::Profile => {
-            manager.run_onboarding(id).await.unwrap();
+            manager.account_setup().run_onboarding(id).await.unwrap();
             manager
+                .account_setup()
                 .propose_onboarding_profile(
                     id,
                     UserProfileMetadata {
@@ -4263,12 +5106,14 @@ async fn approve_blocked_repair(
                 .unwrap()
         }
         OnboardingStep::Follows => {
-            manager.run_onboarding(id).await.unwrap();
+            manager.account_setup().run_onboarding(id).await.unwrap();
             manager
+                .account_setup()
                 .continue_onboarding_without(id, OnboardingStep::Profile)
                 .await
                 .unwrap();
             manager
+                .account_setup()
                 .propose_onboarding_follows(
                     id,
                     vec![nostr::prelude::Keys::generate().public_key().to_hex()],
@@ -4279,21 +5124,30 @@ async fn approve_blocked_repair(
         OnboardingStep::Relays => {
             missing_relays(runtime, id).await;
             manager
+                .account_setup()
                 .propose_onboarding_relays(id, OnboardingStep::Relays, None)
                 .await
                 .unwrap()
         }
         OnboardingStep::InboxRelays => {
             missing_relays(runtime, id).await;
-            let mut checkpoint = manager.onboarding_checkpoint(id).unwrap().unwrap();
+            let mut checkpoint = manager
+                .setup_records()
+                .onboarding_checkpoint(id)
+                .unwrap()
+                .unwrap();
             checkpoint.set(OnboardingStep::Relays, OnboardingStatus::Passed, vec![]);
             checkpoint.set(
                 OnboardingStep::InboxRelays,
                 OnboardingStatus::NeedsInput,
                 vec![finding(OnboardingIssue::Missing)],
             );
-            manager.save_onboarding(&mut checkpoint).unwrap();
             manager
+                .account_setup()
+                .save_onboarding(&mut checkpoint)
+                .unwrap();
+            manager
+                .account_setup()
                 .propose_onboarding_relays(id, OnboardingStep::InboxRelays, None)
                 .await
                 .unwrap()
@@ -4305,7 +5159,12 @@ async fn approve_blocked_repair(
     let revision = proposal.revision;
     let task = tokio::spawn({
         let manager = manager.clone();
-        async move { manager.approve_onboarding_repair(&account, revision).await }
+        async move {
+            manager
+                .account_setup()
+                .approve_onboarding_repair(&account, revision)
+                .await
+        }
     });
     network.publishing.notified().await;
     (proposal, task)
@@ -4319,11 +5178,18 @@ async fn assert_cancelled_and_fresh(
     previous_sends: usize,
 ) {
     let manager = runtime.accounts();
-    assert!(manager.onboarding_snapshot(id).unwrap().is_none());
+    assert!(
+        manager
+            .account_setup()
+            .onboarding_snapshot(id)
+            .unwrap()
+            .is_none()
+    );
     assert!(manager.resolve(id).unwrap().signed_out);
     assert!(!manager.managed_accounts().unwrap()[0].running);
     assert_eq!(network.attempts.lock().len(), previous_sends);
     let resumed = manager
+        .account_setup()
         .begin_onboarding(
             Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
             options(),
@@ -4331,7 +5197,7 @@ async fn assert_cancelled_and_fresh(
         .await
         .unwrap();
     assert!(!resumed.ready && !resumed.cancellation_pending && resumed.proposal.is_none());
-    manager.run_onboarding(id).await.unwrap();
+    manager.account_setup().run_onboarding(id).await.unwrap();
     assert_eq!(network.attempts.lock().len(), previous_sends);
 }
 
@@ -4346,7 +5212,11 @@ async fn late_publish_responses_do_not_resurrect_cancelled_repairs() {
         let (_dir, runtime, network, keys, id) = fixture().await;
         network.zero_acks.store(zero_acks, Ordering::SeqCst);
         let (_proposal, task) = approve_blocked_repair(&runtime, &network, &id, step).await;
-        runtime.accounts().cancel_onboarding(&id).await.unwrap();
+        runtime
+            .account_setup()
+            .cancel_onboarding(&id)
+            .await
+            .unwrap();
         network.block_publish.store(false, Ordering::SeqCst);
         network.release_publish.notify_waiters();
         let _ = task.await.unwrap();
@@ -4361,7 +5231,11 @@ async fn late_publish_does_not_overwrite_a_newer_attempt() {
     let (_dir, runtime, network, keys, id) = fixture().await;
     let (_proposal, task) =
         approve_blocked_repair(&runtime, &network, &id, OnboardingStep::Relays).await;
-    runtime.accounts().cancel_onboarding(&id).await.unwrap();
+    runtime
+        .account_setup()
+        .cancel_onboarding(&id)
+        .await
+        .unwrap();
     let first_attempt = runtime
         .accounts()
         .app
@@ -4371,7 +5245,7 @@ async fn late_publish_does_not_overwrite_a_newer_attempt() {
         .unwrap();
     let first: OnboardingCheckpoint = serde_json::from_slice(&first_attempt).unwrap();
     runtime
-        .accounts()
+        .account_setup()
         .begin_onboarding(
             Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
             options(),
@@ -4380,6 +5254,7 @@ async fn late_publish_does_not_overwrite_a_newer_attempt() {
         .unwrap();
     let newer = runtime
         .accounts()
+        .setup_records()
         .onboarding_checkpoint(&id)
         .unwrap()
         .unwrap();
@@ -4389,6 +5264,7 @@ async fn late_publish_does_not_overwrite_a_newer_attempt() {
     let _ = task.await.unwrap();
     let after = runtime
         .accounts()
+        .setup_records()
         .onboarding_checkpoint(&id)
         .unwrap()
         .unwrap();
@@ -4402,11 +5278,15 @@ async fn cancel_during_blocked_publish_releases_begin_without_aborting_caller() 
     let (_dir, runtime, network, keys, id) = fixture().await;
     let (_proposal, task) =
         approve_blocked_repair(&runtime, &network, &id, OnboardingStep::Relays).await;
-    runtime.accounts().cancel_onboarding(&id).await.unwrap();
+    runtime
+        .account_setup()
+        .cancel_onboarding(&id)
+        .await
+        .unwrap();
     let signed = network.attempts.lock()[0].clone();
     tokio::time::timeout(
         Duration::from_secs(2),
-        runtime.accounts().begin_onboarding(
+        runtime.account_setup().begin_onboarding(
             Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
             options(),
         ),
@@ -4415,7 +5295,7 @@ async fn cancel_during_blocked_publish_releases_begin_without_aborting_caller() 
     .unwrap()
     .unwrap();
     let queued = runtime
-        .accounts()
+        .account_setup()
         .retry_onboarding_step(&id, OnboardingStep::Profile)
         .await;
     assert!(queued.is_err());
@@ -4544,7 +5424,7 @@ async fn signer_diagnostic_recovery() {
         let block = Arc::new(AtomicBool::new(false));
         let started = Arc::new(Notify::new());
         first
-            .accounts()
+            .account_setup()
             .begin_external_signer_onboarding(
                 id.clone(),
                 BlockingSigner {
@@ -4559,7 +5439,7 @@ async fn signer_diagnostic_recovery() {
         missing_relays(&first, &id).await;
         let (step, context, purpose) = if approved {
             let preview = first
-                .accounts()
+                .account_setup()
                 .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
                 .await
                 .unwrap();
@@ -4569,6 +5449,7 @@ async fn signer_diagnostic_recovery() {
                 let id = id.clone();
                 async move {
                     manager
+                        .account_setup()
                         .approve_onboarding_repair(&id, preview.revision)
                         .await
                 }
@@ -4585,7 +5466,11 @@ async fn signer_diagnostic_recovery() {
             )
         } else {
             let manager = first.accounts();
-            let mut checkpoint = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+            let mut checkpoint = manager
+                .setup_records()
+                .onboarding_checkpoint(&id)
+                .unwrap()
+                .unwrap();
             checkpoint.set(OnboardingStep::Relays, OnboardingStatus::Passed, vec![]);
             checkpoint.records[OnboardingStep::Relays.index()] = Some(signed(
                 &keys,
@@ -4594,7 +5479,10 @@ async fn signer_diagnostic_recovery() {
                 "",
                 unix_now_seconds(),
             ));
-            manager.save_onboarding(&mut checkpoint).unwrap();
+            manager
+                .account_setup()
+                .save_onboarding(&mut checkpoint)
+                .unwrap();
             (
                 OnboardingStep::InboxRelays,
                 OnboardingFindingContext::RecordDiscovery,
@@ -4603,7 +5491,7 @@ async fn signer_diagnostic_recovery() {
         };
         first.shutdown_and_close().await.unwrap();
         let reopened = runtime(directory.path(), network.clone());
-        let snapshot = reopened.accounts().run_onboarding(&id).await.unwrap();
+        let snapshot = reopened.account_setup().run_onboarding(&id).await.unwrap();
         let state = &snapshot.steps[step.index()];
         assert_eq!(state.status, OnboardingStatus::WaitingForSigner);
         let finding = &state.findings[0];
@@ -4635,7 +5523,7 @@ async fn cancel_during_blocked_signer_allows_fresh_external_begin() {
     let block = Arc::new(AtomicBool::new(false));
     let started = Arc::new(Notify::new());
     runtime
-        .accounts()
+        .account_setup()
         .begin_external_signer_onboarding(
             id.clone(),
             BlockingSigner {
@@ -4649,7 +5537,7 @@ async fn cancel_during_blocked_signer_allows_fresh_external_begin() {
         .unwrap();
     missing_relays(&runtime, &id).await;
     let proposal = runtime
-        .accounts()
+        .account_setup()
         .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
         .await
         .unwrap();
@@ -4658,13 +5546,22 @@ async fn cancel_during_blocked_signer_allows_fresh_external_begin() {
         let manager = runtime.accounts();
         let account = id.clone();
         let revision = proposal.revision;
-        async move { manager.approve_onboarding_repair(&account, revision).await }
+        async move {
+            manager
+                .account_setup()
+                .approve_onboarding_repair(&account, revision)
+                .await
+        }
     });
     started.notified().await;
-    runtime.accounts().cancel_onboarding(&id).await.unwrap();
+    runtime
+        .account_setup()
+        .cancel_onboarding(&id)
+        .await
+        .unwrap();
     tokio::time::timeout(
         Duration::from_secs(2),
-        runtime.accounts().begin_external_signer_onboarding(
+        runtime.account_setup().begin_external_signer_onboarding(
             id.clone(),
             BlockingSigner {
                 keys: keys.clone(),
@@ -4685,7 +5582,11 @@ async fn cancel_during_blocked_signer_allows_fresh_external_begin() {
 async fn cancel_between_liveness_and_activation_keeps_account_signed_out() {
     let (_dir, runtime, network, _keys, id) = fixture().await;
     let manager = runtime.accounts();
-    let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let mut c = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
     for step in [
         OnboardingStep::Profile,
         OnboardingStep::Follows,
@@ -4695,22 +5596,32 @@ async fn cancel_between_liveness_and_activation_keeps_account_signed_out() {
     ] {
         c.set(step, OnboardingStatus::Passed, vec![]);
     }
-    manager.save_onboarding(&mut c).unwrap();
-    let hold = manager.install_onboarding_activation_hold();
+    manager.account_setup().save_onboarding(&mut c).unwrap();
+    let hold = manager.account_setup().install_onboarding_activation_hold();
     let task = tokio::spawn({
         let manager = manager.clone();
         let account = id.clone();
-        async move { manager.run_onboarding(&account).await }
+        async move { manager.account_setup().run_onboarding(&account).await }
     });
     hold.wait_until_entered().await;
-    manager.cancel_onboarding(&id).await.unwrap();
+    manager
+        .account_setup()
+        .cancel_onboarding(&id)
+        .await
+        .unwrap();
     hold.release.notify_one();
     let _ = timeout(Duration::from_secs(2), task)
         .await
         .expect("retired onboarding operation did not stop")
         .unwrap();
     assert!(manager.resolve(&id).unwrap().signed_out);
-    assert!(manager.onboarding_snapshot(&id).unwrap().is_none());
+    assert!(
+        manager
+            .account_setup()
+            .onboarding_snapshot(&id)
+            .unwrap()
+            .is_none()
+    );
     assert!(network.attempts.lock().is_empty());
     runtime.shutdown_and_close().await.unwrap();
 }
@@ -4720,19 +5631,31 @@ async fn cancel_between_liveness_and_publish_admission_does_not_send() {
     let (_dir, runtime, network, _keys, id) = fixture().await;
     missing_relays(&runtime, &id).await;
     let proposal = runtime
-        .accounts()
+        .account_setup()
         .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
         .await
         .unwrap();
-    let hold = runtime.accounts().install_onboarding_publication_hold();
+    let hold = runtime
+        .accounts()
+        .account_setup()
+        .install_onboarding_publication_hold();
     let task = tokio::spawn({
         let manager = runtime.accounts();
         let account = id.clone();
         let revision = proposal.revision;
-        async move { manager.approve_onboarding_repair(&account, revision).await }
+        async move {
+            manager
+                .account_setup()
+                .approve_onboarding_repair(&account, revision)
+                .await
+        }
     });
     hold.wait_until_entered().await;
-    runtime.accounts().cancel_onboarding(&id).await.unwrap();
+    runtime
+        .account_setup()
+        .cancel_onboarding(&id)
+        .await
+        .unwrap();
     hold.release.notify_one();
     let _ = timeout(Duration::from_secs(2), task)
         .await
@@ -4741,7 +5664,7 @@ async fn cancel_between_liveness_and_publish_admission_does_not_send() {
     assert!(network.attempts.lock().is_empty());
     assert!(
         runtime
-            .accounts()
+            .account_setup()
             .onboarding_snapshot(&id)
             .unwrap()
             .is_none()
@@ -4759,19 +5682,32 @@ async fn dropped_reconcile_during_worker_reap_still_reaps() {
         .account_home()
         .set_account_signed_out(&id, false)
         .unwrap();
-    let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let mut c = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
     c.set(
         OnboardingStep::KeyPackage,
         OnboardingStatus::Checking,
         vec![],
     );
-    manager.save_onboarding(&mut c).unwrap();
+    manager.account_setup().save_onboarding(&mut c).unwrap();
     manager.reconcile().await.unwrap();
     assert!(manager.onboarding_worker_tracked(&id).await);
-    let mut pending = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let mut pending = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
     pending.snapshot.cancellation_pending = true;
-    manager.save_onboarding(&mut pending).unwrap();
-    let hold = manager.install_onboarding_worker_reap_hold();
+    manager
+        .account_setup()
+        .save_onboarding(&mut pending)
+        .unwrap();
+    let hold = manager
+        .account_setup()
+        .install_onboarding_worker_reap_hold();
     let reconcile = tokio::spawn({
         let manager = manager.clone();
         async move { manager.reconcile().await }
@@ -4780,11 +5716,15 @@ async fn dropped_reconcile_during_worker_reap_still_reaps() {
     reconcile.abort();
     let _ = reconcile.await;
     assert!(!manager.onboarding_worker_tracked(&id).await);
-    assert!(manager.onboarding_worker_reap_in_flight(&id));
+    assert!(
+        manager
+            .account_setup()
+            .onboarding_worker_reap_in_flight(&id)
+    );
     let cancel = tokio::spawn({
         let manager = manager.clone();
         let account = id.clone();
-        async move { manager.cancel_onboarding(&account).await }
+        async move { manager.account_setup().cancel_onboarding(&account).await }
     });
     hold.release.notify_one();
     timeout(Duration::from_secs(2), cancel)
@@ -4793,7 +5733,11 @@ async fn dropped_reconcile_during_worker_reap_still_reaps() {
         .unwrap()
         .unwrap();
     assert!(!manager.onboarding_worker_tracked(&id).await);
-    assert!(!manager.onboarding_worker_reap_in_flight(&id));
+    assert!(
+        !manager
+            .account_setup()
+            .onboarding_worker_reap_in_flight(&id)
+    );
     assert!(manager.resolve(&id).unwrap().signed_out);
     runtime.shutdown_and_close().await.unwrap();
 }
@@ -4821,7 +5765,11 @@ fn mark_ready(c: &mut OnboardingCheckpoint) {
 async fn stale_ready_cleanup_after_cancel_retains_setup_journal() {
     let (_dir, runtime, _network, _keys, id) = fixture().await;
     let manager = runtime.accounts();
-    let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let mut c = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
     mark_ready(&mut c);
     c.setup_cleanup_pending = true;
     manager
@@ -4834,11 +5782,20 @@ async fn stale_ready_cleanup_after_cancel_retains_setup_journal() {
         .account_home()
         .set_account_setup_context(&id, b"retained-setup")
         .unwrap();
-    manager.save_onboarding(&mut c).unwrap();
-    let stale = manager.onboarding_checkpoint(&id).unwrap().unwrap();
-    manager.cancel_onboarding(&id).await.unwrap();
+    manager.account_setup().save_onboarding(&mut c).unwrap();
+    let stale = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
+    manager
+        .account_setup()
+        .cancel_onboarding(&id)
+        .await
+        .unwrap();
     assert!(
         manager
+            .account_setup()
             .run_captured_onboarding(&mut stale.clone())
             .await
             .is_err()
@@ -4878,6 +5835,7 @@ async fn stale_ready_cleanup_after_cancel_retains_setup_journal() {
         .unwrap();
     assert!(
         manager
+            .account_setup()
             .run_captured_onboarding(&mut stale.clone())
             .await
             .is_err()
@@ -4908,7 +5866,11 @@ async fn stale_ready_cleanup_after_cancel_retains_setup_journal() {
 async fn cancel_during_ready_cleanup_hold_retains_setup() {
     let (_dir, runtime, _network, _keys, id) = fixture().await;
     let manager = runtime.accounts();
-    let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let mut c = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
     mark_ready(&mut c);
     c.setup_cleanup_pending = true;
     manager
@@ -4921,15 +5883,21 @@ async fn cancel_during_ready_cleanup_hold_retains_setup() {
         .account_home()
         .set_account_setup_context(&id, b"cleanup-hold")
         .unwrap();
-    manager.save_onboarding(&mut c).unwrap();
-    let hold = manager.install_onboarding_setup_cleanup_hold();
+    manager.account_setup().save_onboarding(&mut c).unwrap();
+    let hold = manager
+        .account_setup()
+        .install_onboarding_setup_cleanup_hold();
     let running = tokio::spawn({
         let manager = manager.clone();
         let account = id.clone();
-        async move { manager.run_onboarding(&account).await }
+        async move { manager.account_setup().run_onboarding(&account).await }
     });
     hold.wait_until_entered().await;
-    manager.cancel_onboarding(&id).await.unwrap();
+    manager
+        .account_setup()
+        .cancel_onboarding(&id)
+        .await
+        .unwrap();
     hold.release.notify_one();
     assert!(
         timeout(Duration::from_secs(2), running)
@@ -4960,7 +5928,11 @@ async fn stale_key_package_setup_after_cancel_does_not_mutate_setup() {
         .account_setup_state(&id)
         .unwrap()
         .unwrap();
-    let mut stale = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let mut stale = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
     for step in [
         OnboardingStep::Profile,
         OnboardingStep::Follows,
@@ -4970,10 +5942,24 @@ async fn stale_key_package_setup_after_cancel_does_not_mutate_setup() {
     ] {
         stale.set(step, OnboardingStatus::Passed, vec![]);
     }
-    manager.save_onboarding(&mut stale).unwrap();
-    let mut stale = manager.onboarding_checkpoint(&id).unwrap().unwrap();
-    manager.cancel_onboarding(&id).await.unwrap();
-    assert!(manager.run_captured_onboarding(&mut stale).await.is_err());
+    manager.account_setup().save_onboarding(&mut stale).unwrap();
+    let mut stale = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
+    manager
+        .account_setup()
+        .cancel_onboarding(&id)
+        .await
+        .unwrap();
+    assert!(
+        manager
+            .account_setup()
+            .run_captured_onboarding(&mut stale)
+            .await
+            .is_err()
+    );
     let after = manager
         .app
         .account_home()
@@ -5003,30 +5989,46 @@ fn write_legacy_checkpoint(
 async fn pre_generation_checkpoints_resume_retry_and_cancel_without_replay() {
     let (dir, runtime, network, keys, id) = fixture().await;
     let manager = runtime.accounts();
-    let pending = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let pending = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
     write_legacy_checkpoint(dir.path(), &id, serde_json::to_value(&pending).unwrap(), 2);
-    let discovered = manager.run_onboarding(&id).await.unwrap();
+    let discovered = manager.account_setup().run_onboarding(&id).await.unwrap();
     assert_ne!(
         discovered.steps[OnboardingStep::Profile.index()].status,
         OnboardingStatus::Pending
     );
     write_legacy_checkpoint(dir.path(), &id, serde_json::to_value(&pending).unwrap(), 1);
     assert_ne!(
-        manager.run_onboarding(&id).await.unwrap().steps[0].status,
+        manager
+            .account_setup()
+            .run_onboarding(&id)
+            .await
+            .unwrap()
+            .steps[0]
+            .status,
         OnboardingStatus::Pending
     );
     missing_relays(&runtime, &id).await;
     let proposal = manager
+        .account_setup()
         .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
         .await
         .unwrap();
     network.zero_acks.store(true, Ordering::SeqCst);
     manager
+        .account_setup()
         .approve_onboarding_repair(&id, proposal.revision)
         .await
         .unwrap();
     let signed = network.attempts.lock()[0].clone();
-    let approved = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let approved = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
     assert!(approved.approved && approved.signed_repair == Some(signed.clone()));
     for version in [2_u32, 1] {
         write_legacy_checkpoint(
@@ -5035,9 +6037,14 @@ async fn pre_generation_checkpoints_resume_retry_and_cancel_without_replay() {
             serde_json::to_value(&approved).unwrap(),
             version,
         );
-        let loaded = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+        let loaded = manager
+            .setup_records()
+            .onboarding_checkpoint(&id)
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded.attempt_start_revision, 0);
         let retried = manager
+            .account_setup()
             .retry_onboarding_step(&id, OnboardingStep::Relays)
             .await
             .unwrap();
@@ -5052,6 +6059,7 @@ async fn pre_generation_checkpoints_resume_retry_and_cancel_without_replay() {
     write_legacy_checkpoint(dir.path(), &id, serde_json::to_value(&approved).unwrap(), 2);
     assert_eq!(
         manager
+            .setup_records()
             .onboarding_checkpoint(&id)
             .unwrap()
             .unwrap()
@@ -5065,23 +6073,32 @@ async fn pre_generation_checkpoints_resume_retry_and_cancel_without_replay() {
         let account = id.clone();
         async move {
             manager
+                .account_setup()
                 .retry_onboarding_step(&account, OnboardingStep::Relays)
                 .await
         }
     });
     network.publishing.notified().await;
-    tokio::time::timeout(Duration::from_secs(2), manager.cancel_onboarding(&id))
-        .await
-        .expect("cancellation must wake a migrated generation-zero publish wait")
-        .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        manager.account_setup().cancel_onboarding(&id),
+    )
+    .await
+    .expect("cancellation must wake a migrated generation-zero publish wait")
+    .unwrap();
     let restarted = manager
+        .account_setup()
         .begin_onboarding(
             Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
             options(),
         )
         .await
         .unwrap();
-    let fresh = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let fresh = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
     assert_ne!(fresh.attempt_start_revision, 0);
     assert_ne!(
         fresh.attempt_start_revision,
@@ -5103,26 +6120,37 @@ async fn dropped_cancel_after_reaper_finishes_still_cleans_up_and_restarts() {
         .account_home()
         .set_account_signed_out(&id, false)
         .unwrap();
-    let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let mut c = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
     c.set(
         OnboardingStep::KeyPackage,
         OnboardingStatus::Checking,
         vec![],
     );
-    manager.save_onboarding(&mut c).unwrap();
+    manager.account_setup().save_onboarding(&mut c).unwrap();
     manager.reconcile().await.unwrap();
     assert!(manager.onboarding_worker_tracked(&id).await);
-    let hold = manager.install_onboarding_worker_reap_hold();
+    let hold = manager
+        .account_setup()
+        .install_onboarding_worker_reap_hold();
     let first = tokio::spawn({
         let manager = manager.clone();
         let account = id.clone();
-        async move { manager.cancel_onboarding(&account).await }
+        async move { manager.account_setup().cancel_onboarding(&account).await }
     });
     hold.wait_until_entered().await;
     first.abort();
     let _ = first.await;
-    assert!(manager.onboarding_worker_reap_in_flight(&id));
+    assert!(
+        manager
+            .account_setup()
+            .onboarding_worker_reap_in_flight(&id)
+    );
     let mut completed = manager
+        .setup
         .onboarding_cancellations
         .lock()
         .unwrap()
@@ -5133,17 +6161,34 @@ async fn dropped_cancel_after_reaper_finishes_still_cleans_up_and_restarts() {
     hold.release.notify_one();
     // Let cancellation consume and remove the map entry before observing the
     // retained receiver, reproducing the ordering that broke the old poller.
-    manager.await_onboarding_owned_handles_finished().await;
-    assert!(manager.onboarding_worker_reap_watch_state(&id).is_none());
+    manager
+        .account_setup()
+        .await_onboarding_owned_handles_finished()
+        .await;
+    assert!(
+        manager
+            .account_setup()
+            .onboarding_worker_reap_watch_state(&id)
+            .is_none()
+    );
     timeout(Duration::from_secs(2), completed.wait_for(|done| *done))
         .await
         .expect("worker reap did not complete")
         .expect("worker reap dropped without completion");
-    assert!(!manager.onboarding_worker_reap_in_flight(&id));
-    manager.cancel_onboarding(&id).await.unwrap();
+    assert!(
+        !manager
+            .account_setup()
+            .onboarding_worker_reap_in_flight(&id)
+    );
+    manager
+        .account_setup()
+        .cancel_onboarding(&id)
+        .await
+        .unwrap();
     assert!(!manager.onboarding_worker_tracked(&id).await);
     assert!(manager.resolve(&id).unwrap().signed_out);
     let restarted = manager
+        .account_setup()
         .begin_onboarding(
             Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
             options(),
@@ -5151,6 +6196,74 @@ async fn dropped_cancel_after_reaper_finishes_still_cleans_up_and_restarts() {
         .await
         .unwrap();
     assert!(!restarted.ready && !restarted.cancellation_pending);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+/// mdk#3318: a cancellation dropped while onboarding reaps its worker leaves
+/// that worker retiring outside `worker_reapers`, with the account signed
+/// out. A direct group write for the account refuses, with nothing written,
+/// until that reap finishes, so it never lands beside a worker that may
+/// still save the group's record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_group_write_refuses_while_onboarding_reaps_the_worker() {
+    let (_dir, runtime, _network, _keys, id) = fixture().await;
+    let manager = runtime.accounts();
+    manager
+        .app
+        .account_home()
+        .set_account_signed_out(&id, false)
+        .unwrap();
+    let mut c = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
+    c.set(
+        OnboardingStep::KeyPackage,
+        OnboardingStatus::Checking,
+        vec![],
+    );
+    manager.account_setup().save_onboarding(&mut c).unwrap();
+    manager.reconcile().await.unwrap();
+    assert!(manager.onboarding_worker_tracked(&id).await);
+    let hold = manager
+        .account_setup()
+        .install_onboarding_worker_reap_hold();
+    let cancel = tokio::spawn({
+        let manager = manager.clone();
+        let account = id.clone();
+        async move { manager.account_setup().cancel_onboarding(&account).await }
+    });
+    hold.wait_until_entered().await;
+    cancel.abort();
+    let _ = cancel.await;
+    assert!(manager.resolve(&id).unwrap().signed_out);
+    assert!(
+        manager
+            .account_setup()
+            .onboarding_worker_reap_in_flight(&id)
+    );
+
+    // Archiving a group the account does not hold fails in storage, so the
+    // error says whether the write ran.
+    let group = cgka_traits::GroupId::new(vec![7; 16]);
+    let refused = manager.set_group_archived(&id, &group, true).await;
+    assert!(
+        matches!(&refused, Err(AppError::BlockingTask(reason))
+            if reason == "account worker cleanup still in progress"),
+        "the write must not run beside the retiring worker: {refused:?}"
+    );
+
+    hold.release.notify_one();
+    manager
+        .account_setup()
+        .await_onboarding_owned_handles_finished()
+        .await;
+    let written = manager.set_group_archived(&id, &group, true).await;
+    assert!(
+        matches!(&written, Err(AppError::UnknownGroup(hex)) if *hex == "07".repeat(16)),
+        "once the reap finishes the write runs: {written:?}"
+    );
     runtime.shutdown_and_close().await.unwrap();
 }
 
@@ -5163,19 +6276,32 @@ async fn dropped_reconcile_reap_completes_with_zero_receivers_then_restarts() {
         .account_home()
         .set_account_signed_out(&id, false)
         .unwrap();
-    let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let mut c = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
     c.set(
         OnboardingStep::KeyPackage,
         OnboardingStatus::Checking,
         vec![],
     );
-    manager.save_onboarding(&mut c).unwrap();
+    manager.account_setup().save_onboarding(&mut c).unwrap();
     manager.reconcile().await.unwrap();
     assert!(manager.onboarding_worker_tracked(&id).await);
-    let mut pending = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let mut pending = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
     pending.snapshot.cancellation_pending = true;
-    manager.save_onboarding(&mut pending).unwrap();
-    let hold = manager.install_onboarding_worker_reap_hold();
+    manager
+        .account_setup()
+        .save_onboarding(&mut pending)
+        .unwrap();
+    let hold = manager
+        .account_setup()
+        .install_onboarding_worker_reap_hold();
     let reconcile = tokio::spawn({
         let manager = manager.clone();
         async move { manager.reconcile().await }
@@ -5184,22 +6310,42 @@ async fn dropped_reconcile_reap_completes_with_zero_receivers_then_restarts() {
     reconcile.abort();
     let _ = reconcile.await;
     assert!(!manager.onboarding_worker_tracked(&id).await);
-    assert!(manager.onboarding_worker_reap_in_flight(&id));
+    assert!(
+        manager
+            .account_setup()
+            .onboarding_worker_reap_in_flight(&id)
+    );
     assert_eq!(
-        manager.onboarding_worker_reap_watch_state(&id),
+        manager
+            .account_setup()
+            .onboarding_worker_reap_watch_state(&id),
         Some((false, 0))
     );
     hold.release.notify_one();
-    manager.await_onboarding_owned_handles_finished().await;
+    manager
+        .account_setup()
+        .await_onboarding_owned_handles_finished()
+        .await;
     assert_eq!(
-        manager.onboarding_worker_reap_watch_state(&id),
+        manager
+            .account_setup()
+            .onboarding_worker_reap_watch_state(&id),
         Some((true, 0))
     );
-    manager.cancel_onboarding(&id).await.unwrap();
+    manager
+        .account_setup()
+        .cancel_onboarding(&id)
+        .await
+        .unwrap();
     assert!(!manager.onboarding_worker_tracked(&id).await);
-    assert!(!manager.onboarding_worker_reap_in_flight(&id));
+    assert!(
+        !manager
+            .account_setup()
+            .onboarding_worker_reap_in_flight(&id)
+    );
     assert!(manager.resolve(&id).unwrap().signed_out);
     let restarted = manager
+        .account_setup()
         .begin_onboarding(
             Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
             options(),
@@ -5219,18 +6365,31 @@ async fn timed_out_reap_waiter_retains_completion_through_shutdown() {
         .account_home()
         .set_account_signed_out(&id, false)
         .unwrap();
-    let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let mut c = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
     c.set(
         OnboardingStep::KeyPackage,
         OnboardingStatus::Checking,
         vec![],
     );
-    manager.save_onboarding(&mut c).unwrap();
+    manager.account_setup().save_onboarding(&mut c).unwrap();
     manager.reconcile().await.unwrap();
-    let mut pending = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let mut pending = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
     pending.snapshot.cancellation_pending = true;
-    manager.save_onboarding(&mut pending).unwrap();
-    let hold = manager.install_onboarding_worker_reap_hold();
+    manager
+        .account_setup()
+        .save_onboarding(&mut pending)
+        .unwrap();
+    let hold = manager
+        .account_setup()
+        .install_onboarding_worker_reap_hold();
     let reconcile = tokio::spawn({
         let manager = manager.clone();
         async move { manager.reconcile().await }
@@ -5239,17 +6398,27 @@ async fn timed_out_reap_waiter_retains_completion_through_shutdown() {
     reconcile.abort();
     let _ = reconcile.await;
     let timed_out = manager
+        .account_setup()
         .await_onboarding_worker_reap_with_budget(&id, Duration::from_millis(20))
         .await;
     assert!(matches!(
         timed_out,
         Err(AppError::AccountWorkerResponseTimedOut)
     ));
-    assert!(manager.onboarding_worker_reap_in_flight(&id));
+    assert!(
+        manager
+            .account_setup()
+            .onboarding_worker_reap_in_flight(&id)
+    );
     hold.release.notify_one();
-    manager.await_onboarding_owned_handles_finished().await;
+    manager
+        .account_setup()
+        .await_onboarding_owned_handles_finished()
+        .await;
     assert_eq!(
-        manager.onboarding_worker_reap_watch_state(&id),
+        manager
+            .account_setup()
+            .onboarding_worker_reap_watch_state(&id),
         Some((true, 0))
     );
     assert!(!manager.onboarding_worker_tracked(&id).await);
@@ -5260,25 +6429,38 @@ async fn timed_out_reap_waiter_retains_completion_through_shutdown() {
 async fn shutdown_reaps_late_onboarding_worker_after_reconcile_is_dropped() {
     let (_dir, runtime, _network, _keys, id) = fixture().await;
     let manager = runtime.accounts();
-    let mut checkpoint = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let mut checkpoint = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
     checkpoint.set(
         OnboardingStep::KeyPackage,
         OnboardingStatus::Checking,
         vec![],
     );
-    manager.save_onboarding(&mut checkpoint).unwrap();
+    manager
+        .account_setup()
+        .save_onboarding(&mut checkpoint)
+        .unwrap();
     manager.reconcile().await.unwrap();
     assert!(manager.onboarding_worker_tracked(&id).await);
     checkpoint.snapshot.cancellation_pending = true;
-    manager.save_onboarding(&mut checkpoint).unwrap();
+    manager
+        .account_setup()
+        .save_onboarding(&mut checkpoint)
+        .unwrap();
 
     let recovery = OnboardingTestHold::new();
     *manager
+        .setup
         .onboarding_test_holds
         .cancellation_recovery
         .lock()
         .unwrap() = Some(recovery.clone());
-    let reap = manager.install_onboarding_worker_reap_hold();
+    let reap = manager
+        .account_setup()
+        .install_onboarding_worker_reap_hold();
     let reconcile = tokio::spawn({
         let manager = manager.clone();
         async move { manager.reconcile().await }
@@ -5290,7 +6472,14 @@ async fn shutdown_reaps_late_onboarding_worker_after_reconcile_is_dropped() {
     let shutdown = manager.shutdown();
     tokio::pin!(shutdown);
     assert!(futures::poll!(&mut shutdown).is_pending());
-    assert!(!manager.onboarding_cancellations.lock().unwrap().accepting);
+    assert!(
+        !manager
+            .setup
+            .onboarding_cancellations
+            .lock()
+            .unwrap()
+            .accepting
+    );
     recovery.release.notify_one();
     reap.wait_until_entered().await;
     assert!(!manager.onboarding_worker_tracked(&id).await);
@@ -5302,18 +6491,25 @@ async fn shutdown_reaps_late_onboarding_worker_after_reconcile_is_dropped() {
 
     // The only worker is now owned by a reaper added AFTER that snapshot.
     // Shutdown must await it even though the worker map is already empty.
-    assert!(manager.onboarding_worker_reap_in_flight(&id));
+    assert!(
+        manager
+            .account_setup()
+            .onboarding_worker_reap_in_flight(&id)
+    );
     assert!(futures::poll!(&mut shutdown).is_pending());
     reap.release.notify_one();
     timeout(Duration::from_secs(2), &mut shutdown)
         .await
         .expect("shutdown did not reap the late worker");
     assert_eq!(
-        manager.onboarding_worker_reap_watch_state(&id),
+        manager
+            .account_setup()
+            .onboarding_worker_reap_watch_state(&id),
         Some((true, 0))
     );
     assert!(
         manager
+            .setup
             .onboarding_cancellations
             .lock()
             .unwrap()
@@ -5335,9 +6531,13 @@ fn write_cancelled_checkpoint(dir: &std::path::Path, id: &str, value: serde_json
 async fn cancelled_checkpoint_validation_rejects_malformed_archives() {
     let (dir, runtime, _network, keys, id) = fixture().await;
     let manager = runtime.accounts();
-    let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let mut c = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
     c.snapshot.cancellation_pending = true;
-    manager.save_onboarding(&mut c).unwrap();
+    manager.account_setup().save_onboarding(&mut c).unwrap();
     manager
         .app
         .account_home()
@@ -5353,6 +6553,7 @@ async fn cancelled_checkpoint_validation_rejects_malformed_archives() {
     write_cancelled_checkpoint(dir.path(), &id, unsupported);
     assert!(
         manager
+            .account_setup()
             .begin_onboarding(
                 Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
                 options(),
@@ -5367,6 +6568,7 @@ async fn cancelled_checkpoint_validation_rejects_malformed_archives() {
     write_cancelled_checkpoint(dir.path(), &id, empty);
     assert!(
         manager
+            .account_setup()
             .begin_onboarding(
                 Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
                 options(),
@@ -5379,6 +6581,7 @@ async fn cancelled_checkpoint_validation_rejects_malformed_archives() {
     write_cancelled_checkpoint(dir.path(), &id, order);
     assert!(
         manager
+            .account_setup()
             .begin_onboarding(
                 Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
                 options(),
@@ -5393,9 +6596,13 @@ async fn cancelled_checkpoint_validation_rejects_malformed_archives() {
 async fn cancelled_v1_and_v2_archives_migrate_and_overflow_fails_closed() {
     let (dir, runtime, _network, keys, id) = fixture().await;
     let manager = runtime.accounts();
-    let mut c = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let mut c = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
     c.snapshot.cancellation_pending = true;
-    manager.save_onboarding(&mut c).unwrap();
+    manager.account_setup().save_onboarding(&mut c).unwrap();
     manager
         .app
         .account_home()
@@ -5411,6 +6618,7 @@ async fn cancelled_v1_and_v2_archives_migrate_and_overflow_fails_closed() {
     write_cancelled_checkpoint(dir.path(), &id, v2);
     assert!(
         manager
+            .account_setup()
             .begin_onboarding(
                 Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
                 options(),
@@ -5418,7 +6626,11 @@ async fn cancelled_v1_and_v2_archives_migrate_and_overflow_fails_closed() {
             .await
             .is_ok()
     );
-    manager.cancel_onboarding(&id).await.unwrap();
+    manager
+        .account_setup()
+        .cancel_onboarding(&id)
+        .await
+        .unwrap();
     let mut v1 = serde_json::to_value(&c).unwrap();
     v1["version"] = serde_json::json!(1);
     v1["snapshot"]["steps"].as_array_mut().unwrap().remove(4);
@@ -5426,6 +6638,7 @@ async fn cancelled_v1_and_v2_archives_migrate_and_overflow_fails_closed() {
     write_cancelled_checkpoint(dir.path(), &id, v1);
     assert!(
         manager
+            .account_setup()
             .begin_onboarding(
                 Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
                 options(),
@@ -5433,7 +6646,11 @@ async fn cancelled_v1_and_v2_archives_migrate_and_overflow_fails_closed() {
             .await
             .is_ok()
     );
-    manager.cancel_onboarding(&id).await.unwrap();
+    manager
+        .account_setup()
+        .cancel_onboarding(&id)
+        .await
+        .unwrap();
     let mut overflow = serde_json::to_value(&c).unwrap();
     overflow["snapshot"]["revision"] = serde_json::json!(u64::MAX);
     overflow["attempt_start_revision"] = serde_json::json!(u64::MAX);
@@ -5441,6 +6658,7 @@ async fn cancelled_v1_and_v2_archives_migrate_and_overflow_fails_closed() {
     write_cancelled_checkpoint(dir.path(), &id, overflow);
     assert!(
         manager
+            .account_setup()
             .begin_onboarding(
                 Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
                 options(),
@@ -5456,9 +6674,16 @@ async fn cancelled_v1_and_v2_archives_migrate_and_overflow_fails_closed() {
 async fn pending_checkpoint_updates_fail_without_replacing_input_or_stored_bytes() {
     let (_dir, runtime, _, _, id) = fixture().await;
     let manager = runtime.accounts();
-    let mut checkpoint = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let mut checkpoint = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
     checkpoint.snapshot.cancellation_pending = true;
-    manager.save_onboarding(&mut checkpoint).unwrap();
+    manager
+        .account_setup()
+        .save_onboarding(&mut checkpoint)
+        .unwrap();
     let bytes = manager
         .app
         .account_home()
@@ -5470,7 +6695,7 @@ async fn pending_checkpoint_updates_fail_without_replacing_input_or_stored_bytes
         stale.snapshot.cancellation_pending = pending;
         stale.snapshot.revision += 100;
         let input = serde_json::to_vec(&stale).unwrap();
-        assert!(manager.save_onboarding(&mut stale).is_err());
+        assert!(manager.account_setup().save_onboarding(&mut stale).is_err());
         assert_eq!(serde_json::to_vec(&stale).unwrap(), input);
         assert_eq!(
             manager
@@ -5482,21 +6707,33 @@ async fn pending_checkpoint_updates_fail_without_replacing_input_or_stored_bytes
             bytes
         );
     }
-    manager.cancel_onboarding(&id).await.unwrap();
-    manager.cancel_onboarding(&id).await.unwrap();
+    manager
+        .account_setup()
+        .cancel_onboarding(&id)
+        .await
+        .unwrap();
+    manager
+        .account_setup()
+        .cancel_onboarding(&id)
+        .await
+        .unwrap();
     runtime.shutdown_and_close().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_hold_retains_release_before_the_wait_is_registered() {
     let (_dir, runtime, _, _, _) = fixture().await;
-    let hold = runtime.accounts().install_onboarding_activation_hold();
+    let hold = runtime
+        .accounts()
+        .account_setup()
+        .install_onboarding_activation_hold();
     hold.release.notify_one();
     timeout(
         Duration::from_secs(2),
         runtime
             .accounts()
-            .await_onboarding_test_hold(&runtime.accounts().onboarding_test_holds.activation),
+            .account_setup()
+            .await_onboarding_test_hold(&runtime.accounts().setup.onboarding_test_holds.activation),
     )
     .await
     .unwrap();
@@ -5535,6 +6772,8 @@ fn controlled_reap_worker() -> (
             handle,
             shutdown,
             commands,
+            unit: Default::default(),
+            read_state: Default::default(),
         },
         release,
         dropped,
@@ -5548,9 +6787,16 @@ async fn duplicate_reapers_own_pending_and_completed_workers_until_destruction()
         let manager = runtime.accounts();
         let (first, first_exit, first_dropped) = controlled_reap_worker();
         let mut first_exit = Some(first_exit);
-        manager.start_tracked_worker_reap(&id, first, Duration::from_secs(2));
-        let mut old_completion =
-            manager.onboarding_cancellations.lock().unwrap().reaping[&id].subscribe();
+        manager
+            .account_setup()
+            .start_tracked_worker_reap(&id, first, Duration::from_secs(2));
+        let mut old_completion = manager
+            .setup
+            .onboarding_cancellations
+            .lock()
+            .unwrap()
+            .reaping[&id]
+            .subscribe();
         if previous_complete {
             first_exit.take().unwrap().send(()).unwrap();
             timeout(
@@ -5565,15 +6811,19 @@ async fn duplicate_reapers_own_pending_and_completed_workers_until_destruction()
         if !previous_complete {
             assert!(
                 manager
+                    .account_setup()
                     .await_tracked_worker_reap(&id, Duration::ZERO)
                     .await
                     .is_err()
             );
         }
         let (second, second_exit, second_dropped) = controlled_reap_worker();
-        manager.start_tracked_worker_reap(&id, second, Duration::from_secs(2));
+        manager
+            .account_setup()
+            .start_tracked_worker_reap(&id, second, Duration::from_secs(2));
         assert!(
             manager
+                .account_setup()
                 .await_tracked_worker_reap(&id, Duration::ZERO)
                 .await
                 .is_err()
@@ -5584,6 +6834,7 @@ async fn duplicate_reapers_own_pending_and_completed_workers_until_destruction()
             // Even destruction of the new worker cannot stand in for the old.
             assert!(
                 manager
+                    .account_setup()
                     .await_tracked_worker_reap(&id, Duration::ZERO)
                     .await
                     .is_err()
@@ -5604,17 +6855,27 @@ async fn duplicate_reapers_own_pending_and_completed_workers_until_destruction()
 async fn shutdown_joins_late_reaper_after_owned_cancellation_times_out() {
     let (_dir, runtime, _, _, id) = fixture().await;
     let manager = runtime.accounts();
-    let mut checkpoint = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let mut checkpoint = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
     checkpoint.set(
         OnboardingStep::KeyPackage,
         OnboardingStatus::Checking,
         vec![],
     );
-    manager.save_onboarding(&mut checkpoint).unwrap();
+    manager
+        .account_setup()
+        .save_onboarding(&mut checkpoint)
+        .unwrap();
     manager.reconcile().await.unwrap();
-    let hold = manager.install_onboarding_worker_reap_hold();
+    let hold = manager
+        .account_setup()
+        .install_onboarding_worker_reap_hold();
     let workers = manager.worker_transactions.lock().await;
-    let cancel = manager.cancel_onboarding(&id);
+    let setup = manager.account_setup();
+    let cancel = setup.cancel_onboarding(&id);
     tokio::pin!(cancel);
     assert!(futures::poll!(&mut cancel).is_pending());
     let shutdown = manager.shutdown();
@@ -5631,11 +6892,14 @@ async fn shutdown_joins_late_reaper_after_owned_cancellation_times_out() {
     hold.release.notify_one();
     timeout(Duration::from_secs(2), shutdown).await.unwrap();
     assert_eq!(
-        manager.onboarding_worker_reap_watch_state(&id),
+        manager
+            .account_setup()
+            .onboarding_worker_reap_watch_state(&id),
         Some((true, 0))
     );
     assert!(
         manager
+            .setup
             .onboarding_cancellations
             .lock()
             .unwrap()
@@ -5653,16 +6917,22 @@ async fn explicit_recovery_preserves_opaque_evidence_and_rejects_stale_approval_
         let home = manager.app.account_home();
         missing_relays(&runtime, &id).await;
         let old_proposal = manager
+            .account_setup()
             .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
             .await
             .unwrap();
         network.zero_acks.store(true, Ordering::SeqCst);
         manager
+            .account_setup()
             .approve_onboarding_repair(&id, old_proposal.revision)
             .await
             .unwrap();
         let signed_active = home.account_onboarding(&id).unwrap().unwrap();
-        let mut old = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+        let mut old = manager
+            .setup_records()
+            .onboarding_checkpoint(&id)
+            .unwrap()
+            .unwrap();
         old.snapshot.cancellation_pending = true;
         old.approved = true;
         let bytes = match fault {
@@ -5686,11 +6956,33 @@ async fn explicit_recovery_preserves_opaque_evidence_and_rejects_stale_approval_
         .unwrap();
         let setup = home.account_setup_state(&id).unwrap();
         let context = home.account_setup_context(&id).unwrap();
-        assert!(manager.onboarding_recovery_required(&id).unwrap());
-        assert!(manager.recover_onboarding(&id, false).await.is_err());
+        assert!(
+            manager
+                .account_setup()
+                .onboarding_recovery_required(&id)
+                .unwrap()
+        );
+        assert!(
+            manager
+                .account_setup()
+                .recover_onboarding(&id, false)
+                .await
+                .is_err()
+        );
         assert!(home.account_onboarding_recovery(&id).unwrap().is_none());
-        let epoch = manager.recover_onboarding(&id, true).await.unwrap();
-        assert_eq!(manager.recover_onboarding(&id, true).await.unwrap(), epoch);
+        let epoch = manager
+            .account_setup()
+            .recover_onboarding(&id, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            manager
+                .account_setup()
+                .recover_onboarding(&id, true)
+                .await
+                .unwrap(),
+            epoch
+        );
         assert_eq!(home.account_setup_state(&id).unwrap(), setup);
         assert_eq!(home.account_setup_context(&id).unwrap(), context);
         assert!(manager.resolve(&id).unwrap().signed_out);
@@ -5710,6 +7002,7 @@ async fn explicit_recovery_preserves_opaque_evidence_and_rejects_stale_approval_
             4
         );
         let fresh = manager
+            .account_setup()
             .begin_onboarding(
                 Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
                 options(),
@@ -5721,40 +7014,49 @@ async fn explicit_recovery_preserves_opaque_evidence_and_rejects_stale_approval_
         // A stale captured checkpoint cannot write even if its number matches.
         old.version = ONBOARDING_VERSION;
         old.attempt_start_revision = manager
+            .setup_records()
             .onboarding_checkpoint(&id)
             .unwrap()
             .unwrap()
             .attempt_start_revision;
-        assert!(manager.save_onboarding(&mut old).is_err());
-        manager.run_onboarding(&id).await.unwrap();
+        assert!(manager.account_setup().save_onboarding(&mut old).is_err());
+        manager.account_setup().run_onboarding(&id).await.unwrap();
         missing_relays(&runtime, &id).await;
         let proposal = manager
+            .account_setup()
             .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
             .await
             .unwrap();
         assert!(
             manager
+                .account_setup()
                 .approve_onboarding_repair(&id, proposal.revision)
                 .await
                 .is_err()
         );
         assert!(
             manager
+                .account_setup()
                 .approve_onboarding_repair_in_epoch(&id, proposal.revision, &"f".repeat(64))
                 .await
                 .is_err()
         );
         network.zero_acks.store(true, Ordering::SeqCst);
         manager
+            .account_setup()
             .approve_onboarding_repair_in_epoch(&id, proposal.revision, &epoch)
             .await
             .unwrap();
         assert_eq!(network.attempts.lock().len(), 2);
-        manager.cancel_onboarding(&id).await.unwrap();
+        manager
+            .account_setup()
+            .cancel_onboarding(&id)
+            .await
+            .unwrap();
         runtime.shutdown_and_close().await.unwrap();
         let reopened = super::tests::runtime(dir.path(), network.clone());
         let restarted = reopened
-            .accounts()
+            .account_setup()
             .begin_onboarding(
                 Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
                 options(),
@@ -5763,9 +7065,13 @@ async fn explicit_recovery_preserves_opaque_evidence_and_rejects_stale_approval_
             .unwrap();
         assert_eq!(restarted.recovery_epoch.as_deref(), Some(epoch.as_str()));
         assert!(restarted.proposal.is_none());
-        reopened.accounts().run_onboarding(&id).await.unwrap();
+        reopened.account_setup().run_onboarding(&id).await.unwrap();
         assert_eq!(network.attempts.lock().len(), 2);
-        reopened.accounts().cancel_onboarding(&id).await.unwrap();
+        reopened
+            .account_setup()
+            .cancel_onboarding(&id)
+            .await
+            .unwrap();
         reopened.shutdown_and_close().await.unwrap();
     }
 }
@@ -5779,7 +7085,11 @@ async fn unreadable_cancelled_evidence_does_not_block_live_cancellation_intent()
         .join(&id)
         .join("onboarding-cancelled.json");
     std::fs::write(&path, b"unreadable older cancellation").unwrap();
-    runtime.accounts().cancel_onboarding(&id).await.unwrap();
+    runtime
+        .account_setup()
+        .cancel_onboarding(&id)
+        .await
+        .unwrap();
     let latest: OnboardingCheckpoint =
         serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
     assert!(latest.snapshot.cancellation_pending);
@@ -5803,7 +7113,11 @@ async fn pending_recovery_resumes_after_intent_or_tombstone_write_on_reopen() {
             cancelled,
         )
         .unwrap();
-        let epoch = manager.recover_onboarding(&id, true).await.unwrap();
+        let epoch = manager
+            .account_setup()
+            .recover_onboarding(&id, true)
+            .await
+            .unwrap();
         let mut intent: serde_json::Value =
             serde_json::from_slice(&home.account_onboarding_recovery(&id).unwrap().unwrap())
                 .unwrap();
@@ -5824,10 +7138,15 @@ async fn pending_recovery_resumes_after_intent_or_tombstone_write_on_reopen() {
             .unwrap();
         first.shutdown_and_close().await.unwrap();
         let second = runtime(dir.path(), network);
-        assert!(second.accounts().onboarding_recovery_required(&id).unwrap());
         assert!(
             second
-                .accounts()
+                .account_setup()
+                .onboarding_recovery_required(&id)
+                .unwrap()
+        );
+        assert!(
+            second
+                .account_setup()
                 .begin_onboarding(
                     Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
                     options()
@@ -5836,9 +7155,14 @@ async fn pending_recovery_resumes_after_intent_or_tombstone_write_on_reopen() {
                 .is_err()
         );
         second.accounts().reconcile().await.unwrap();
-        assert!(!second.accounts().onboarding_recovery_required(&id).unwrap());
+        assert!(
+            !second
+                .account_setup()
+                .onboarding_recovery_required(&id)
+                .unwrap()
+        );
         let fresh = second
-            .accounts()
+            .account_setup()
             .begin_onboarding(
                 Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
                 options(),
@@ -5846,8 +7170,8 @@ async fn pending_recovery_resumes_after_intent_or_tombstone_write_on_reopen() {
             .await
             .unwrap();
         assert_eq!(fresh.recovery_epoch.as_deref(), Some(epoch.as_str()));
-        second.accounts().run_onboarding(&id).await.unwrap();
-        second.accounts().cancel_onboarding(&id).await.unwrap();
+        second.account_setup().run_onboarding(&id).await.unwrap();
+        second.account_setup().cancel_onboarding(&id).await.unwrap();
         second.shutdown_and_close().await.unwrap();
     }
 }
@@ -5861,8 +7185,17 @@ async fn recovery_of_unreadable_recovery_journal_preserves_its_bytes() {
         .account_home()
         .set_account_onboarding_recovery(&id, b"unknown recovery journal")
         .unwrap();
-    assert!(manager.onboarding_recovery_required(&id).unwrap());
-    let epoch = manager.recover_onboarding(&id, true).await.unwrap();
+    assert!(
+        manager
+            .account_setup()
+            .onboarding_recovery_required(&id)
+            .unwrap()
+    );
+    let epoch = manager
+        .account_setup()
+        .recover_onboarding(&id, true)
+        .await
+        .unwrap();
     let retained: serde_json::Value = serde_json::from_slice(
         &manager
             .app
@@ -5877,6 +7210,7 @@ async fn recovery_of_unreadable_recovery_journal_preserves_its_bytes() {
         serde_json::json!(b"unknown recovery journal".to_vec())
     );
     let fresh = manager
+        .account_setup()
         .begin_onboarding(
             Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
             options(),
@@ -5884,7 +7218,11 @@ async fn recovery_of_unreadable_recovery_journal_preserves_its_bytes() {
         .await
         .unwrap();
     assert_eq!(fresh.recovery_epoch.as_deref(), Some(epoch.as_str()));
-    manager.cancel_onboarding(&id).await.unwrap();
+    manager
+        .account_setup()
+        .cancel_onboarding(&id)
+        .await
+        .unwrap();
     runtime.shutdown_and_close().await.unwrap();
 }
 
@@ -5902,11 +7240,13 @@ async fn recovery_retires_blocked_external_signer_and_survives_dropped_caller() 
     };
     let manager = runtime.accounts();
     manager
+        .account_setup()
         .begin_external_signer_onboarding(id.clone(), signer.clone(), options())
         .await
         .unwrap();
     missing_relays(&runtime, &id).await;
     let proposal = manager
+        .account_setup()
         .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
         .await
         .unwrap();
@@ -5916,6 +7256,7 @@ async fn recovery_retires_blocked_external_signer_and_survives_dropped_caller() 
         let id = id.clone();
         async move {
             manager
+                .account_setup()
                 .approve_onboarding_repair(&id, proposal.revision)
                 .await
         }
@@ -5934,12 +7275,16 @@ async fn recovery_retires_blocked_external_signer_and_survives_dropped_caller() 
     )
     .unwrap();
     let workers = manager.worker_transactions.lock().await;
-    let mut recovery = Box::pin(manager.recover_onboarding(&id, true));
+    let setup = manager.account_setup();
+    let mut recovery = Box::pin(setup.recover_onboarding(&id, true));
     assert!(futures::poll!(&mut recovery).is_pending());
     // Drop the public waiter; the registered task still owns completion.
     drop(recovery);
     drop(workers);
-    manager.await_onboarding_owned_handles_finished().await;
+    manager
+        .account_setup()
+        .await_onboarding_owned_handles_finished()
+        .await;
     timeout(Duration::from_secs(2), approval)
         .await
         .unwrap()
@@ -5948,25 +7293,33 @@ async fn recovery_retires_blocked_external_signer_and_survives_dropped_caller() 
     signer.block.store(false, Ordering::SeqCst);
     let fresh = timeout(
         Duration::from_secs(2),
-        manager.begin_external_signer_onboarding(id.clone(), signer, options()),
+        manager
+            .account_setup()
+            .begin_external_signer_onboarding(id.clone(), signer, options()),
     )
     .await
     .unwrap()
     .unwrap();
     let epoch = fresh.recovery_epoch.unwrap();
-    manager.run_onboarding(&id).await.unwrap();
+    manager.account_setup().run_onboarding(&id).await.unwrap();
     missing_relays(&runtime, &id).await;
     let proposal = manager
+        .account_setup()
         .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
         .await
         .unwrap();
     network.zero_acks.store(true, Ordering::SeqCst);
     manager
+        .account_setup()
         .approve_onboarding_repair_in_epoch(&id, proposal.revision, &epoch)
         .await
         .unwrap();
     assert_eq!(network.attempts.lock().len(), 1);
-    manager.cancel_onboarding(&id).await.unwrap();
+    manager
+        .account_setup()
+        .cancel_onboarding(&id)
+        .await
+        .unwrap();
     runtime.shutdown_and_close().await.unwrap();
 }
 
@@ -5975,12 +7328,17 @@ async fn reap_waiter_captured_before_duplicate_registration_waits_for_both_worke
     let (_dir, runtime, _, _, id) = fixture().await;
     let manager = runtime.accounts();
     let (first, first_exit, first_dropped) = controlled_reap_worker();
-    manager.start_tracked_worker_reap(&id, first, Duration::from_secs(2));
-    let waiting = manager.await_tracked_worker_reap(&id, Duration::from_secs(2));
+    manager
+        .account_setup()
+        .start_tracked_worker_reap(&id, first, Duration::from_secs(2));
+    let setup = manager.account_setup();
+    let waiting = setup.await_tracked_worker_reap(&id, Duration::from_secs(2));
     tokio::pin!(waiting);
     assert!(futures::poll!(&mut waiting).is_pending());
     let (second, second_exit, second_dropped) = controlled_reap_worker();
-    manager.start_tracked_worker_reap(&id, second, Duration::from_secs(2));
+    manager
+        .account_setup()
+        .start_tracked_worker_reap(&id, second, Duration::from_secs(2));
     first_exit.send(()).unwrap();
     // Deterministically wait for first completion while holding the new worker.
     timeout(Duration::from_secs(2), async {
@@ -6010,15 +7368,24 @@ async fn recovery_device_acknowledgment_requires_the_displayed_epoch() {
         b"unreadable",
     )
     .unwrap();
-    let epoch = manager.recover_onboarding(&id, true).await.unwrap();
+    let epoch = manager
+        .account_setup()
+        .recover_onboarding(&id, true)
+        .await
+        .unwrap();
     manager
+        .account_setup()
         .begin_onboarding(
             Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
             options(),
         )
         .await
         .unwrap();
-    let mut checkpoint = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let mut checkpoint = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
     for step in [
         OnboardingStep::Profile,
         OnboardingStep::Follows,
@@ -6028,6 +7395,7 @@ async fn recovery_device_acknowledgment_requires_the_displayed_epoch() {
         checkpoint.set(step, OnboardingStatus::Passed, vec![]);
     }
     manager
+        .account_setup()
         .check_onboarding_single_device(&mut checkpoint)
         .await
         .unwrap();
@@ -6037,39 +7405,51 @@ async fn recovery_device_acknowledgment_requires_the_displayed_epoch() {
         OnboardingStatus::RetryableFailure,
         vec![],
     );
-    manager.save_onboarding(&mut checkpoint).unwrap();
+    manager
+        .account_setup()
+        .save_onboarding(&mut checkpoint)
+        .unwrap();
     let revision = checkpoint.snapshot.revision;
     assert!(
         manager
+            .account_setup()
             .acknowledge_onboarding_single_device(&id, revision)
             .await
             .is_err()
     );
     assert!(
         manager
+            .account_setup()
             .acknowledge_onboarding_single_device_in_epoch(&id, revision, "stale")
             .await
             .is_err()
     );
     assert!(
         !manager
+            .setup_records()
             .onboarding_checkpoint(&id)
             .unwrap()
             .unwrap()
             .single_device_acknowledged
     );
     manager
+        .account_setup()
         .acknowledge_onboarding_single_device_in_epoch(&id, revision, &epoch)
         .await
         .unwrap();
     assert!(
         manager
+            .setup_records()
             .onboarding_checkpoint(&id)
             .unwrap()
             .unwrap()
             .single_device_acknowledged
     );
-    manager.cancel_onboarding(&id).await.unwrap();
+    manager
+        .account_setup()
+        .cancel_onboarding(&id)
+        .await
+        .unwrap();
     runtime.shutdown_and_close().await.unwrap();
 }
 
@@ -6083,21 +7463,40 @@ async fn repeated_recovery_changes_epoch_even_when_attempt_numbers_repeat() {
         .join(&id)
         .join("onboarding-cancelled.json");
     std::fs::write(&cancelled_path, b"broken").unwrap();
-    let first_epoch = manager.recover_onboarding(&id, true).await.unwrap();
+    let first_epoch = manager
+        .account_setup()
+        .recover_onboarding(&id, true)
+        .await
+        .unwrap();
     manager
+        .account_setup()
         .begin_onboarding(
             Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
             options(),
         )
         .await
         .unwrap();
-    let mut old = manager.onboarding_checkpoint(&id).unwrap().unwrap();
-    manager.cancel_onboarding(&id).await.unwrap();
+    let mut old = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
+    manager
+        .account_setup()
+        .cancel_onboarding(&id)
+        .await
+        .unwrap();
     // Losing the tombstone must not silently restart this epoch at one.
     std::fs::remove_file(&cancelled_path).unwrap();
-    assert!(manager.onboarding_recovery_required(&id).unwrap());
     assert!(
         manager
+            .account_setup()
+            .onboarding_recovery_required(&id)
+            .unwrap()
+    );
+    assert!(
+        manager
+            .account_setup()
             .begin_onboarding(
                 Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
                 options()
@@ -6105,24 +7504,38 @@ async fn repeated_recovery_changes_epoch_even_when_attempt_numbers_repeat() {
             .await
             .is_err()
     );
-    let second_epoch = manager.recover_onboarding(&id, true).await.unwrap();
+    let second_epoch = manager
+        .account_setup()
+        .recover_onboarding(&id, true)
+        .await
+        .unwrap();
     assert_ne!(first_epoch, second_epoch);
     manager
+        .account_setup()
         .begin_onboarding(
             Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
             options(),
         )
         .await
         .unwrap();
-    let fresh = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let fresh = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
     assert_eq!(fresh.attempt_start_revision, old.attempt_start_revision);
-    assert!(manager.save_onboarding(&mut old).is_err());
+    assert!(manager.account_setup().save_onboarding(&mut old).is_err());
     assert!(
         manager
+            .account_setup()
             .require_captured_attempt(&fresh, old.attempt())
             .is_err()
     );
-    manager.cancel_onboarding(&id).await.unwrap();
+    manager
+        .account_setup()
+        .cancel_onboarding(&id)
+        .await
+        .unwrap();
     runtime.shutdown_and_close().await.unwrap();
 }
 
@@ -6130,7 +7543,11 @@ async fn repeated_recovery_changes_epoch_even_when_attempt_numbers_repeat() {
 async fn exhausted_active_proposals_fail_closed_and_can_be_explicitly_recovered() {
     let (dir, runtime, _, keys, id) = fixture().await;
     let manager = runtime.accounts();
-    let mut checkpoint = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let mut checkpoint = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
     checkpoint.set(OnboardingStep::Relays, OnboardingStatus::NeedsInput, vec![]);
     checkpoint.set(
         OnboardingStep::Follows,
@@ -6147,12 +7564,14 @@ async fn exhausted_active_proposals_fail_closed_and_can_be_explicitly_recovered(
         .unwrap();
     assert!(
         manager
+            .account_setup()
             .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
             .await
             .is_err()
     );
     assert!(
         manager
+            .account_setup()
             .propose_onboarding_follows(&id, vec![])
             .await
             .is_err()
@@ -6166,9 +7585,19 @@ async fn exhausted_active_proposals_fail_closed_and_can_be_explicitly_recovered(
             .unwrap(),
         bytes
     );
-    assert!(manager.onboarding_recovery_required(&id).unwrap());
-    let epoch = manager.recover_onboarding(&id, true).await.unwrap();
+    assert!(
+        manager
+            .account_setup()
+            .onboarding_recovery_required(&id)
+            .unwrap()
+    );
+    let epoch = manager
+        .account_setup()
+        .recover_onboarding(&id, true)
+        .await
+        .unwrap();
     let fresh = manager
+        .account_setup()
         .begin_onboarding(
             Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
             options(),
@@ -6176,8 +7605,12 @@ async fn exhausted_active_proposals_fail_closed_and_can_be_explicitly_recovered(
         .await
         .unwrap();
     assert_eq!(fresh.recovery_epoch.as_deref(), Some(epoch.as_str()));
-    manager.run_onboarding(&id).await.unwrap();
-    manager.cancel_onboarding(&id).await.unwrap();
+    manager.account_setup().run_onboarding(&id).await.unwrap();
+    manager
+        .account_setup()
+        .cancel_onboarding(&id)
+        .await
+        .unwrap();
     runtime.shutdown_and_close().await.unwrap();
 }
 
@@ -6185,13 +7618,20 @@ async fn exhausted_active_proposals_fail_closed_and_can_be_explicitly_recovered(
 async fn shutdown_during_recovery_reap_leaves_intent_for_the_next_runtime() {
     let (dir, first, network, keys, id) = fixture().await;
     let manager = first.accounts();
-    let mut checkpoint = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let mut checkpoint = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
     checkpoint.set(
         OnboardingStep::KeyPackage,
         OnboardingStatus::Checking,
         vec![],
     );
-    manager.save_onboarding(&mut checkpoint).unwrap();
+    manager
+        .account_setup()
+        .save_onboarding(&mut checkpoint)
+        .unwrap();
     manager.reconcile().await.unwrap();
     assert!(manager.onboarding_worker_tracked(&id).await);
     std::fs::write(
@@ -6202,8 +7642,11 @@ async fn shutdown_during_recovery_reap_leaves_intent_for_the_next_runtime() {
         b"unsupported evidence",
     )
     .unwrap();
-    let hold = manager.install_onboarding_worker_reap_hold();
-    let mut recovery = Box::pin(manager.recover_onboarding(&id, true));
+    let hold = manager
+        .account_setup()
+        .install_onboarding_worker_reap_hold();
+    let setup = manager.account_setup();
+    let mut recovery = Box::pin(setup.recover_onboarding(&id, true));
     assert!(futures::poll!(&mut recovery).is_pending());
     hold.wait_until_entered().await;
     let mut shutdown = Box::pin(manager.shutdown());
@@ -6216,12 +7659,17 @@ async fn shutdown_during_recovery_reap_leaves_intent_for_the_next_runtime() {
             .is_err()
     );
     timeout(Duration::from_secs(2), shutdown).await.unwrap();
-    assert!(manager.onboarding_recovery_pending(&id).unwrap());
+    assert!(
+        manager
+            .setup_records()
+            .onboarding_recovery_pending(&id)
+            .unwrap()
+    );
     first.shutdown_and_close().await.unwrap();
     let second = runtime(dir.path(), network);
     second.accounts().reconcile().await.unwrap();
     let fresh = second
-        .accounts()
+        .account_setup()
         .begin_onboarding(
             Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
             options(),
@@ -6229,8 +7677,8 @@ async fn shutdown_during_recovery_reap_leaves_intent_for_the_next_runtime() {
         .await
         .unwrap();
     assert!(fresh.recovery_epoch.is_some());
-    second.accounts().run_onboarding(&id).await.unwrap();
-    second.accounts().cancel_onboarding(&id).await.unwrap();
+    second.account_setup().run_onboarding(&id).await.unwrap();
+    second.account_setup().cancel_onboarding(&id).await.unwrap();
     second.shutdown_and_close().await.unwrap();
 }
 
@@ -6238,13 +7686,20 @@ async fn shutdown_during_recovery_reap_leaves_intent_for_the_next_runtime() {
 async fn recovery_sign_out_refreshes_attention_before_worker_reap_finishes() {
     let (dir, runtime, _network, _keys, id) = fixture().await;
     let manager = runtime.accounts();
-    let mut checkpoint = manager.onboarding_checkpoint(&id).unwrap().unwrap();
+    let mut checkpoint = manager
+        .setup_records()
+        .onboarding_checkpoint(&id)
+        .unwrap()
+        .unwrap();
     checkpoint.set(
         OnboardingStep::KeyPackage,
         OnboardingStatus::Checking,
         vec![],
     );
-    manager.save_onboarding(&mut checkpoint).unwrap();
+    manager
+        .account_setup()
+        .save_onboarding(&mut checkpoint)
+        .unwrap();
     manager.reconcile().await.unwrap();
     assert!(manager.onboarding_worker_tracked(&id).await);
     let mut attention = runtime.subscribe_account_attention().await.unwrap();
@@ -6257,8 +7712,11 @@ async fn recovery_sign_out_refreshes_attention_before_worker_reap_finishes() {
         b"unsupported evidence",
     )
     .unwrap();
-    let hold = manager.install_onboarding_worker_reap_hold();
-    let mut recovery = Box::pin(manager.recover_onboarding(&id, true));
+    let hold = manager
+        .account_setup()
+        .install_onboarding_worker_reap_hold();
+    let setup = manager.account_setup();
+    let mut recovery = Box::pin(setup.recover_onboarding(&id, true));
     assert!(futures::poll!(&mut recovery).is_pending());
     hold.wait_until_entered().await;
     assert!(manager.resolve(&id).unwrap().signed_out);
@@ -6303,14 +7761,19 @@ async fn manual_relay_edit_restart_preserves_preview_and_retries_exact_signed_ev
     *network.events.lock() = vec![source.clone()];
     let mut checkpoint = first
         .accounts()
+        .setup_records()
         .onboarding_checkpoint(&id)
         .unwrap()
         .unwrap();
     checkpoint.set(OnboardingStep::Relays, OnboardingStatus::NeedsInput, vec![]);
     checkpoint.records[OnboardingStep::Relays.index()] = Some(source.clone());
-    first.accounts().save_onboarding(&mut checkpoint).unwrap();
-    let preview = first
+    first
         .accounts()
+        .account_setup()
+        .save_onboarding(&mut checkpoint)
+        .unwrap();
+    let preview = first
+        .account_setup()
         .propose_onboarding_relays(
             &id,
             OnboardingStep::Relays,
@@ -6332,6 +7795,7 @@ async fn manual_relay_edit_restart_preserves_preview_and_retries_exact_signed_ev
     assert!(network.attempts.lock().is_empty());
     let checkpoint = first
         .accounts()
+        .setup_records()
         .onboarding_checkpoint(&id)
         .unwrap()
         .unwrap();
@@ -6342,11 +7806,15 @@ async fn manual_relay_edit_restart_preserves_preview_and_retries_exact_signed_ev
     first.shutdown_and_close().await.unwrap();
 
     let second = runtime(directory.path(), network.clone());
-    let restored = second.accounts().onboarding_snapshot(&id).unwrap().unwrap();
+    let restored = second
+        .account_setup()
+        .onboarding_snapshot(&id)
+        .unwrap()
+        .unwrap();
     assert_eq!(restored.proposal, preview.proposal);
     assert!(
         second
-            .accounts()
+            .account_setup()
             .approve_onboarding_repair(&id, preview.revision - 1)
             .await
             .is_err()
@@ -6354,7 +7822,7 @@ async fn manual_relay_edit_restart_preserves_preview_and_retries_exact_signed_ev
     assert!(network.attempts.lock().is_empty());
     network.zero_acks.store(true, Ordering::SeqCst);
     second
-        .accounts()
+        .account_setup()
         .approve_onboarding_repair(&id, preview.revision)
         .await
         .unwrap();
@@ -6365,7 +7833,7 @@ async fn manual_relay_edit_restart_preserves_preview_and_retries_exact_signed_ev
 
     let third = runtime(directory.path(), network.clone());
     third
-        .accounts()
+        .account_setup()
         .retry_onboarding_step(&id, OnboardingStep::Relays)
         .await
         .unwrap();
@@ -6494,6 +7962,7 @@ async fn manual_relay_edit_inbox_preview_preserves_extensions_and_rejects_tamper
     *network.events.lock() = vec![source.clone()];
     let mut checkpoint = runtime
         .accounts()
+        .setup_records()
         .onboarding_checkpoint(&id)
         .unwrap()
         .unwrap();
@@ -6503,9 +7972,13 @@ async fn manual_relay_edit_inbox_preview_preserves_extensions_and_rejects_tamper
         OnboardingStatus::NeedsInput,
         vec![],
     );
-    runtime.accounts().save_onboarding(&mut checkpoint).unwrap();
-    let preview = runtime
+    runtime
         .accounts()
+        .account_setup()
+        .save_onboarding(&mut checkpoint)
+        .unwrap();
+    let preview = runtime
+        .account_setup()
         .propose_onboarding_relays(
             &id,
             OnboardingStep::InboxRelays,
@@ -6530,6 +8003,7 @@ async fn manual_relay_edit_inbox_preview_preserves_extensions_and_rejects_tamper
     );
     let original = runtime
         .accounts()
+        .setup_records()
         .onboarding_checkpoint(&id)
         .unwrap()
         .unwrap();
@@ -6563,7 +8037,7 @@ async fn manual_relay_edit_inbox_preview_preserves_extensions_and_rejects_tamper
             .unwrap();
         assert!(
             runtime
-                .accounts()
+                .account_setup()
                 .approve_onboarding_repair(&id, preview.revision)
                 .await
                 .is_err()
@@ -6585,14 +8059,19 @@ async fn manual_relay_edit_unchanged_selection_cannot_publish() {
     );
     let mut checkpoint = runtime
         .accounts()
+        .setup_records()
         .onboarding_checkpoint(&id)
         .unwrap()
         .unwrap();
     checkpoint.records[OnboardingStep::Relays.index()] = Some(source);
     checkpoint.set(OnboardingStep::Relays, OnboardingStatus::NeedsInput, vec![]);
-    runtime.accounts().save_onboarding(&mut checkpoint).unwrap();
-    let preview = runtime
+    runtime
         .accounts()
+        .account_setup()
+        .save_onboarding(&mut checkpoint)
+        .unwrap();
+    let preview = runtime
+        .account_setup()
         .propose_onboarding_relays(
             &id,
             OnboardingStep::Relays,
@@ -6610,11 +8089,1316 @@ async fn manual_relay_edit_unchanged_selection_cannot_publish() {
     );
     assert!(
         runtime
-            .accounts()
+            .account_setup()
             .approve_onboarding_repair(&id, preview.revision)
             .await
             .is_err()
     );
     assert!(network.attempts.lock().is_empty());
     runtime.shutdown_and_close().await.unwrap();
+}
+
+/// What a test does to a just-created generated identity while its
+/// background publication is in flight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GeneratedSetupRemoval {
+    /// `sign_out_and_wipe`, as a host does (whitenoise-ios#1302).
+    Wipe,
+    /// The non-destructive `sign_out`.
+    SignOut,
+    /// `sign_out`, then `sign_in_account` once it has returned.
+    SignOutThenSignIn,
+    /// `sign_out`, cancelled by the host after it fenced generated setup.
+    CancelledSignOut,
+    /// The account directory removed without any runtime call, so nothing
+    /// can stop the background task first.
+    Directory,
+}
+
+/// A local file secret store that records every account it writes a secret
+/// for, so a test sees an identity even if setup rolls it back at once.
+struct RecordingSecretStore {
+    inner: marmot_account::LocalFileSecretStore,
+    written: FixtureMutex<Vec<String>>,
+}
+
+fn generated_setup_runtime(
+    path: &std::path::Path,
+    network: Arc<Network>,
+    secrets: Arc<RecordingSecretStore>,
+) -> MarmotAppRuntime {
+    let mut app = MarmotApp::with_relays_and_account_home(
+        path,
+        vec!["wss://default.example".into()],
+        AccountHome::open_with_secret_store(path, secrets),
+    )
+    .with_test_relay_client(network.clone());
+    app.relay_plane = MarmotRelayPlane::new_with_directory_fetcher_for_test(
+        Some(Duration::from_secs(120)),
+        network.clone(),
+        network,
+        false,
+    );
+    MarmotAppRuntime::new(app)
+}
+
+fn generated_setup_fixture() -> (
+    tempfile::TempDir,
+    MarmotAppRuntime,
+    Arc<Network>,
+    Arc<RecordingSecretStore>,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let secrets = Arc::new(RecordingSecretStore {
+        inner: marmot_account::LocalFileSecretStore::new(dir.path()),
+        written: FixtureMutex::new(Vec::new()),
+    });
+    let network = Arc::new(Network::default());
+    let runtime = generated_setup_runtime(dir.path(), network.clone(), secrets.clone());
+    (dir, runtime, network, secrets)
+}
+
+fn generated_setup_request() -> AccountSetupRequest {
+    AccountSetupRequest {
+        default_relays: vec![TransportEndpoint("wss://default.example".into())],
+        bootstrap_relays: vec![TransportEndpoint("wss://default.example".into())],
+        publish_missing_relay_lists: true,
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    }
+}
+
+impl marmot_account::AccountSecretStore for RecordingSecretStore {
+    fn has_secret_for_label(&self, label: &str) -> marmot_account::AccountHomeResult<bool> {
+        self.inner.has_secret_for_label(label)
+    }
+    fn write_secret(
+        &self,
+        account: &AccountSummary,
+        keys: &nostr::prelude::Keys,
+    ) -> marmot_account::AccountHomeResult<()> {
+        self.written.lock().push(account.account_id_hex.clone());
+        self.inner.write_secret(account, keys)
+    }
+    fn load_secret(
+        &self,
+        account: &AccountSummary,
+    ) -> marmot_account::AccountHomeResult<nostr::prelude::Keys> {
+        self.inner.load_secret(account)
+    }
+    fn remove_secret(&self, account: &AccountSummary) -> marmot_account::AccountHomeResult<()> {
+        self.inner.remove_secret(account)
+    }
+}
+
+fn assert_setup_stayed_removed(
+    runtime: &MarmotAppRuntime,
+    secrets: &RecordingSecretStore,
+    original: &AccountSummary,
+    other: Option<&AccountSetupResult>,
+) {
+    let home = runtime.accounts.app.account_home();
+    let expected = other
+        .iter()
+        .map(|result| result.account.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(home.accounts().unwrap(), expected);
+    let expected_writes = std::iter::once(original.account_id_hex.clone())
+        .chain(
+            other
+                .iter()
+                .map(|result| result.account.account_id_hex.clone()),
+        )
+        .collect::<Vec<_>>();
+    assert_eq!(
+        *secrets.written.lock(),
+        expected_writes,
+        "stale setup must not write a replacement secret, even if it later rolls back"
+    );
+    assert!(!home.account_dir(&original.label).exists());
+    assert!(matches!(
+        home.account(&original.account_id_hex),
+        Err(AccountHomeError::UnknownAccount(_))
+    ));
+    assert!(
+        !marmot_account::AccountSecretStore::has_secret_for_label(secrets, &original.label)
+            .unwrap()
+    );
+    if let Some(other) = other {
+        assert_eq!(
+            runtime
+                .account_setup_readiness(&other.account.label)
+                .unwrap(),
+            AccountSetupReadiness::LocalReady,
+            "the unrelated account must not become network-ready"
+        );
+        assert_eq!(
+            home.load_signing_keys(&other.account.label)
+                .unwrap()
+                .public_key()
+                .to_hex(),
+            other.account.account_id_hex
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_startup_stays_gone() {
+    for keep_other in [false, true] {
+        let (dir, runtime, network, secrets) = generated_setup_fixture();
+        let mut events = runtime.subscribe();
+        let original = runtime
+            .create_generated_account_local_ready(
+                generated_setup_request(),
+                false,
+                None,
+                GeneratedIdentity::ResumeOrCreate,
+            )
+            .await
+            .unwrap();
+        assert_eq!(original.readiness, AccountSetupReadiness::LocalReady);
+        assert_eq!(
+            runtime
+                .accounts
+                .app
+                .account_home()
+                .load_signing_keys(&original.account.label)
+                .unwrap()
+                .public_key()
+                .to_hex(),
+            original.account.account_id_hex
+        );
+
+        let admission = runtime.setup.generated_setup_local_transaction.lock().await;
+        let manager = runtime.accounts();
+        let removal = manager.remove_account(&original.account.account_id_hex);
+        tokio::pin!(removal);
+        let other = async {
+            if keep_other {
+                Some(
+                    runtime
+                        .create_generated_account_local_ready(
+                            generated_setup_request(),
+                            false,
+                            None,
+                            GeneratedIdentity::ResumeOrCreate,
+                        )
+                        .await
+                        .unwrap(),
+                )
+            } else {
+                None
+            }
+        };
+        tokio::pin!(other);
+        let startup = runtime.resume_generated_account_setup();
+        tokio::pin!(startup);
+        // FIFO admission queues removal, a fresh setup, then startup after it
+        // captured the original identity and its valid persisted context.
+        assert!(futures::poll!(removal.as_mut()).is_pending());
+        if keep_other {
+            assert!(futures::poll!(other.as_mut()).is_pending());
+        }
+        assert!(futures::poll!(startup.as_mut()).is_pending());
+        drop(admission);
+
+        // Drive removal to completion before polling either continuation, even
+        // when testing the old removal path that did not take local admission.
+        timeout(Duration::from_secs(30), removal)
+            .await
+            .unwrap()
+            .unwrap();
+        let other = timeout(Duration::from_secs(30), other).await.unwrap();
+        timeout(Duration::from_secs(30), startup)
+            .await
+            .unwrap()
+            .unwrap();
+        timeout(
+            Duration::from_secs(30),
+            runtime.setup.join_generated_setup_tasks_for_test(),
+        )
+        .await
+        .expect("startup's admitted generated setup must finish before observing its effects");
+
+        assert_setup_stayed_removed(&runtime, &secrets, &original.account, other.as_ref());
+        while let Ok(event) = events.try_recv() {
+            assert!(
+                !matches!(event, MarmotAppEvent::AccountError(error)
+                    if error.account_id_hex == original.account.account_id_hex),
+                "removed setup is a clean stop, not an account failure"
+            );
+        }
+        assert!(
+            network.attempts.lock().is_empty(),
+            "stale startup must not publish"
+        );
+        runtime.shutdown_and_close().await.unwrap();
+        if !keep_other {
+            let restarted = generated_setup_runtime(dir.path(), network.clone(), secrets.clone());
+            restarted.start().await.unwrap();
+            timeout(
+                Duration::from_secs(30),
+                restarted.setup.join_generated_setup_tasks_for_test(),
+            )
+            .await
+            .expect("restarted generated setup must finish before observing its effects");
+            assert_setup_stayed_removed(&restarted, &secrets, &original.account, None);
+            assert!(restarted.accounts().managed_accounts().unwrap().is_empty());
+            restarted.shutdown_and_close().await.unwrap();
+        }
+    }
+}
+
+struct GeneratedSetupRemovalRun {
+    account_id_hex: String,
+    /// Every account a secret was ever written for, in order.
+    secrets_written: Vec<String>,
+    /// Every event publication attempted, in order.
+    published: Vec<NostrTransportEvent>,
+    /// The background task's reports of failed attempts, in order.
+    publication_failures: Vec<String>,
+    /// The account list once the background task has ended.
+    accounts: Vec<ManagedAccount>,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_creates_coalesce() {
+    let (_dir, runtime, network, secrets) = generated_setup_fixture();
+    network.block_publish.store(true, Ordering::SeqCst);
+    let first = runtime.create_identity(generated_setup_request());
+    tokio::pin!(first);
+    timeout(Duration::from_secs(30), async {
+        tokio::select! {
+            _ = network.publishing.notified() => {}
+            result = first.as_mut() => panic!("first create returned before its held publication: {result:?}"),
+        }
+    }).await.unwrap();
+    assert_eq!(network.held_publishes.load(Ordering::SeqCst), 1);
+    let original = runtime.accounts.app.account_home().accounts().unwrap();
+    assert_eq!(original.len(), 1);
+
+    let second = runtime.create_identity(generated_setup_request());
+    tokio::pin!(second);
+    assert!(futures::poll!(second.as_mut()).is_pending());
+    assert_eq!(
+        *secrets.written.lock(),
+        vec![original[0].account_id_hex.clone()]
+    );
+    network.block_publish.store(false, Ordering::SeqCst);
+    network.release_publish.notify_waiters();
+    let (first, second) = timeout(Duration::from_secs(30), async {
+        tokio::join!(first, second)
+    })
+    .await
+    .unwrap();
+    let first = first.unwrap();
+    let second = second.unwrap();
+    assert_eq!(first.account, original[0]);
+    assert_eq!(second.account, original[0]);
+    assert_network_setup(&runtime, &network, &first);
+    assert_network_setup(&runtime, &network, &second);
+    assert_eq!(first.relay_lists, second.relay_lists);
+    assert_eq!(first.key_package_bytes, second.key_package_bytes);
+    assert_eq!(
+        runtime.accounts.app.account_home().accounts().unwrap(),
+        original
+    );
+    assert_eq!(*secrets.written.lock(), vec![first.account.account_id_hex]);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+fn assert_network_setup(
+    runtime: &MarmotAppRuntime,
+    network: &Network,
+    result: &AccountSetupResult,
+) {
+    const NIP65_KIND: u64 = 10002;
+    const INBOX_KIND: u64 = 10050;
+    const KEY_PACKAGE_KIND: u64 = 30443;
+
+    assert_eq!(result.readiness, AccountSetupReadiness::NetworkReady);
+    assert!(result.relay_lists.complete);
+    assert!(result.relay_lists.missing.is_empty());
+    assert_eq!(
+        result.relay_lists.nip65.relays,
+        vec!["wss://default.example"]
+    );
+    assert_eq!(
+        result.relay_lists.inbox.relays,
+        vec!["wss://default.example"]
+    );
+    let bytes = {
+        let accepted = network.events.lock();
+        let relay_list = accepted
+            .iter()
+            .rfind(|event| {
+                event.kind == NIP65_KIND && event.pubkey == result.account.account_id_hex
+            })
+            .expect("network-ready setup must have an accepted relay list");
+        let inbox = accepted
+            .iter()
+            .rfind(|event| {
+                event.kind == INBOX_KIND && event.pubkey == result.account.account_id_hex
+            })
+            .expect("network-ready setup must have an accepted inbox list");
+        assert_eq!(result.relay_lists.nip65.created_at, relay_list.created_at);
+        assert_eq!(result.relay_lists.inbox.created_at, inbox.created_at);
+        let published = accepted
+            .iter()
+            .rfind(|event| {
+                event.kind == KEY_PACKAGE_KIND && event.pubkey == result.account.account_id_hex
+            })
+            .expect("network-ready setup must have an accepted KeyPackage");
+        base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            &published.content,
+        )
+        .unwrap()
+    };
+    assert_eq!(result.key_package_bytes, Some(bytes.len()));
+    let lifecycle = runtime
+        .accounts
+        .app
+        .account_storage(&result.account.label)
+        .unwrap()
+        .key_package_lifecycle()
+        .unwrap()
+        .unwrap();
+    assert_eq!(lifecycle.current_key_package.unwrap().bytes(), bytes);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn background_wins_handoff() {
+    let (_dir, runtime, network, secrets) = generated_setup_fixture();
+    let local = runtime
+        .create_generated_account_local_ready(
+            generated_setup_request(),
+            false,
+            None,
+            GeneratedIdentity::ResumeOrCreate,
+        )
+        .await
+        .unwrap();
+    assert_eq!(local.readiness, AccountSetupReadiness::LocalReady);
+    let original = local.account.clone();
+    let context: GeneratedAccountSetupContext = serde_json::from_slice(
+        &runtime
+            .accounts
+            .app
+            .account_home()
+            .account_setup_context(&original.label)
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    runtime.start().await.unwrap();
+    timeout(
+        Duration::from_secs(30),
+        runtime.setup.join_generated_setup_tasks_for_test(),
+    )
+    .await
+    .expect("startup background setup must finish");
+    assert_eq!(
+        runtime
+            .account_setup_readiness(&original.account_id_hex)
+            .unwrap(),
+        AccountSetupReadiness::NetworkReady
+    );
+    let completed = timeout(
+        Duration::from_secs(30),
+        runtime.finish_generated_setup(local, context),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(completed.account, original);
+    assert_network_setup(&runtime, &network, &completed);
+    assert_eq!(
+        runtime.accounts.app.account_home().accounts().unwrap(),
+        vec![original.clone()]
+    );
+    assert_eq!(*secrets.written.lock(), vec![original.account_id_hex]);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[derive(Clone, Copy, Debug)]
+enum AccountTeardown {
+    Remove,
+    SignOut,
+    Wipe,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn label_reuse_keeps_replacement() {
+    for teardown in [
+        AccountTeardown::Remove,
+        AccountTeardown::SignOut,
+        AccountTeardown::Wipe,
+    ] {
+        let (_dir, runtime, network, secrets) = generated_setup_fixture();
+        let home = runtime.accounts.app.account_home();
+        let original = home.create_account("reused-label").unwrap();
+        let transaction = runtime
+            .account_setup()
+            .app()
+            .onboarding_transaction(&original.account_id_hex);
+        let gate = transaction.lock().await;
+        let manager = runtime.accounts();
+        let removal = async {
+            match teardown {
+                AccountTeardown::Remove => manager.remove_account(&original.label).await,
+                AccountTeardown::SignOut => runtime
+                    .sign_out(&original.label, SignOutOptions::default())
+                    .await
+                    .map(|_| ()),
+                AccountTeardown::Wipe => {
+                    runtime.sign_out_and_wipe(&original.label).await.map(|_| ())
+                }
+            }
+        };
+        tokio::pin!(removal);
+        assert!(futures::poll!(removal.as_mut()).is_pending());
+        assert!(
+            runtime
+                .setup
+                .generated_setup_fenced_for_test(&original.account_id_hex)
+        );
+        home.remove_account(&original.label).unwrap();
+        let replacement = home.create_account(&original.label).unwrap();
+        assert_ne!(replacement.account_id_hex, original.account_id_hex);
+        drop(gate);
+        let removed = timeout(Duration::from_secs(30), removal).await.unwrap();
+        assert!(
+            matches!(removed,
+            Err(AppError::AccountHome(AccountHomeError::UnknownAccount(id)))
+                if id == original.account_id_hex),
+            "{teardown:?} must reject the removed original"
+        );
+        assert_eq!(home.accounts().unwrap(), vec![replacement.clone()]);
+        assert!(
+            marmot_account::AccountSecretStore::has_secret_for_label(
+                secrets.as_ref(),
+                &replacement.label,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            home.load_signing_keys(&replacement.label)
+                .unwrap()
+                .public_key()
+                .to_hex(),
+            replacement.account_id_hex
+        );
+        assert_eq!(
+            *secrets.written.lock(),
+            vec![original.account_id_hex, replacement.account_id_hex]
+        );
+        assert!(
+            network.attempts.lock().is_empty(),
+            "{teardown:?} must not publish for the replacement"
+        );
+        runtime.shutdown_and_close().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_foreground_stays_gone() {
+    for keep_other in [false, true] {
+        let (_dir, runtime, network, secrets) = generated_setup_fixture();
+        let local = runtime
+            .create_generated_account_local_ready(
+                generated_setup_request(),
+                false,
+                None,
+                GeneratedIdentity::ResumeOrCreate,
+            )
+            .await
+            .unwrap();
+        assert_eq!(local.readiness, AccountSetupReadiness::LocalReady);
+        let home = runtime.accounts.app.account_home();
+        let context: GeneratedAccountSetupContext = serde_json::from_slice(
+            &home
+                .account_setup_context(&local.account.label)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            home.load_signing_keys(&local.account.label)
+                .unwrap()
+                .public_key()
+                .to_hex(),
+            local.account.account_id_hex
+        );
+        let original = local.account.clone();
+        runtime
+            .accounts()
+            .remove_account(&original.account_id_hex)
+            .await
+            .unwrap();
+        let other = if keep_other {
+            Some(
+                runtime
+                    .create_generated_account_local_ready(
+                        generated_setup_request(),
+                        false,
+                        None,
+                        GeneratedIdentity::ResumeOrCreate,
+                    )
+                    .await
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
+
+        // The foreground caller still owns its real local-ready result and
+        // persisted request after removal, just before network continuation.
+        let continued = timeout(
+            Duration::from_secs(30),
+            runtime.finish_generated_setup(local, context),
+        )
+        .await
+        .expect("a stale foreground handoff must settle");
+        assert_setup_stayed_removed(&runtime, &secrets, &original, other.as_ref());
+        assert!(
+            network.attempts.lock().is_empty(),
+            "stale foreground setup must not publish"
+        );
+        assert!(
+            matches!(continued,
+                Err(AppError::AccountHome(AccountHomeError::UnknownAccount(id)))
+                    if id == original.account_id_hex),
+            "foreground continuation must reject the removed original identity"
+        );
+        runtime.shutdown_and_close().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn foreground_blocks_removal() {
+    let (_dir, runtime, network, secrets) = generated_setup_fixture();
+    let local = runtime
+        .create_generated_account_local_ready(
+            generated_setup_request(),
+            false,
+            None,
+            GeneratedIdentity::ResumeOrCreate,
+        )
+        .await
+        .unwrap();
+    assert_eq!(local.readiness, AccountSetupReadiness::LocalReady);
+    let original = local.account.clone();
+    let context: GeneratedAccountSetupContext = serde_json::from_slice(
+        &runtime
+            .accounts
+            .app
+            .account_home()
+            .account_setup_context(&original.label)
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    network.block_publish.store(true, Ordering::SeqCst);
+    let foreground = runtime.finish_generated_setup(local, context);
+    tokio::pin!(foreground);
+    assert!(futures::poll!(foreground.as_mut()).is_pending());
+    timeout(Duration::from_secs(30), async {
+        tokio::select! {
+            _ = network.publishing.notified() => {}
+            result = foreground.as_mut() => panic!("foreground setup returned before its held publication: {result:?}"),
+        }
+    }).await.expect("foreground setup must reach its bootstrap publication");
+    assert_eq!(network.held_publishes.load(Ordering::SeqCst), 1);
+    network.block_publish.store(false, Ordering::SeqCst);
+
+    let manager = runtime.accounts();
+    let removal = manager.remove_account(&original.account_id_hex);
+    tokio::pin!(removal);
+    assert!(futures::poll!(removal.as_mut()).is_pending());
+    assert!(
+        runtime
+            .setup
+            .generated_setup_fenced_for_test(&original.account_id_hex)
+    );
+
+    // Reconciliation must get through while removal waits for the foreground
+    // publication. An unfenced removal instead deletes the account first.
+    timeout(Duration::from_secs(30), async {
+        tokio::select! {
+            result = removal.as_mut() => panic!("removal overtook held foreground setup: {result:?}"),
+            result = runtime.reconcile_accounts() => result.unwrap(),
+        }
+    }).await.expect("reconciliation must not wait for the held foreground publication");
+    assert_eq!(
+        runtime
+            .accounts
+            .app
+            .account_home()
+            .account(&original.account_id_hex)
+            .unwrap(),
+        original
+    );
+    assert_eq!(network.held_publishes.load(Ordering::SeqCst), 1);
+
+    // Local preparation still makes progress while removal waits on network
+    // publication. The pending identity is reused, not replaced.
+    let refreshed = timeout(
+        Duration::from_secs(30),
+        runtime.create_identity_local_ready(generated_setup_request()),
+    )
+    .await
+    .expect("waiting removal must not hold global local-setup admission")
+    .unwrap();
+    assert_eq!(refreshed.account.account_id_hex, original.account_id_hex);
+
+    network.release_publish.notify_waiters();
+    let finished = timeout(Duration::from_secs(30), async {
+        tokio::select! {
+            result = removal.as_mut() => panic!("removal completed before foreground setup: {result:?}"),
+            result = foreground.as_mut() => result.unwrap(),
+        }
+    }).await.expect("admitted foreground setup must finish before removal");
+    assert_eq!(finished.account.account_id_hex, original.account_id_hex);
+    assert_eq!(finished.readiness, AccountSetupReadiness::NetworkReady);
+    timeout(Duration::from_secs(30), removal)
+        .await
+        .unwrap()
+        .unwrap();
+    timeout(
+        Duration::from_secs(30),
+        runtime.setup.join_generated_setup_tasks_for_test(),
+    )
+    .await
+    .expect("the held background task must stop after removal");
+    assert_setup_stayed_removed(&runtime, &secrets, &original, None);
+    assert!(
+        network
+            .attempts
+            .lock()
+            .iter()
+            .all(|event| event.pubkey == original.account_id_hex)
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn foreground_before_withdrawal() {
+    for removal in [GeneratedSetupRemoval::Wipe, GeneratedSetupRemoval::SignOut] {
+        let (_dir, runtime, network, secrets) = generated_setup_fixture();
+        let local = runtime
+            .create_generated_account_local_ready(
+                generated_setup_request(),
+                false,
+                None,
+                GeneratedIdentity::ResumeOrCreate,
+            )
+            .await
+            .unwrap();
+        let original = local.account.clone();
+        let context = serde_json::from_slice(
+            &runtime
+                .accounts
+                .app
+                .account_home()
+                .account_setup_context(&original.label)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        network.block_publish.store(true, Ordering::SeqCst);
+        let foreground = runtime.finish_generated_setup(local, context);
+        tokio::pin!(foreground);
+        assert!(futures::poll!(foreground.as_mut()).is_pending());
+        timeout(Duration::from_secs(30), async {
+            tokio::select! {
+                _ = network.publishing.notified() => {}
+                result = foreground.as_mut() => panic!("foreground ended before its held publication: {result:?}"),
+            }
+        }).await.unwrap();
+        network.block_publish.store(false, Ordering::SeqCst);
+
+        let teardown = async {
+            match removal {
+                GeneratedSetupRemoval::Wipe => runtime
+                    .sign_out_and_wipe(&original.account_id_hex)
+                    .await
+                    .map(|outcome| outcome.local_cleanup.completed),
+                _ => runtime
+                    .sign_out(&original.account_id_hex, SignOutOptions::default())
+                    .await
+                    .map(|outcome| outcome.local_cleanup.completed),
+            }
+        };
+        tokio::pin!(teardown);
+        assert!(futures::poll!(teardown.as_mut()).is_pending());
+        assert!(
+            runtime
+                .setup
+                .generated_setup_fenced_for_test(&original.account_id_hex)
+        );
+        assert!(
+            !network.events.lock().iter().any(|event| event.kind == 5),
+            "{removal:?} withdrew the slot before foreground setup completed"
+        );
+
+        network.release_publish.notify_waiters();
+        let finished = timeout(Duration::from_secs(30), foreground)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(finished.readiness, AccountSetupReadiness::NetworkReady);
+        let manager = runtime.accounts();
+        let contender = manager.remove_account(&original.account_id_hex);
+        tokio::pin!(contender);
+        timeout(Duration::from_secs(30), async {
+            tokio::select! {
+                biased;
+                result = contender.as_mut() => panic!("competing removal overtook queued {removal:?}: {result:?}"),
+                result = teardown.as_mut() => assert!(result.unwrap()),
+            }
+        }).await.expect("the queued teardown must finish before competing removal");
+        let published = network.events.lock().clone();
+        let withdrawal = published
+            .iter()
+            .rposition(|event| event.kind == 5)
+            .expect("sign-out withdraws the device's KeyPackage slot");
+        assert!(
+            published[..withdrawal]
+                .iter()
+                .any(|event| event.kind == 30443)
+        );
+        assert!(
+            !published[withdrawal..]
+                .iter()
+                .any(|event| event.kind == 30443),
+            "{removal:?} must not leave a newly published KeyPackage after withdrawal: {:?}",
+            published.iter().map(|event| event.kind).collect::<Vec<_>>()
+        );
+        if removal == GeneratedSetupRemoval::Wipe {
+            assert_setup_stayed_removed(&runtime, &secrets, &original, None);
+        } else {
+            assert!(
+                runtime
+                    .accounts
+                    .resolve(&original.account_id_hex)
+                    .unwrap()
+                    .signed_out
+            );
+            assert_eq!(
+                *secrets.written.lock(),
+                vec![original.account_id_hex.clone()]
+            );
+        }
+        let removed = timeout(Duration::from_secs(30), contender).await.unwrap();
+        if removal == GeneratedSetupRemoval::Wipe {
+            assert!(matches!(removed,
+                Err(AppError::AccountHome(AccountHomeError::UnknownAccount(id)))
+                    if id == original.account_id_hex));
+        } else {
+            removed.unwrap();
+            assert_setup_stayed_removed(&runtime, &secrets, &original, None);
+        }
+        runtime.shutdown_and_close().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_signed_out_stays_quiet() {
+    let (_dir, runtime, _network, secrets) = generated_setup_fixture();
+    let local = runtime
+        .create_generated_account_local_ready(
+            generated_setup_request(),
+            false,
+            None,
+            GeneratedIdentity::ResumeOrCreate,
+        )
+        .await
+        .unwrap();
+    runtime
+        .sign_out(&local.account.account_id_hex, SignOutOptions::default())
+        .await
+        .unwrap();
+    let mut events = runtime.subscribe();
+    runtime.start().await.unwrap();
+    while let Ok(event) = events.try_recv() {
+        assert!(
+            !matches!(event, MarmotAppEvent::AccountError(error)
+                if error.account_id_hex == local.account.account_id_hex),
+            "startup must not report the signed-out setup as a failure"
+        );
+    }
+    assert!(
+        runtime
+            .accounts
+            .resolve(&local.account.account_id_hex)
+            .unwrap()
+            .signed_out
+    );
+    assert_eq!(*secrets.written.lock(), vec![local.account.account_id_hex]);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn signed_out_allows_new_setup() {
+    for unlinked in [false, true] {
+        let (_dir, runtime, network, secrets) = generated_setup_fixture();
+        let original = runtime
+            .create_generated_account_local_ready(
+                generated_setup_request(),
+                false,
+                None,
+                GeneratedIdentity::ResumeOrCreate,
+            )
+            .await
+            .unwrap();
+        runtime
+            .sign_out(&original.account.account_id_hex, SignOutOptions::default())
+            .await
+            .unwrap();
+        let home = runtime.accounts.app.account_home();
+        if unlinked {
+            home.mark_account_unlinked(&original.account.label).unwrap();
+        }
+        let inactive = home.account(&original.account.label).unwrap();
+        let journal = home.account_setup_state(&inactive.label).unwrap().unwrap();
+        let context = home.account_setup_context(&inactive.label).unwrap();
+
+        let foreground = timeout(
+            Duration::from_secs(30),
+            runtime.create_identity(generated_setup_request()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_ne!(foreground.account.account_id_hex, inactive.account_id_hex);
+        assert_network_setup(&runtime, &network, &foreground);
+
+        let local = timeout(
+            Duration::from_secs(30),
+            runtime.create_identity_local_ready(generated_setup_request()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_ne!(local.account.account_id_hex, inactive.account_id_hex);
+        assert_ne!(
+            local.account.account_id_hex,
+            foreground.account.account_id_hex
+        );
+        timeout(
+            Duration::from_secs(30),
+            runtime.setup.join_generated_setup_tasks_for_test(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(home.account(&inactive.label).unwrap(), inactive);
+        assert_eq!(
+            home.account_setup_state(&inactive.label).unwrap(),
+            Some(journal)
+        );
+        assert_eq!(
+            home.account_setup_context(&inactive.label).unwrap(),
+            context
+        );
+        let mut expected = vec![
+            inactive.clone(),
+            foreground.account.clone(),
+            local.account.clone(),
+        ];
+        expected.sort_by(|a, b| a.account_id_hex.cmp(&b.account_id_hex));
+        assert_eq!(home.accounts().unwrap(), expected);
+        assert_eq!(
+            *secrets.written.lock(),
+            vec![
+                inactive.account_id_hex,
+                foreground.account.account_id_hex,
+                local.account.account_id_hex
+            ]
+        );
+        runtime.shutdown_and_close().await.unwrap();
+    }
+}
+
+impl GeneratedSetupRemovalRun {
+    /// Whether a KeyPackage was published after the teardown withdrew the
+    /// slot (its kind-5 deletion), which must be the last word on it.
+    fn key_package_after_withdrawal(&self) -> bool {
+        let withdrawal = self
+            .published
+            .iter()
+            .rposition(|event| event.kind == 5)
+            .expect("the teardown withdraws the KeyPackage slot");
+        self.published[withdrawal..]
+            .iter()
+            .any(|event| event.kind == 30443)
+    }
+
+    /// Whether the background task ran its attempts out after `removal`.
+    fn setup_carried_on(&self) -> bool {
+        self.publication_failures
+            .last()
+            .is_some_and(|message| message.starts_with("generated account publication deferred"))
+    }
+}
+
+/// Create a generated identity at local readiness against relays that never
+/// acknowledge, and hold the account's first publications: its relay-list
+/// bootstrap and its initial KeyPackage, which go out independently. Apply
+/// `removal` while they are pending, release them, and let the background
+/// task run every attempt it has left.
+async fn remove_generated_identity_while_publishing(
+    removal: GeneratedSetupRemoval,
+) -> GeneratedSetupRemovalRun {
+    let (_dir, runtime, network, secrets) = generated_setup_fixture();
+    network.zero_acks.store(true, Ordering::SeqCst);
+    network.block_publish.store(true, Ordering::SeqCst);
+    let mut events = runtime.subscribe();
+    let created = timeout(
+        Duration::from_secs(30),
+        runtime.create_identity_local_ready(generated_setup_request()),
+    )
+    .await
+    .expect("local readiness publishes nothing")
+    .unwrap();
+    assert_eq!(created.readiness, AccountSetupReadiness::LocalReady);
+    let id = created.account.account_id_hex.clone();
+
+    // Wait for both holds: a release must reach every held publication, and
+    // one that is still on its way when the release fires would miss it.
+    timeout(Duration::from_secs(30), async {
+        while network.held_publishes.load(Ordering::SeqCst) < 2 {
+            network.publishing.notified().await;
+        }
+    })
+    .await
+    .expect("generated setup publishes in the background");
+    let mut held = network
+        .attempts
+        .lock()
+        .iter()
+        .map(|event| event.kind)
+        .collect::<Vec<_>>();
+    held.sort_unstable();
+    assert_eq!(held, [10002, 30443]);
+    // Later publishes, the removal's own included, answer at once.
+    network.block_publish.store(false, Ordering::SeqCst);
+
+    let teardown = match removal {
+        GeneratedSetupRemoval::Directory => {
+            runtime
+                .accounts()
+                .app
+                .account_home()
+                .remove_account(&id)
+                .unwrap();
+            None
+        }
+        _ => {
+            let (teardown, account) = (runtime.clone(), id.clone());
+            let task = tokio::spawn(async move {
+                match removal {
+                    GeneratedSetupRemoval::Wipe => teardown
+                        .sign_out_and_wipe(&account)
+                        .await
+                        .map(|outcome| outcome.local_cleanup.completed),
+                    _ => teardown
+                        .sign_out(&account, SignOutOptions::default())
+                        .await
+                        .map(|outcome| outcome.local_cleanup.completed),
+                }
+            });
+            // The teardown queues behind the worker's held publication, so
+            // wait for it to take the account's setup fence first.
+            timeout(Duration::from_secs(30), async {
+                while !runtime.setup.generated_setup_fenced_for_test(&id) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the teardown fences generated setup first");
+            if removal == GeneratedSetupRemoval::CancelledSignOut {
+                task.abort();
+                assert!(task.await.unwrap_err().is_cancelled());
+                None
+            } else {
+                Some(task)
+            }
+        }
+    };
+    network.release_publish.notify_waiters();
+    if let Some(task) = teardown {
+        let completed = timeout(Duration::from_secs(30), task)
+            .await
+            .expect("the teardown ends once the publication answers")
+            .unwrap()
+            .unwrap();
+        assert!(completed, "{removal:?} completes its local cleanup");
+    }
+    if removal == GeneratedSetupRemoval::SignOutThenSignIn {
+        // The sign-out ended the task; only the sign-in can start another.
+        timeout(
+            Duration::from_secs(30),
+            runtime.setup.join_generated_setup_tasks_for_test(),
+        )
+        .await
+        .expect("the sign-out ends generated setup");
+        runtime.sign_in_account(&id).await.unwrap();
+    }
+    timeout(
+        Duration::from_secs(30),
+        runtime.setup.join_generated_setup_tasks_for_test(),
+    )
+    .await
+    .expect("generated setup ends");
+    let published = network.attempts.lock().clone();
+    let accounts = runtime.accounts().managed_accounts().unwrap();
+    runtime.shutdown_and_close().await.unwrap();
+    let mut publication_failures = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let MarmotAppEvent::AccountError(error) = event
+            && error.message.starts_with("generated account publication")
+        {
+            assert_eq!(error.account_id_hex, id);
+            publication_failures.push(error.message);
+        }
+    }
+    let secrets_written = secrets.written.lock().clone();
+    GeneratedSetupRemovalRun {
+        account_id_hex: id,
+        secrets_written,
+        published,
+        publication_failures,
+        accounts,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wiping_a_publishing_generated_identity_mints_no_other_account() {
+    let run = remove_generated_identity_while_publishing(GeneratedSetupRemoval::Wipe).await;
+    assert_eq!(
+        run.secrets_written,
+        vec![run.account_id_hex.clone()],
+        "only the created identity ever gets a secret"
+    );
+    assert!(
+        run.published
+            .iter()
+            .all(|event| event.pubkey == run.account_id_hex)
+    );
+    assert!(
+        !run.setup_carried_on(),
+        "setup stops with the wipe: {:?}",
+        run.publication_failures
+    );
+    assert!(!run.key_package_after_withdrawal());
+    assert!(run.accounts.is_empty(), "the wipe leaves no account behind");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn signing_out_a_publishing_generated_identity_stops_its_setup() {
+    let run = remove_generated_identity_while_publishing(GeneratedSetupRemoval::SignOut).await;
+    assert_eq!(run.secrets_written, vec![run.account_id_hex.clone()]);
+    assert!(
+        !run.setup_carried_on(),
+        "setup stops with the sign-out: {:?}",
+        run.publication_failures
+    );
+    assert!(
+        !run.key_package_after_withdrawal(),
+        "no KeyPackage is published after the sign-out withdraws the slot"
+    );
+    assert_eq!(run.accounts.len(), 1);
+    assert_eq!(run.accounts[0].account_id_hex, run.account_id_hex);
+    assert!(run.accounts[0].signed_out);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn signing_a_generated_identity_back_in_resumes_its_setup() {
+    let run =
+        remove_generated_identity_while_publishing(GeneratedSetupRemoval::SignOutThenSignIn).await;
+    assert_eq!(run.secrets_written, vec![run.account_id_hex.clone()]);
+    assert!(
+        run.setup_carried_on(),
+        "setup publishes again after sign-in: {:?}",
+        run.publication_failures
+    );
+    assert_eq!(run.accounts.len(), 1);
+    assert!(!run.accounts[0].signed_out);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancelled_sign_out_leaves_generated_setup_publishing() {
+    let run =
+        remove_generated_identity_while_publishing(GeneratedSetupRemoval::CancelledSignOut).await;
+    assert_eq!(run.secrets_written, vec![run.account_id_hex.clone()]);
+    assert!(
+        run.setup_carried_on(),
+        "setup keeps publishing the account the sign-out left: {:?}",
+        run.publication_failures
+    );
+    assert_eq!(run.accounts.len(), 1);
+    assert!(!run.accounts[0].signed_out);
+}
+
+/// Removal the runtime never hears of: the background task alone must
+/// notice that its account is gone and stop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn generated_setup_never_continues_another_account_than_its_own() {
+    let run = remove_generated_identity_while_publishing(GeneratedSetupRemoval::Directory).await;
+    assert_eq!(
+        run.secrets_written,
+        vec![run.account_id_hex.clone()],
+        "a background attempt minted another identity"
+    );
+    assert!(
+        run.published
+            .iter()
+            .all(|event| event.pubkey == run.account_id_hex)
+    );
+    assert!(run.accounts.is_empty());
+}
+
+/// Start a generated setup task whose first attempt is stuck in synchronous
+/// code, as one doing account I/O is: a fence reaches it only once that code
+/// returns. Its second attempt runs once no fence is held. It returns once
+/// the first attempt runs, with the sender that lets it return and a
+/// receiver for whether each attempt ran to completion.
+async fn spawn_blocked_generated_setup(
+    state: &SetupState,
+    account_id: &str,
+) -> (
+    std::sync::mpsc::Sender<()>,
+    tokio::sync::oneshot::Receiver<(bool, bool)>,
+) {
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let (started, running) = tokio::sync::oneshot::channel();
+    let (finished, attempts) = tokio::sync::oneshot::channel();
+    assert!(
+        state
+            .generated_setup_tasks
+            .spawn(account_id, move |gate| async move {
+                let first = gate
+                    .attempt(async move {
+                        let _ = started.send(());
+                        let _ = released.recv();
+                    })
+                    .await;
+                gate.wait_unfenced().await;
+                let second = gate.attempt(async {}).await;
+                let _ = finished.send((first.is_some(), second.is_some()));
+            })
+    );
+    running.await.unwrap();
+    (release, attempts)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_teardowns_all_wait_for_the_generated_setup_attempt_to_stop() {
+    let state = SetupState::new();
+    let (release, attempts) = spawn_blocked_generated_setup(&state, "account").await;
+    let mut first = Box::pin(state.fence_generated_setup("account"));
+    let mut second = Box::pin(state.fence_generated_setup("account"));
+    assert!(futures::poll!(first.as_mut()).is_pending());
+    assert!(
+        futures::poll!(second.as_mut()).is_pending(),
+        "a second teardown waits for the attempt the first one stops"
+    );
+    release.send(()).unwrap();
+    let first = first.await;
+    let second = second.await;
+    drop(first);
+    // One teardown still holds the fence, so the next attempt waits.
+    assert!(state.generated_setup_fenced_for_test("account"));
+    drop(second);
+    assert_eq!(attempts.await.unwrap(), (true, true));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancelled_teardown_releases_the_generated_setup_fence() {
+    let state = SetupState::new();
+    let (release, attempts) = spawn_blocked_generated_setup(&state, "account").await;
+    let mut teardown = Box::pin(state.fence_generated_setup("account"));
+    assert!(futures::poll!(teardown.as_mut()).is_pending());
+    // The host cancels the teardown while it waits for the attempt.
+    drop(teardown);
+    release.send(()).unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(30), attempts)
+            .await
+            .expect("a cancelled teardown leaves no fence behind")
+            .unwrap(),
+        (true, true)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fence_cancels_the_attempt_in_flight_and_holds_the_next_one() {
+    let state = SetupState::new();
+    let (started, running) = tokio::sync::oneshot::channel();
+    let (finished, mut attempts) = tokio::sync::oneshot::channel();
+    assert!(
+        state
+            .generated_setup_tasks
+            .spawn("account", move |gate| async move {
+                let first = gate
+                    .attempt(async move {
+                        let _ = started.send(());
+                        std::future::pending::<()>().await;
+                    })
+                    .await;
+                gate.wait_unfenced().await;
+                let second = gate.attempt(async {}).await;
+                let _ = finished.send((first.is_some(), second.is_some()));
+            })
+    );
+    running.await.unwrap();
+    let fence = timeout(
+        Duration::from_secs(30),
+        state.fence_generated_setup("account"),
+    )
+    .await
+    .expect("the fence cancels a pending attempt");
+    assert!(
+        attempts.try_recv().is_err(),
+        "no attempt runs while the fence is held"
+    );
+    assert!(
+        !state.generated_setup_tasks.spawn("account", |_| async {}),
+        "an account whose task is held gets no second one"
+    );
+    drop(fence);
+    assert_eq!(attempts.await.unwrap(), (false, true));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_task_scheduled_under_a_fence_waits_for_it_to_drop() {
+    let state = SetupState::new();
+    // A teardown fences the account before its setup task exists, as when
+    // it lands between local readiness and the task's start.
+    let fence = state.fence_generated_setup("account").await;
+    let (finished, mut attempted) = tokio::sync::oneshot::channel();
+    assert!(
+        state
+            .generated_setup_tasks
+            .spawn("account", move |gate| async move {
+                gate.wait_unfenced().await;
+                let ran = gate.attempt(async {}).await;
+                let _ = finished.send(ran.is_some());
+            }),
+        "a fenced account still gets its task"
+    );
+    tokio::task::yield_now().await;
+    assert!(
+        attempted.try_recv().is_err(),
+        "no attempt runs while the fence is held"
+    );
+    // The teardown is cancelled or fails: the account stays published.
+    drop(fence);
+    assert!(
+        timeout(Duration::from_secs(30), attempted)
+            .await
+            .expect("the task runs once the fence drops")
+            .unwrap()
+    );
 }

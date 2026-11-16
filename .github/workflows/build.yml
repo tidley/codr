@@ -37,6 +37,8 @@ jobs:
         with:
           ref: ${{ inputs.source_ref || github.ref }}
           persist-credentials: false
+      - name: Install pinned Odin for MDK Markdown
+        uses: ./.github/actions/setup-odin
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -73,6 +75,8 @@ jobs:
         with:
           ref: ${{ inputs.source_ref || github.ref }}
           persist-credentials: false
+      - name: Install pinned Odin for MDK Markdown
+        uses: ./.github/actions/setup-odin
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
         with:
@@ -118,6 +122,8 @@ jobs:
         if: runner.os == 'macOS'
         with:
           python-version: '3.11'
+      - name: Install pinned Odin for MDK Markdown
+        uses: ./.github/actions/setup-odin
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -154,8 +160,7 @@ jobs:
           fi
           asset="codr-v$version-$OS_NAME-$ARCH.tar.gz"
           tar -czf "dist/$asset" -C "target/$TARGET/release" herdr-white-noise-bridge \
-            -C "$GITHUB_WORKSPACE/vendor/mdk" LICENSE README.codr.md \
-            -C "$GITHUB_WORKSPACE/vendor/mdk/vendor/hpke-rs-libcrux" LICENSE-MPL-2.0
+            -C "$GITHUB_WORKSPACE/vendor/mdk" LICENSE README.codr.md LICENSE-MPL-2.0 NOTICE.codr
           if [ "$OS_NAME" = macos ]; then
             shasum -a 256 "dist/$asset" > "dist/$asset.sha256"
           else
@@ -265,6 +270,8 @@ jobs:
         with:
           ref: ${{ inputs.source_ref || github.ref }}
           persist-credentials: false
+      - name: Install pinned Odin for MDK Markdown
+        uses: ./.github/actions/setup-odin
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -301,8 +308,7 @@ jobs:
           mkdir -p dist
           asset="codr-v$version-linux-$ARCH.tar.gz"
           tar -czf "dist/$asset" -C "target/$TARGET/release" herdr-white-noise-bridge \
-            -C "$GITHUB_WORKSPACE/vendor/mdk" LICENSE README.codr.md \
-            -C "$GITHUB_WORKSPACE/vendor/mdk/vendor/hpke-rs-libcrux" LICENSE-MPL-2.0
+            -C "$GITHUB_WORKSPACE/vendor/mdk" LICENSE README.codr.md LICENSE-MPL-2.0 NOTICE.codr
           (cd dist && sha256sum "$asset" > "$asset.sha256")
       - name: Read connector source pin
         id: connector
