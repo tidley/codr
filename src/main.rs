@@ -169,7 +169,7 @@ async fn main() -> Result<()> {
                 })
                 .transpose()?;
             bridge.update_messaging_home = messaging_home.clone();
-            let messaging = match messaging_home {
+            let mut messaging = match messaging_home {
                 Some(home) => Some(
                     herdr_white_noise_bridge::messaging::EmbeddedMessaging::start(
                         &bridge.config,
@@ -182,6 +182,15 @@ async fn main() -> Result<()> {
             let enabled = !no_porter && (porter || bridge.config.portr_enabled);
             let result = tokio::select! {
                 result = bridge.run(enabled) => result,
+                result = async {
+                    match messaging.as_mut() {
+                        Some(messaging) => messaging.wait_for_exit().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    bridge.save()?;
+                    result
+                }
                 result = terminate_signal() => {
                     result?;
                     bridge.save()

@@ -1,0 +1,174 @@
+//! The runner's starting values (decision 7 of mdk#2660's phase 4 plan),
+//! registered as convergence-ledger decision A19, and its re-check schedule
+//! (decision 5), registered as A20. They are tuned in the simulator once the
+//! runner runs in the app (PR 5).
+
+use std::time::Duration;
+
+use storage_sqlite::RecoveryUnitPolicy;
+use transport_nostr_adapter::compare::ComparePolicy;
+use transport_nostr_adapter::sweep::SweepPolicy;
+
+/// The first no-progress backoff of a unit or complete unresolved epoch-gap
+/// visit; each further one doubles it.
+pub(crate) const RUNNER_BACKOFF_BASE_SECS: u64 = 30;
+pub(crate) const RUNNER_BACKOFF_CAP_SECS: u64 = 60 * 60;
+/// No-progress answers in a row before a unit breaks, also the complete
+/// unsuccessful visit cap for an epoch gap. The first five delays total about
+/// 15 minutes.
+pub(crate) const RUNNER_BREAK_AFTER_NO_PROGRESS: u32 = 6;
+/// How long a newly broken unit waits before its first timed probe; each
+/// failed probe doubles the wait up to the cap (mdk#3308). A probe is quiet:
+/// it raises no notice, and goes through the ordinary scheduling, budgets and
+/// relay cooldowns.
+pub(crate) const RUNNER_PROBE_BASE_SECS: u64 = 60 * 60;
+pub(crate) const RUNNER_PROBE_CAP_SECS: u64 = 24 * 60 * 60;
+/// How long a unit whose relay was unreachable waits before its next attempt.
+pub(crate) const RUNNER_UNREACHABLE_RETRY_SECS: u64 = 30;
+/// Unreachable results in a row before the relay cools down.
+pub(crate) const RUNNER_COOLDOWN_AFTER_UNREACHABLE: u32 = 3;
+/// The first relay cooldown; each further one doubles it. A reconnect ends it.
+pub(crate) const RUNNER_COOLDOWN_BASE_SECS: u64 = 60;
+pub(crate) const RUNNER_COOLDOWN_CAP_SECS: u64 = 60 * 60;
+/// Quanta per rolling hour before the account breaker pauses the runner.
+///
+/// A runaway-loop guard, not a pace: a pause is reported as a bug signal.
+/// One account runs one quantum at a time, so this sits near what a second-long
+/// quantum can reach. A first catch-up proves each (route, relay) of every
+/// group a slice at a time, mostly empty slices that fetch nothing, and at 720
+/// an account of about 80 groups paused within minutes of opening and again at
+/// every window roll for hours. The event-byte cap bounds what is fetched.
+pub(crate) const RUNNER_MAX_QUANTA_PER_HOUR: u64 = 7_200;
+/// Fetched event bytes per rolling hour before the account breaker pauses.
+pub(crate) const RUNNER_MAX_EVENT_BYTES_PER_HOUR: u64 = 256 * 1024 * 1024;
+/// One quantum's network deadline.
+pub(crate) const RUNNER_QUANTUM: Duration = Duration::from_secs(10);
+/// One relay request's own timeout. Shorter than [`RUNNER_QUANTUM`], so a
+/// quantum the deadline cut before any answer was preempted, never slow.
+pub(crate) const RUNNER_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// A local failure (staging or a ledger write) holds its unit back in memory,
+/// doubling from the base to the cap, as worker retries do.
+pub(crate) const RUNNER_LOCAL_FAILURE_BACKOFF_BASE_SECS: u64 = 1;
+pub(crate) const RUNNER_LOCAL_FAILURE_BACKOFF_CAP_SECS: u64 = 60;
+/// Staged events one relay may hold for a group before it waits for the
+/// group's laggard. One comparison quantum fetches at most these.
+pub(crate) const RUNNER_STAGED_GROUP_EVENTS: u64 = 2_048;
+pub(crate) const RUNNER_STAGED_GROUP_BYTES: u64 = 8 * 1024 * 1024;
+/// Staged bytes the whole account may hold.
+pub(crate) const RUNNER_STAGED_ACCOUNT_BYTES: u64 = 64 * 1024 * 1024;
+/// Staged events one worker admission command ingests, as the comparison job's
+/// admission does (A13). Each batch's existing plan also checks due gap visits.
+pub(crate) const RUNNER_ADMISSION_PER_TURN: usize = 16;
+/// Capture ranges one unit keeps fenced across a restart. Past it the newest
+/// are joined into one, which can only fence more.
+pub(crate) const RUNNER_FENCES_PER_UNIT: usize = 8;
+/// A unit's next re-check pass falls due this long after its last full one
+/// (decision 5).
+pub(crate) const RUNNER_RECHECK_INTERVAL_SECS: u64 = 6 * 60 * 60;
+/// A relay cooldown that lasted longer than this makes a re-check of each of
+/// the relay's units due once the relay answers or reconnects.
+pub(crate) const RUNNER_RECHECK_AFTER_COOLDOWN_SECS: u64 = 60 * 60;
+
+/// How much fetched history may wait in staging.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RecoveryStagingBounds {
+    pub(crate) group_events: u64,
+    pub(crate) group_bytes: u64,
+    pub(crate) account_bytes: u64,
+}
+
+/// Every value the runner schedules by, in one place.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RecoveryRunnerPolicy {
+    /// The outcome table's budgets and the account caps, as storage applies them.
+    pub(crate) unit: RecoveryUnitPolicy,
+    pub(crate) quantum: Duration,
+    pub(crate) request_timeout: Duration,
+    pub(crate) local_failure_backoff_base_seconds: u64,
+    pub(crate) local_failure_backoff_cap_seconds: u64,
+    pub(crate) staging: RecoveryStagingBounds,
+    pub(crate) admission_per_turn: usize,
+    pub(crate) fences_per_unit: usize,
+    pub(crate) sweep: SweepPolicy,
+    pub(crate) recheck_interval_seconds: u64,
+    /// Whether every due unit fetches on its own. Off in a wake-collection
+    /// (`CursorPersistence::Frozen`) process, which fetches only for the
+    /// routes of groups whose live frames a fence holds (every route of such
+    /// a group, since they share its frontier), so the messages that woke it
+    /// can be shown, and otherwise only for an explicit full-history repair,
+    /// the one recovery that posture allows. Other debt (a loss, a
+    /// joined group's history, the standing window) waits for an Advance
+    /// process.
+    pub(crate) fetches_unasked: bool,
+}
+
+impl Default for RecoveryRunnerPolicy {
+    fn default() -> Self {
+        Self {
+            unit: RecoveryUnitPolicy {
+                backoff_base_seconds: RUNNER_BACKOFF_BASE_SECS,
+                backoff_cap_seconds: RUNNER_BACKOFF_CAP_SECS,
+                break_after_no_progress: RUNNER_BREAK_AFTER_NO_PROGRESS,
+                unreachable_retry_seconds: RUNNER_UNREACHABLE_RETRY_SECS,
+                cooldown_after_unreachable: RUNNER_COOLDOWN_AFTER_UNREACHABLE,
+                cooldown_base_seconds: RUNNER_COOLDOWN_BASE_SECS,
+                cooldown_cap_seconds: RUNNER_COOLDOWN_CAP_SECS,
+                max_attempts_per_hour: RUNNER_MAX_QUANTA_PER_HOUR,
+                max_event_bytes_per_hour: RUNNER_MAX_EVENT_BYTES_PER_HOUR,
+                recheck_after_cooldown_seconds: RUNNER_RECHECK_AFTER_COOLDOWN_SECS,
+                probe_base_seconds: RUNNER_PROBE_BASE_SECS,
+                probe_cap_seconds: RUNNER_PROBE_CAP_SECS,
+            },
+            quantum: RUNNER_QUANTUM,
+            request_timeout: RUNNER_REQUEST_TIMEOUT,
+            local_failure_backoff_base_seconds: RUNNER_LOCAL_FAILURE_BACKOFF_BASE_SECS,
+            local_failure_backoff_cap_seconds: RUNNER_LOCAL_FAILURE_BACKOFF_CAP_SECS,
+            staging: RecoveryStagingBounds {
+                group_events: RUNNER_STAGED_GROUP_EVENTS,
+                group_bytes: RUNNER_STAGED_GROUP_BYTES,
+                account_bytes: RUNNER_STAGED_ACCOUNT_BYTES,
+            },
+            admission_per_turn: RUNNER_ADMISSION_PER_TURN,
+            fences_per_unit: RUNNER_FENCES_PER_UNIT,
+            sweep: SweepPolicy::default(),
+            recheck_interval_seconds: RUNNER_RECHECK_INTERVAL_SECS,
+            fetches_unasked: true,
+        }
+    }
+}
+
+impl RecoveryRunnerPolicy {
+    /// The in-memory hold after `failures` local failures in a row.
+    pub(crate) fn local_failure_backoff_seconds(&self, failures: u32) -> u64 {
+        let doubled = 1u64
+            .checked_shl(failures.saturating_sub(1))
+            .unwrap_or(u64::MAX);
+        self.local_failure_backoff_base_seconds
+            .saturating_mul(doubled)
+            .min(self.local_failure_backoff_cap_seconds)
+    }
+
+    /// One comparison quantum's limits: at most what one relay may stage for
+    /// a group, paced as a sweep is.
+    pub(crate) fn compare(&self) -> ComparePolicy {
+        ComparePolicy {
+            pacing: self.sweep,
+            ..ComparePolicy::new(
+                usize::try_from(self.staging.group_events).unwrap_or(usize::MAX),
+                self.staging.group_bytes,
+            )
+        }
+    }
+
+    /// The in-memory hold after `failures` re-check quanta in a row that
+    /// moved their pass nowhere: the unit backoff's doubling.
+    pub(crate) fn recheck_backoff_seconds(&self, failures: u32) -> u64 {
+        let doubled = 1u64
+            .checked_shl(failures.saturating_sub(1))
+            .unwrap_or(u64::MAX);
+        self.unit
+            .backoff_base_seconds
+            .saturating_mul(doubled)
+            .min(self.unit.backoff_cap_seconds)
+    }
+}

@@ -6,7 +6,9 @@ async fn queued_messages(app: &MarmotApp) -> (AppClient, cgka_traits::GroupId, V
     let group = client
         .create_group("publication progress", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let sender = hex::encode(client.runtime.session().self_id().as_slice());
     let mut ids = Vec::new();
     for content in ["first queued message", "second queued message"] {
@@ -137,6 +139,7 @@ fn projection_connection(app: &MarmotApp) -> rusqlite::Connection {
     let key = app
         .sqlcipher_key("alice", &keys, &path, SqlcipherDatabaseKind::Session)
         .unwrap();
+    storage_sqlite::expect_uncounted_writes_for_test(&path);
     let connection = rusqlite::Connection::open(path).unwrap();
     storage_sqlite::open_hardened_sqlcipher(
         &connection,
@@ -516,10 +519,12 @@ async fn queued_publication_cancel_finalizer_keeps_progress_before_revival() {
             "pending route",
             &[],
             Default::default(),
-            &AppPerformanceTelemetry::default(),
+            &marmot_observability::PerformanceRecorder::default(),
         )
         .await
         .unwrap()
+        .operation
+        .expect("eligible fixture members")
         .group_id;
     // Leave a real uninstalled group route for the finalizer's route refresh.
     client
@@ -601,7 +606,6 @@ async fn queued_publication_updates_live_window_before_later_publish_finishes() 
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = MarmotApp::with_relay(dir.path(), "wss://progress.example")
         .with_test_relay_client(relay.clone());
-    let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
     let (client, group, ids) = queued_messages(&app).await;
     drop(client);
     struct HeldSchedule(String);
@@ -714,9 +718,35 @@ async fn queued_publication_updates_live_window_before_later_publish_finishes() 
     );
 }
 
-/// A due, confirmed replica retry cannot retain the owner while a new durable send waits.
+enum ForegroundSend {
+    Durable,
+    Direct,
+    Draft,
+    Tagged,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_send_yields_retry() {
+    send_during_secondary_retry(ForegroundSend::Direct).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn draft_send_yields_retry() {
+    send_during_secondary_retry(ForegroundSend::Draft).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tagged_send_yields_retry() {
+    send_during_secondary_retry(ForegroundSend::Tagged).await;
+}
+
+/// A due, confirmed replica retry cannot retain the owner while a new send waits.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn durable_send_interrupts_due_secondary_retry_and_updates_live_window() {
+    send_during_secondary_retry(ForegroundSend::Durable).await;
+}
+
+async fn send_during_secondary_retry(foreground: ForegroundSend) {
     let dir = tempfile::tempdir().unwrap();
     AccountHome::open(dir.path())
         .create_account("alice")
@@ -724,7 +754,6 @@ async fn durable_send_interrupts_due_secondary_retry_and_updates_live_window() {
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = MarmotApp::with_relay(dir.path(), "wss://progress.example")
         .with_test_relay_client(relay.clone());
-    let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
     let mut client = client_on_app_relay_plane(&app, "alice").await;
     let group = client
         .create_group_with_options(
@@ -739,8 +768,19 @@ async fn durable_send_interrupts_due_secondary_retry_and_updates_live_window() {
             },
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     drop(client);
+    // A recent announce keeps the creator's first send from owing a push
+    // announce, so the indexer's next publish is the text's retry.
+    app.record_group_push_gossip_announce(
+        "alice",
+        &hex::encode(group.as_slice()),
+        crate::notifications::unix_now_ms(),
+        None,
+    )
+    .unwrap();
     let runtime = crate::MarmotAppRuntime::new(app.clone());
     runtime.reconcile_accounts().await.unwrap();
     runtime.catch_up_accounts().await.unwrap();
@@ -805,21 +845,71 @@ async fn durable_send_interrupts_due_secondary_retry_and_updates_live_window() {
         original_source,
         "the held operation must be the exact already-accepted publication's retry"
     );
-    let accepted = runtime
-        .submit_text(
-            "alice",
-            &group,
-            "foreground during secondary retry".to_owned(),
-            "secondary-foreground".to_owned(),
-        )
-        .await
-        .unwrap();
     let observed = tokio::time::timeout(Duration::from_secs(3), async {
+        let message_id = match foreground {
+            ForegroundSend::Durable => {
+                runtime
+                    .submit_text(
+                        "alice",
+                        &group,
+                        "foreground during secondary retry".to_owned(),
+                        "secondary-foreground".to_owned(),
+                    )
+                    .await
+                    .unwrap()
+                    .message_id_hex
+            }
+            ForegroundSend::Direct | ForegroundSend::Draft | ForegroundSend::Tagged => {
+                let sent = if matches!(foreground, ForegroundSend::Direct) {
+                    runtime
+                        .send_message("alice", &group, b"direct during secondary retry".to_vec())
+                        .await
+                        .unwrap()
+                } else if matches!(foreground, ForegroundSend::Tagged) {
+                    runtime
+                        .send_tagged_text(
+                            "alice",
+                            &group,
+                            "tagged during secondary retry".into(),
+                            vec![],
+                        )
+                        .await
+                        .unwrap()
+                } else {
+                    let initial = runtime
+                        .selected_message_draft("alice", &hex::encode(group.as_slice()))
+                        .unwrap();
+                    let saved = runtime
+                        .save_message_draft_if_revision(
+                            "alice",
+                            &initial.revision,
+                            "draft during secondary retry",
+                            None,
+                            vec![],
+                        )
+                        .unwrap();
+                    runtime
+                        .send_message_draft("alice", &group, saved.revision, vec![])
+                        .await
+                        .unwrap()
+                };
+                assert_eq!(
+                    sent.accept_disposition,
+                    cgka_traits::SendAcceptDisposition::Published
+                );
+                assert_eq!(sent.published, 1);
+                sent.message_ids.into_iter().next().unwrap()
+            }
+        };
         loop {
             let snapshot = window.recv().await.unwrap().unwrap();
-            if snapshot.page.page().messages.iter().any(|row| {
-                row.message_id_hex == accepted.message_id_hex && row.source_message_id_hex.is_some()
-            }) {
+            if snapshot
+                .page
+                .page()
+                .messages
+                .iter()
+                .any(|row| row.message_id_hex == message_id && row.source_message_id_hex.is_some())
+            {
                 break snapshot;
             }
         }
@@ -831,9 +921,8 @@ async fn durable_send_interrupts_due_secondary_retry_and_updates_live_window() {
         .store(false, std::sync::atomic::Ordering::SeqCst);
     relay.indexer_publish_release.notify_waiters();
     runtime.shutdown_and_close().await.unwrap();
-    let observed = observed.expect(
-        "new durable send must publish and project while the old secondary ACK remains withheld",
-    );
+    let observed = observed
+        .expect("new send must publish and project while the old secondary ACK remains withheld");
     assert!(observed.presentation.header.capabilities.can_send);
     assert!(relay.attempted_events.lock().unwrap().len() > attempts_before);
 }

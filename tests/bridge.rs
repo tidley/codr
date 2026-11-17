@@ -49,6 +49,142 @@ fn inbound(sender: &str, id: &str) -> Value {
     json!({"marmot_agent_control":"marmot.agent-control.v2","type":"inbound_message","account_id_hex":"aa".repeat(32),"group_id_hex":"bb".repeat(16),"message":{"message_id_hex":id,"sender":{"account_id_hex":sender},"text":"test prompt","recorded_at":u64::MAX}})
 }
 
+#[tokio::test]
+async fn native_opencode_prompt_persists_id_before_post_and_never_types_a_fallback() {
+    use tokio::io::AsyncReadExt;
+    for (lose_response, pending_inbox) in [(false, false), (true, false), (true, true)] {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = config(root.path());
+        config.auto_forwarding = true;
+        let http = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let file = root.path().join("service.json");
+        std::fs::write(
+            &file,
+            json!({"url":format!("http://{}",http.local_addr().unwrap()),"pid":1}).to_string(),
+        )
+        .unwrap();
+        config.opencode_service_file = Some(file);
+        let state_path = config.state_path.clone();
+        let posts = Arc::new(Mutex::new(Vec::new()));
+        let seen = posts.clone();
+        let native_server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = http.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                loop {
+                    bytes.push(socket.read_u8().await.unwrap());
+                    if bytes.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let headers = String::from_utf8(bytes).unwrap();
+                let line = headers.lines().next().unwrap();
+                let length = headers
+                    .lines()
+                    .find_map(|s| {
+                        s.to_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|s| s.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                let mut body = vec![0; length];
+                socket.read_exact(&mut body).await.unwrap();
+                if pending_inbox && line.contains("/message/msg_codr_") {
+                    socket.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").await.unwrap();
+                    continue;
+                }
+                let response = if line.starts_with("POST ") {
+                    let body: Value = serde_json::from_slice(&body).unwrap();
+                    let saved = BridgeState::load(&state_path).unwrap();
+                    assert_eq!(
+                        saved.mappings[&agent().key()].submissions[0]
+                            .native_message_id
+                            .as_deref(),
+                        body["id"].as_str()
+                    );
+                    seen.lock().unwrap().push(body.clone());
+                    if lose_response {
+                        continue;
+                    }
+                    json!({"data":{"id":body["id"],"sessionID":"ses_1","type":"user","payload":{"text":body["text"]}}}).to_string()
+                } else if line.contains("/message/msg_codr_") {
+                    let sent = seen.lock().unwrap();
+                    json!({"data":{"id":sent[0]["id"],"type":"user","text":sent[0]["text"]}})
+                        .to_string()
+                } else if line.contains("/inbox") {
+                    let sent = seen.lock().unwrap();
+                    json!({"data":[{"id":sent[0]["id"],"sessionID":"ses_1","type":"user","payload":{"text":sent[0]["text"]}}]}).to_string()
+                } else if line.contains("/log?") {
+                    "data: {\"type\":\"log.synced\",\"aggregateID\":\"ses_1\",\"seq\":1}\n\n".into()
+                } else if line.contains("/message?") {
+                    json!({"data":[],"cursor":{"next":null}}).to_string()
+                } else {
+                    json!({"data":[]}).to_string()
+                };
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",response.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let calls = Arc::new(Mutex::new(vec![]));
+        let mdk = peer(&config.wn_agent_socket, true, calls.clone()).await;
+        let herdr = peer_for_agent(&config.herdr_socket, false, calls.clone(), agent()).await;
+        let mut bridge = Bridge::open(config.clone()).unwrap();
+        bridge.herdr_available = true;
+        bridge.agents.insert(agent().key(), agent());
+        bridge
+            .state
+            .mappings
+            .insert(agent().key(), activity_mapping(agent(), &"bb".repeat(16)));
+        bridge.inbound(&inbound(HEX, "native-phone")).await.unwrap();
+        bridge.inbound(&inbound(HEX, "native-phone")).await.unwrap();
+        assert_eq!(
+            posts.lock().unwrap().len(),
+            1,
+            "Duplicate delivery must not POST again"
+        );
+        assert!(
+            !calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|call| call["method"] == "agent.prompt")
+        );
+        assert_eq!(
+            bridge.state.mappings[&agent().key()].submissions.len(),
+            usize::from(lose_response)
+        );
+        drop(bridge);
+        let mut restored = Bridge::open(config).unwrap();
+        assert_eq!(
+            restored.state.mappings[&agent().key()].submissions.len(),
+            usize::from(lose_response)
+        );
+        restored.reconcile(vec![agent()]).await.unwrap();
+        assert!(
+            restored.state.mappings[&agent().key()]
+                .submissions
+                .is_empty()
+        );
+        let mapping = &restored.state.mappings[&agent().key()];
+        assert!(
+            mapping.queue_flight.as_ref().unwrap().confirmed,
+            "Recovered admission must confirm its flight"
+        );
+        let activity = serde_json::to_value(&mapping.activity).unwrap();
+        assert!(
+            activity["phone"][0]["confirmed"] == true,
+            "Recovered admission must keep phone attribution"
+        );
+        assert_eq!(
+            posts.lock().unwrap().len(),
+            1,
+            "Restart reconciliation must never POST again"
+        );
+        native_server.abort();
+        herdr.abort();
+        mdk.abort();
+    }
+}
+
 #[test]
 fn state_save_skips_unchanged_snapshots_but_persists_delivery_changes_immediately() {
     use std::os::unix::fs::MetadataExt;
@@ -407,6 +543,14 @@ async fn terminal_ack_without_native_input_warns_once_and_never_retries_after_re
         Some(1),
         "A terminal acknowledgement must retain native acceptance intent"
     );
+    // Without a pre-submission history baseline, matching text is deliberately
+    // insufficient to clear the safety latch. Diagnose that separately from
+    // failure to reconcile the late receipt below.
+    assert_eq!(
+        saved["mappings"][&key]["submissions"][0]["before"],
+        json!([]),
+        "The fixture must capture an empty native-input baseline before submission"
+    );
     saved["mappings"][&key]["submissions"][0]["submitted_at"] = json!(now() - 120);
     bridge.state = serde_json::from_value(saved).unwrap();
     bridge.save().unwrap();
@@ -460,7 +604,8 @@ async fn terminal_ack_without_native_input_warns_once_and_never_retries_after_re
     bridge.reconcile(vec![agent]).await.unwrap();
     assert!(
         bridge.state.mappings[&key].submissions.is_empty(),
-        "Late native evidence releases the safety latch"
+        "Late native evidence releases the safety latch; remaining submissions: {:?}",
+        bridge.state.mappings[&key].submissions
     );
     assert!(bridge.state.mappings[&key].queue_flight.is_none());
     assert_eq!(bridge.state.outbox.iter().filter(|item| item.text == "The agent has now received your earlier message. This chat's delivery pause is cleared.").count(), 1);
@@ -889,6 +1034,205 @@ async fn cancel_interrupts_only_the_current_verified_session_once_without_cleari
         1
     );
     server.abort();
+}
+
+#[tokio::test]
+async fn serial_controls_dispatch_in_order_and_survive_replay() {
+    let root = tempfile::tempdir().unwrap();
+    let config = config(root.path());
+    let observed = agent();
+    let mut bridge = mapped_bridge(config.clone(), &observed);
+    let mut event = inbound(HEX, "serial-sync");
+    event["message"]["text"] = json!("/sync off /sync on /queue");
+    bridge.inbound(&event).await.unwrap();
+    assert_eq!(
+        herdr_white_noise_bridge::forwarding::load(&config.state_path)
+            .unwrap()
+            .mode,
+        herdr_white_noise_bridge::forwarding::Mode::On
+    );
+    assert_eq!(bridge.state.outbox.len(), 3);
+    assert!(
+        bridge.state.mappings[&observed.key()]
+            .seen_messages
+            .contains(&"serial-sync".into())
+    );
+    drop(bridge);
+    let mut bridge = Bridge::open(config.clone()).unwrap();
+    herdr_white_noise_bridge::forwarding::set_mode(
+        &config.state_path,
+        herdr_white_noise_bridge::forwarding::Mode::Off,
+    )
+    .unwrap();
+    bridge.inbound(&event).await.unwrap();
+    assert_eq!(bridge.state.outbox.len(), 3);
+    assert_eq!(
+        herdr_white_noise_bridge::forwarding::load(&config.state_path)
+            .unwrap()
+            .mode,
+        herdr_white_noise_bridge::forwarding::Mode::Off
+    );
+}
+
+#[tokio::test]
+async fn serial_controls_history_then_unmute_is_nonblocking_and_durable() {
+    let root = tempfile::tempdir().unwrap();
+    let config = config(root.path());
+    let observed = agent();
+    let mut bridge = mapped_bridge(config.clone(), &observed);
+    bridge.poll_sessions(vec![observed.clone()]).await.unwrap();
+    // No native reader or herdr socket exists: dispatch must only queue collection.
+    let mut event = inbound(HEX, "serial-recent");
+    event["message"]["text"] = json!("/recent /unmute");
+    tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        bridge.inbound(&event),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let saved = BridgeState::load(&config.state_path).unwrap();
+    assert_eq!(saved.history_requests.len(), 1);
+    assert!(
+        saved.mappings[&observed.key()]
+            .seen_messages
+            .contains(&"serial-recent".into())
+    );
+    assert!(
+        saved
+            .outbox
+            .iter()
+            .any(|item| item.text.contains("No prompt was sent"))
+    );
+    drop(bridge);
+    let mut bridge = Bridge::open(config).unwrap();
+    bridge.inbound(&event).await.unwrap();
+    assert_eq!(bridge.state.history_requests.len(), 1);
+    assert_eq!(bridge.state.outbox.len(), saved.outbox.len());
+}
+
+#[tokio::test]
+async fn serial_controls_retry_only_unfinished_commands_after_restart() {
+    let root = tempfile::tempdir().unwrap();
+    let config = config(root.path());
+    let observed = agent();
+    let mut bridge = mapped_bridge(config.clone(), &observed);
+    bridge.poll_sessions(vec![observed.clone()]).await.unwrap();
+    for index in 0..16 {
+        let mut event = inbound(HEX, &format!("fill-{index}"));
+        event["message"]["text"] = json!("/last");
+        bridge.inbound(&event).await.unwrap();
+    }
+    let mut event = inbound(HEX, "serial-full");
+    event["message"]["text"] = json!("/queue /last /sync on");
+    assert!(bridge.inbound(&event).await.is_err());
+    assert_eq!(bridge.state.outbox.len(), 1);
+    assert!(
+        !bridge.state.mappings[&observed.key()]
+            .seen_messages
+            .contains(&"serial-full".into())
+    );
+    assert_eq!(
+        herdr_white_noise_bridge::forwarding::load(&config.state_path)
+            .unwrap()
+            .mode,
+        herdr_white_noise_bridge::forwarding::Mode::Auto
+    );
+    drop(bridge);
+    let mut bridge = Bridge::open(config).unwrap();
+    bridge.poll_sessions(vec![observed]).await.unwrap();
+    bridge.state.history_requests.clear();
+    bridge.inbound(&event).await.unwrap();
+    assert_eq!(
+        bridge.state.outbox.len(),
+        2,
+        "completed /queue must not repeat"
+    );
+    assert_eq!(bridge.state.history_requests.len(), 1);
+}
+
+#[tokio::test]
+async fn serial_controls_failed_save_keeps_receipts_retryable() {
+    for (text, replies) in [("/queue /sync off", 2), ("/queue /last 0", 1)] {
+        let root = tempfile::tempdir().unwrap();
+        let config = config(root.path());
+        let observed = agent();
+        let mut bridge = mapped_bridge(config.clone(), &observed);
+        std::fs::remove_file(&config.state_path).unwrap();
+        std::fs::create_dir(&config.state_path).unwrap();
+        let mut event = inbound(HEX, "serial-save");
+        event["message"]["text"] = json!(text);
+        assert!(bridge.inbound(&event).await.is_err());
+        assert!(bridge.state.outbox.is_empty());
+        assert!(
+            bridge.state.mappings[&observed.key()]
+                .seen_messages
+                .is_empty()
+        );
+        std::fs::remove_dir(&config.state_path).unwrap();
+        bridge.inbound(&event).await.unwrap();
+        assert_eq!(bridge.state.outbox.len(), replies);
+        assert!(
+            BridgeState::load(&config.state_path).unwrap().mappings[&observed.key()]
+                .seen_messages
+                .contains(&"serial-save".into())
+        );
+    }
+}
+
+#[tokio::test]
+async fn serial_controls_validate_before_effects_and_require_owner_plain_text() {
+    for (index, text) in [
+        "/sync off /recent 0",
+        "/sync off /update",
+        "/sync off /allow",
+        "/sync off /new",
+        "/sync off /help /unknown",
+        "/sync off /last 101",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let root = tempfile::tempdir().unwrap();
+        let config = config(root.path());
+        let mut bridge = mapped_bridge(config.clone(), &agent());
+        let mut event = inbound(HEX, &format!("invalid-{index}"));
+        event["message"]["text"] = json!(text);
+        bridge.inbound(&event).await.unwrap();
+        assert_eq!(
+            herdr_white_noise_bridge::forwarding::load(&config.state_path)
+                .unwrap()
+                .mode,
+            herdr_white_noise_bridge::forwarding::Mode::Auto
+        );
+        assert_eq!(bridge.state.outbox.len(), 1);
+        assert!(bridge.state.outbox[0].text.contains("No commands were run"));
+    }
+    for field in [
+        "sender",
+        "text_truncated",
+        "attachments_truncated",
+        "media",
+        "attachments",
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let config = config(root.path());
+        let mut bridge = mapped_bridge(config.clone(), &agent());
+        let mut event = inbound(HEX, "not-plain-owner");
+        event["message"]["text"] = json!("/sync off /sync on");
+        event["message"][field] = match field {
+            "sender" => json!({"account_id_hex": "foreign", "is_self": false}),
+            "media" | "attachments" => json!([{}]),
+            _ => json!(true),
+        };
+        bridge.inbound(&event).await.unwrap();
+        assert_eq!(
+            herdr_white_noise_bridge::forwarding::load(&config.state_path)
+                .unwrap()
+                .mode,
+            herdr_white_noise_bridge::forwarding::Mode::Auto
+        );
+    }
 }
 
 #[tokio::test]

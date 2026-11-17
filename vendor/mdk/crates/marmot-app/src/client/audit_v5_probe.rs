@@ -6,12 +6,11 @@
 //! checkpoint are distinct evidence boundaries. A sender founding preparation
 //! also records the returned retained artifact and recipient engine join.
 //! Publication receipts are captured at the account owner boundary.
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use cgka_session::{PublishWork, SessionEffects};
 use cgka_traits::engine::WelcomeMetadata;
 use cgka_traits::error::PeelerError;
 use cgka_traits::group::{Group, ProtocolProfile};
@@ -22,6 +21,9 @@ use cgka_traits::transport::EncryptedPayload;
 use cgka_traits::types::MemberId;
 use cgka_traits::{GroupEvent, GroupId, MessageId, TransportMessage};
 use marmot_forensics::v5::*;
+use marmot_session::{PublishWork, SessionEffects};
+#[cfg(feature = "unreleased-device-pairing")]
+use transport_nostr_peeler::AccountGiftWrap;
 use transport_nostr_peeler::{NostrMlsPeeler, NostrTransportEvent, WelcomePeelProvenance};
 
 use crate::AppGroupRecord;
@@ -38,7 +40,9 @@ pub(crate) struct FoundingSelection {
 }
 
 pub(crate) struct PendingFounding {
-    selected: BTreeMap<Vec<u8>, (LocalId, [u8; 32])>,
+    /// Each recipient's selected KeyPackages, in the order the engine wraps
+    /// their Welcomes.
+    selected: BTreeMap<Vec<u8>, VecDeque<(LocalId, [u8; 32])>>,
 }
 
 /// One selected AppClient delivery episode. The app arms it before engine
@@ -47,6 +51,7 @@ pub(crate) struct PendingFounding {
 pub(crate) struct PeelSlot {
     armed: Option<(Vec<u8>, LocalId, NostrEventRef)>,
     completed: Option<PeelCompletion>,
+    private_control: bool,
 }
 
 pub(crate) struct PeelCompletion {
@@ -62,27 +67,71 @@ impl PeelSlot {
     pub(crate) fn arm(&mut self, message: &TransportMessage, receive: (LocalId, NostrEventRef)) {
         self.armed = Some((message.id.as_slice().to_vec(), receive.0, receive.1));
         self.completed = None;
+        self.private_control = false;
     }
 
-    pub(crate) fn take(&mut self) -> Option<PeelCompletion> {
+    pub(crate) fn take(&mut self) -> (bool, Option<PeelCompletion>) {
         self.armed = None;
-        self.completed.take()
+        (
+            std::mem::take(&mut self.private_control),
+            self.completed.take(),
+        )
     }
 }
 
-/// The only selected test peeler. It delegates product behavior, and observes
-/// the same concrete Welcome peel the engine uses without a second decode.
+/// App-owned inbox boundary: apply invitation policy only after the one
+/// authenticated inner decode, and observe that same peel without repeating it.
 pub(crate) struct ProbePeeler {
     pub inner: NostrMlsPeeler,
     pub slot: Arc<Mutex<PeelSlot>>,
+    pub storage: storage_sqlite::SqliteAppStorage,
+    /// Takes the pairing messages among the gift wraps to the account.
+    #[cfg(feature = "unreleased-device-pairing")]
+    pub pairing: Option<super::device_pairing::PairingInbox>,
+}
+
+impl ProbePeeler {
+    /// Open a gift wrap to the account once: a Welcome peels as before, and
+    /// a pairing message goes to the pairing inbox and recovery keeps its
+    /// authenticated control payload. Other rumors are still refused.
+    async fn open_welcome(
+        &self,
+        msg: &TransportMessage,
+    ) -> Result<(PeeledMessage, Option<WelcomePeelProvenance>), PeelerError> {
+        #[cfg(feature = "unreleased-device-pairing")]
+        {
+            let opened = self.inner.peel_account_gift_wrap(msg).await?;
+            if let AccountGiftWrap::Other(unwrapped) = &opened {
+                // Remember the authenticated inner kind before the engine
+                // refuses this non-Welcome, even when pairing is disabled or
+                // its content cannot be admitted to the pairing inbox.
+                if marmot_pairing::PAIRING_KINDS.contains(&unwrapped.rumor.kind.as_u16()) {
+                    self.slot.lock().unwrap().private_control = true;
+                }
+                if let Some(pairing) = &self.pairing {
+                    pairing.offer(unwrapped);
+                }
+            }
+            opened.into_welcome()
+        }
+        #[cfg(not(feature = "unreleased-device-pairing"))]
+        self.inner.peel_welcome_with_provenance(msg).await
+    }
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl TransportPeeler for ProbePeeler {
+    fn prepare_group_message<'a>(
+        &self,
+        msg: &'a TransportMessage,
+    ) -> Result<cgka_traits::peeler::PreparedGroupMessage<'a>, PeelerError> {
+        self.inner.prepare_group_message(msg)
+    }
+
     async fn peel_group_message(
         &self,
-        msg: &TransportMessage,
+        msg: &cgka_traits::peeler::PreparedGroupMessage<'_>,
         ctx: &GroupContextSnapshot,
     ) -> Result<PeeledMessage, PeelerError> {
         self.inner.peel_group_message(msg, ctx).await
@@ -90,14 +139,46 @@ impl TransportPeeler for ProbePeeler {
 
     async fn peel_welcome(&self, msg: &TransportMessage) -> Result<PeeledMessage, PeelerError> {
         let started = Instant::now();
-        let result = self.inner.peel_welcome_with_provenance(msg).await;
+        let result = self
+            .open_welcome(msg)
+            .await
+            .and_then(|(peeled, provenance)| {
+                // The caller holds the account policy lock through admission and
+                // projection. Only an authenticated Welcome is an invitation.
+                if matches!(&peeled.content, cgka_traits::PeeledContent::Welcome { .. }) {
+                    let sender = peeled
+                        .sender
+                        .as_ref()
+                        .ok_or(PeelerError::InvalidSignature)?;
+                    let blocked = self
+                        .storage
+                        .is_user_blocked(&hex::encode(sender.as_slice()))
+                        .map_err(|_| {
+                            PeelerError::Backend("Welcome policy storage failed".into())
+                        })?;
+                    if blocked {
+                        self.storage
+                            .dismiss_blocked_welcome(&hex::encode(msg.id.as_slice()))
+                            .map_err(|_| {
+                                PeelerError::Backend("Welcome dismissal storage failed".into())
+                            })?;
+                        return Err(PeelerError::WrongRecipient);
+                    }
+                }
+                Ok((peeled, provenance))
+            });
         let elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
         let mut slot = self.slot.lock().unwrap();
+        // Retain the already authenticated classification even without audit
+        // capture, and even if runtime recovery processing subsequently fails.
+        slot.private_control |= matches!(&result, Ok((peeled, _))
+            if matches!(&peeled.content, cgka_traits::PeeledContent::GroupRecovery { .. }));
         if let Some((id, receive_id, outer)) = slot.armed.take()
             && id == msg.id.as_slice()
+            && !slot.private_control
         {
             let (outcome, reason, provenance) = match &result {
-                Ok((_, provenance)) => (UnwrapResult::Validated, None, Some(provenance.clone())),
+                Ok((_, provenance)) => (UnwrapResult::Validated, None, provenance.clone()),
                 Err(error) => {
                     let (outcome, reason) = match error {
                         PeelerError::WrongRecipient => {
@@ -132,6 +213,14 @@ impl TransportPeeler for ProbePeeler {
             });
         }
         result.map(|(peeled, _)| peeled)
+    }
+
+    async fn wrap_group_recovery(
+        &self,
+        message: &cgka_traits::GroupRecoveryMessage,
+        recipient: &MemberId,
+    ) -> Result<TransportMessage, PeelerError> {
+        self.inner.wrap_group_recovery(message, recipient).await
     }
 
     async fn wrap_group_message(
@@ -327,7 +416,7 @@ impl WelcomeProbe {
             self.dropped += selections.len();
             return None;
         }
-        let mut selected = BTreeMap::new();
+        let mut selected = BTreeMap::<Vec<u8>, VecDeque<(LocalId, [u8; 32])>>::new();
         for selection in selections {
             let Ok(recipient) = hex::decode(selection.recipient_hex) else {
                 self.invalid += 1;
@@ -345,18 +434,20 @@ impl WelcomeProbe {
                 self.invalid += 1;
                 return None;
             };
-            let op_id = self.local_id();
-            if selected.insert(recipient, (op_id, event_id)).is_some() {
+            let packages = selected.entry(recipient).or_default();
+            if packages.iter().any(|(_, selected)| *selected == event_id) {
                 self.invalid += 1;
                 return None;
             }
+            packages.push_back((self.local_id(), event_id));
         }
         Some(PendingFounding { selected })
     }
 
     /// The returned FoundingGroupCreated artifact comes after the engine's
     /// canonical transaction retained these exact Welcome messages as Sent.
-    /// Match by validated recipient identity, never by incidental vec order.
+    /// Match by validated recipient identity. One account's several
+    /// KeyPackages match in the order the engine wrapped their Welcomes.
     pub(crate) fn founding_prepared(
         &mut self,
         mut pending: PendingFounding,
@@ -385,8 +476,10 @@ impl WelcomeProbe {
                     self.invalid += 1;
                     return;
                 };
-                let Some((op_id, key_package_event_id)) =
-                    pending.selected.remove(recipient.as_slice())
+                let Some((op_id, key_package_event_id)) = pending
+                    .selected
+                    .get_mut(recipient.as_slice())
+                    .and_then(VecDeque::pop_front)
                 else {
                     self.invalid += 1;
                     return;
@@ -413,7 +506,12 @@ impl WelcomeProbe {
                 rows.push((op_id, recipient_ref, key_package_event_id, outer_event_id));
             }
         }
-        if !found_work || !pending.selected.is_empty() {
+        if !found_work
+            || pending
+                .selected
+                .values()
+                .any(|packages| !packages.is_empty())
+        {
             self.invalid += 1;
             return;
         }
@@ -469,31 +567,23 @@ impl WelcomeProbe {
         };
         let receive_id = self.local_id();
         let outer = NostrEventRef::from_validated_event_id(&id);
-        let before = if self.live {
-            self.pending_live.len()
-        } else {
-            self.rows.len()
-        };
+        // Allocate the receipt episode now, but record it only after the
+        // normal peeler distinguishes a Welcome (or peel failure) from control.
+        Some((receive_id, outer))
+    }
+
+    pub(super) fn unwrapped(&mut self, completion: PeelCompletion) {
         self.record(
             None,
             Event::WelcomeObserved(WelcomeObserved {
-                receive_id: receive_id.clone(),
-                outer_event_ref: outer.clone(),
+                receive_id: completion.receive_id.clone(),
+                outer_event_ref: completion.outer.clone(),
                 // The app drain does not expose a reliable live/history distinction.
                 acquisition: Acquisition::Unknown,
                 endpoint_ref: None,
                 fetch_id: None,
             }),
         );
-        let after = if self.live {
-            self.pending_live.len()
-        } else {
-            self.rows.len()
-        };
-        (after > before).then_some((receive_id, outer))
-    }
-
-    pub(super) fn unwrapped(&mut self, completion: PeelCompletion) {
         self.record(
             None,
             Event::WelcomeUnwrapped(WelcomeUnwrapped {
@@ -581,12 +671,13 @@ impl WelcomeProbe {
                 Some(BaselineMember { member_ref, admin })
             })
             .collect::<Vec<_>>();
+        // One entry per account: an account with several devices holds
+        // several leaves, which is not an identity fault.
         members.sort_by(|a, b| a.member_ref.cmp(&b.member_ref));
-        let before_dedup = members.len();
         members.dedup_by(|a, b| a.member_ref == b.member_ref);
-        let member_count = u32::try_from(group.members.len()).ok();
+        let member_count = u32::try_from(crate::groups::member_account_count(&group.members)).ok();
         let mut limitations = Vec::new();
-        if invalid_member_identity || members.len() != before_dedup {
+        if invalid_member_identity {
             limitations.push(Limitation::MemberIdentityInvalid);
         }
         if members.len() > MAX_MEMBERS {

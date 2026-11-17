@@ -1,28 +1,31 @@
-//! Regression for a catch-up drain that fails after earlier deliveries commit.
+//! Regressions for a sync that fails after earlier deliveries commit.
 //!
 //! The first delivery is durable before the injected second-step failure. The
-//! managed runtime must still broadcast that delivery's `SyncSummary`; otherwise
-//! a live-only subscriber can never learn about the already-projected message.
+//! caller must still learn that delivery's `SyncSummary` exactly once, across
+//! a retry and a restart; otherwise it can never learn about the
+//! already-projected message.
 #![cfg(feature = "test-policy-overrides")]
 
 use std::time::Duration;
 
 use cgka_traits::GroupId;
 use marmot_account::AccountHome;
-use marmot_app::audit_otlp_sender::AuditOtlpSender;
 use marmot_app::{
-    AppClient, AuditLogSettings, MarmotApp, MarmotAppConfig, MarmotAppEvent, MarmotAppRuntime,
+    AppClient, AppError, AuditLogSettings, MarmotApp, MarmotAppConfig, MarmotAppEvent,
+    MarmotAppRuntime,
 };
 use nostr_relay_builder::MockRelay;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
-use tokio::sync::oneshot;
+#[path = "support/limited_relay.rs"]
+mod limited_relay;
+use limited_relay::TestRelay;
 
 fn open_store(
     dir: &tempfile::TempDir,
     relay_url: &str,
     fail_sync_before_delivery: Option<u64>,
 ) -> MarmotApp {
+    // These faults prove committed state and replay, not power-loss durability.
+    storage_sqlite::relax_storage_for_test_process();
     let mut config = MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
     if let Some(deliveries) = fail_sync_before_delivery {
         config = config.with_dev_fail_sync_before_delivery(deliveries);
@@ -35,6 +38,7 @@ fn open_store_with_boundary_failure(
     relay_url: &str,
     completed_deliveries: u64,
 ) -> MarmotApp {
+    storage_sqlite::relax_storage_for_test_process();
     let config = MarmotAppConfig::white_noise()
         .with_allow_loopback_relay_endpoints(true)
         .with_dev_fail_sync_before_boundary_save(completed_deliveries);
@@ -42,6 +46,7 @@ fn open_store_with_boundary_failure(
 }
 
 fn open_store_with_post_ack_failure(dir: &tempfile::TempDir, relay_url: &str) -> MarmotApp {
+    storage_sqlite::relax_storage_for_test_process();
     let config = MarmotAppConfig::white_noise()
         .with_allow_loopback_relay_endpoints(true)
         .with_dev_fail_ingest_after_application_event_ack();
@@ -67,18 +72,36 @@ async fn wait_for_event<F>(
 }
 
 struct PendingMessageBatch {
-    _relay: MockRelay,
+    _relay: TestRelay,
     bob_dir: tempfile::TempDir,
     _alice_dir: tempfile::TempDir,
     relay_url: String,
-    bob_id: String,
     group_id: GroupId,
     alice: AppClient,
+    pending_messages: Vec<String>,
 }
 
 impl PendingMessageBatch {
     fn bob_app(&self, fail_sync_before_delivery: Option<u64>) -> MarmotApp {
         open_store(&self.bob_dir, &self.relay_url, fail_sync_before_delivery)
+    }
+
+    async fn publish_pending_messages(&mut self) {
+        for message in std::mem::take(&mut self.pending_messages) {
+            self.alice
+                .send(&self.group_id, message.as_bytes())
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn activate_then_publish(&mut self, bob: &mut AppClient) {
+        // These faults belong to ordinary native ingress, which remains
+        // supported without a native backward pager. Establish its live
+        // subscription before publishing; cold replay may instead be admitted
+        // by the recovery runner and cannot witness native-drain faults.
+        assert!(bob.sync().await.unwrap().messages.is_empty());
+        self.publish_pending_messages().await;
     }
 }
 
@@ -91,8 +114,9 @@ async fn pending_two_message_batch() -> PendingMessageBatch {
 }
 
 async fn pending_message_batch(messages: Vec<String>) -> PendingMessageBatch {
-    let relay = MockRelay::run().await.unwrap();
-    let relay_url = relay.url().await.to_string();
+    // A truthful cap lets the current-second replay reach the injected
+    // ingestion/projection fault; unknown-cap fencing is a separate contract.
+    let (relay, relay_url) = limited_relay::mock_relay().await;
 
     let bob_dir = tempfile::tempdir().unwrap();
     let home_bob = AccountHome::open(bob_dir.path());
@@ -104,8 +128,8 @@ async fn pending_message_batch(messages: Vec<String>) -> PendingMessageBatch {
     home_alice.create_account("alice").unwrap();
     let app_alice = open_store(&alice_dir, &relay_url, None);
 
-    // Boot bob once so the welcome is consumed before the failing batch. The
-    // cold second boot then drains exactly the application messages below.
+    // Consume the Welcome before preparing the failing application batch.
+    // Each test chooses live ingress or the explicit old startup-drain control.
     let app_bob_boot1 = open_store(&bob_dir, &relay_url, None);
     app_bob_boot1
         .set_audit_log_settings(AuditLogSettings { enabled: true })
@@ -122,7 +146,9 @@ async fn pending_message_batch(messages: Vec<String>) -> PendingMessageBatch {
     let group_id = alice
         .create_group("partial sync summary", &[bob_id.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events_bob_boot1, |event| {
         matches!(
             event,
@@ -136,37 +162,23 @@ async fn pending_message_batch(messages: Vec<String>) -> PendingMessageBatch {
     .await;
     runtime_bob_boot1.shutdown().await;
 
-    for message in messages {
-        alice.send(&group_id, message.as_bytes()).await.unwrap();
-    }
-
     PendingMessageBatch {
         _relay: relay,
         bob_dir,
         _alice_dir: alice_dir,
         relay_url,
-        bob_id,
         group_id,
         alice,
+        pending_messages: messages,
     }
-}
-
-async fn acknowledge_one_http_request(listener: TcpListener, observed: oneshot::Sender<()>) {
-    let (mut stream, _) = listener.accept().await.expect("audit tracker request");
-    let mut request = [0_u8; 4096];
-    let _ = stream.read(&mut request).await;
-    let _ = observed.send(());
-    stream
-        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
-        .await
-        .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn direct_sync_failure_returns_applied_prefix() {
-    let batch = pending_two_message_batch().await;
+    let mut batch = pending_two_message_batch().await;
     let app_bob = batch.bob_app(Some(1));
     let mut bob = app_bob.client("bob").await.unwrap();
+    batch.activate_then_publish(&mut bob).await;
 
     let failure = bob
         .sync_with_partial_progress()
@@ -207,9 +219,11 @@ async fn direct_sync_failure_returns_applied_prefix() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failure_after_application_event_ack_replays_summary_exactly_once() {
-    let batch = pending_message_batch(vec!["applied before projection failure".to_owned()]).await;
+    let mut batch =
+        pending_message_batch(vec!["applied before projection failure".to_owned()]).await;
     let app_bob = open_store_with_post_ack_failure(&batch.bob_dir, &batch.relay_url);
     let mut bob = app_bob.client("bob").await.unwrap();
+    batch.activate_then_publish(&mut bob).await;
 
     let failure = bob
         .sync_with_partial_progress()
@@ -243,9 +257,10 @@ async fn failure_after_application_event_ack_replays_summary_exactly_once() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_prefix_survives_error() {
-    let batch = pending_two_message_batch().await;
+    let mut batch = pending_two_message_batch().await;
     let app_bob = open_store_with_boundary_failure(&batch.bob_dir, &batch.relay_url, 1);
     let mut bob = app_bob.client("bob").await.unwrap();
+    batch.activate_then_publish(&mut bob).await;
 
     let failure = bob
         .sync_with_partial_progress()
@@ -281,9 +296,10 @@ async fn native_prefix_survives_error() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_prefix_reports_once() {
-    let batch = pending_two_message_batch().await;
+    let mut batch = pending_two_message_batch().await;
     let app_bob = open_store_with_boundary_failure(&batch.bob_dir, &batch.relay_url, 1);
     let mut bob = app_bob.client("bob").await.unwrap();
+    batch.activate_then_publish(&mut bob).await;
 
     let failure = bob
         .sync_with_partial_progress()
@@ -306,8 +322,18 @@ async fn native_prefix_reports_once() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn joined_group_replays_once_after_boundary_save_failure_and_restart() {
+/// Bob, invited by alice, with the Welcome still on the relay: bob's next sync
+/// is the cold pass that joins the group.
+struct PendingWelcome {
+    _relay: MockRelay,
+    relay_url: String,
+    bob_dir: tempfile::TempDir,
+    _alice_dir: tempfile::TempDir,
+    _alice: AppClient,
+    group_id: GroupId,
+}
+
+async fn pending_welcome(group_name: &str) -> PendingWelcome {
     let relay = MockRelay::run().await.unwrap();
     let relay_url = relay.url().await.to_string();
 
@@ -328,11 +354,26 @@ async fn joined_group_replays_once_after_boundary_save_failure_and_restart() {
     let app_alice = open_store(&alice_dir, &relay_url, None);
     let mut alice = app_alice.client("alice").await.unwrap();
     let group_id = alice
-        .create_group("join boundary recovery", &[bob_id.as_str()])
+        .create_group(group_name, &[bob_id.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    PendingWelcome {
+        _relay: relay,
+        relay_url,
+        bob_dir,
+        _alice_dir: alice_dir,
+        _alice: alice,
+        group_id,
+    }
+}
 
-    let app_bob_failing = open_store_with_boundary_failure(&bob_dir, &relay_url, 0);
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn joined_group_replays_once_after_boundary_save_failure_and_restart() {
+    let welcome = pending_welcome("join boundary recovery").await;
+
+    let app_bob_failing = open_store_with_boundary_failure(&welcome.bob_dir, &welcome.relay_url, 0);
     let mut bob_failing = app_bob_failing.client("bob").await.unwrap();
     let failure = bob_failing
         .sync_with_partial_progress()
@@ -348,23 +389,56 @@ async fn joined_group_replays_once_after_boundary_save_failure_and_restart() {
     drop(bob_failing);
     drop(app_bob_failing);
 
-    let app_bob_recovered = open_store(&bob_dir, &relay_url, None);
+    let app_bob_recovered = open_store(&welcome.bob_dir, &welcome.relay_url, None);
     let mut bob_recovered = app_bob_recovered.client("bob").await.unwrap();
     let recovered = bob_recovered.sync().await.unwrap();
     assert_eq!(
         recovered.joined_groups,
-        vec![group_id.clone()],
+        vec![welcome.group_id.clone()],
         "the durable engine-to-app outbox must replay the joined group"
     );
     drop(bob_recovered);
     drop(app_bob_recovered);
 
-    let app_bob_acknowledged = open_store(&bob_dir, &relay_url, None);
+    let app_bob_acknowledged = open_store(&welcome.bob_dir, &welcome.relay_url, None);
     let mut bob_acknowledged = app_bob_acknowledged.client("bob").await.unwrap();
     let after_ack = bob_acknowledged.sync().await.unwrap();
     assert!(
         after_ack.joined_groups.is_empty(),
         "the projection save must acknowledge the replay exactly once"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sync_account_keeps_open_failure_apart_from_pass_failure() {
+    let welcome = pending_welcome("sync account failures").await;
+    let app_bob = open_store_with_boundary_failure(&welcome.bob_dir, &welcome.relay_url, 0);
+
+    // Another open holds bob's engine session, so `sync_account` fails to
+    // open before anything syncs: the open's own error, not an empty partial
+    // sync.
+    let held = app_bob.client("bob").await.unwrap();
+    let busy = app_bob.sync_account("bob").await;
+    assert!(
+        matches!(busy, Err(AppError::AccountSessionBusy)),
+        "a failed open must surface as its AppError: {busy:?}",
+    );
+    drop(held);
+
+    // The cold pass `wn sync` runs fails projecting the Welcome: a pass
+    // failure, returned inside the open that succeeded.
+    let failure = app_bob
+        .sync_account("bob")
+        .await
+        .expect("the client opens once the other open is dropped")
+        .expect_err("the Welcome projection boundary must fail");
+    assert!(
+        failure
+            .source
+            .to_string()
+            .contains("injected catch-up boundary save failure"),
+        "the fault must come from the pass: {}",
+        failure.source
     );
 }
 
@@ -392,11 +466,15 @@ async fn route_changing_delivery_persists_seen_id_before_later_failure() {
     let first_group_id = alice
         .create_group("route boundary one", &[bob_id.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let second_group_id = alice
         .create_group("route boundary two", &[bob_id.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let expected_groups = [first_group_id, second_group_id];
 
     // Both welcomes are already stored in MockRelay before this sync starts,
@@ -431,117 +509,4 @@ async fn route_changing_delivery_persists_seen_id_before_later_failure() {
         "the persisted welcome event id must suppress route-changing replay",
     );
     assert!(expected_groups.contains(&resumed.joined_groups[0]));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn catch_up_failure_emits_summary_for_earlier_committed_delivery() {
-    let mut batch = pending_two_message_batch().await;
-    let app_bob_boot2 = MarmotApp::try_with_relays_and_account_home_and_config(
-        batch.bob_dir.path(),
-        vec![batch.relay_url.clone()],
-        AccountHome::open(batch.bob_dir.path()),
-        MarmotAppConfig::white_noise()
-            .with_allow_loopback_relay_endpoints(true)
-            .with_dev_fail_sync_before_delivery(1),
-    )
-    .unwrap();
-    let runtime_bob_boot2 = MarmotAppRuntime::new(app_bob_boot2);
-    let mut events_bob_boot2 = runtime_bob_boot2.subscribe();
-    let tracker_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let tracker_addr = tracker_listener.local_addr().unwrap();
-    let (tracker_observed, tracker_request) = oneshot::channel();
-    let tracker_server = tokio::spawn(acknowledge_one_http_request(
-        tracker_listener,
-        tracker_observed,
-    ));
-    runtime_bob_boot2.set_audit_log_batch_window_for_test(Duration::ZERO);
-    runtime_bob_boot2
-        .set_audit_otlp_sender(Some(
-            AuditOtlpSender::for_loopback_dev(
-                "partial-summary-v5",
-                format!("http://{tracker_addr}/v1/logs"),
-                "partial-summary-test-token".to_owned(),
-            )
-            .unwrap(),
-        ))
-        .unwrap();
-    runtime_bob_boot2.start().await.unwrap();
-
-    let committed_before_failure = tokio::time::timeout(Duration::from_secs(10), async {
-        let mut message_arrived = None;
-        loop {
-            match events_bob_boot2.recv().await.expect("runtime event stream") {
-                MarmotAppEvent::MessageReceived(message)
-                    if message.account_id_hex == batch.bob_id
-                        && message.message.group_id == batch.group_id
-                        && matches!(
-                            message.message.plaintext.as_str(),
-                            "committed before batch failure" | "still queued after batch failure"
-                        ) =>
-                {
-                    message_arrived = Some(message.message.plaintext);
-                }
-                MarmotAppEvent::AccountError(error)
-                    if error.account_id_hex == batch.bob_id
-                        && error.message.starts_with("runtime startup receive failed:") =>
-                {
-                    break message_arrived;
-                }
-                _ => {}
-            }
-        }
-    })
-    .await
-    .expect("injected catch-up failure event")
-    .expect("the completed delivery's summary must be emitted before the later batch error");
-
-    assert_eq!(
-        runtime_bob_boot2
-            .shared_services()
-            .app_performance_telemetry()
-            .snapshot()
-            .account_sync
-            .failures,
-        1,
-        "the test must exercise the injected mid-batch failure",
-    );
-    tokio::time::timeout(Duration::from_secs(10), tracker_request)
-        .await
-        .expect("partial summary must schedule the audit tracker")
-        .expect("audit tracker observation channel");
-    tracker_server.await.unwrap();
-    runtime_bob_boot2.shutdown().await;
-
-    // The accumulated-prefix checkpoint must persist the seen-id/cursor state
-    // and app-outbox acknowledgement. Bound the third boot with fresh traffic
-    // and prove the delivery announced before the failure is not replayed.
-    let app_bob_boot3 = batch.bob_app(None);
-    let runtime_bob_boot3 = MarmotAppRuntime::new(app_bob_boot3);
-    let mut events_bob_boot3 = runtime_bob_boot3.subscribe();
-    runtime_bob_boot3.start().await.unwrap();
-    batch
-        .alice
-        .send(&batch.group_id, b"fresh after failed batch restart")
-        .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if let MarmotAppEvent::MessageReceived(message) =
-                events_bob_boot3.recv().await.expect("runtime event stream")
-                && message.account_id_hex == batch.bob_id
-                && message.message.group_id == batch.group_id
-            {
-                assert_ne!(
-                    message.message.plaintext, committed_before_failure,
-                    "the persisted delivery must not replay after restart"
-                );
-                if message.message.plaintext == "fresh after failed batch restart" {
-                    break;
-                }
-            }
-        }
-    })
-    .await
-    .expect("fresh message after restart");
-    runtime_bob_boot3.shutdown().await;
 }

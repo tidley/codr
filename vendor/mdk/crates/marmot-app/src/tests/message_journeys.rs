@@ -25,6 +25,23 @@ impl transport_nostr::DirectoryRelayFetcher for CrashRelay {
 
 #[async_trait]
 impl NostrRelayClient for CrashRelay {
+    fn relay_notification_source(
+        &self,
+    ) -> Option<Arc<dyn transport_nostr_adapter::NostrRelayNotificationSource>> {
+        self.inner.relay_notification_source()
+    }
+
+    async fn reply_sent_nothing(
+        &self,
+        account: Option<&MemberId>,
+        endpoint: &TransportEndpoint,
+        subscription_id: &str,
+    ) -> bool {
+        self.inner
+            .reply_sent_nothing(account, endpoint, subscription_id)
+            .await
+    }
+
     async fn subscribe(
         &self,
         subscription: NostrSubscription,
@@ -113,7 +130,12 @@ async fn message_journey_crash_child() {
     let app =
         MarmotApp::with_relay(&root, "wss://journey.example").with_test_relay_client(relay.clone());
     let mut client = app.client("sender").await.unwrap();
-    let group = client.create_group("journey", &[]).await.unwrap();
+    let group = client
+        .create_group("journey", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     fs_private::write_private(&root.join("group"), group.as_slice()).unwrap();
     relay.armed.store(true, Ordering::SeqCst);
     let mut updates = 0;
@@ -241,14 +263,14 @@ async fn message_journey_queue_cancel() {
     let app = MarmotApp::with_relay(root.path(), "wss://journey.example")
         .with_test_relay_client(relay.clone());
     let mut client = app.client("sender").await.unwrap();
-    let group = client.create_group("journey", &[]).await.unwrap();
+    let group = client
+        .create_group("journey", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     drop(client);
     let runtime = app.runtime();
-    let _eose = scripted_eose_pump(
-        runtime.shared_services().relay_plane().clone(),
-        relay.clone(),
-        every_subscription,
-    );
     runtime.reconcile_accounts().await.unwrap();
     relay.block_next_publish();
     let sender = runtime.clone();

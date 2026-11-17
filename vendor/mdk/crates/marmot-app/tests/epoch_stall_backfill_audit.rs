@@ -42,7 +42,9 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use marmot_account::AccountHome;
 use marmot_app::{AuditLogSettings, CursorPersistence, MarmotApp, MarmotAppConfig};
-use nostr_relay_builder::MockRelay;
+#[path = "support/limited_relay.rs"]
+mod limited_relay;
+use limited_relay::{TestRelay, mock_relay};
 use nostr_sdk::prelude::{
     Client as NostrSdkClient, EventBuilder, FinalizeEvent, Keys, Kind, Tag,
     Timestamp as NostrTimestamp,
@@ -51,7 +53,7 @@ use tokio::time::{sleep, timeout};
 use transport_nostr_adapter::{NostrRelayClient, NostrSdkRelayClient};
 use transport_nostr_peeler::{NOSTR_GROUP_CONTENT_MIN_LEN, NostrTransportEvent};
 
-/// Mirrors `marmot_app::client::epoch_stall::EPOCH_STALL_BACKFILL_THRESHOLD`
+/// Mirrors `marmot_app::client::history_recovery::epoch_stall::EPOCH_STALL_BACKFILL_THRESHOLD`
 /// (crate-private, hence mirrored): the number of distinct undecryptable
 /// messages a group must accumulate at one stalled epoch before the runtime
 /// arms a full-history epoch-gap backfill.
@@ -65,7 +67,7 @@ const NEXT_EVENT_DEADLINE: Duration = Duration::from_secs(10);
 /// Deadline for bob's welcome to arrive and the group to become live.
 const JOIN_DEADLINE: Duration = Duration::from_secs(10);
 
-/// Mirrors `marmot_app::client::epoch_stall::EPOCH_STALL_ESCALATION_ARM_THRESHOLD`
+/// Mirrors `marmot_app::client::history_recovery::epoch_stall::EPOCH_STALL_ESCALATION_ARM_THRESHOLD`
 /// (crate-private, hence mirrored): backfills one group may arm in an
 /// unrecovered run before the runtime escalates.
 const ESCALATION_ARM_THRESHOLD: usize = 3;
@@ -105,12 +107,6 @@ const EPOCH_ADVANCE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// of taking whichever one the feature resolution hands it.
 const SETTLEMENT_QUIESCENCE_MS: u64 = 1_000;
 
-async fn mock_relay() -> (MockRelay, String) {
-    let relay = MockRelay::run().await.unwrap();
-    let url = relay.url().await.to_string();
-    (relay, url)
-}
-
 fn open_store(dir: &tempfile::TempDir, relay_url: &str) -> MarmotApp {
     open_store_with_config(dir, relay_url, MarmotAppConfig::white_noise())
 }
@@ -120,6 +116,8 @@ fn open_store_with_config(
     relay_url: &str,
     config: MarmotAppConfig,
 ) -> MarmotApp {
+    // Keep encrypted files and reopens without paying production allocator/fsync costs.
+    storage_sqlite::relax_storage_for_test_process();
     MarmotApp::with_relay_and_config(
         dir.path(),
         relay_url.to_owned(),
@@ -238,7 +236,7 @@ fn ingested_message_ids(rows: &[serde_json::Value]) -> Vec<String> {
 /// their own store, plus the handles the tests drive them through.
 struct StalledGroup {
     /// Kept bound so the mock relay outlives the clients.
-    _relay: MockRelay,
+    _relay: TestRelay,
     app_bob: MarmotApp,
     bob: marmot_app::AppClient,
     /// Alice advances the group epoch so bob can stall again at a new one.
@@ -292,7 +290,9 @@ async fn stalled_bob_in_a_live_group_with_config(
     let group_id = alice
         .create_group("epoch-stall backfill audit", &[bob_id.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
 
     // bob joins by draining the welcome; poll `sync` until the group is live so
@@ -363,8 +363,7 @@ impl StalledGroup {
     /// until its quiescence window closes. The account worker drives that second
     /// step; a direct client must call `retry_group_convergence` itself.
     ///
-    /// Awaits bob's observable epoch rather than a fixed wait, the shape
-    /// `wait_for_inbound_delivered` in `since_floor.rs` uses: each pass re-drains,
+    /// Awaits bob's observable epoch rather than a fixed wait: each pass re-drains,
     /// re-drives convergence, and reads the epoch, so the loop returns as soon as
     /// the fold lands instead of one whole `EPOCH_ADVANCE_POLL_INTERVAL` late.
     async fn advance_bobs_epoch(&mut self, name: &str) {
@@ -602,7 +601,7 @@ async fn undecryptable_traffic_ingested_only_while_frozen_arms_on_the_next_advan
         .await;
     }
     let mut frozen_rows = Vec::new();
-    timeout(NEXT_EVENT_DEADLINE, async {
+    let collected = timeout(NEXT_EVENT_DEADLINE, async {
         loop {
             frozen.sync().await.expect("frozen admission succeeds");
             frozen_rows.extend(audit_rows.new_rows(&app_frozen, "bob"));
@@ -611,8 +610,23 @@ async fn undecryptable_traffic_ingested_only_while_frozen_arms_on_the_next_advan
             }
         }
     })
-    .await
-    .expect("the Frozen wake retains the whole burst within the existing deadline");
+    .await;
+    if collected.is_err() {
+        frozen_rows.extend(audit_rows.new_rows(&app_frozen, "bob"));
+        let retained = ingested_message_ids(&frozen_rows).len();
+        let kept = dir_bob.keep();
+        std::fs::write(
+            kept.join("frozen-deadline-audit.json"),
+            serde_json::to_vec_pretty(&frozen_rows).unwrap(),
+        )
+        .unwrap();
+        drop(frozen);
+        drop(app_frozen);
+        panic!(
+            "the Frozen wake retains the whole burst within the existing deadline: retained={retained}, evidence={}",
+            kept.display()
+        );
+    }
     assert!(
         rows_of_kind(&frozen_rows, "epoch_stall_backfill_armed").is_empty(),
         "a Frozen wake tracks no stalls: {frozen_rows:?}"

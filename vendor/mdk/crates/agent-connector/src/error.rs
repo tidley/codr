@@ -7,6 +7,12 @@ use marmot_app::{AppError, DirectoryError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConnectorError {
+    #[error("attachment source epoch is unavailable")]
+    AttachmentEpochUnavailable,
+    #[error("attachment handoff release failed; retry the same lease")]
+    AttachmentReleaseFailed,
+    #[error("attachment reference was rejected")]
+    AttachmentRejected(marmot_app::MediaAttachmentRejection),
     #[error(transparent)]
     AccountHome(#[from] AccountHomeError),
     #[error(transparent)]
@@ -31,6 +37,8 @@ pub enum ConnectorError {
     Stream(String),
     #[error("invalid group create request: {0}")]
     InvalidGroupCreate(&'static str),
+    #[error("no requested group member is available")]
+    MemberResolutionFailed,
     #[error("invalid profile name: {0}")]
     InvalidProfileName(&'static str),
     #[error("invalid profile {0}: {1}")]
@@ -49,6 +57,8 @@ pub enum ConnectorError {
     MediaPathDenied(&'static str),
     #[error("outbound media exceeds connector limits: {0}")]
     MediaLimitsExceeded(&'static str),
+    #[error("media idempotency key was reused with different inputs")]
+    MediaIdempotencyConflict,
     #[error("stream id is already reserved")]
     StreamIdInUse,
     #[error("stream capability denied")]
@@ -71,6 +81,9 @@ impl From<DirectoryError> for ConnectorError {
 impl ConnectorError {
     pub fn code(&self) -> &'static str {
         match self {
+            Self::AttachmentEpochUnavailable => "attachment_epoch_unavailable",
+            Self::AttachmentReleaseFailed => "attachment_release_failed",
+            Self::AttachmentRejected(_) => "attachment_rejected",
             Self::AccountHome(_) => "account_home_error",
             Self::App(AppError::ReactionNotFound) => "reaction_not_found",
             Self::App(AppError::MediaUploadTimedOut) => "media_upload_timeout",
@@ -78,7 +91,11 @@ impl ConnectorError {
             Self::App(AppError::AgentStreamFinishMismatch) => "stream_finalize_mismatch",
             Self::App(AppError::AgentStreamSendFailed(_)) => "stream_send_failed",
             Self::App(AppError::InvalidGroupProfile(_)) => "invalid_group_profile",
+            Self::App(AppError::GroupCreateAdminNotMember) => "invalid_group_create",
             Self::App(AppError::InvalidEditTarget) => "invalid_edit_target",
+            Self::App(AppError::MissingRelayLists(_) | AppError::MissingDefaultRelays) => {
+                "missing_relay_lists"
+            }
             Self::App(error)
                 if matches!(
                     error.as_engine_error(),
@@ -98,6 +115,7 @@ impl ConnectorError {
             Self::UnsafeControlPlaneConfig(_) => "unsafe_control_plane_config",
             Self::Stream(_) => "stream_error",
             Self::InvalidGroupCreate(_) => "invalid_group_create",
+            Self::MemberResolutionFailed => "member_resolution_failed",
             Self::InvalidProfileName(_) => "invalid_profile_name",
             Self::InvalidProfileField(_, _) => "invalid_profile_field",
             Self::InvalidRelayUrl(_) => "invalid_relay_url",
@@ -107,6 +125,7 @@ impl ConnectorError {
             Self::SendInProgress => "send_in_progress",
             Self::MediaPathDenied(_) => "media_path_denied",
             Self::MediaLimitsExceeded(_) => "media_limits_exceeded",
+            Self::MediaIdempotencyConflict => "media_idempotency_conflict",
             Self::StreamIdInUse => "stream_id_in_use",
             Self::StreamCapabilityDenied => "stream_capability_denied",
             Self::InvalidStreamBeginRequestId => "invalid_stream_begin_request_id",
@@ -117,6 +136,15 @@ impl ConnectorError {
 
     pub fn client_message(&self) -> &'static str {
         match self {
+            Self::AttachmentReleaseFailed => {
+                "plaintext handoff cleanup failed. Retry release_attachment with the same lease."
+            }
+            Self::AttachmentEpochUnavailable => {
+                "attachment's original source epoch is unavailable; restore authenticated source history before requesting recovery"
+            }
+            Self::AttachmentRejected(_) => {
+                "attachment reference was rejected by the native parser; check its version and fields"
+            }
             Self::DebugControlsDisabled => "debug controls are disabled",
             Self::SocketPathTooLong => {
                 "control socket path exceeds platform byte limit; shorten --home or --socket"
@@ -135,8 +163,13 @@ impl ConnectorError {
                 "stream durable send failed; retry the same finish request"
             }
             Self::App(AppError::InvalidGroupProfile(_)) => "invalid group profile",
+            Self::App(AppError::GroupCreateAdminNotMember) => "invalid group create request",
             Self::App(AppError::InvalidEditTarget) => {
                 "edit target must be an available chat message this account sent"
+            }
+            Self::App(AppError::MissingRelayLists(_) | AppError::MissingDefaultRelays) => {
+                "account relay lists are missing or empty; give wn-agent relays to publish them \
+                 (--relay or MARMOT_RELAYS), or publish complete lists from another client"
             }
             Self::App(error)
                 if matches!(
@@ -147,6 +180,9 @@ impl ConnectorError {
                 "only a group admin can make this change"
             }
             Self::InvalidGroupCreate(_) => "invalid group create request",
+            Self::MemberResolutionFailed => {
+                "member has no usable current KeyPackage and Marmot inbox route; nothing was changed"
+            }
             Self::InvalidProfileName(_) => "invalid profile name",
             Self::InvalidProfileField(_, _) => "invalid profile field",
             Self::InvalidRelayUrl(_) => "invalid relay URL",
@@ -160,6 +196,9 @@ impl ConnectorError {
             }
             Self::MediaPathDenied(_) => "media path is not allowed",
             Self::MediaLimitsExceeded(_) => "outbound media exceeds connector limits",
+            Self::MediaIdempotencyConflict => {
+                "media idempotency key was reused with different inputs"
+            }
             Self::StreamIdInUse => "stream id is already in use",
             Self::StreamCapabilityDenied => "stream capability is not authorized",
             Self::InvalidStreamBeginRequestId => "stream begin request id is invalid",
@@ -169,7 +208,9 @@ impl ConnectorError {
             Self::StreamPreviewIdempotencyConflict => {
                 "stream preview idempotency key was reused with different inputs"
             }
-            Self::Io(_) => "connector I/O failed",
+            Self::Io(error) => {
+                crate::socket::socket_rejection(error).unwrap_or("connector I/O failed")
+            }
             Self::App(AppError::ReactionNotFound) => "no matching reaction to remove",
             Self::App(AppError::MediaUploadTimedOut) => "media upload timed out before publication",
             Self::AccountHome(_) | Self::App(_) => "connector request failed",
@@ -180,6 +221,7 @@ impl ConnectorError {
         matches!(
             self,
             Self::SendInProgress
+                | Self::AttachmentReleaseFailed
                 | Self::RelayListInconclusive(_)
                 | Self::App(AppError::MediaUploadTimedOut | AppError::AgentStreamSendFailed(_))
         )

@@ -5,6 +5,7 @@
 use super::*;
 use crate::AccountMediaStore;
 use crate::media::AttachmentDownloadFailure;
+use crate::runtime::attachment_controls::AttachmentUpdates;
 use media_store::{Category, MediaError};
 use storage_sqlite::SqliteAppStorage;
 use storage_sqlite::{
@@ -25,6 +26,10 @@ const KEEP_MEDIA_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// How long one "Keep media" pass removes before leaving the rest to the
 /// next tick.
 const KEEP_MEDIA_SWEEP_BUDGET: Duration = Duration::from_millis(250);
+/// How often deferred housekeeping is checked again once nothing else is
+/// owed: free-page reclaim, an owed WAL truncate, and a compaction that was
+/// not yet worthwhile or did not fit (mdk#2923 §4). Deletions recheck sooner.
+const HOUSEKEEPING_RECHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 type PermitWait = std::pin::Pin<
     Box<
@@ -44,8 +49,13 @@ pub(super) struct Admission {
     media_sweep: Option<tokio::task::JoinHandle<()>>,
     /// The outgoing upload promotion pass running on the blocking pool, if
     /// any, and where the next one resumes.
-    upload_promotion: Option<tokio::task::JoinHandle<()>>,
-    upload_cursor: Arc<std::sync::Mutex<Option<storage_sqlite::AttachmentUploadOwner>>>,
+    upload_promotion:
+        Option<tokio::task::JoinHandle<(Option<storage_sqlite::AttachmentUploadOwner>, bool)>>,
+    upload_cursor: Option<storage_sqlite::AttachmentUploadOwner>,
+    /// A pass skipped the batch in `upload_promotion`. That pass may have
+    /// come for an owner the batch's read missed, so the batch's completion
+    /// runs one more pass even when it was idle (mdk#3378).
+    upload_skipped: bool,
     /// The legacy body migration batch running on the blocking pool, if any.
     legacy_migration: Option<tokio::task::JoinHandle<()>>,
     /// The one-time database compaction ran under this worker; it is not
@@ -70,11 +80,87 @@ pub(super) struct Admission {
     /// A sweep stopped at its time budget with attachments still past the
     /// window, or failed: the next tick runs it again.
     keep_media_more: Arc<std::sync::atomic::AtomicBool>,
+    /// What idle housekeeping has derived from the opened database's data
+    /// (mdk#2923 §4): finished one-time work stops, and the media sweep runs
+    /// only when something may have left work for it.
+    pub(super) latches: HousekeepingLatches,
+}
+
+/// Housekeeping state derived from one opened account database. Keyed to its
+/// [`SqliteAppStorage::connection_serial`]: a reopened, reset or replaced
+/// database starts unlatched and derives everything again from its data.
+/// Only terminal outcomes latch; deferred ones are rechecked on a deadline.
+#[derive(Default)]
+pub(super) struct HousekeepingLatches {
+    serial: Option<u64>,
+    /// No legacy attachment body and no legacy upload that could add one.
+    legacy_bodies_done: Arc<std::sync::atomic::AtomicBool>,
+    /// No avatar image held in the database; nothing writes one any more.
+    database_avatars_done: Arc<std::sync::atomic::AtomicBool>,
+    /// The database is already incremental, so the one-time compaction can
+    /// never be due on it.
+    compaction_settled: Arc<std::sync::atomic::AtomicBool>,
+    /// When deferred housekeeping (reclaim, an owed WAL truncate, a
+    /// compaction not yet worthwhile, too large or too tight) is checked
+    /// again. `None` means now.
+    recheck_due: Option<std::time::Instant>,
+    /// The deletion count the last housekeeping batch saw: a deletion frees
+    /// pages, so reclaim checks again.
+    batch_cleanup_seen: Option<i64>,
+    /// The deletion count, and the other-connection commit count, the last
+    /// media sweep started from. `None` means a sweep is owed.
+    sweep_cleanup_seen: Option<i64>,
+    sweep_foreign_seen: Option<i64>,
+    /// The last sweep batch did not reach the end of the store, or failed.
+    sweep_unfinished: Arc<std::sync::atomic::AtomicBool>,
+    /// A batch failed. Its cursor may have moved past what it failed on, so
+    /// a full pass from the start is owed. Finishing the current pass does
+    /// not clear it; only starting that rescan does.
+    sweep_rescan: Arc<std::sync::atomic::AtomicBool>,
+    /// When the owed rescan runs: one housekeeping recheck after the
+    /// failure, so a failure that persists costs one pass per recheck, not
+    /// one per tick.
+    sweep_rescan_due: Option<std::time::Instant>,
+}
+
+impl HousekeepingLatches {
+    /// Resets everything when `storage` is not the database these were
+    /// derived from.
+    pub(super) fn bind(&mut self, storage: &SqliteAppStorage) {
+        let serial = storage.connection_serial();
+        if self.serial != Some(serial) {
+            *self = Self {
+                serial: Some(serial),
+                ..Self::default()
+            };
+        }
+    }
+
+    fn done(flag: &std::sync::atomic::AtomicBool) -> bool {
+        flag.load(std::sync::atomic::Ordering::Acquire)
+    }
 }
 
 /// Starts a media sweep on the blocking pool unless one is still running:
-/// to completion when the worker takes ownership, otherwise one batch.
-fn spawn_media_sweep(admission: &mut Admission, media: AccountMediaStore, until_complete: bool) {
+/// to completion when the worker takes ownership, otherwise one batch, and
+/// then only while something may have left work for it (mdk#2923 §4):
+/// - this connection deleted a `media_files` or `attachment_partial` row,
+///   which can leave a file with no row;
+/// - another connection or process committed (`PRAGMA data_version`);
+/// - the media store reports a best-effort unlink, truncate or abandon that
+///   failed;
+/// - the last batch did not reach the end of the store, or failed.
+///
+/// A crash leaves its orphans to the sweep that runs when the next worker
+/// takes ownership.
+fn spawn_media_sweep(
+    admission: &mut Admission,
+    storage: &SqliteAppStorage,
+    media: AccountMediaStore,
+    until_complete: bool,
+    telemetry: &marmot_observability::PerformanceRecorder,
+) {
+    use std::sync::atomic::Ordering;
     if admission
         .media_sweep
         .as_ref()
@@ -82,43 +168,105 @@ fn spawn_media_sweep(admission: &mut Admission, media: AccountMediaStore, until_
     {
         return;
     }
+    let latches = &mut admission.latches;
+    latches.bind(storage);
+    // A failed batch owes a rescan from the start on the next recheck.
+    let mut rescan_now = false;
+    if latches.sweep_rescan.load(Ordering::Acquire) {
+        let now = std::time::Instant::now();
+        match latches.sweep_rescan_due {
+            None => latches.sweep_rescan_due = Some(now + HOUSEKEEPING_RECHECK_INTERVAL),
+            Some(due) if now >= due => rescan_now = true,
+            Some(_) => {}
+        }
+    }
+    // Read before the batch starts, so a deletion while it runs is seen.
+    // A failed read counts as a change.
+    let cleanup = storage.media_cleanup_epoch().ok();
+    let foreign = storage.foreign_commit_version().ok();
+    // A failed unlink, truncate or abandon may have left its file behind the
+    // cursor of a pass in progress, so it owes a pass from the start.
+    let store_owed = media.take_sweep_owed();
+    let owed = until_complete
+        | rescan_now
+        | store_owed
+        | latches.sweep_unfinished.load(Ordering::Acquire)
+        | latches.sweep_cleanup_seen.is_none()
+        | (cleanup.is_none() || cleanup != latches.sweep_cleanup_seen)
+        | (foreign.is_none() || foreign != latches.sweep_foreign_seen);
+    if !owed {
+        return;
+    }
+    latches.sweep_cleanup_seen = cleanup;
+    latches.sweep_foreign_seen = foreign;
+    // Each is a full pass from the start, which is what was owed. The
+    // cursor restart takes the store's sweep lock, which an earlier batch
+    // may still hold, so it runs on the blocking pool with the sweep.
+    let restart = rescan_now || until_complete || store_owed;
+    if restart {
+        latches.sweep_rescan.store(false, Ordering::Release);
+        latches.sweep_rescan_due = None;
+    }
+    let unfinished = latches.sweep_unfinished.clone();
+    let rescan = latches.sweep_rescan.clone();
+    // Timed on the blocking pool (mdk#2923); a batch that never runs or
+    // panics drops its span, which records it as cancelled.
+    let batch = telemetry.observe(RuntimeOp::WorkerMediaSweep);
     admission.media_sweep = Some(tokio::task::spawn_blocking(move || {
-        loop {
+        if restart {
+            media.restart_sweep();
+        }
+        let outcome = loop {
             match media.sweep(MEDIA_SWEEP_BATCH) {
                 Ok(report) if until_complete && !report.complete => {}
-                Ok(_) => break,
+                Ok(report) => {
+                    unfinished.store(!report.complete, Ordering::Release);
+                    break TelemetryOutcome::Success;
+                }
                 Err(_) => {
+                    // Not again next tick: a failure that persists would
+                    // repeat every 15 s. A full rescan is owed instead, on
+                    // the next recheck.
+                    unfinished.store(false, Ordering::Release);
+                    rescan.store(true, Ordering::Release);
                     tracing::warn!(target: "marmot_app::runtime", method = "media_sweep",
                         "media store sweep deferred");
-                    break;
+                    break TelemetryOutcome::Failure;
                 }
             }
-        }
+        };
+        batch.finish(outcome);
     }));
 }
 /// Starts one page of outgoing upload promotion on the blocking pool unless
 /// one is still running. Each run resumes after the last, so uploads that
 /// cannot promote yet never starve the rest; a promotion wakes attachment
-/// observers.
+/// observers with a state change. A batch requests another worker pass on
+/// completion when it promoted, left a page, or a pass skipped it.
 fn spawn_upload_promotion(
     admission: &mut Admission,
     storage: SqliteAccountStorage,
     media: AccountMediaStore,
-    updates: tokio::sync::watch::Sender<()>,
+    updates: AttachmentUpdates,
+    telemetry: &marmot_observability::PerformanceRecorder,
 ) {
-    if admission
-        .upload_promotion
-        .as_ref()
-        .is_some_and(|task| !task.is_finished())
+    // Consume even a finished batch through ready(), preserving its wakeup,
+    // and owe the skipped pass a follow-up.
+    if admission.upload_promotion.is_some() {
+        admission.upload_skipped = true;
+        return;
+    }
+    // Only a file-backed upload promotes. With none, and no page in
+    // progress, there is nothing to page (mdk#2923). A failed read still
+    // runs the pass.
+    if admission.upload_cursor.is_none()
+        && matches!(storage.app_storage().has_file_backed_uploads(), Ok(false))
     {
         return;
     }
-    let cursor = admission.upload_cursor.clone();
+    let after = admission.upload_cursor.take();
+    let batch = telemetry.observe(RuntimeOp::WorkerUploadPromotion);
     admission.upload_promotion = Some(tokio::task::spawn_blocking(move || {
-        let after = cursor
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
         match crate::media::outgoing::promote_uploads(
             &storage.app_storage(),
             &media,
@@ -126,34 +274,48 @@ fn spawn_upload_promotion(
             crate::media::outgoing::UPLOAD_PROMOTION_BATCH,
         ) {
             Ok((next, promoted)) => {
-                *cursor
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = next;
+                let more = next.is_some() || promoted;
                 if promoted {
-                    updates.send_modify(|_| {});
+                    updates.state_changed();
                 }
+                batch.finish(TelemetryOutcome::Success);
+                (next, more)
             }
             Err(_) => {
                 tracing::warn!(target: "marmot_app::runtime", method = "outgoing_upload_promotion",
                     "outgoing upload promotion deferred");
+                batch.finish(TelemetryOutcome::Failure);
+                (None, false)
             }
         }
     }));
 }
 
-/// Starts one batch of moving legacy database bodies into the media store
-/// (mdk#2314 step 6) on the blocking pool, unless one is still running, and
-/// then returns freed database pages to the filesystem once the database is
-/// incremental. The account worker calls this once per maintenance tick,
-/// after readiness. A batch that pauses for free space, resumes, finishes,
-/// or drops a corrupt body wakes attachment observers. At worker start and
-/// then hourly, the batch first applies the "Keep media" setting (mdk#2314
-/// step 10) for up to [`KEEP_MEDIA_SWEEP_BUDGET`].
+/// Starts one housekeeping batch on the blocking pool, unless one is still
+/// running or none of its parts is owed (mdk#2923 §4):
+/// - the "Keep media" setting (mdk#2314 step 10), at worker start, then
+///   hourly, or again while a pass left more;
+/// - moving legacy database bodies, then database-held avatar images, into
+///   the media store (mdk#2314 steps 6 and 9), until the data shows none is
+///   left;
+/// - returning freed database pages to the filesystem once the database is
+///   incremental, and a WAL truncate the startup or an earlier pass owes;
+/// - checking whether the one-time compaction is due, until the database is
+///   incremental.
+///
+/// Finished work latches for the life of the opened database; a deferred
+/// outcome never does. Keep-media more runs again on the next tick. An owed
+/// WAL truncate is retried hourly or after a deletion. The compaction check
+/// (not worthwhile, too large or too tight) runs on every batch while a
+/// migration is owed, otherwise hourly or after a deletion. The startup
+/// truncate runs on the first batch. A batch that pauses for free space, resumes, finishes,
+/// or drops a corrupt body wakes attachment observers.
 pub(super) fn spawn_legacy_migration(
     client: &AppClient,
     shared: &RuntimeSharedServices,
     admission: &mut Admission,
 ) {
+    use std::sync::atomic::Ordering;
     if client.app.config.cursor_persistence == crate::CursorPersistence::Frozen
         || admission
             .legacy_migration
@@ -162,21 +324,57 @@ pub(super) fn spawn_legacy_migration(
     {
         return;
     }
+    let Ok(storage) = client.app.account_storage(&client.state.label) else {
+        return;
+    };
+    let app_storage = storage.app_storage();
+    admission.latches.bind(&app_storage);
+    let now = std::time::Instant::now();
+    let sweep_keep_media = admission.keep_media_more.load(Ordering::Acquire)
+        || admission.keep_media_due.is_none_or(|due| now >= due);
+    let latches = &mut admission.latches;
+    let legacy_owed = !HousekeepingLatches::done(&latches.legacy_bodies_done);
+    let avatars_owed = !HousekeepingLatches::done(&latches.database_avatars_done);
+    let startup = !admission.startup_wal_settled.load(Ordering::Acquire);
+    let recheck = latches.recheck_due.is_none_or(|due| now >= due);
+    // A deletion frees pages: reclaim checks again. A failed read counts as
+    // one, so the batch still runs.
+    let cleanup = app_storage.media_cleanup_epoch().ok();
+    let deleted = cleanup.is_none() || cleanup != latches.batch_cleanup_seen;
+    // An owed WAL truncate is not a trigger of its own: every batch retries
+    // it, so it waits for the hourly recheck or a deletion. A reader that
+    // keeps blocking it then costs one batch per recheck, not one per tick.
+    if !(sweep_keep_media || legacy_owed || avatars_owed || startup || recheck || deleted) {
+        return;
+    }
+    if sweep_keep_media {
+        admission.keep_media_more.store(false, Ordering::Release);
+        admission.keep_media_due = Some(now + KEEP_MEDIA_SWEEP_INTERVAL);
+    }
+    latches.batch_cleanup_seen = cleanup;
+    if recheck {
+        latches.recheck_due = Some(now + HOUSEKEEPING_RECHECK_INTERVAL);
+    }
+    // While a migration is owed, every batch checks: the batch that frees
+    // the pages also sees them, after its legacy and avatar steps. A
+    // deletion frees pages too. Neither happens on an idle tick, so this
+    // costs an idle account nothing.
+    let check_compaction = (recheck || deleted || legacy_owed || avatars_owed)
+        && !admission.compaction_attempted
+        && !HousekeepingLatches::done(&latches.compaction_settled);
+    let legacy_done = latches.legacy_bodies_done.clone();
+    let avatars_done = latches.database_avatars_done.clone();
+    let compaction_settled = latches.compaction_settled.clone();
     let app = client.app.clone();
     let label = client.state.label.clone();
     let updates = shared.attachment_updates.clone();
     let startup_wal_settled = admission.startup_wal_settled.clone();
     let compaction_due = admission.compaction_due.clone();
-    let check_compaction = !admission.compaction_attempted;
-    let now = std::time::Instant::now();
-    let sweep_keep_media = admission
-        .keep_media_more
-        .swap(false, std::sync::atomic::Ordering::AcqRel)
-        || admission.keep_media_due.is_none_or(|due| now >= due);
-    if sweep_keep_media {
-        admission.keep_media_due = Some(now + KEEP_MEDIA_SWEEP_INTERVAL);
-    }
     let keep_media_more = admission.keep_media_more.clone();
+    let batch = shared
+        .observer
+        .performance()
+        .observe(RuntimeOp::WorkerMaintenanceHousekeepingBatch);
     admission.legacy_migration = Some(tokio::task::spawn_blocking(move || {
         let started = (|| {
             let storage = app.account_storage(&label)?;
@@ -191,11 +389,12 @@ pub(super) fn spawn_legacy_migration(
         })();
         let Ok((storage, media, reserve)) = started else {
             if sweep_keep_media {
-                keep_media_more.store(true, std::sync::atomic::Ordering::Release);
+                keep_media_more.store(true, Ordering::Release);
             }
             tracing::warn!(target: "marmot_app::storage_maintenance",
                 method = "migrate_legacy_attachments",
                 "legacy attachment migration batch deferred");
+            batch.finish(TelemetryOutcome::Failure);
             return;
         };
         let account_dir = app.account_dir(&label);
@@ -204,6 +403,7 @@ pub(super) fn spawn_legacy_migration(
         let app_storage = storage.app_storage();
         // "Keep media" first, so bodies past the window are not moved only
         // to be removed.
+        let mut outcome = TelemetryOutcome::Success;
         if sweep_keep_media {
             let deadline = std::time::Instant::now() + KEEP_MEDIA_SWEEP_BUDGET;
             match super::super::attachment_storage::clean_past_keep_window(
@@ -213,54 +413,77 @@ pub(super) fn spawn_legacy_migration(
             ) {
                 Ok((removed, more)) => {
                     if more {
-                        keep_media_more.store(true, std::sync::atomic::Ordering::Release);
+                        keep_media_more.store(true, Ordering::Release);
                     }
                     if removed > 0 {
                         tracing::info!(target: "marmot_app::storage_maintenance",
                             method = "keep_media_sweep", removed, more,
                             "attachments past the keep media window removed");
-                        updates.send_modify(|_| {});
+                        // Rows leave Ready for CleanedBySetting.
+                        updates.state_changed();
                     }
                 }
                 Err(_) => {
-                    keep_media_more.store(true, std::sync::atomic::Ordering::Release);
+                    // Deferred by an error: the batch still runs the rest,
+                    // but its span reports the failure.
+                    outcome = TelemetryOutcome::Failure;
+                    keep_media_more.store(true, Ordering::Release);
                     tracing::warn!(target: "marmot_app::storage_maintenance",
                         method = "keep_media_sweep",
                         "keep media sweep deferred");
                 }
             }
         }
-        let changed = crate::media::legacy_migration::run_batch(
-            &app_storage,
-            &media,
-            reserve,
-            &free,
-            &progress,
-        );
-        if changed {
-            updates.send_modify(|_| {});
+        if legacy_owed {
+            let changed = crate::media::legacy_migration::run_batch(
+                &app_storage,
+                &media,
+                reserve,
+                &free,
+                &progress,
+            );
+            if changed {
+                // A moved, paused or dropped body: a dropped one leaves Ready.
+                updates.state_changed();
+            }
+            // Finished only when the data shows nothing left, including a
+            // legacy upload whose promotion would add a body; a pause or a
+            // deferral leaves it owed.
+            if matches!(app_storage.has_legacy_attachment_work(), Ok(false)) {
+                legacy_done.store(true, Ordering::Release);
+            }
         }
         // Then images still held in the database move into cache files
         // (mdk#2314 step 9), so compaction can return their pages.
-        if crate::media::avatar_files::run_batch(&app_storage, &media, reserve, &free) {
-            app.presentation_signals.wake();
-            let _ = app.presentation_signals.avatars.send(label.clone());
+        if avatars_owed {
+            if crate::media::avatar_files::run_batch(&app_storage, &media, reserve, &free) {
+                app.presentation_signals.wake();
+                let _ = app.presentation_signals.avatars.send(label.clone());
+            }
+            if matches!(app_storage.has_database_held_avatars(), Ok(false)) {
+                avatars_done.store(true, Ordering::Release);
+            }
         }
-        let startup = !startup_wal_settled.load(std::sync::atomic::Ordering::Acquire);
         if crate::media::storage_compaction::reclaim(&app_storage, startup) && startup {
-            startup_wal_settled.store(true, std::sync::atomic::Ordering::Release);
+            startup_wal_settled.store(true, Ordering::Release);
         }
-        if check_compaction
-            && crate::media::storage_compaction::compaction_check(
+        if check_compaction {
+            // An incremental database never needs the one-time compaction:
+            // that is terminal. Anything else is checked again later.
+            if matches!(app_storage.database_space(), Ok(space) if space.incremental) {
+                compaction_settled.store(true, Ordering::Release);
+            } else if crate::media::storage_compaction::compaction_check(
                 &app_storage,
                 reserve,
                 &free,
                 &progress,
             )
             .is_some()
-        {
-            compaction_due.store(true, std::sync::atomic::Ordering::Release);
+            {
+                compaction_due.store(true, Ordering::Release);
+            }
         }
+        batch.finish(outcome);
     }));
 }
 
@@ -308,7 +531,9 @@ pub(super) async fn compact_if_due(
             reserve,
             &|| crate::media::attachment_resume::available_space(&account_dir),
             &app.legacy_media_migration(&label),
-            &|| updates.send_modify(|_| {}),
+            // Rare, twice per compaction: reported as a state change, which
+            // costs observers one read each.
+            &|| updates.state_changed(),
         ))
     })
     .await;
@@ -331,18 +556,33 @@ impl Admission {
             CompactionAttempt::RolledBack => {
                 self.compaction_rollbacks += 1;
                 self.compaction_attempted = self.compaction_rollbacks >= MAX_COMPACTION_ROLLBACKS;
+                // A rollback is not the idle path: check again on the next
+                // tick, not after the hourly recheck.
+                self.latches.recheck_due = None;
             }
             CompactionAttempt::NotDue => {}
         }
     }
 
     pub(super) fn is_waiting(&self) -> bool {
-        self.waiting.is_some()
+        self.waiting.is_some() || self.upload_promotion.is_some()
     }
-    pub(super) async fn ready(&mut self) {
-        if let Some(waiting) = self.waiting.as_mut() {
-            self.permit = waiting.await.ok();
-            self.waiting = None;
+    pub(super) async fn ready(&mut self) -> bool {
+        tokio::select! {
+            permit = async { self.waiting.as_mut().unwrap().await }, if self.waiting.is_some() => {
+                self.permit = permit.ok();
+                self.waiting = None;
+                true
+            }
+            result = async { self.upload_promotion.as_mut().unwrap().await }, if self.upload_promotion.is_some() => {
+                self.upload_promotion = None;
+                let (next, more) = result.unwrap_or_default();
+                self.upload_cursor = next;
+                // Clear the skip even when `more` already wakes the worker.
+                let skipped = std::mem::take(&mut self.upload_skipped);
+                more || skipped
+            }
+            else => false,
         }
     }
 }
@@ -407,11 +647,34 @@ fn capacity(
     let disk = media_store::DiskPolicy {
         reserve_bytes: policy.disk_reserve,
     };
+    admissible_limit(max)
+        && disk.admit(free, admission_need(max, recorded)) == media_store::Admission::Admitted
+}
+
+/// What a download of up to `max` body bytes may still write, beyond the
+/// reserve, crediting a recorded checkpoint with one unrecorded append (see
+/// [`capacity`]). A job admission refuses parks with this as its target.
+fn admission_need(max: u64, recorded: Option<u64>) -> u64 {
     let on_disk = recorded.map_or(0, |recorded| {
         recorded.saturating_add(media_store::CHECKPOINT_APPEND_MAX as u64)
     });
-    let needed = media_store::DiskPolicy::download_need(max, on_disk);
-    admissible_limit(max) && disk.admit(free, needed) == media_store::Admission::Admitted
+    media_store::DiskPolicy::download_need(max, on_disk)
+}
+
+/// Whether free space covers every transfer the runtime may run at once
+/// ([`crate::runtime::ATTACHMENT_TRANSFER_LIMIT`]) each writing the most the
+/// largest account limit (`limit_bound`) allows, above the reserve.
+fn concurrent_admission_fits(
+    policy: &storage_sqlite::AttachmentDownloadPolicy,
+    free: u64,
+    limit_bound: u64,
+) -> bool {
+    let disk = media_store::DiskPolicy {
+        reserve_bytes: policy.disk_reserve,
+    };
+    let need = (crate::runtime::ATTACHMENT_TRANSFER_LIMIT as u64)
+        .saturating_mul(media_store::DiskPolicy::download_need(limit_bound, 0));
+    disk.admit(free, need) == media_store::Admission::Admitted
 }
 
 fn admissible_limit(max: u64) -> bool {
@@ -440,6 +703,27 @@ fn readmit_admission(
     }
 }
 
+/// Complete one real storage observation before deciding whether work is cancelled.
+async fn cancellation_observed(
+    storage: &SqliteAccountStorage,
+    job: &AttachmentAcquisition,
+    permission: Option<&super::super::attachment_permission::PermissionLease>,
+) -> bool {
+    let store = storage.app_storage();
+    let current = job.clone();
+    let active = tokio::task::spawn_blocking(move || {
+        Ok::<_, cgka_traits::StorageError>((
+            store.attachment_transfer_is_active(&current, crate::unix_now_seconds())?,
+            store.attachment_request_is_explicit(&current.reference)?,
+        ))
+    })
+    .await;
+    // Failure to observe is not cancellation. The transfer deadline and
+    // publication fence still bound work while a storage read is unavailable.
+    matches!(active, Ok(Ok((false, _))))
+        || (permission.is_some_and(|p| !p.allowed()) && !matches!(active, Ok(Ok((_, true)))))
+}
+
 async fn cancelled(
     storage: SqliteAccountStorage,
     job: AttachmentAcquisition,
@@ -447,21 +731,7 @@ async fn cancelled(
     permission: Option<super::super::attachment_permission::PermissionLease>,
 ) {
     loop {
-        let store = storage.app_storage();
-        let current = job.clone();
-        let active = tokio::task::spawn_blocking(move || {
-            Ok::<_, cgka_traits::StorageError>((
-                store.attachment_transfer_is_active(&current, crate::unix_now_seconds())?,
-                store.attachment_request_is_explicit(&current.reference)?,
-            ))
-        })
-        .await;
-        // Failure to observe is not cancellation. The transfer deadline and
-        // publication fence still bound work while a storage read is unavailable.
-        if matches!(active, Ok(Ok((false, _))))
-            || (permission.as_ref().is_some_and(|p| !p.allowed())
-                && !matches!(active, Ok(Ok((_, true)))))
-        {
+        if cancellation_observed(&storage, &job, permission.as_ref()).await {
             return;
         }
         tokio::select! {
@@ -543,18 +813,22 @@ pub(super) fn schedule(
         // Reclaim whatever a crash left in the media store before new work.
         spawn_media_sweep(
             admission,
+            &storage.app_storage(),
             client
                 .app
                 .account_media_store(&client.state.label, &storage)?,
             true,
+            shared.observer.performance(),
         );
     } else {
         spawn_media_sweep(
             admission,
+            &storage.app_storage(),
             client
                 .app
                 .account_media_store(&client.state.label, &storage)?,
             false,
+            shared.observer.performance(),
         );
     }
     let expired = storage
@@ -580,6 +854,7 @@ pub(super) fn schedule(
             .app
             .account_media_store(&client.state.label, &storage)?,
         shared.attachment_updates.clone(),
+        shared.observer.performance(),
     );
     let resumed = if policy.automatic {
         storage.app_storage().resume_permitted_attachments(
@@ -610,10 +885,19 @@ pub(super) fn schedule(
         admission.waiting = None;
         return Ok(more);
     }
+    // Publish this account's limit before measuring, and read the bound
+    // after: an admission concurrent with another account's then always has
+    // the later of the two checks covering both transfers.
+    shared
+        .attachment_limit_bound
+        .fetch_max(policy.transfer_limit, std::sync::atomic::Ordering::AcqRel);
     let free = crate::media::attachment_resume::available_space(
         &client.app.account_dir(&client.state.label),
     )
     .ok();
+    let limit_bound = shared
+        .attachment_limit_bound
+        .load(std::sync::atomic::Ordering::Acquire);
     // Jobs parked for disk space rejoin the due page only once the device can
     // publish them; their checkpoints make the readmitted attempt local work.
     // Unknown free space readmits nothing, as it admits nothing below.
@@ -624,11 +908,13 @@ pub(super) fn schedule(
             free,
             policy.automatic,
             readmit_admission(&policy, free),
+            |recorded| admission_need(policy.transfer_limit, recorded),
         )?,
         None => 0,
     };
     if readmitted > 0 {
-        shared.attachment_updates.send_modify(|_| {});
+        // Parked jobs leave StorageBlocked.
+        shared.attachment_updates.state_changed();
     }
     let more = more || readmitted == ATTACHMENT_ACQUISITION_BATCH_LIMIT;
     let free = free.unwrap_or(0);
@@ -640,16 +926,23 @@ pub(super) fn schedule(
         admission.waiting = None;
         return Ok(more);
     }
-    let Some(background_permit) = held_permit else {
+    let Some(mut background_permit) = held_permit else {
         if admission.waiting.is_none() {
             admission.waiting = Some(Box::pin(shared.attachment_transfer.clone().acquire_owned()));
         }
         return Ok(more);
     };
+    let limit = crate::runtime::ATTACHMENT_TRANSFER_LIMIT;
     let Ok(permit) = http.permits.clone().try_acquire_owned() else {
         return Ok(more);
     };
-    for candidate in candidates {
+    // Each pass starts one transfer. Once it is claimed (off the due page),
+    // a later candidate asks the worker for another pass, which admits it
+    // while global and HTTP capacity remain. A candidate that stays due must
+    // not ask, or the next pass would select it again at once.
+    let count = candidates.len();
+    for (position, candidate) in candidates.into_iter().enumerate() {
+        let started = more || position + 1 < count;
         let explicit = storage
             .app_storage()
             .attachment_request_is_explicit(&candidate)?;
@@ -721,7 +1014,8 @@ pub(super) fn schedule(
                 .account_media_store(&client.state.label, &storage)?;
             let storage = storage.clone();
             let updates = shared.attachment_updates.clone();
-            updates.send_modify(|_| {});
+            // Claimed: the row leaves Queued.
+            updates.state_changed();
             spawn_media_http(
                 http,
                 permit,
@@ -741,7 +1035,8 @@ pub(super) fn schedule(
                             "retained attachment copy unavailable".to_owned(),
                         )))
                     };
-                    updates.send_modify(|_| {});
+                    // The twin is attached (Ready) or the job retries.
+                    updates.state_changed();
                     MediaHttpCompletion::Attachment {
                         job,
                         result,
@@ -750,7 +1045,37 @@ pub(super) fn schedule(
                 },
                 |completion| completion,
             );
-            return Ok(more);
+            return Ok(started);
+        }
+        // Downloads run concurrently only while free space covers every one
+        // the runtime may run writing the most any account's automatic limit
+        // allows: none of them then needs to know what the others still
+        // write. An explicit download may be far larger than that limit, so it
+        // always runs alone, as a tap did with the single slot. Running alone
+        // holds every global permit, and admission measures free space with
+        // nothing else in flight. When others are in flight, wait for all of
+        // them in the semaphore's FIFO queue: candidates stay queued and due,
+        // and the wait ends the moment the last one finishes, in any account.
+        if background_permit.num_permits() < limit
+            && (explicit || !concurrent_admission_fits(&policy, free, limit_bound))
+        {
+            match shared
+                .attachment_transfer
+                .clone()
+                .try_acquire_many_owned((limit - background_permit.num_permits()) as u32)
+            {
+                Ok(rest) => background_permit.merge(rest),
+                Err(_) => {
+                    drop(background_permit);
+                    admission.waiting = Some(Box::pin(
+                        shared
+                            .attachment_transfer
+                            .clone()
+                            .acquire_many_owned(limit as u32),
+                    ));
+                    return Ok(more);
+                }
+            }
         }
         // References do not declare a trustworthy size. Reserve the configured
         // automatic-sized object even for explicit work, then enforce actual
@@ -760,11 +1085,17 @@ pub(super) fn schedule(
             .app_storage()
             .attachment_checkpoint_recorded(&candidate)?;
         if !capacity(&policy, reservation, recorded, free) {
-            storage.app_storage().finish_attachment_preparation(
+            // Park it storage-blocked with what admission needs, rather than
+            // a timer: readmission releases it once the device can fund it,
+            // and it keeps its place meanwhile (mdk#3414).
+            if storage.app_storage().park_attachment_admission(
                 &candidate,
+                admission_need(reservation, recorded),
                 now,
-                Some(now.saturating_add(15)),
-            )?;
+            )? {
+                // The row is now StorageBlocked.
+                shared.attachment_updates.state_changed();
+            }
             continue;
         }
         // Free disk is the only gate (mdk#2314): retained media has no byte
@@ -790,14 +1121,18 @@ pub(super) fn schedule(
         // Queued explicit work (Retry, download again) derives a missing
         // source-epoch key from the retained anchor; automatic work reads only
         // what projection and sync cached.
+        let message = Some(source.message_id_hex.as_str());
         let prepared = if explicit {
             client
-                .cache_attachment_source_epoch_secret(&group, &reference)
+                .cache_attachment_source_epoch_secret(&group, &source.message_id_hex, &reference)
                 .and_then(|()| {
-                    client.prepare_background_attachment_download(&group, reference, max)
+                    client.prepare_background_attachment_download_for_message(
+                        &group, message, reference, max,
+                    )
                 })
         } else {
-            client.prepare_background_attachment_download(&group, reference, max)
+            client
+                .prepare_background_attachment_download_for_message(&group, message, reference, max)
         };
         let prepared = match prepared {
             Ok(Some(prepared)) => prepared,
@@ -858,7 +1193,8 @@ pub(super) fn schedule(
             permission,
         );
         let updates = shared.attachment_updates.clone();
-        updates.send_modify(|_| {});
+        // Claimed: the row leaves Queued.
+        updates.state_changed();
         spawn_media_http(
             http,
             permit,
@@ -877,7 +1213,8 @@ pub(super) fn schedule(
                 } else {
                     finish_or_cancel(prepared.run_acquisition(resume), cancel, finishing).await
                 };
-                updates.send_modify(|_| {});
+                // The attempt ended, with or without a body.
+                updates.state_changed();
                 MediaHttpCompletion::Attachment {
                     job,
                     result,
@@ -886,7 +1223,7 @@ pub(super) fn schedule(
             },
             |completion| completion,
         );
-        return Ok(more);
+        return Ok(started);
     }
     Ok(more)
 }

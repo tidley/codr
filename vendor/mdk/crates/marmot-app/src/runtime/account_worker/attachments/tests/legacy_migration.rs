@@ -1,9 +1,11 @@
 //! The maintenance tick's legacy body migration (mdk#2314 step 6): one batch
 //! on the blocking pool, with the account's policy and free space, waking
-//! attachment observers when it finishes.
+//! attachment observers with a state change when it finishes.
 use super::*;
 use crate::media::attachment_resume::test_free_space;
 
+/// One maintenance batch moves a legacy body into the media store, still
+/// readable, and wakes observers with a state change.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_maintenance_batch_moves_a_legacy_body_and_wakes_observers() {
     let (dir, client, storage, _reference) = offline_fixture().await;
@@ -39,6 +41,7 @@ async fn the_maintenance_batch_moves_a_legacy_body_and_wakes_observers() {
         observer.has_changed().unwrap(),
         "completion wakes observers"
     );
+    assert!(*observer.borrow() > 0, "as a state change");
     assert_eq!(storage.app_storage().legacy_attachment_bytes().unwrap(), 0);
     let read = read_retained(&storage, &client.app, "alice", &asset, now, 0, 1024)
         .unwrap()
@@ -55,7 +58,7 @@ async fn the_maintenance_batch_moves_a_legacy_body_and_wakes_observers() {
 }
 
 /// The maintenance tick's compaction runs once per worker ownership, awaited
-/// off the worker's async thread, and wakes observers.
+/// off the worker's async thread, and wakes observers with a state change.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_maintenance_tick_compacts_the_database_once() {
     let (dir, client, storage, _reference) = offline_fixture().await;
@@ -85,6 +88,7 @@ async fn the_maintenance_tick_compacts_the_database_once() {
     maintenance_tick(&client, &shared, &mut admission).await;
     assert!(admission.compaction_attempted);
     assert!(observer.has_changed().unwrap(), "observers hear of it");
+    assert!(*observer.borrow() > 0, "as a state change");
     let after = storage.app_storage().database_space().unwrap();
     assert!(after.incremental);
     assert!(after.file_bytes() < before.file_bytes());
@@ -124,6 +128,61 @@ async fn a_rolled_back_compaction_is_tried_again_later() {
     maintenance_tick(&client, &shared, &mut admission).await;
     assert!(admission.compaction_attempted);
     assert!(storage.app_storage().database_space().unwrap().incremental);
+    test_free_space::clear(dir.path());
+}
+
+/// The compaction check runs on every batch while a migration is owed, not
+/// only on the hourly recheck: the batch that moves a legacy body frees its
+/// pages, then sees them, so the compaction follows on that tick instead of
+/// up to an hour later (mdk#2923).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_tick_that_finishes_the_migration_flags_the_compaction() {
+    use std::sync::atomic::Ordering;
+    let body = vec![7u8; 4 << 20];
+    let (dir, client, storage, _reference) = offline_fixture_with(&body).await;
+    let app_storage = storage.app_storage();
+    app_storage.make_non_incremental_for_test().unwrap();
+    // A legacy body large enough that moving it leaves the database
+    // mostly free pages.
+    let now = crate::unix_now_seconds();
+    admit_demands(&app_storage, now, false).unwrap();
+    let asset = app_storage
+        .due_attachment_acquisitions(now, 1)
+        .unwrap()
+        .remove(0);
+    let job = app_storage
+        .claim_attachment_acquisition(&asset, now, now + 60)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        app_storage
+            .complete_attachment_acquisition(&job, &body, now, u64::MAX / 2)
+            .unwrap(),
+        storage_sqlite::AttachmentPublishResult::Published
+    );
+    let shared = RuntimeSharedServices::default();
+    let mut admission = Admission::default();
+
+    // No free space: the migration pauses, so the first check is not due.
+    test_free_space::set(dir.path(), 0);
+    maintenance_tick(&client, &shared, &mut admission).await;
+    assert!(app_storage.legacy_attachment_bytes().unwrap() > 0);
+    assert!(!admission.compaction_due.load(Ordering::Acquire));
+    assert!(!app_storage.database_space().unwrap().incremental);
+    assert!(
+        admission
+            .latches
+            .recheck_due
+            .is_some_and(|due| due > std::time::Instant::now()),
+        "the hourly recheck is not due on the next tick"
+    );
+
+    test_free_space::set(dir.path(), 1 << 40);
+    maintenance_tick(&client, &shared, &mut admission).await;
+    assert_eq!(app_storage.legacy_attachment_bytes().unwrap(), 0);
+    assert!(admission.latches.legacy_bodies_done.load(Ordering::Acquire));
+    assert!(admission.compaction_attempted, "flagged and compacted");
+    assert!(app_storage.database_space().unwrap().incremental);
     test_free_space::clear(dir.path());
 }
 

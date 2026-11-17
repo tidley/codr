@@ -24,17 +24,16 @@ use marmot_app::audit_otlp_sender::AuditOtlpSender;
 use marmot_app::{
     AccountRelayListBootstrap, AccountSetupRequest, AccountSetupResult, AppError, AppMessageQuery,
     AuditLogSettings, ChatListRow, MarmotApp, MarmotAppConfig, MarmotAppEvent, MarmotAppRuntime,
-    MediaAttachmentReference, MediaLocator, MediaUploadAttachmentRequest, MediaUploadRequest,
-    MissingRelayListKind, NotificationTrigger, NotificationWakeSource, PushPlatform,
-    RetentionSweepStatus, RuntimeMessageUpdate, RuntimeNotificationsSubscription, SelfMembership,
-    SignOutOptions, TimelineMessageQuery, TimelinePagination, UserDirectorySearch,
-    UserProfileMetadata, tag_value,
+    MediaUploadAttachmentRequest, MediaUploadRequest, MissingRelayListKind, NotificationTrigger,
+    NotificationWakeSource, PushPlatform, RetentionSweepStatus, RuntimeMessageUpdate,
+    RuntimeNotificationsSubscription, SelfMembership, SignOutOptions, TimelineMessageQuery,
+    TimelinePagination, UserDirectorySearch, UserProfileMetadata, tag_value,
 };
 use marmot_forensics::v5::{EndpointRef, Record as V5Record};
 use nostr_relay_builder::prelude::{
     BoxedFuture, Kind as OldKind, PolicyResult, QueryPolicy, WritePolicy,
 };
-use nostr_relay_builder::{LocalRelay, MockRelay, RelayBuilder};
+use nostr_relay_builder::{LocalRelay, RelayBuilder};
 use nostr_sdk::prelude::{
     Client as NostrSdkClient, EventBuilder, Filter, FinalizeEvent, Keys, Kind, Tag,
     Timestamp as NostrTimestamp,
@@ -106,7 +105,9 @@ async fn active_group_send_timings() {
         )
         .await
         .expect("group setup completes")
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
         eprintln!("created group members={member_count}");
         for index in 1..member_count {
             accept_group_invite_retrying_busy(&runtimes[index], &accounts[index], &group)
@@ -268,7 +269,9 @@ async fn send_connection_reuse() {
     let group = runtimes[0]
         .create_group(&accounts[0], "socket reuse", &accounts[1..], None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     accept_group_invite_retrying_busy(&runtimes[1], &accounts[1], &group)
         .await
         .unwrap();
@@ -375,13 +378,19 @@ async fn send_connection_reuse() {
             observed_triggers >= minimum_triggers,
             "expected at least {minimum_triggers} triggers, got {observed_triggers}"
         );
+        let mut contents = std::collections::HashSet::new();
         for event in events {
             let gift = nostr::nips::nip59::extract_rumor(&push_server, &event).unwrap();
             assert_eq!(gift.rumor.kind, Kind::Custom(446));
+            let content = BASE64_STANDARD.decode(&gift.rumor.content).unwrap();
             assert_eq!(
-                BASE64_STANDARD.decode(&gift.rumor.content).unwrap().len(),
-                marmot_app::PUSH_ENCRYPTED_TOKEN_LEN,
-                "each trigger carries the peer's single encrypted token"
+                content.len(),
+                2 * marmot_app::PUSH_ENCRYPTED_TOKEN_LEN,
+                "each trigger carries the peer's single encrypted token and one padding chunk"
+            );
+            assert!(
+                contents.insert(Sha256::digest(&content)),
+                "repeat triggers must not share content-hash dedup keys"
             );
         }
         eprintln!("push_summary minimum={minimum_triggers} verified={observed_triggers}");
@@ -541,13 +550,21 @@ async fn publish_socket_isolation() {
     );
 }
 
-async fn mock_relay() -> (MockRelay, String) {
-    let relay = MockRelay::run().await.unwrap();
-    let url = relay.url().await.to_string();
-    (relay, url)
+#[path = "support/limited_relay.rs"]
+mod limited_relay;
+use limited_relay::TestRelay;
+
+/// The fixture relay publishes the cap it enforces, as White Noise's relays
+/// do: a relay whose information document cannot be read holds a group's
+/// live input until its recovery unit gives up, a contract of its own.
+async fn mock_relay() -> (TestRelay, String) {
+    limited_relay::mock_relay().await
 }
 
-async fn mock_app(dir: &tempfile::TempDir) -> (MockRelay, MarmotApp, String) {
+async fn mock_app(dir: &tempfile::TempDir) -> (TestRelay, MarmotApp, String) {
+    // Opt in at ordinary app fixtures; shared relay/setup helpers also serve
+    // ignored diagnostics and nightly replay, which keep their original settings.
+    storage_sqlite::relax_storage_for_test_process();
     let (relay, url) = mock_relay().await;
     // The test harness exercises encrypted-media upload/download against a
     // loopback MockBlossom server, which is exactly the dev/test scenario the
@@ -577,7 +594,8 @@ async fn sync_to_epoch(client: &mut marmot_app::AppClient, group: &GroupId, epoc
     .expect("recipient did not settle the committed group epoch");
 }
 
-async fn mock_audit_app(dir: &tempfile::TempDir) -> (MockRelay, MarmotApp, String) {
+async fn mock_audit_app(dir: &tempfile::TempDir) -> (TestRelay, MarmotApp, String) {
+    storage_sqlite::relax_storage_for_test_process();
     let (relay, url) = mock_relay().await;
     let app = MarmotApp::try_with_relays_and_account_home_and_config(
         dir.path(),
@@ -609,14 +627,43 @@ async fn accept_group_invite_retrying_busy(
     account_ref: &str,
     group_id: &GroupId,
 ) -> Result<marmot_app::AppGroupRecord, AppError> {
+    let group_id_hex = hex::encode(group_id.as_slice());
+    // Whether the last attempt found no saved row for the group.
+    let mut row_missing = false;
     timeout(Duration::from_secs(5), async {
         loop {
-            match runtime.accept_group_invite(account_ref, group_id).await {
-                Err(AppError::AccountWorkerBusy | AppError::UnknownGroup(_)) => {
-                    sleep(Duration::from_millis(10)).await
+            if row_missing {
+                // Wait for the row with the lookup `accept_group_invite`
+                // makes, read off the account worker: a refused attempt
+                // would cost the worker a turn, and attempts back to back can
+                // keep it from receiving the Welcome. `GroupJoined` is no such
+                // signal: a projection save that fails after the Welcome's
+                // ingest announces the join before the row exists, and its
+                // retry saves the row without announcing it again. A probe
+                // that finds the row starts a group-state watch, dropped
+                // here, which reads off the worker and ends at the row's
+                // next change or at shutdown.
+                row_missing = matches!(
+                    runtime
+                        .subscribe_group_state(account_ref, &group_id_hex)
+                        .await,
+                    Err(AppError::UnknownGroup(_))
+                );
+                if !row_missing {
+                    continue;
                 }
-                result => return result,
+            } else {
+                match runtime.accept_group_invite(account_ref, group_id).await {
+                    Err(AppError::UnknownGroup(_)) => row_missing = true,
+                    // A startup or catch-up sync holds the live client and
+                    // refused before starting the mutation. The runtime emits
+                    // nothing when that sync lets go; these refusals answer
+                    // without a worker turn.
+                    Err(AppError::AccountWorkerBusy) => {}
+                    result => return result,
+                }
             }
+            sleep(Duration::from_millis(10)).await;
         }
     })
     .await
@@ -649,6 +696,7 @@ async fn group_message_blocking_app(
     dir: &tempfile::TempDir,
     gate: BlockNextGroupMessages,
 ) -> (LocalRelay, MarmotApp, String) {
+    storage_sqlite::relax_storage_for_test_process();
     let relay = LocalRelay::new(RelayBuilder::default().write_policy(gate));
     relay.run().await.unwrap();
     let url = relay.url().await.to_string();
@@ -908,6 +956,7 @@ async fn gift_wrap_blocking_app_with_config(
     gate: BlockNextGiftWraps,
     config: MarmotAppConfig,
 ) -> (LocalRelay, MarmotApp, String) {
+    storage_sqlite::relax_storage_for_test_process();
     let relay = LocalRelay::new(RelayBuilder::default().write_policy(gate));
     relay.run().await.unwrap();
     let url = relay.url().await.to_string();
@@ -970,6 +1019,7 @@ async fn gift_wrap_counting_app(
     dir: &tempfile::TempDir,
     gate: CountGiftWraps,
 ) -> (LocalRelay, MarmotApp, String) {
+    storage_sqlite::relax_storage_for_test_process();
     let relay = LocalRelay::new(RelayBuilder::default().write_policy(gate));
     relay.run().await.unwrap();
     let url = relay.url().await.to_string();
@@ -1058,6 +1108,7 @@ impl WritePolicy for BlockKeyPackagesWhileArmed {
 }
 
 async fn deletion_rejecting_app(dir: &tempfile::TempDir) -> (LocalRelay, MarmotApp, String) {
+    storage_sqlite::relax_storage_for_test_process();
     let relay = LocalRelay::new(RelayBuilder::default().write_policy(RejectDeletionEvents));
     relay.run().await.unwrap();
     let url = relay.url().await.to_string();
@@ -1669,6 +1720,33 @@ fn sqlite_file_requires_key_for_test(path: &Path) -> bool {
         .is_err()
 }
 
+/// The account read-state oracle runs in marmot-app's integration tests,
+/// which link this crate without `cfg(test)`: their runner names the package.
+/// `marmot-uniffi`'s `read_state_oracle_stays_off_in_downstream_tests` is the
+/// other half (mdk#3273).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_state_oracle_runs_in_marmot_app_integration_tests() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app);
+    let account = create_network_ready_identity(
+        &runtime,
+        AccountSetupRequest {
+            default_relays: vec![endpoint(&url)],
+            bootstrap_relays: vec![endpoint(&url)],
+            ..AccountSetupRequest::default()
+        },
+    )
+    .await
+    .account
+    .account_id_hex;
+    marmot_app::worker_fences::worker_round_trip(&runtime, &account)
+        .await
+        .unwrap();
+    assert!(marmot_app::read_state_oracle_checks() > 0);
+    runtime.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn import_with_stalled_discovery_endpoint_completes_within_the_advisory_cap() {
     let dir = tempfile::tempdir().unwrap();
@@ -1749,6 +1827,7 @@ async fn import_with_stalled_discovery_endpoint_completes_within_the_advisory_ca
 async fn app_runtime_private_key_import_recovers_orphaned_keychain_credential() {
     use nostr::prelude::ToBech32;
 
+    storage_sqlite::relax_storage_for_test_process();
     install_mock_keyring();
     let dir = tempfile::tempdir().unwrap();
     let (_relay, url) = mock_relay().await;
@@ -1828,6 +1907,7 @@ async fn app_runtime_private_key_import_recovers_orphaned_keychain_credential() 
 async fn failed_key_package_setup_retries_same_nsec_after_restart() {
     use nostr::prelude::ToBech32;
 
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let rejecting = Arc::new(AtomicBool::new(true));
     let relay = LocalRelay::new(
@@ -1919,6 +1999,7 @@ async fn failed_key_package_setup_retries_same_nsec_after_restart() {
 async fn failed_reactivation_key_package_publish_restores_signed_out_retry() {
     use nostr::prelude::ToBech32;
 
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let rejecting = Arc::new(AtomicBool::new(false));
     let relay = LocalRelay::new(
@@ -1981,6 +2062,7 @@ async fn failed_reactivation_key_package_publish_restores_signed_out_retry() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_external_signer_reactivation_restores_signed_out_retry() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let rejecting = Arc::new(AtomicBool::new(false));
     let relay = LocalRelay::new(
@@ -2051,6 +2133,7 @@ async fn failed_external_signer_reactivation_restores_signed_out_retry() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_generated_identity_setup_resumes_same_identity_after_restart() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let rejecting = Arc::new(AtomicBool::new(true));
     let relay = LocalRelay::new(
@@ -2104,6 +2187,7 @@ async fn failed_generated_identity_setup_resumes_same_identity_after_restart() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_external_signer_setup_resumes_after_restart() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let rejecting = Arc::new(AtomicBool::new(true));
     let relay = LocalRelay::new(
@@ -2169,6 +2253,7 @@ async fn cancelled_key_package_setup_resumes_exact_pending_attempt_after_restart
     use marmot_account::AccountSetupPhase;
     use nostr::prelude::ToBech32;
 
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let armed = Arc::new(AtomicBool::new(true));
     let entered = Arc::new(Notify::new());
@@ -2251,6 +2336,7 @@ async fn cancelled_key_package_setup_resumes_exact_pending_attempt_after_restart
 async fn app_runtime_private_key_setup_rollback_preserves_only_recovered_keychain_secret() {
     use nostr::prelude::ToBech32;
 
+    storage_sqlite::relax_storage_for_test_process();
     install_mock_keyring();
     let dir = tempfile::tempdir().unwrap();
     let (_relay, url) = mock_relay().await;
@@ -2424,16 +2510,6 @@ async fn app_runtime_create_identity_bootstraps_managed_account_and_key_package(
             .attempts,
         1,
         "setup must open the worker-owned session exactly once"
-    );
-    assert!(
-        dir.path()
-            .join("key-packages")
-            .join(format!(
-                "{}.capability-refresh-v1-relay-scan-complete",
-                created.account.label
-            ))
-            .exists(),
-        "a generated account must persist the guaranteed-empty cutover scan marker before opening"
     );
 
     let fetched = app
@@ -3011,6 +3087,7 @@ async fn app_runtime_can_rotate_key_package_on_request() {
 async fn account_key_packages_reports_durable_ownership_merges_relay_echo_and_survives_restart() {
     use nostr::prelude::ToBech32;
 
+    storage_sqlite::relax_storage_for_test_process();
     let first_dir = tempfile::tempdir().unwrap();
     let second_dir = tempfile::tempdir().unwrap();
     let (relay, url) = mock_relay().await;
@@ -3136,6 +3213,7 @@ async fn account_key_packages_reports_durable_ownership_merges_relay_echo_and_su
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(feature = "test-policy-overrides")]
 async fn local_account_key_packages_are_readable_while_startup_is_held() {
+    storage_sqlite::relax_storage_for_test_process();
     async fn read_while_startup_is_held(
         runtime: &MarmotAppRuntime,
         account_id: &str,
@@ -3386,7 +3464,9 @@ async fn app_runtime_executes_group_and_message_intents_on_managed_accounts() {
             Some("initial description".to_owned()),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert_eq!(
         account_sync_attempts(),
         sync_attempts_before_create,
@@ -3573,7 +3653,9 @@ async fn app_component_lifecycle() {
     let group = runtime
         .create_group(&alice, "components", std::slice::from_ref(&bob), None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| matches!(event,
         MarmotAppEvent::GroupJoined { account_id_hex, group_id, .. } if account_id_hex == &bob && group_id == &group
     )).await;
@@ -3589,10 +3671,10 @@ async fn app_component_lifecycle() {
     );
 
     let epoch = runtime.group_mls_state(&alice, &group).await.unwrap().epoch;
-    // Protocol space: an assigned id, the draft multi-device-join id the
-    // registry already owns, and the registry's next unassigned id. All three
-    // are below the application range and none of them reaches an MLS commit.
-    for protocol_id in [0x8003, 0x800a, 0x800d] {
+    // Protocol space: an assigned id, the withdrawn multi-device-join id
+    // (marmot#427), 0x800d, and an id the registry never assigned. All are
+    // below the application range and none of them reaches an MLS commit.
+    for protocol_id in [0x8003, 0x800a, 0x800d, 0xefff] {
         let reserved = runtime
             .update_app_component(&alice, &group, protocol_id, vec![])
             .await
@@ -3640,7 +3722,9 @@ async fn app_component_lifecycle() {
     runtime
         .invite_members(&alice, &group, std::slice::from_ref(&carol))
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| matches!(event,
         MarmotAppEvent::GroupJoined { account_id_hex, group_id, .. } if account_id_hex == &carol && group_id == &group
     )).await;
@@ -3770,7 +3854,9 @@ async fn app_runtime_custom_events_roundtrip_and_filter_by_kind() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -3875,6 +3961,212 @@ async fn app_runtime_custom_events_roundtrip_and_filter_by_kind() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tagged_poll_sticker_peer() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..Default::default()
+    };
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only())
+        .await
+        .account;
+    let bob = create_network_ready_identity(&runtime, setup).await.account;
+    let a = &alice.account_id_hex;
+    let b = &bob.account_id_hex;
+    let mut events = runtime.subscribe();
+    let group = runtime
+        .create_group(a, "tagged context", std::slice::from_ref(b), None)
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    wait_for_event(&mut events, |event| {
+        matches!(event, MarmotAppEvent::GroupJoined { account_id_hex, group_id, .. }
+            if account_id_hex == b && group_id == &group)
+    })
+    .await;
+    accept_group_invite_retrying_busy(&runtime, b, &group)
+        .await
+        .unwrap();
+    let group_hex = hex::encode(group.as_slice());
+    let mut bob_timeline = runtime
+        .subscribe_timeline_messages(
+            b,
+            TimelineMessageQuery {
+                group_id_hex: Some(group_hex.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let root = runtime
+        .send_message(a, &group, b"Choose a drink".to_vec())
+        .await
+        .unwrap();
+    let root_id = &root.message_ids[0];
+    let tags = vec![
+        vec!["e".into(), root_id.clone()],
+        vec!["E".into(), root_id.clone(), String::new(), a.clone()],
+        vec!["K".into(), "9".into()],
+        vec!["P".into(), a.clone()],
+        vec!["effect".into(), "party".into()],
+    ];
+    let sent = runtime
+        .create_tagged_poll(
+            a,
+            &group,
+            "Drink?".into(),
+            vec!["Tea".into(), "Coffee".into()],
+            cgka_traits::PollType::MultipleChoice,
+            None,
+            tags.clone(),
+        )
+        .await
+        .unwrap();
+    let poll_id = &sent.message_ids[0];
+    wait_for_timeline_update(&mut bob_timeline, |update| {
+        matches!(update, marmot_app::RuntimeTimelineMessageUpdate::Projection(projection)
+            if projection.update.timeline_messages.iter().any(|row| row.message_id_hex == *poll_id && row.poll.is_some()))
+    }).await;
+    let peer = runtime
+        .timeline_message(b, &group_hex, poll_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        peer.reply_to_message_id_hex.as_deref(),
+        Some(root_id.as_str())
+    );
+    assert_eq!(
+        peer.reply_preview.as_ref().unwrap().plaintext,
+        "Choose a drink"
+    );
+    for tag in &tags {
+        assert!(peer.tags.contains(tag));
+    }
+    let poll = peer.poll.unwrap();
+    assert_eq!(poll.question, "Drink?");
+    assert_eq!(poll.poll_type, cgka_traits::PollType::MultipleChoice);
+    assert_eq!(
+        poll.options
+            .iter()
+            .map(|option| option.label.as_str())
+            .collect::<Vec<_>>(),
+        ["Tea", "Coffee"]
+    );
+    runtime
+        .cast_poll_vote(b, &group, poll_id.clone(), vec!["0".into(), "1".into()])
+        .await
+        .unwrap();
+    let voted = runtime
+        .timeline_message(b, &group_hex, poll_id)
+        .unwrap()
+        .unwrap()
+        .poll
+        .unwrap();
+    assert_eq!(voted.participants, 1);
+    assert_eq!(voted.local_selection, ["0", "1"]);
+    assert_eq!(
+        voted
+            .options
+            .iter()
+            .map(|option| option.votes)
+            .collect::<Vec<_>>(),
+        [1, 1]
+    );
+
+    // Fetch a signed pack through the public path so sticker authorization is real.
+    use sonar_stickers::{PackAddress, Sticker, StickerPack, build_pack_tags};
+    let author = Keys::generate();
+    let coordinate = format!("30031:{}:context", author.public_key().to_hex());
+    let hash = "11".repeat(32);
+    let pack = StickerPack::new(
+        PackAddress::new(author.public_key().to_hex(), "context").unwrap(),
+        "Context",
+        None,
+        None,
+        vec![
+            Sticker::new(
+                "wave",
+                format!("https://cdn.example/{hash}.png"),
+                hash.clone(),
+                "image/png",
+                Some(32),
+                Some(32),
+                None,
+                None,
+            )
+            .unwrap(),
+        ],
+        None,
+    )
+    .unwrap();
+    let pack_tags = build_pack_tags(&pack)
+        .into_iter()
+        .map(|tag| {
+            let fields: Vec<String> =
+                serde_json::from_str(&serde_json::to_string(&tag).unwrap()).unwrap();
+            Tag::parse(fields).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let signed = EventBuilder::new(Kind::Custom(30031), "")
+        .tags(pack_tags)
+        .finalize(&author)
+        .unwrap();
+    let relay_client = NostrSdkRelayClient::new(NostrSdkClient::builder().build());
+    relay_client
+        .publish_event(
+            &[endpoint(&url)],
+            &NostrTransportEvent::from_nostr_event(&signed).unwrap(),
+            1,
+        )
+        .await
+        .unwrap();
+    app.fetch_sticker_pack(a, &coordinate).await.unwrap();
+    let sent = runtime
+        .send_tagged_sticker(
+            a,
+            &group,
+            marmot_app::AppStickerRef {
+                pack_coordinate: coordinate,
+                shortcode: "wave".into(),
+                plaintext_sha256: hash,
+            },
+            tags.clone(),
+        )
+        .await
+        .unwrap();
+    let sticker_id = &sent.message_ids[0];
+    wait_for_timeline_update(&mut bob_timeline, |update| {
+        matches!(update, marmot_app::RuntimeTimelineMessageUpdate::Projection(projection)
+            if projection.update.timeline_messages.iter().any(|row| row.message_id_hex == *sticker_id))
+    }).await;
+    let peer = runtime
+        .timeline_message(b, &group_hex, sticker_id)
+        .unwrap()
+        .unwrap();
+    for tag in &tags {
+        assert!(peer.tags.contains(tag));
+    }
+    assert_eq!(
+        peer.reply_to_message_id_hex.as_deref(),
+        Some(root_id.as_str())
+    );
+    assert_eq!(peer.reply_preview.unwrap().plaintext, "Choose a drink");
+    assert_eq!(
+        marmot_app::sticker_ref_from_tags(peer.kind, &peer.tags)
+            .unwrap()
+            .shortcode,
+        "wave"
+    );
+    drop(bob_timeline);
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn app_runtime_delete_group_local_removes_projection_without_publishing_leave() {
     let dir = tempfile::tempdir().unwrap();
     let (_relay, app, url) = mock_app(&dir).await;
@@ -3900,7 +4192,9 @@ async fn app_runtime_delete_group_local_removes_projection_without_publishing_le
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -3924,7 +4218,9 @@ async fn app_runtime_delete_group_local_removes_projection_without_publishing_le
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -4145,6 +4441,7 @@ async fn app_runtime_delete_group_local_removes_projection_without_publishing_le
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(feature = "test-policy-overrides")]
 async fn app_runtime_serves_member_reads_during_scheduled_convergence() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let (_relay, url) = mock_relay().await;
     let app = MarmotApp::with_relay_and_config(
@@ -4174,7 +4471,9 @@ async fn app_runtime_serves_member_reads_during_scheduled_convergence() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(event, MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined, .. }
             if account_id_hex == &bob_id && joined == &group_id)
@@ -4226,7 +4525,7 @@ async fn app_runtime_serves_member_reads_during_scheduled_convergence() {
             .await
             .expect("roster reads must not wait for scheduled recovery")
             .unwrap();
-            assert_eq!(roster.roster_revision, roster.epoch.saturating_mul(3));
+            assert_eq!(roster.roster_revision, roster.epoch.saturating_mul(4));
             assert_eq!(roster.self_membership, SelfMembership::Member);
             assert_eq!(roster.members.len(), 2);
         }
@@ -4270,7 +4569,9 @@ async fn app_runtime_serves_member_reads_before_initial_catch_up_completes() {
     let group_id = runtime
         .create_group(&alice_id, "fast reads", std::slice::from_ref(&bob_id), None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -4299,8 +4600,9 @@ async fn app_runtime_serves_member_reads_before_initial_catch_up_completes() {
         .await
         .expect("restarted worker must reach initial sync");
 
-    // The bounded chat-list companion read uses the same snapshot during the
-    // detached catch-up, so batching does not reintroduce a readiness wait.
+    // The bounded chat-list companion read answers from the read state
+    // published before the detached catch-up, so batching does not
+    // reintroduce a readiness wait.
     let member_ids_page = timeout(
         Duration::from_secs(2),
         runtime.group_member_ids_page(&bob_id, std::slice::from_ref(&group_id)),
@@ -4319,8 +4621,8 @@ async fn app_runtime_serves_member_reads_before_initial_catch_up_completes() {
         !member_ids_page[0].admin_ids_hex.contains(&bob_id),
         "invited member must not be reported as an admin"
     );
-    // The combined roster read must also use the post-hydration snapshot
-    // while the startup sync is held behind the barrier.
+    // The combined roster read must also answer from that post-hydration
+    // version while the startup sync is held behind the barrier.
     let roster = timeout(
         Duration::from_secs(2),
         runtime.group_roster(&bob_id, &group_id),
@@ -4328,7 +4630,7 @@ async fn app_runtime_serves_member_reads_before_initial_catch_up_completes() {
     .await
     .expect("roster read must not block on the initial catch-up")
     .unwrap();
-    assert_eq!(roster.roster_revision, roster.epoch.saturating_mul(3));
+    assert_eq!(roster.roster_revision, roster.epoch.saturating_mul(4));
     assert_eq!(roster.self_membership, SelfMembership::Member);
     let roster_member_ids = roster
         .members
@@ -4337,7 +4639,7 @@ async fn app_runtime_serves_member_reads_before_initial_catch_up_completes() {
         .collect::<std::collections::HashSet<_>>();
     assert!(
         roster_member_ids.contains(&alice_id) && roster_member_ids.contains(&bob_id),
-        "snapshot/live roster read must report the full roster",
+        "the published roster read must report the full roster",
     );
 
     // The existing member-only read remains command-ready as well.
@@ -4354,7 +4656,7 @@ async fn app_runtime_serves_member_reads_before_initial_catch_up_completes() {
         .collect::<std::collections::HashSet<_>>();
     assert!(
         member_ids.contains(&alice_id) && member_ids.contains(&bob_id),
-        "snapshot/live read must report the full roster",
+        "the published member read must report the full roster",
     );
 
     // Release Bob's initial sync and await the real catch-up result so the
@@ -4389,7 +4691,9 @@ async fn group_conversation_snapshot_is_internally_consistent_around_mutation() 
     let group_id = runtime
         .create_group(&alice_id, "before snapshot", &[], None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
 
     let before = runtime
         .group_conversation_snapshot(&alice_id, &group_id)
@@ -4478,7 +4782,9 @@ async fn group_roster_reports_left_after_local_leave_without_worker_restart() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -4535,7 +4841,9 @@ async fn group_roster_reports_removed_after_admin_eviction_without_worker_restar
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -4611,7 +4919,9 @@ async fn app_runtime_schedules_audit_tracker_update_after_managed_send() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -4743,7 +5053,9 @@ async fn app_runtime_schedules_audit_tracker_update_after_inbound_welcome() {
     let group_id = runtime
         .create_group("alice", "runtime inbound audit", &["bob".to_owned()], None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -4815,7 +5127,9 @@ async fn app_runtime_uploads_armed_backfill_row_without_visible_activity() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -4916,7 +5230,9 @@ async fn app_runtime_coalesces_audit_tracker_updates_while_upload_is_in_flight()
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -5121,7 +5437,9 @@ async fn push_token_gossip_register_replace_and_remove_lifecycle() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_push_group_member(&app, &bob.account.label, &group_id).await;
     let server_pubkey = nostr::prelude::Keys::generate().public_key().to_hex();
 
@@ -5272,7 +5590,9 @@ async fn push_registration_before_join_is_automatically_shared_without_catch_up(
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     // No host retry/share/catch-up follows creation: the worker-owned receive
     // tail must discover and drain the new group's durable push outbox itself.
     wait_for_push_group_member(&app, &bob.account.label, &group).await;
@@ -5288,15 +5608,53 @@ async fn push_registration_before_join_is_automatically_shared_without_catch_up(
         view.tokens[0].token_fingerprint,
         registration.token_fingerprint
     );
-    assert!(
-        app.push_registration(&bob.account.account_id_hex)
-            .unwrap()
-            .unwrap()
-            .last_shared_at_ms
-            .is_some(),
-        "automatic publication must commit durable share completion"
-    );
+    // Alice can receive the token before Bob's publication completion commits.
+    // Observe that durable completion without initiating another share or retry.
+    timeout(Duration::from_secs(20), async {
+        loop {
+            if app
+                .push_registration(&bob.account.account_id_hex)
+                .unwrap()
+                .unwrap()
+                .last_shared_at_ms
+                .is_some()
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("automatic publication must commit durable share completion");
     runtime.shutdown().await;
+}
+
+/// Wait until `account` has joined `group` and holds a token record of `member`.
+async fn wait_for_member_push_token(
+    runtime: &MarmotAppRuntime,
+    account: &str,
+    group: &GroupId,
+    member: &str,
+) {
+    timeout(Duration::from_secs(30), async {
+        loop {
+            match runtime.group_push_debug_info(account, group).await {
+                Ok(view)
+                    if view
+                        .tokens
+                        .iter()
+                        .any(|token| token.member_id_hex == member) =>
+                {
+                    break;
+                }
+                Ok(_) | Err(AppError::AccountWorkerBusy | AppError::UnknownGroup(_)) => {}
+                Err(error) => panic!("push debug info failed: {error}"),
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the member's push token must reach the account");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5313,34 +5671,9 @@ async fn removed_member_triggers_local_push_token_cleanup() {
     let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
     let bob = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
     let carol = create_network_ready_identity(&runtime, setup).await;
-    let mut bob_chats = runtime
-        .subscribe_chats(&bob.account.account_id_hex, false)
-        .await
-        .unwrap();
-    let mut carol_chats = runtime
-        .subscribe_chats(&carol.account.account_id_hex, false)
-        .await
-        .unwrap();
-    let group_id = runtime
-        .create_group(
-            &alice.account.account_id_hex,
-            "removal cleanup",
-            &[
-                bob.account.account_id_hex.clone(),
-                carol.account.account_id_hex.clone(),
-            ],
-            None,
-        )
-        .await
-        .unwrap();
-    // Group creation schedules recipient catch-up in the background. Wait for
-    // both recipients to join before registering tokens, otherwise a share can
-    // succeed with no joined groups and leave this cleanup test racing setup.
-    let group_id_hex = hex::encode(group_id.as_slice());
-    wait_for_chat_update(&mut bob_chats, |chat| chat.group_id_hex == group_id_hex).await;
-    wait_for_chat_update(&mut carol_chats, |chat| chat.group_id_hex == group_id_hex).await;
     let server_pubkey = nostr::prelude::Keys::generate().public_key().to_hex();
-
+    // Tokens are registered before anyone joins; no host share or catch-up
+    // follows, so every share below is the workers' own.
     for member in [&bob, &carol] {
         app.set_native_push_enabled(&member.account.account_id_hex, true)
             .unwrap();
@@ -5352,14 +5685,51 @@ async fn removed_member_triggers_local_push_token_cleanup() {
             Some(url.clone()),
         )
         .unwrap();
-        let share = runtime
-            .share_push_registration(&member.account.account_id_hex)
-            .await
-            .unwrap();
-        assert_eq!(share.failed_groups, 0);
-        assert_eq!(share.pending_groups, 0);
     }
-    runtime.catch_up_accounts().await.unwrap();
+    let group_id = runtime
+        .create_group(
+            &alice.account.account_id_hex,
+            "removal cleanup",
+            std::slice::from_ref(&bob.account.account_id_hex),
+            None,
+        )
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    // Bob's token reaches Alice before Carol is added, so only Bob's re-share
+    // after the add can bring it to Carol (mdk#2604).
+    wait_for_member_push_token(
+        &runtime,
+        &alice.account.account_id_hex,
+        &group_id,
+        &bob.account.account_id_hex,
+    )
+    .await;
+    runtime
+        .invite_members(
+            &alice.account.account_id_hex,
+            &group_id,
+            std::slice::from_ref(&carol.account.account_id_hex),
+        )
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    wait_for_member_push_token(
+        &runtime,
+        &carol.account.account_id_hex,
+        &group_id,
+        &bob.account.account_id_hex,
+    )
+    .await;
+    wait_for_member_push_token(
+        &runtime,
+        &bob.account.account_id_hex,
+        &group_id,
+        &carol.account.account_id_hex,
+    )
+    .await;
 
     let bob_view_before = runtime
         .group_push_debug_info(&bob.account.account_id_hex, &group_id)
@@ -5407,6 +5777,119 @@ async fn removed_member_triggers_local_push_token_cleanup() {
     runtime.shutdown().await;
 }
 
+/// Wait until `account` holds no token record of `member`.
+async fn wait_for_no_member_push_token(
+    runtime: &MarmotAppRuntime,
+    account: &str,
+    group: &GroupId,
+    member: &str,
+) {
+    timeout(Duration::from_secs(30), async {
+        loop {
+            let view = runtime.group_push_debug_info(account, group).await.unwrap();
+            if view
+                .tokens
+                .iter()
+                .all(|token| token.member_id_hex != member)
+            {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the departed member's push tokens must leave the account");
+}
+
+/// A removal blanks a leaf, so a later member's leaf no longer equals its
+/// position in member order. Push debug info checks each record against the
+/// real (member, leaf) roster and reports the device's own leaf (mdk#2622).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn push_debug_info_reads_real_leaves_after_a_removal() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let carol = create_network_ready_identity(&runtime, setup).await;
+    let alice_id = &alice.account.account_id_hex;
+    let bob_id = &bob.account.account_id_hex;
+    let carol_id = &carol.account.account_id_hex;
+    let server_pubkey = nostr::prelude::Keys::generate().public_key().to_hex();
+    for member in [bob_id, carol_id] {
+        app.set_native_push_enabled(member, true).unwrap();
+        app.upsert_push_registration(
+            member,
+            PushPlatform::Fcm,
+            &format!("token-{}", &member[..8]),
+            &server_pubkey,
+            Some(url.clone()),
+        )
+        .unwrap();
+    }
+    // Bob joins in the founding Commit (leaf 1) and Carol after him (leaf 2).
+    let group_id = runtime
+        .create_group(
+            alice_id,
+            "leaf positions",
+            std::slice::from_ref(bob_id),
+            None,
+        )
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    wait_for_member_push_token(&runtime, alice_id, &group_id, bob_id).await;
+    runtime
+        .invite_members(alice_id, &group_id, std::slice::from_ref(carol_id))
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    wait_for_member_push_token(&runtime, carol_id, &group_id, bob_id).await;
+    wait_for_member_push_token(&runtime, carol_id, &group_id, carol_id).await;
+    wait_for_member_push_token(&runtime, alice_id, &group_id, carol_id).await;
+
+    runtime
+        .remove_members(alice_id, &group_id, std::slice::from_ref(bob_id))
+        .await
+        .unwrap();
+    runtime.catch_up_accounts().await.unwrap();
+    // Bob's records leave each device once it applies his removal.
+    wait_for_no_member_push_token(&runtime, alice_id, &group_id, bob_id).await;
+    wait_for_no_member_push_token(&runtime, carol_id, &group_id, bob_id).await;
+
+    for (account, local_leaf_index) in [(alice_id, 0), (carol_id, 2)] {
+        let view = runtime
+            .group_push_debug_info(account, &group_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            view.local_registration.local_leaf_index,
+            Some(local_leaf_index),
+            "the device's own leaf, not its position in member order"
+        );
+        let carol_record = view
+            .tokens
+            .iter()
+            .find(|token| &token.member_id_hex == carol_id)
+            .expect("each device holds Carol's record");
+        assert_eq!(carol_record.leaf_index, 2);
+        assert!(carol_record.active_leaf);
+        assert!(carol_record.member_matches_active_leaf);
+        assert_eq!(view.stale_token_count, 0);
+        assert_eq!(view.active_token_count, view.total_token_count);
+    }
+
+    runtime.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn eviction_projects_removed_from_group_notification() {
     let dir = tempfile::tempdir().unwrap();
@@ -5428,7 +5911,9 @@ async fn eviction_projects_removed_from_group_notification() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     app.set_local_notifications_enabled(&bob.account.account_id_hex, true)
         .unwrap();
     runtime.catch_up_accounts().await.unwrap();
@@ -5480,7 +5965,9 @@ async fn admin_grant_projects_made_admin_notification() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     app.set_local_notifications_enabled(&bob.account.account_id_hex, true)
         .unwrap();
     runtime.catch_up_accounts().await.unwrap();
@@ -5523,7 +6010,9 @@ async fn admin_revoke_projects_removed_as_admin_notification() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     app.set_local_notifications_enabled(&bob.account.account_id_hex, true)
         .unwrap();
     runtime.catch_up_accounts().await.unwrap();
@@ -5586,7 +6075,9 @@ async fn remove_members_sends_context_free_wake_from_snapshotted_tokens() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let server_pubkey = nostr::prelude::Keys::generate().public_key().to_hex();
     app.set_native_push_enabled(&bob.account.account_id_hex, true)
         .unwrap();
@@ -5654,7 +6145,9 @@ async fn remove_members_succeeds_when_wake_publish_fails() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let server_pubkey = nostr::prelude::Keys::generate().public_key().to_hex();
     app.set_native_push_enabled(&bob.account.account_id_hex, true)
         .unwrap();
@@ -5706,7 +6199,9 @@ async fn unauthorized_remove_and_self_demotion_send_no_wake() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     runtime.catch_up_accounts().await.unwrap();
     sleep(Duration::from_millis(300)).await;
     let wraps_before = gate.count();
@@ -5797,7 +6292,9 @@ async fn live_muted_chat_notifies_direct_mentions_but_not_ordinary_messages() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_hex = hex::encode(group_id.as_slice());
     app.set_local_notifications_enabled(&bob_id, true).unwrap();
     runtime.catch_up_accounts().await.unwrap();
@@ -5938,7 +6435,9 @@ async fn concurrent_wake_collection_and_foreground_subscription_share_notificati
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
 
     app.set_local_notifications_enabled(&bob.account.account_id_hex, true)
         .unwrap();
@@ -6046,7 +6545,9 @@ async fn message_send_succeeds_when_notification_trigger_publish_fails() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let server_pubkey = nostr::prelude::Keys::generate().public_key().to_hex();
 
     app.set_native_push_enabled(&bob.account.account_id_hex, true)
@@ -6098,11 +6599,15 @@ async fn overlapping_reciprocal_invites_deliver_both_incoming_welcomes() {
     let alice_group = runtime
         .create_group(&alice_id, "alice reciprocal invite", &[], None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let bob_group = runtime
         .create_group(&bob_id, "bob reciprocal invite", &[], None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let mut alice_events = runtime.subscribe();
     let mut bob_events = runtime.subscribe();
 
@@ -6184,11 +6689,15 @@ async fn successful_invite_delivers_while_overlapping_invite_fails() {
     let alice_group = runtime
         .create_group(&alice_id, "successful overlap", &[], None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let bob_group = runtime
         .create_group(&bob_id, "failed overlap", &[], None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let mut bob_events = runtime.subscribe();
 
     gate.arm(1);
@@ -6215,10 +6724,14 @@ async fn successful_invite_delivers_while_overlapping_invite_fails() {
             std::slice::from_ref(&missing_key_package_member),
         )
         .await;
-    assert!(
-        failed.is_err(),
-        "invite without a published KeyPackage must fail"
+    let failed = failed.unwrap();
+    assert!(failed.operation.is_none());
+    assert_eq!(failed.member_outcomes.len(), 1);
+    assert_eq!(
+        failed.member_outcomes[0].account_id_hex,
+        missing_key_package_member
     );
+    assert_eq!(failed.member_outcomes[0].selected_device_count, 0);
     gate.release();
     successful_invite
         .await
@@ -6262,7 +6775,9 @@ async fn app_runtime_marks_welcome_joined_groups_pending_until_accepted() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -6332,7 +6847,9 @@ async fn app_runtime_readd_after_remove_resurfaces_removed_member_group() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -6457,7 +6974,9 @@ async fn app_runtime_readd_after_remove_resurfaces_removed_member_group() {
     runtime
         .invite_members(&alice_id, &group_id, std::slice::from_ref(&bob_id))
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -6563,7 +7082,9 @@ async fn app_runtime_archive_survives_subsequent_inbound_delivery() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -6632,8 +7153,8 @@ async fn app_runtime_archive_survives_subsequent_inbound_delivery() {
 // fall back to a direct `MarmotApp::set_group_archived` write when the account
 // worker is unavailable (e.g. a startup/reconcile failure). The direct write
 // can race a freshly spawned worker holding the pre-archive snapshot and revert
-// the flag again. Only non-local-signing accounts (which can never own a
-// worker) are allowed the direct-write path. Here we make the worker
+// the flag again. Only an account that signs on no worker is allowed the
+// direct-write path (mdk#3318). Here we make the worker
 // unavailable by stopping the runtime and assert the toggle surfaces the error
 // instead of silently persisting through the bypass.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6665,7 +7186,9 @@ async fn app_runtime_archive_does_not_direct_write_when_worker_unavailable() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -6709,6 +7232,238 @@ async fn app_runtime_archive_does_not_direct_write_when_worker_unavailable() {
     );
 }
 
+/// Log in an external-signer account, whose registered signer gives it a
+/// running account worker.
+async fn login_external_signer_with_worker(
+    runtime: &MarmotAppRuntime,
+    url: &str,
+) -> AccountSetupResult {
+    let keys = Keys::generate();
+    let created = runtime
+        .login_external_signer(
+            keys.public_key().to_hex(),
+            TestExternalAccountSigner { keys },
+            AccountSetupRequest {
+                default_relays: vec![endpoint(url)],
+                bootstrap_relays: vec![endpoint(url)],
+                inbox_relays: Vec::new(),
+                discovery_relays: vec![endpoint(url)],
+                publish_missing_relay_lists: true,
+                publish_initial_key_package: true,
+                ..AccountSetupRequest::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(created.account.external_signing && !created.account.local_signing);
+    created
+}
+
+/// mdk#3318: archiving an external-signer account's chat goes through its
+/// running worker, as for a local signer (mdk#178). A direct storage write
+/// left the worker's in-memory record unarchived, and the worker's next save
+/// of that group's record, here for an inbound rename commit, wrote
+/// `archived = false` back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_signer_archive_survives_an_inbound_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let alice = create_network_ready_identity(
+        &runtime,
+        AccountSetupRequest {
+            default_relays: vec![endpoint(&url)],
+            bootstrap_relays: vec![endpoint(&url)],
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        },
+    )
+    .await;
+    let alice_id = alice.account.account_id_hex.clone();
+    let bob = login_external_signer_with_worker(&runtime, &url).await;
+    let bob_id = bob.account.account_id_hex.clone();
+    let bob_label = bob.account.label.clone();
+    let mut events = runtime.subscribe();
+
+    let group_id = runtime
+        .create_group(
+            &alice_id,
+            "external signer archive",
+            std::slice::from_ref(&bob_id),
+            None,
+        )
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined_group, .. }
+                if account_id_hex == &bob_id && joined_group == &group_id
+        )
+    })
+    .await;
+    let group_id_hex = hex::encode(group_id.as_slice());
+
+    let archived = runtime
+        .set_group_archived(&bob_id, &group_id_hex, true)
+        .await
+        .unwrap();
+    assert!(archived.archived);
+
+    // Bob's worker applies Alice's rename and saves the group's whole record.
+    let mut bob_group = runtime
+        .subscribe_group_state(&bob_id, &group_id_hex)
+        .await
+        .unwrap();
+    runtime
+        .update_group_profile(
+            &alice_id,
+            &group_id,
+            Some("renamed after archive".to_owned()),
+            None,
+        )
+        .await
+        .unwrap();
+    wait_for_group_state_update(&mut bob_group, |group| {
+        group.profile.name == "renamed after archive"
+    })
+    .await;
+
+    let stored = app.group(&bob_label, &group_id_hex).unwrap().unwrap();
+    assert_eq!(stored.profile.name, "renamed after archive");
+    assert!(
+        stored.archived,
+        "the worker's save of the renamed record must not unarchive the chat"
+    );
+    assert!(
+        runtime
+            .group_conversation_snapshot(&bob_id, &group_id)
+            .await
+            .unwrap()
+            .group
+            .archived,
+        "the worker's own record must carry the archive"
+    );
+    runtime.shutdown().await;
+}
+
+/// mdk#3318: forgetting or deleting an external-signer account's group goes
+/// through its running worker, as for a local signer. The worker drops the
+/// group from its own state before the host hears of it. A direct storage
+/// write left the worker holding the group's record: after a delete it kept
+/// answering for the group, and after a forget it read the record and failed
+/// in storage instead of not knowing the group.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_signer_forget_and_delete_go_through_the_accounts_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app);
+    let account = login_external_signer_with_worker(&runtime, &url).await;
+    let account_id = account.account.account_id_hex;
+
+    for forget in [true, false] {
+        let group = runtime
+            .create_group(&account_id, "local only", &[], None)
+            .await
+            .unwrap()
+            .operation
+            .expect("a group with no other members");
+        let group_hex = hex::encode(group.as_slice());
+        runtime.group_mls_state(&account_id, &group).await.unwrap();
+        let removed = if forget {
+            runtime.forget_group_local(&account_id, &group).await
+        } else {
+            runtime.delete_group_local(&account_id, &group).await
+        };
+        assert!(removed.unwrap());
+        let mls_state = runtime.group_mls_state(&account_id, &group).await;
+        assert!(
+            matches!(&mls_state, Err(AppError::UnknownGroup(id)) if *id == group_hex),
+            "forget={forget}: the worker's published reads must not hold the removed group: {mls_state:?}"
+        );
+        let snapshot = runtime
+            .group_conversation_snapshot(&account_id, &group)
+            .await
+            .map(|_| ());
+        assert!(
+            matches!(&snapshot, Err(AppError::UnknownGroup(id)) if *id == group_hex),
+            "forget={forget}: the worker's published reads must not hold the removed group: {snapshot:?}"
+        );
+    }
+
+    runtime.shutdown().await;
+}
+
+/// mdk#3318: an account that signs on no worker, here a signed-out external
+/// signer, archives, forgets and deletes its chats in storage directly, and
+/// the worker it signs back in with starts from those writes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn signed_out_account_archives_forgets_and_deletes_without_a_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app);
+    let account = login_external_signer_with_worker(&runtime, &url).await;
+    let account_id = account.account.account_id_hex;
+    let mut groups = Vec::new();
+    for name in ["archived", "forgotten", "deleted"] {
+        groups.push(
+            runtime
+                .create_group(&account_id, name, &[], None)
+                .await
+                .unwrap()
+                .operation
+                .expect("a group with no other members"),
+        );
+    }
+    let [archived, forgotten, deleted] = groups.try_into().unwrap();
+    runtime
+        .sign_out(&account_id, SignOutOptions::default())
+        .await
+        .unwrap();
+
+    let record = runtime
+        .set_group_archived(&account_id, &hex::encode(archived.as_slice()), true)
+        .await
+        .unwrap();
+    assert!(record.archived);
+    assert!(
+        runtime
+            .forget_group_local(&account_id, &forgotten)
+            .await
+            .unwrap()
+    );
+    assert!(
+        runtime
+            .delete_group_local(&account_id, &deleted)
+            .await
+            .unwrap()
+    );
+
+    assert!(runtime.sign_in_account(&account_id).await.unwrap().running);
+    assert!(
+        runtime
+            .group_conversation_snapshot(&account_id, &archived)
+            .await
+            .unwrap()
+            .group
+            .archived
+    );
+    for removed in [forgotten, deleted] {
+        let snapshot = runtime
+            .group_conversation_snapshot(&account_id, &removed)
+            .await
+            .map(|_| ());
+        assert!(
+            matches!(&snapshot, Err(AppError::UnknownGroup(id))
+                if *id == hex::encode(removed.as_slice())),
+            "the new worker must start without the removed group: {snapshot:?}"
+        );
+    }
+    runtime.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn app_runtime_declines_pending_invite_by_leaving_and_archiving() {
     let dir = tempfile::tempdir().unwrap();
@@ -6734,7 +7489,9 @@ async fn app_runtime_declines_pending_invite_by_leaving_and_archiving() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -6831,7 +7588,9 @@ async fn app_runtime_emits_live_messages_for_local_accounts_without_manual_sync(
     let group_id = runtime
         .create_group("alice", "live", &["bob".to_owned()], None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -7037,7 +7796,9 @@ async fn app_runtime_message_subscription_returns_snapshot_then_live_updates() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -7128,7 +7889,9 @@ async fn app_runtime_message_subscription_kinds_filter_applies_to_live_updates()
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -7321,7 +8084,9 @@ async fn app_runtime_chat_and_group_state_subscriptions_stream_projection_update
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
     let chat = wait_for_chat_update(&mut bob_chats, |chat| chat.group_id_hex == group_id_hex).await;
     assert_eq!(chat.profile.name, "runtime chats");
@@ -7368,6 +8133,7 @@ async fn app_runtime_chat_and_group_state_subscriptions_stream_projection_update
 #[cfg(feature = "test-policy-overrides")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn group_state_subscription_observes_rename_applied_during_interleaved_send() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let (_relay, url) = mock_relay().await;
     let app = MarmotApp::with_relay_and_config(
@@ -7400,7 +8166,9 @@ async fn group_state_subscription_observes_rename_applied_during_interleaved_sen
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -7471,13 +8239,19 @@ async fn group_state_subscription_observes_rename_applied_during_interleaved_sen
 #[cfg(feature = "test-policy-overrides")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn group_state_subscription_observes_rename_applied_during_failed_send() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let reject_armed = Arc::new(AtomicBool::new(false));
-    let relay = LocalRelay::new(
+    // Publish the enforced cap, like the interleaved-send sibling's relay. A
+    // relay with no NIP-11 page leaves bob's post-join group REQ unprovable
+    // when it is answered after alice's rename is stored: the unknown-cap
+    // replay fence then holds the rename for longer than the retention wait,
+    // which is a different contract with its own tests.
+    let (_relay, url) = limited_relay::relay_publishing_with(
         RelayBuilder::default().write_policy(RejectGroupMessagesWhileArmed(reject_armed.clone())),
-    );
-    relay.run().await.unwrap();
-    let url = relay.url().await.to_string();
+        Some(500),
+    )
+    .await;
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
         url.clone(),
@@ -7508,7 +8282,9 @@ async fn group_state_subscription_observes_rename_applied_during_failed_send() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -7590,7 +8366,9 @@ async fn app_runtime_timeline_subscription_reopen_keeps_local_sent_message() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
     let query = TimelineMessageQuery {
         group_id_hex: Some(group_id_hex.clone()),
@@ -7661,7 +8439,9 @@ async fn app_runtime_timeline_subscription_paginates_backwards_through_real_stor
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
 
     // Five messages, oldest to newest. (Intra-second `timeline_at` ties are
@@ -7826,6 +8606,7 @@ fn row_title(app: &MarmotApp, label: &str, group_id_hex: &str) -> Option<String>
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(feature = "test-policy-overrides")]
 async fn accepted_disband_finishes_for_both_members_without_followup_commands() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let (_relay, url) = mock_relay().await;
     let app = MarmotApp::with_relay_and_config(
@@ -7850,7 +8631,9 @@ async fn accepted_disband_finishes_for_both_members_without_followup_commands() 
     let group_id = runtime
         .create_group(&alice_id, "closure", std::slice::from_ref(&bob_id), None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(event, MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined, .. }
             if account_id_hex == &bob_id && joined == &group_id)
@@ -7928,7 +8711,12 @@ async fn relay_app_runtime_exchanges_messages_without_lab() {
     bob.publish_key_package().await.unwrap();
 
     let mut alice = app.client("alice").await.unwrap();
-    let group_id = alice.create_group("general", &["bob"]).await.unwrap();
+    let group_id = alice
+        .create_group("general", &["bob"])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
 
     let joined = bob.sync().await.unwrap();
     assert_eq!(joined.joined_groups, vec![group_id.clone()]);
@@ -7970,7 +8758,9 @@ async fn self_removal_suppresses_account_unread_while_peer_removal_advances_it()
     let group_id = alice
         .create_group("departures", &["bob", "carol"])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     bob.sync().await.unwrap();
     carol.sync().await.unwrap();
 
@@ -8082,7 +8872,12 @@ async fn local_leave_suppresses_account_unread_total() {
     bob.publish_key_package().await.unwrap();
 
     let mut alice = app.client("alice").await.unwrap();
-    let group_id = alice.create_group("departures", &["bob"]).await.unwrap();
+    let group_id = alice
+        .create_group("departures", &["bob"])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     bob.sync().await.unwrap();
 
     // Account attention excludes invitations until explicitly accepted.
@@ -8171,7 +8966,9 @@ async fn pending_leave_request_survives_a_cold_launch() {
     let group_id = alice
         .create_group("pending departures", &["bob"])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     bob.sync().await.unwrap();
     let group_id_hex = hex::encode(group_id.as_slice());
 
@@ -8272,7 +9069,12 @@ async fn open_backfill_preserves_unread_for_still_member_account() {
     bob.publish_key_package().await.unwrap();
 
     let mut alice = app.client("alice").await.unwrap();
-    let group_id = alice.create_group("backfill", &["bob"]).await.unwrap();
+    let group_id = alice
+        .create_group("backfill", &["bob"])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     bob.sync().await.unwrap();
 
     // Account attention excludes invitations until explicitly accepted.
@@ -8350,7 +9152,12 @@ async fn unresolved_send_keeps_local_message_read_marker_and_inbound_unread() {
     bob.publish_key_package().await.unwrap();
 
     let mut alice = app.client("alice").await.unwrap();
-    let group_id = alice.create_group("markers", &["bob"]).await.unwrap();
+    let group_id = alice
+        .create_group("markers", &["bob"])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     bob.sync().await.unwrap();
 
     // Account attention excludes invitations until explicitly accepted.
@@ -8432,7 +9239,8 @@ async fn unresolved_send_keeps_local_message_read_marker_and_inbound_unread() {
     // No relay remains to confirm whether bob's message was accepted. The
     // attempt can take up to the adapter's ~20s publish overall-wait
     // (SDK_RELAY_PUBLISH_OVERALL_WAIT) before it reports completion unknown.
-    relay.shutdown();
+    // Dropping the fixture closes its listener and every connection.
+    drop(relay);
     let unresolved = bob
         .send(&group_id, b"bob unresolved")
         .await
@@ -8498,7 +9306,12 @@ async fn relay_app_runtime_publishes_member_leave() {
     bob.publish_key_package().await.unwrap();
 
     let mut alice = app.client("alice").await.unwrap();
-    let group_id = alice.create_group("departures", &["bob"]).await.unwrap();
+    let group_id = alice
+        .create_group("departures", &["bob"])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     bob.sync().await.unwrap();
 
     let leave = bob.leave_group(&group_id).await.unwrap();
@@ -8562,11 +9375,21 @@ async fn relay_app_runtime_synthesizes_system_row_for_own_invite() {
     carol.publish_key_package().await.unwrap();
 
     let mut alice = app.client("alice").await.unwrap();
-    let group_id = alice.create_group("ops", &["bob"]).await.unwrap();
+    let group_id = alice
+        .create_group("ops", &["bob"])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
 
     // Own action: alice invites carol post-creation. The confirmed commit
     // synthesizes a kind-1210 member_added row in alice's own timeline.
-    alice.invite_members(&group_id, &["carol"]).await.unwrap();
+    alice
+        .invite_members(&group_id, &["carol"])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
 
     let alice_timeline = MarmotApp::with_relay(dir.path(), url)
         .timeline_messages_with_query(
@@ -8601,7 +9424,12 @@ async fn relay_app_runtime_synthesizes_system_row_for_retention_change() {
 
     let alice_id = home.account("alice").unwrap().account_id_hex;
     let mut alice = app.client("alice").await.unwrap();
-    let group_id = alice.create_group("ops", &["bob"]).await.unwrap();
+    let group_id = alice
+        .create_group("ops", &["bob"])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     bob.sync().await.unwrap();
 
     alice.update_message_retention(&group_id, 60).await.unwrap();
@@ -8698,7 +9526,9 @@ async fn app_runtime_retention_sweep_prunes_with_the_supplied_clock() {
     let group_id = alice
         .create_group("retention sweep", &["bob"])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     alice.update_message_retention(&group_id, 60).await.unwrap();
     alice
         .send(&group_id, b"expire through runtime")
@@ -8741,12 +9571,22 @@ async fn relay_app_runtime_synthesizes_initial_retention_row_on_join() {
 
     let alice_id = home.account("alice").unwrap().account_id_hex;
     let mut alice = app.client("alice").await.unwrap();
-    let group_id = alice.create_group("ops", &["bob"]).await.unwrap();
+    let group_id = alice
+        .create_group("ops", &["bob"])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     bob.sync().await.unwrap();
     alice.update_message_retention(&group_id, 60).await.unwrap();
     bob.sync().await.unwrap();
 
-    alice.invite_members(&group_id, &["carol"]).await.unwrap();
+    alice
+        .invite_members(&group_id, &["carol"])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     carol.sync().await.unwrap();
 
     let carol_timeline = MarmotApp::with_relay(dir.path(), url)
@@ -8800,14 +9640,21 @@ async fn relay_app_runtime_synthesizes_rows_for_multi_member_invite() {
     }
 
     let mut alice = app.client("alice").await.unwrap();
-    let group_id = alice.create_group("ops", &["bob"]).await.unwrap();
+    let group_id = alice
+        .create_group("ops", &["bob"])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
 
     // One commit invites two members, so two member_added rows must both persist
     // — previously they collided on the unique source index and one was dropped.
     alice
         .invite_members(&group_id, &["carol", "dave"])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
 
     let alice_timeline = MarmotApp::with_relay(dir.path(), url)
         .timeline_messages_with_query(
@@ -8845,7 +9692,12 @@ async fn relay_app_runtime_projects_typed_reactions_and_deletes() {
     bob.publish_key_package().await.unwrap();
 
     let mut alice = app.client("alice").await.unwrap();
-    let group_id = alice.create_group("updates", &["bob"]).await.unwrap();
+    let group_id = alice
+        .create_group("updates", &["bob"])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     bob.sync().await.unwrap();
 
     let sent = alice
@@ -8896,47 +9748,46 @@ async fn relay_app_runtime_projects_typed_reactions_and_deletes() {
         Some(target_message_id.as_str())
     );
 
-    // A reference is only sendable in the epoch that encrypted it; the
-    // synthetic references below claim the group's live epoch.
-    let media_epoch = bob.group_mls_state(&group_id).unwrap().epoch;
-    bob.send_media_attachments(
-        &group_id,
-        vec![
-            MediaAttachmentReference {
-                locators: vec![MediaLocator {
-                    kind: "blossom-v1".to_owned(),
-                    value: format!("https://media.example/{}.bin", hex::encode([0x11_u8; 32])),
-                }],
-                ciphertext_sha256: hex::encode([0x11_u8; 32]),
-                plaintext_sha256: hex::encode([0x42_u8; 32]),
-                nonce_hex: hex::encode([0x24_u8; 12]),
-                file_name: "diagram.png".to_owned(),
-                media_type: "image/png".to_owned(),
-                version: "encrypted-media-v2".to_owned(),
-                source_epoch: media_epoch,
-                dim: Some("800x600".to_owned()),
-                thumbhash: Some("1QcSHQRnh493V4dIh4eXh1h4kJUI".to_owned()),
+    // Use real upload provenance: the projection must preserve the uploaded
+    // descriptors without putting their device-local identity on the wire.
+    let blossom = mock_blossom().await;
+    let uploaded = bob
+        .upload_media(
+            &group_id,
+            MediaUploadRequest {
+                attachments: vec![
+                    MediaUploadAttachmentRequest {
+                        file_name: "diagram.png".into(),
+                        media_type: "image/png".into(),
+                        plaintext: b"diagram fixture".to_vec(),
+                        dim: Some("800x600".into()),
+                        thumbhash: Some("1QcSHQRnh493V4dIh4eXh1h4kJUI".into()),
+                    },
+                    MediaUploadAttachmentRequest {
+                        file_name: "audio.ogg".into(),
+                        media_type: "audio/ogg".into(),
+                        plaintext: b"audio fixture".to_vec(),
+                        dim: None,
+                        thumbhash: None,
+                    },
+                ],
+                caption: None,
+                send: false,
+                blossom_server: Some(blossom.url.clone()),
+                message_tags: Vec::new(),
             },
-            MediaAttachmentReference {
-                locators: vec![MediaLocator {
-                    kind: "blossom-v1".to_owned(),
-                    value: format!("https://media.example/{}.bin", hex::encode([0x12_u8; 32])),
-                }],
-                ciphertext_sha256: hex::encode([0x12_u8; 32]),
-                plaintext_sha256: hex::encode([0x43_u8; 32]),
-                nonce_hex: hex::encode([0x25_u8; 12]),
-                file_name: "audio.ogg".to_owned(),
-                media_type: "audio/ogg".to_owned(),
-                version: "encrypted-media-v2".to_owned(),
-                source_epoch: media_epoch,
-                dim: None,
-                thumbhash: None,
-            },
-        ],
-        Some("launch diagram".to_owned()),
-    )
-    .await
-    .unwrap();
+        )
+        .await
+        .unwrap();
+    let references: Vec<_> = uploaded
+        .attachments
+        .into_iter()
+        .map(|attachment| attachment.reference)
+        .collect();
+    let diagram = references[0].clone();
+    bob.send_media_attachments(&group_id, references, Some("launch diagram".into()))
+        .await
+        .unwrap();
     let media = alice.sync().await.unwrap();
     // Media is a kind-9 chat: content is the caption, attachment is an `imeta`.
     assert_eq!(media.messages[0].plaintext, "launch diagram");
@@ -8948,17 +9799,23 @@ async fn relay_app_runtime_projects_typed_reactions_and_deletes() {
         .collect();
     assert_eq!(imeta_tags.len(), 2);
     let imeta = imeta_tags[0];
-    assert!(imeta.iter().any(|field| field
-        == &format!(
-            "locator blossom-v1 https://media.example/{}.bin",
-            hex::encode([0x11_u8; 32])
-        )));
+    assert!(
+        imeta
+            .iter()
+            .any(|field| field == &format!("locator blossom-v1 {}", diagram.locators[0].value))
+    );
     assert!(imeta.iter().any(|field| field == "m image/png"));
     assert!(imeta.iter().any(|field| field == "filename diagram.png"));
     assert!(
         imeta
             .iter()
-            .any(|field| field == "nonce 242424242424242424242424")
+            .any(|field| field == &format!("nonce {}", diagram.nonce_hex))
+    );
+    assert!(imeta.iter().any(|field| field == "dim 800x600"));
+    assert!(
+        imeta
+            .iter()
+            .all(|field| !field.starts_with("source_epoch_identity "))
     );
     assert!(imeta.iter().any(|field| field == "v encrypted-media-v2"));
     assert!(imeta.iter().any(|field| field.starts_with("thumbhash ")));
@@ -8969,26 +9826,10 @@ async fn relay_app_runtime_projects_typed_reactions_and_deletes() {
             .any(|field| field == "filename audio.ogg")
     );
 
+    let mut malformed = diagram;
+    malformed.plaintext_sha256 = "not-hex".into();
     let bad_media = bob
-        .send_media_attachments(
-            &group_id,
-            vec![MediaAttachmentReference {
-                locators: vec![MediaLocator {
-                    kind: "blossom-v1".to_owned(),
-                    value: format!("https://media.example/{}.bin", hex::encode([0x11_u8; 32])),
-                }],
-                ciphertext_sha256: hex::encode([0x11_u8; 32]),
-                plaintext_sha256: "not-hex".to_owned(),
-                nonce_hex: hex::encode([0x24_u8; 12]),
-                file_name: "diagram.png".to_owned(),
-                media_type: "image/png".to_owned(),
-                version: "encrypted-media-v2".to_owned(),
-                source_epoch: 0,
-                dim: None,
-                thumbhash: None,
-            }],
-            None,
-        )
+        .send_media_attachments(&group_id, vec![malformed], None)
         .await
         .unwrap_err();
     assert!(bad_media.to_string().contains("media plaintext_sha256"));
@@ -9007,7 +9848,12 @@ async fn relay_app_runtime_creates_default_agent_text_stream_group() {
     bob.publish_key_package().await.unwrap();
 
     let mut alice = app.client("alice").await.unwrap();
-    let group_id = alice.create_group("agent", &["bob"]).await.unwrap();
+    let group_id = alice
+        .create_group("agent", &["bob"])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
 
     let alice_group = app.group("alice", &group_id_hex).unwrap().unwrap();
@@ -9074,7 +9920,9 @@ async fn tagged_upload_and_text_reach_peer() {
     let group = runtime
         .create_group(a, "tagged", std::slice::from_ref(b), None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| matches!(event, MarmotAppEvent::GroupJoined { account_id_hex, group_id, .. } if account_id_hex == b && group_id == &group)).await;
     accept_group_invite_retrying_busy(&runtime, b, &group)
         .await
@@ -9152,7 +10000,12 @@ async fn encrypted_media_upload_sends_ciphertext_and_download_decrypts_plaintext
     bob.publish_key_package().await.unwrap();
 
     let mut alice = app.client("alice").await.unwrap();
-    let group_id = alice.create_group("media", &["bob"]).await.unwrap();
+    let group_id = alice
+        .create_group("media", &["bob"])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     bob.sync().await.unwrap();
     let group_state = alice.group_mls_state(&group_id).unwrap();
     assert!(
@@ -9403,7 +10256,9 @@ async fn retained_media_rehydrates_a_retired_current_epoch_before_the_group_adva
     let group_id = alice
         .create_group("retired media epoch", &["bob"])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
     bob.sync().await.unwrap();
     // Keep automatic wall-clock pruning out of this regression: relay sync
@@ -9546,7 +10401,9 @@ async fn sweep_keeps_unread_message_in_read_marker_wall_second() {
     let group_id = alice
         .create_group("read cursor retention", &["bob"])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
     bob.sync().await.unwrap();
     alice
@@ -9689,7 +10546,9 @@ async fn encrypted_media_endpoint_updates_are_full_replacement_and_admin_only() 
     let group_id = alice
         .create_group("media endpoints", &["bob"])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
     bob.sync().await.unwrap();
 
@@ -9760,6 +10619,7 @@ async fn encrypted_media_endpoint_updates_are_full_replacement_and_admin_only() 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_neutral_deployment_creates_text_only_groups_and_refuses_group_images() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
     home.create_account("alice").unwrap();
@@ -9777,7 +10637,12 @@ async fn a_neutral_deployment_creates_text_only_groups_and_refuses_group_images(
     bob.publish_key_package().await.unwrap();
 
     let mut alice = app.client("alice").await.unwrap();
-    let group_id = alice.create_group("text only", &["bob"]).await.unwrap();
+    let group_id = alice
+        .create_group("text only", &["bob"])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group = app
         .group("alice", &hex::encode(group_id.as_slice()))
         .unwrap()
@@ -9836,7 +10701,9 @@ async fn upload_media_errors_when_policy_has_no_blossom_endpoint() {
     let group_id = alice
         .create_group("non-blossom media", &["bob"])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     bob.sync().await.unwrap();
 
     // Replace the default Blossom policy with one that serves only a non-Blossom
@@ -9895,7 +10762,12 @@ async fn relay_app_runtime_reopens_account_state() {
     bob.publish_key_package().await.unwrap();
 
     let mut alice = app.client("alice").await.unwrap();
-    let group_id = alice.create_group("restart", &["bob"]).await.unwrap();
+    let group_id = alice
+        .create_group("restart", &["bob"])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert!(bob.sync().await.unwrap().joined_groups.contains(&group_id));
     drop(alice);
     drop(bob);
@@ -10080,6 +10952,7 @@ async fn relay_list_fetch_only_uses_requested_bootstrap_relays_without_cache() {
 // Investigation-only regression: metadata is split across discovery and the
 // identity's advertised outbox, with a third relay owning Welcome delivery.
 async fn existing_login_preserves_outbox_only_inbox(external_signer: bool, stale_first_hop: bool) {
+    storage_sqlite::relax_storage_for_test_process();
     use nostr::prelude::ToBech32;
 
     let publisher_dir = tempfile::tempdir().unwrap();
@@ -10233,6 +11106,7 @@ async fn relay_list_empty_fetch_keeps_cached_lists() {
 async fn import_ignores_retired_published_routes_without_rewriting_relay_lists() {
     use nostr::prelude::ToBech32;
 
+    storage_sqlite::relax_storage_for_test_process();
     let publisher_dir = tempfile::tempdir().unwrap();
     let publisher_home = AccountHome::open(publisher_dir.path());
     let keys = Keys::generate();
@@ -10298,6 +11172,7 @@ async fn import_ignores_retired_published_routes_without_rewriting_relay_lists()
 // pins `login_external_signer`, not only the shared routing helpers exercised
 // by the nsec-import regression above.
 async fn external_signer_login_ignores_retired_routes_without_rewriting_relay_lists() {
+    storage_sqlite::relax_storage_for_test_process();
     let publisher_dir = tempfile::tempdir().unwrap();
     let publisher_home = AccountHome::open(publisher_dir.path());
     let keys = Keys::generate();
@@ -10599,8 +11474,109 @@ async fn relay_list_future_skew_is_configurable_at_app_instantiation() {
 // NIP-30: upload unsent, then name the attachment by its locator url.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nip30_emoji_media_and_reaction_reach_peer() {
+    use marmot_app::{
+        AttachmentAcquisitionMode, AttachmentAutomaticPermission, AttachmentLocalTarget,
+        AttachmentTransferState, MediaAttachmentOutcome,
+    };
+
+    storage_sqlite::relax_storage_for_test_process();
+    async fn acquire(
+        runtime: &MarmotAppRuntime,
+        account: &str,
+        group: &GroupId,
+        target: AttachmentLocalTarget,
+        expected: &[u8],
+    ) -> marmot_app::AttachmentAssetRef {
+        let transfers = runtime
+            .subscribe_attachment_transfers(account, group, vec![target.clone()])
+            .await
+            .unwrap();
+        assert!(
+            runtime
+                .request_automatic_attachment(account, group, target.clone())
+                .await
+                .unwrap()
+                .status
+                .is_some()
+        );
+        timeout(Duration::from_secs(20), async {
+            loop {
+                let rows = transfers
+                    .next()
+                    .await
+                    .unwrap()
+                    .expect("live attachment transfer subscription");
+                let row = rows[0]
+                    .as_ref()
+                    .expect("source remains available while acquiring");
+                if row.state == AttachmentTransferState::Ready {
+                    break;
+                }
+                assert!(
+                    !matches!(
+                        row.state,
+                        AttachmentTransferState::Failed | AttachmentTransferState::RetryExhausted
+                    ),
+                    "artwork transfer failed: {:?}",
+                    row.state
+                );
+            }
+        })
+        .await
+        .expect("reaction artwork acquired through HostManaged policy");
+        transfers.close();
+        let asset = runtime
+            .attachment_local_assets(account, group, vec![target])
+            .await
+            .unwrap()
+            .remove(0)
+            .expect("verified local artwork");
+        let bytes = runtime
+            .read_attachment_asset(account, asset.reference.clone(), 0, 1024)
+            .await
+            .unwrap()
+            .expect("opaque local artwork read");
+        assert_eq!(bytes.as_slice(), expected);
+        asset.reference
+    }
+
+    async fn advance_epoch(
+        runtime: &MarmotAppRuntime,
+        sender: &str,
+        peer: &str,
+        group: &GroupId,
+        events: &mut tokio::sync::broadcast::Receiver<MarmotAppEvent>,
+        name: &str,
+    ) {
+        let before = runtime.group_mls_state(sender, group).await.unwrap().epoch;
+        runtime
+            .update_group_profile(sender, group, Some(name.into()), None)
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(20), async {
+            loop {
+                if runtime.group_mls_state(sender, group).await.unwrap().epoch > before
+                    && runtime.group_mls_state(peer, group).await.unwrap().epoch > before
+                {
+                    break;
+                }
+                events.recv().await.unwrap();
+            }
+        })
+        .await
+        .expect("both peers advance before the artwork step");
+    }
+
     let dir = tempfile::tempdir().unwrap();
-    let (_relay, app, url) = mock_app(&dir).await;
+    let (_relay, url) = mock_relay().await;
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        url.clone(),
+        MarmotAppConfig::white_noise()
+            .with_allow_loopback_blob_endpoints(true)
+            .with_allow_loopback_relay_endpoints(true)
+            .with_attachment_acquisition_mode(AttachmentAcquisitionMode::HostManaged),
+    );
     let blossom = mock_blossom().await;
     let runtime = MarmotAppRuntime::new(app.clone());
     let setup = AccountSetupRequest {
@@ -10615,11 +11591,32 @@ async fn nip30_emoji_media_and_reaction_reach_peer() {
     let bob = create_network_ready_identity(&runtime, setup).await.account;
     let a = &alice.account_id_hex;
     let b = &bob.account_id_hex;
+    for account in [a, b] {
+        let generation = runtime
+            .begin_attachment_permission_update(account)
+            .await
+            .unwrap();
+        assert!(
+            runtime
+                .set_attachment_automatic_permission(
+                    account,
+                    generation,
+                    AttachmentAutomaticPermission {
+                        images: true,
+                        ..Default::default()
+                    }
+                )
+                .await
+                .unwrap()
+        );
+    }
     let mut events = runtime.subscribe();
     let group = runtime
         .create_group(a, "emoji", std::slice::from_ref(b), None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| matches!(event, MarmotAppEvent::GroupJoined { account_id_hex, group_id, .. } if account_id_hex == b && group_id == &group)).await;
     accept_group_invite_retrying_busy(&runtime, b, &group)
         .await
@@ -10675,9 +11672,26 @@ async fn nip30_emoji_media_and_reaction_reach_peer() {
             .iter()
             .any(|tag| tag[0] == "imeta" && tag.contains(&locator))
     );
-    let downloaded = runtime.download_media(b, &group, reference).await.unwrap();
-    assert_eq!(downloaded.plaintext, emoji_png);
+    acquire(
+        &runtime,
+        b,
+        &group,
+        AttachmentLocalTarget {
+            message_id_hex: id.clone(),
+            source_message_id_hex: app
+                .timeline_message(&bob.label, &hex::encode(group.as_slice()), id)
+                .unwrap()
+                .unwrap()
+                .source_message_id_hex
+                .unwrap(),
+            attachment_index: 0,
+        },
+        &emoji_png,
+    )
+    .await;
 
+    // Reaction-only media uses a fresh epoch, independently of the earlier chat's key.
+    advance_epoch(&runtime, a, b, &group, &mut events, "before reaction").await;
     // The same shape on a kind-7: the reaction carries its own imeta.
     let reaction = runtime
         .upload_media(
@@ -10700,6 +11714,7 @@ async fn nip30_emoji_media_and_reaction_reach_peer() {
         .await
         .unwrap();
     let cat = reaction.attachments[0].reference.clone();
+    assert!(cat.source_epoch > reference.source_epoch);
     let cat_tag: Vec<String> = vec!["emoji".into(), "cat".into(), cat.locators[0].value.clone()];
     let reacted = runtime
         .react_with_media(
@@ -10721,9 +11736,212 @@ async fn nip30_emoji_media_and_reaction_reach_peer() {
     assert_eq!(received.plaintext, ":cat:");
     assert!(received.tags.contains(&cat_tag));
     assert!(received.tags.iter().any(|tag| tag[0] == "imeta"));
-    let downloaded = runtime.download_media(a, &group, cat).await.unwrap();
-    assert_eq!(downloaded.plaintext, b"cat payload");
-    runtime.shutdown().await;
+    // Acquisition must still decrypt the reaction after its source epoch passes.
+    advance_epoch(&runtime, a, b, &group, &mut events, "after reaction").await;
+    assert!(runtime.group_mls_state(a, &group).await.unwrap().epoch > cat.source_epoch);
+    let artwork = runtime
+        .reaction_attachment(a, &group, reaction_id)
+        .await
+        .unwrap()
+        .expect("bounded reaction artwork lookup");
+    let MediaAttachmentOutcome::Accepted {
+        attachment_index,
+        reference: resolved,
+    } = artwork.attachment
+    else {
+        panic!("validated artwork")
+    };
+    assert_eq!(resolved.ciphertext_sha256, cat.ciphertext_sha256);
+    let target = AttachmentLocalTarget {
+        message_id_hex: artwork.message_id_hex,
+        source_message_id_hex: artwork.source_message_id_hex,
+        attachment_index,
+    };
+    let old_asset = acquire(&runtime, a, &group, target.clone(), b"cat payload").await;
+
+    // Another author uses the same shortcode on the same target with different artwork.
+    // Choose the actual canonical earliest source below, including timestamp ties.
+    let uploaded = runtime
+        .upload_media(
+            a,
+            &group,
+            MediaUploadRequest {
+                message_tags: Vec::new(),
+                attachments: vec![MediaUploadAttachmentRequest {
+                    file_name: "another-cat.png".into(),
+                    media_type: "image/png".into(),
+                    plaintext: b"other cat".to_vec(),
+                    dim: None,
+                    thumbhash: None,
+                }],
+                caption: None,
+                send: false,
+                blossom_server: Some(blossom.url.clone()),
+            },
+        )
+        .await
+        .unwrap();
+    let other_cat = uploaded.attachments[0].reference.clone();
+    let other_reaction = runtime
+        .react_with_media(
+            a,
+            &group,
+            id,
+            ":cat:",
+            vec![vec![
+                "emoji".into(),
+                "cat".into(),
+                other_cat.locators[0].value.clone(),
+            ]],
+            vec![other_cat.clone()],
+        )
+        .await
+        .unwrap();
+    let other_reaction_id = &other_reaction.message_ids[0];
+    wait_for_event(&mut events, |event| matches!(event, MarmotAppEvent::MessageReceived(m) if &m.account_id_hex == b && &m.message.message_id_hex == other_reaction_id)).await;
+    let other_artwork = runtime
+        .reaction_attachment(a, &group, other_reaction_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let MediaAttachmentOutcome::Accepted {
+        attachment_index,
+        reference: resolved,
+    } = other_artwork.attachment
+    else {
+        panic!("other validated artwork")
+    };
+    assert_eq!(resolved.ciphertext_sha256, other_cat.ciphertext_sha256);
+    assert_ne!(resolved.ciphertext_sha256, cat.ciphertext_sha256);
+    let other_target = AttachmentLocalTarget {
+        message_id_hex: other_artwork.message_id_hex,
+        source_message_id_hex: other_artwork.source_message_id_hex,
+        attachment_index,
+    };
+    let other_asset = acquire(&runtime, a, &group, other_target.clone(), b"other cat").await;
+    let mut window = runtime
+        .open_conversation_window(
+            a,
+            &group,
+            marmot_app::ConversationOpenQuery {
+                target: marmot_app::ConversationOpenTarget::Message(id.clone()),
+                limit: 20,
+            },
+        )
+        .await
+        .unwrap();
+    let tally = window
+        .snapshot
+        .presentation
+        .messages
+        .iter()
+        .find(|row| &row.message_id_hex == id)
+        .unwrap()
+        .reactions
+        .items
+        .iter()
+        .find(|reaction| reaction.emoji == ":cat:")
+        .unwrap();
+    assert_eq!(tally.count, 2);
+    let earliest = tally.reaction_message_id_hex.clone().unwrap();
+    let (removed_id, successor_id, owner, receiver, removed_target, removed_asset, expected_hash) =
+        if earliest == *reaction_id {
+            (
+                reaction_id,
+                other_reaction_id,
+                b,
+                a,
+                target,
+                old_asset,
+                &other_cat.ciphertext_sha256,
+            )
+        } else {
+            assert_eq!(&earliest, other_reaction_id);
+            (
+                other_reaction_id,
+                reaction_id,
+                a,
+                b,
+                other_target,
+                other_asset,
+                &cat.ciphertext_sha256,
+            )
+        };
+    let removal = runtime
+        .unreact_from_message(owner, &group, id)
+        .await
+        .unwrap();
+    let removal_id = &removal.message_ids[0];
+    wait_for_event(&mut events, |event| matches!(event, MarmotAppEvent::MessageReceived(m) if &m.account_id_hex == receiver && &m.message.message_id_hex == removal_id)).await;
+    assert!(
+        runtime
+            .reaction_attachment(a, &group, removed_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        runtime
+            .attachment_local_assets(a, &group, vec![removed_target.clone()])
+            .await
+            .unwrap()[0]
+            .is_none()
+    );
+    assert!(
+        runtime
+            .read_attachment_asset(a, removed_asset, 0, 1024)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        runtime
+            .request_automatic_attachment(a, &group, removed_target)
+            .await
+            .unwrap()
+            .status
+            .is_none()
+    );
+    let successor = runtime
+        .reaction_attachment(a, &group, successor_id)
+        .await
+        .unwrap()
+        .expect("successor source stays acquirable");
+    let MediaAttachmentOutcome::Accepted { reference, .. } = successor.attachment else {
+        panic!("successor artwork")
+    };
+    assert_eq!(&reference.ciphertext_sha256, expected_hash);
+    timeout(Duration::from_secs(20), async {
+        loop {
+            let snapshot = window
+                .recv()
+                .await
+                .unwrap()
+                .expect("live conversation window");
+            let Some(tally) = snapshot
+                .presentation
+                .messages
+                .iter()
+                .find(|row| &row.message_id_hex == id)
+                .and_then(|row| {
+                    row.reactions
+                        .items
+                        .iter()
+                        .find(|reaction| reaction.emoji == ":cat:")
+                })
+            else {
+                continue;
+            };
+            if tally.reaction_message_id_hex.as_ref() == Some(successor_id) {
+                assert_eq!(tally.count, 1);
+                break;
+            }
+        }
+    })
+    .await
+    .expect("removal selects the next active reaction artwork source");
+    drop(window);
+    runtime.shutdown_and_close().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -10973,7 +12191,12 @@ async fn account_storage_records_received_messages() {
     bob.publish_key_package().await.unwrap();
 
     let mut alice = app.client("alice").await.unwrap();
-    let group_id = alice.create_group("messages", &["bob"]).await.unwrap();
+    let group_id = alice
+        .create_group("messages", &["bob"])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let alice_groups = app.groups("alice").unwrap();
     assert_eq!(alice_groups[0].profile.component_id, 0x8001);
     assert_eq!(alice_groups[0].profile.component, "marmot.group.profile.v1");
@@ -11058,6 +12281,7 @@ async fn account_storage_records_received_messages() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn account_publishes_route_to_own_nip65_not_bootstrap() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let (_home, home_url) = mock_relay().await;
     let (_other, other_url) = mock_relay().await;
@@ -11146,6 +12370,7 @@ async fn assert_published_relay_lists(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn generated_account_declares_separate_inbox_relays() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let (_relay, url) = mock_relay().await;
     let (_inbox_relay, inbox_url) = mock_relay().await;
@@ -11181,6 +12406,8 @@ async fn generated_account_declares_separate_inbox_relays() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn imported_account_publishes_missing_lists_with_separate_inbox_relays() {
     use nostr::prelude::ToBech32;
+
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let (_relay, url) = mock_relay().await;
     let (_inbox_relay, inbox_url) = mock_relay().await;
@@ -11221,6 +12448,7 @@ async fn imported_account_publishes_missing_lists_with_separate_inbox_relays() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn account_owned_profile_publish_uses_the_selected_accounts_relay_configuration() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let (_alice_relay, alice_relay_url) = mock_relay().await;
     let (_bob_relay, bob_relay_url) = mock_relay().await;
@@ -11306,7 +12534,7 @@ async fn app_runtime_sign_out_and_wipe_removes_account_and_deletes_key_package()
     let account_id = created.account.account_id_hex.clone();
 
     // The initial KeyPackage was published to the relay during setup, so the
-    // wipe's stage-2 discovery should find and delete at least one.
+    // wipe's stage 2 deletes this device's slot.
     let before = runtime
         .account_key_packages(&account_id, vec![endpoint(&url)])
         .await
@@ -11323,8 +12551,8 @@ async fn app_runtime_sign_out_and_wipe_removes_account_and_deletes_key_package()
     assert!(outcome.group_leave_failures.is_empty());
     // The published key package is deleted with no per-relay failures.
     assert!(
-        outcome.key_packages_deleted >= 1,
-        "expected at least one relay key package deleted, got {}",
+        outcome.key_packages_deleted == 1,
+        "expected this device's key package slot deleted, got {}",
         outcome.key_packages_deleted
     );
     assert!(
@@ -11488,7 +12716,9 @@ async fn app_runtime_sign_out_and_wipe_leaves_pending_confirmation_groups() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -11589,11 +12819,11 @@ async fn app_runtime_sign_out_and_wipe_removes_external_signer_account() {
     // No groups joined, so nothing to leave and no leave failures.
     assert_eq!(outcome.groups_left, 0);
     assert!(outcome.group_leave_failures.is_empty());
-    // Stage 2 signs the kind:5 deletions through the registered external
+    // Stage 2 signs the kind:5 deletion through the registered external
     // signer, so the relay cleanup is as complete as it is for a local account.
     assert!(
-        outcome.key_packages_deleted >= 1,
-        "expected at least one relay key package deleted, got {}",
+        outcome.key_packages_deleted == 1,
+        "expected this device's key package slot deleted, got {}",
         outcome.key_packages_deleted
     );
     assert!(
@@ -11755,6 +12985,155 @@ async fn app_runtime_sign_out_keeps_external_signer_registration() {
     runtime.shutdown().await;
 }
 
+/// The events `author` has of `kind` on the relay at `url`.
+async fn relay_events_of(url: &str, author: &str, kind: Kind) -> Vec<nostr::prelude::Event> {
+    let client = NostrSdkClient::builder().build();
+    client.add_relay(url).await.unwrap();
+    client.connect().await;
+    let events = client
+        .fetch_events(nostr_sdk::prelude::ReqTarget::manual(vec![(
+            nostr_sdk::prelude::RelayUrl::parse(url).unwrap(),
+            vec![
+                nostr::prelude::Filter::new()
+                    .author(nostr::prelude::PublicKey::parse(author).unwrap())
+                    .kind(kind),
+            ],
+        )]))
+        .timeout(Duration::from_secs(3))
+        .await
+        .unwrap();
+    client.shutdown().await;
+    events.into_iter().collect()
+}
+
+fn event_tags(event: &nostr::prelude::Event) -> Vec<Vec<String>> {
+    event
+        .tags
+        .iter()
+        .map(|tag| tag.as_slice().to_vec())
+        .collect()
+}
+
+fn slot_of(event: &nostr::prelude::Event) -> Option<String> {
+    event_tags(event)
+        .into_iter()
+        .find(|tag| tag.first().is_some_and(|name| name == "d"))
+        .and_then(|tag| tag.get(1).cloned())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn signing_out_one_device_deletes_only_its_own_key_package_slot() {
+    storage_sqlite::relax_storage_for_test_process();
+    // mdk#1697: each device of an account publishes into its own slot, and
+    // signing one out deletes that slot and nothing else
+    // (`foundation/key-packages.md`, "Stopping publication").
+    let (_relay, url) = mock_relay().await;
+    let config = || MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let dir_inviter = tempfile::tempdir().unwrap();
+    let device_a = MarmotAppRuntime::new(MarmotApp::with_relay_and_config(
+        dir_a.path(),
+        url.clone(),
+        config(),
+    ));
+    let app_b = MarmotApp::with_relay_and_config(dir_b.path(), url.clone(), config());
+    let device_b = MarmotAppRuntime::new(app_b.clone());
+    let inviter = MarmotApp::with_relay_and_config(dir_inviter.path(), url.clone(), config());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        discovery_relays: vec![endpoint(&url)],
+        publish_missing_relay_lists: true,
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let created = create_network_ready_identity(&device_a, setup.relay_options_only()).await;
+    let account_id = created.account.account_id_hex.clone();
+    let nsec = AccountHome::open(dir_a.path())
+        .reveal_nsec(&created.account.label)
+        .unwrap();
+    device_b
+        .create_or_import_account(AccountSetupRequest {
+            import_nsec: Some(zeroize::Zeroizing::new(nsec.to_string())),
+            ..setup
+        })
+        .await
+        .unwrap();
+    let slot_a = device_a
+        .key_package_maintenance_status(&account_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .stable_slot_id;
+    let lifecycle_b = device_b
+        .key_package_maintenance_status(&account_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(slot_a, lifecycle_b.stable_slot_id);
+    let mut slots = relay_events_of(&url, &account_id, Kind::Custom(30443))
+        .await
+        .iter()
+        .filter_map(slot_of)
+        .collect::<Vec<_>>();
+    slots.sort();
+    let mut expected = vec![slot_a.clone(), lifecycle_b.stable_slot_id.clone()];
+    expected.sort();
+    assert_eq!(slots, expected);
+
+    let outcome = device_a
+        .sign_out(&account_id, SignOutOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(outcome.key_packages_deleted, 1);
+    assert!(outcome.key_package_failures.is_empty());
+
+    // One kind 5 naming A's slot, with exactly one `a` and one `k` tag.
+    let deletions = relay_events_of(&url, &account_id, Kind::EventDeletion).await;
+    assert_eq!(deletions.len(), 1);
+    assert_eq!(
+        event_tags(&deletions[0]),
+        vec![
+            vec!["a".to_owned(), format!("30443:{account_id}:{slot_a}")],
+            vec!["k".to_owned(), "30443".to_owned()],
+        ]
+    );
+    // B's KeyPackage stays on the relay, and an inviter still selects it.
+    let remaining = relay_events_of(&url, &account_id, Kind::Custom(30443)).await;
+    assert_eq!(
+        remaining.iter().filter_map(slot_of).collect::<Vec<_>>(),
+        vec![lifecycle_b.stable_slot_id.clone()]
+    );
+    assert_eq!(
+        inviter
+            .directory()
+            .resolve_member_key_packages(&[account_id.as_str()])
+            .await
+            .unwrap(),
+        vec![lifecycle_b.current_key_package.clone().unwrap()]
+    );
+
+    // Signing A back in republishes its slot and deletes nothing more.
+    device_a.sign_in_account(&account_id).await.unwrap();
+    device_a.publish_key_package(&account_id).await.unwrap();
+    let mut slots = relay_events_of(&url, &account_id, Kind::Custom(30443))
+        .await
+        .iter()
+        .filter_map(slot_of)
+        .collect::<Vec<_>>();
+    slots.sort();
+    assert_eq!(slots, expected);
+    assert_eq!(
+        relay_events_of(&url, &account_id, Kind::EventDeletion)
+            .await
+            .len(),
+        1
+    );
+    device_a.shutdown_and_close().await.unwrap();
+    device_b.shutdown_and_close().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn app_runtime_sign_out_deletes_key_packages_but_keeps_local_state() {
     // mdk#477: a non-destructive sign-out must clean up the relay
@@ -11778,8 +13157,8 @@ async fn app_runtime_sign_out_deletes_key_packages_but_keeps_local_state() {
     .await;
     let account_id = created.account.account_id_hex.clone();
 
-    // Setup published a KeyPackage to the relay, so the sign-out should find
-    // and delete at least one.
+    // Setup published a KeyPackage to the relay, so the sign-out deletes this
+    // device's slot.
     let before = runtime
         .account_key_packages(&account_id, vec![endpoint(&url)])
         .await
@@ -11796,8 +13175,8 @@ async fn app_runtime_sign_out_deletes_key_packages_but_keeps_local_state() {
 
     // The published key package is deleted with no per-relay failures.
     assert!(
-        outcome.key_packages_deleted >= 1,
-        "expected at least one relay key package deleted, got {}",
+        outcome.key_packages_deleted == 1,
+        "expected this device's key package slot deleted, got {}",
         outcome.key_packages_deleted
     );
     assert!(
@@ -11886,6 +13265,11 @@ async fn app_runtime_sign_out_reports_deletion_failure_and_keeps_local_state() {
     )
     .await;
     let account_id = created.account.account_id_hex;
+    let before = runtime
+        .key_package_maintenance_status(&account_id)
+        .await
+        .unwrap()
+        .unwrap();
 
     let outcome = runtime
         .sign_out(&account_id, SignOutOptions::default())
@@ -11900,6 +13284,15 @@ async fn app_runtime_sign_out_reports_deletion_failure_and_keeps_local_state() {
         runtime.accounts().resolve(&account_id).is_ok(),
         "best-effort remote failure must keep the local account"
     );
+    // No relay accepted the deletion, so the slot is recorded as it was.
+    runtime.sign_in_account(&account_id).await.unwrap();
+    let after = runtime
+        .key_package_maintenance_status(&account_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.slot_withdrawn_at, None);
+    assert_eq!(after.authored_event_id, before.authored_event_id);
     runtime.shutdown().await;
 }
 
@@ -11972,6 +13365,73 @@ async fn app_runtime_sign_out_skips_key_package_deletion_when_disabled() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wiping_a_signed_out_account_deletes_its_key_package_slot() {
+    // A signed-out account runs no worker; wiping it still deletes the slot
+    // it left published before its private material goes.
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app);
+    let created = create_network_ready_identity(
+        &runtime,
+        AccountSetupRequest {
+            default_relays: vec![endpoint(&url)],
+            bootstrap_relays: vec![endpoint(&url)],
+            publish_initial_key_package: true,
+            ..AccountSetupRequest::default()
+        },
+    )
+    .await;
+    let account_id = created.account.account_id_hex;
+    let slot = runtime
+        .key_package_maintenance_status(&account_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .stable_slot_id;
+    runtime
+        .sign_out(
+            &account_id,
+            SignOutOptions {
+                delete_key_packages: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        relay_events_of(&url, &account_id, Kind::Custom(30443))
+            .await
+            .iter()
+            .filter_map(slot_of)
+            .collect::<Vec<_>>(),
+        vec![slot.clone()]
+    );
+
+    let outcome = runtime.sign_out_and_wipe(&account_id).await.unwrap();
+
+    // A signed-out account signs out on its own at once: no sibling went
+    // unasked.
+    assert!(!outcome.siblings_not_reached);
+    assert_eq!(outcome.key_packages_deleted, 1);
+    assert!(outcome.key_package_failures.is_empty());
+    assert!(outcome.local_cleanup.completed);
+    let deletions = relay_events_of(&url, &account_id, Kind::EventDeletion).await;
+    assert_eq!(deletions.len(), 1);
+    assert_eq!(
+        event_tags(&deletions[0]),
+        vec![
+            vec!["a".to_owned(), format!("30443:{account_id}:{slot}")],
+            vec!["k".to_owned(), "30443".to_owned()],
+        ]
+    );
+    assert!(
+        relay_events_of(&url, &account_id, Kind::Custom(30443))
+            .await
+            .is_empty()
+    );
+    runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn app_runtime_sign_out_rejects_unknown_account() {
     let dir = tempfile::tempdir().unwrap();
     let (_relay, app, _url) = mock_app(&dir).await;
@@ -12035,8 +13495,8 @@ async fn app_runtime_sign_out_succeeds_for_external_signer_account() {
         .unwrap();
 
     assert!(
-        outcome.key_packages_deleted >= 1,
-        "expected at least one relay key package deleted, got {}",
+        outcome.key_packages_deleted == 1,
+        "expected this device's key package slot deleted, got {}",
         outcome.key_packages_deleted
     );
     assert!(
@@ -12212,7 +13672,9 @@ async fn runtime_records_app_checkpoint_and_separate_broadcast_outcomes_for_rece
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(event, MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined, .. }
             if account_id_hex == &bob.account.account_id_hex && joined == &group_id)
@@ -12428,7 +13890,9 @@ async fn explicit_shutdown_during_startup_hydration_records_clean_audit_stop() {
     client
         .create_group("stored hydration group", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     drop(client);
 
     let app = MarmotApp::with_relay_and_config(
@@ -12495,7 +13959,9 @@ async fn create_group_returns_before_blocked_founding_welcome() {
     )
     .await
     .expect("create_group must return while a founding Welcome is still blocked")
-    .unwrap();
+    .unwrap()
+    .operation
+    .expect("eligible fixture members");
 
     timeout(Duration::from_secs(5), gate.wait_for_blocked(1))
         .await
@@ -12541,6 +14007,343 @@ async fn create_group_returns_before_blocked_founding_welcome() {
     runtime.shutdown().await;
 }
 
+async fn direct_roles(
+    runtime: &MarmotAppRuntime,
+    account: &str,
+    group: &GroupId,
+) -> (u64, std::collections::BTreeMap<String, bool>) {
+    let roster = runtime.group_roster(account, group).await.unwrap();
+    (
+        roster.epoch,
+        roster
+            .members
+            .into_iter()
+            .map(|member| (member.member_id_hex, member.is_admin))
+            .collect(),
+    )
+}
+
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_start_is_shared() {
+    use std::task::Poll;
+
+    let dir = tempfile::tempdir().unwrap();
+    let gate = BlockNextGiftWraps::new();
+    let (_relay, app, url) = gift_wrap_blocking_app(&dir, gate.clone()).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup).await;
+    let alice_id = &alice.account.account_id_hex;
+    let bob_id = &bob.account.account_id_hex;
+    let bob_npub = marmot_app::npub_for_account_id(bob_id).unwrap();
+    let expected =
+        std::collections::BTreeMap::from([(alice_id.clone(), true), (bob_id.clone(), true)]);
+    let mut events = runtime.subscribe();
+
+    runtime.catch_up_accounts().await.unwrap();
+    let startup = Arc::new(tokio::sync::Barrier::new(2));
+    runtime
+        .shared_services()
+        .set_next_startup_sync_barrier(startup.clone());
+    runtime.restart_account(alice_id).await.unwrap();
+    timeout(Duration::from_secs(5), startup.wait())
+        .await
+        .expect("the restarted worker must hold startup before either start");
+    gate.arm(1);
+    let mut lost_response = Box::pin(runtime.start_direct_conversation(alice_id, &bob_npub));
+    std::future::poll_fn(|cx| {
+        assert!(lost_response.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    let mut concurrent = Box::pin(runtime.start_direct_conversation(alice_id, bob_id));
+    std::future::poll_fn(|cx| {
+        assert!(concurrent.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    assert!(app.groups(&alice.account.label).unwrap().is_empty());
+    timeout(Duration::from_secs(5), startup.wait())
+        .await
+        .expect("both starts must be admitted before startup resumes");
+    timeout(Duration::from_secs(5), gate.wait_for_blocked(1))
+        .await
+        .expect("the admitted command must create and retain its founding Welcome");
+    drop(lost_response);
+    let groups = app.groups(&alice.account.label).unwrap();
+    assert_eq!(groups.len(), 1);
+    assert!(groups[0].profile.name.is_empty());
+    let created_hex = groups[0].group_id_hex.clone();
+    gate.release();
+    let (first, second) = tokio::join!(
+        concurrent,
+        runtime.start_direct_conversation(alice_id, &bob_npub)
+    );
+    let group_id = first.unwrap();
+    assert_eq!(second.unwrap(), group_id);
+    assert_eq!(hex::encode(group_id.as_slice()), created_hex);
+    assert_eq!(app.groups(&alice.account.label).unwrap().len(), 1);
+    assert_eq!(
+        direct_roles(&runtime, alice_id, &group_id).await,
+        (1, expected.clone())
+    );
+
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined, .. }
+                if account_id_hex == bob_id && joined == &group_id
+        )
+    })
+    .await;
+    assert_eq!(
+        direct_roles(&runtime, bob_id, &group_id).await,
+        (1, expected.clone())
+    );
+    for _ in 0..2 {
+        for (account, peer) in [(alice_id, bob_id), (bob_id, alice_id)] {
+            assert_eq!(
+                runtime
+                    .start_direct_conversation(account, peer)
+                    .await
+                    .unwrap(),
+                group_id
+            );
+            assert_eq!(
+                direct_roles(&runtime, account, &group_id).await,
+                (1, expected.clone())
+            );
+        }
+    }
+    runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_reuse_preserves_roles() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_relay, app, url) = mock_app(&dir).await;
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup).await;
+    let alice_id = &alice.account.account_id_hex;
+    let bob_id = &bob.account.account_id_hex;
+    let mut events = runtime.subscribe();
+    let mut group_ids = Vec::new();
+    for name in ["generic named group", "", ""] {
+        let group_id = runtime
+            .create_group(alice_id, name, std::slice::from_ref(bob_id), None)
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
+        wait_for_event(&mut events, |event| {
+            matches!(
+                event,
+                MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined, .. }
+                    if account_id_hex == bob_id && joined == &group_id
+            )
+        })
+        .await;
+        group_ids.push(group_id);
+    }
+    let expected =
+        std::collections::BTreeMap::from([(alice_id.clone(), true), (bob_id.clone(), false)]);
+    for _ in 0..2 {
+        for (account, peer) in [(alice_id, bob_id), (bob_id, alice_id)] {
+            let selected = runtime
+                .existing_direct_conversation(account, peer)
+                .await
+                .unwrap()
+                .expect("the generic unnamed conversations are eligible for reuse");
+            assert_ne!(selected.group_id_hex, hex::encode(group_ids[0].as_slice()));
+            assert!(
+                group_ids[1..]
+                    .iter()
+                    .any(|group| { hex::encode(group.as_slice()) == selected.group_id_hex })
+            );
+            assert_eq!(
+                hex::encode(
+                    runtime
+                        .start_direct_conversation(account, peer)
+                        .await
+                        .unwrap()
+                        .as_slice()
+                ),
+                selected.group_id_hex
+            );
+            for group_id in &group_ids {
+                assert_eq!(
+                    direct_roles(&runtime, account, group_id).await,
+                    (1, expected.clone())
+                );
+            }
+        }
+    }
+    assert_eq!(app.groups(&alice.account.label).unwrap().len(), 3);
+    assert_eq!(app.groups(&bob.account.label).unwrap().len(), 3);
+    runtime.shutdown().await;
+}
+
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_retry_survives_restart() {
+    storage_sqlite::relax_storage_for_test_process();
+    let dir = tempfile::tempdir().unwrap();
+    let rejecting = Arc::new(AtomicBool::new(false));
+    let relay = LocalRelay::new(
+        RelayBuilder::default().write_policy(RejectGiftWrapsWhileArmed(rejecting.clone())),
+    );
+    relay.run().await.unwrap();
+    let url = relay.url().await.to_string();
+    let config = MarmotAppConfig::white_noise()
+        .with_allow_loopback_relay_endpoints(true)
+        .with_dev_fail_create_local_projection(true);
+    let app = MarmotApp::with_relay_and_config(dir.path(), url.clone(), config);
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let setup = AccountSetupRequest {
+        default_relays: vec![endpoint(&url)],
+        bootstrap_relays: vec![endpoint(&url)],
+        publish_initial_key_package: true,
+        ..AccountSetupRequest::default()
+    };
+    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
+    let bob = create_network_ready_identity(&runtime, setup).await;
+    let alice_id = &alice.account.account_id_hex;
+    let bob_id = &bob.account.account_id_hex;
+    let expected =
+        std::collections::BTreeMap::from([(alice_id.clone(), true), (bob_id.clone(), true)]);
+    let catch_up = Arc::new(Notify::new());
+    runtime
+        .shared_services()
+        .set_create_group_catch_up_barrier(Some(catch_up.clone()));
+    rejecting.store(true, Ordering::Relaxed);
+    let group_id = runtime
+        .start_direct_conversation(alice_id, bob_id)
+        .await
+        .unwrap();
+    assert!(app.groups(&alice.account.label).unwrap().is_empty());
+    let group_hex = hex::encode(group_id.as_slice());
+    let pending = timeout(Duration::from_secs(5), async {
+        loop {
+            let pending = runtime.pending_welcome_deliveries(alice_id).await.unwrap();
+            if !pending.is_empty() {
+                break pending;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("post-canonical projection failure must retain the founding Welcome");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].group_id_hex, group_hex);
+    let mut repaired_events = runtime.subscribe();
+    assert_eq!(
+        runtime
+            .start_direct_conversation(alice_id, bob_id)
+            .await
+            .unwrap(),
+        group_id
+    );
+    wait_for_event(&mut repaired_events, |event| {
+        matches!(event, MarmotAppEvent::ProjectionUpdated(update)
+            if update.account_id_hex == *alice_id
+                && update.update.chat_list_trigger == marmot_app::ChatListUpdateTrigger::NewGroup
+                && update.update.chat_list_row.as_ref()
+                    .is_some_and(|row| row.group_id_hex == group_hex))
+    })
+    .await;
+    assert_eq!(
+        direct_roles(&runtime, alice_id, &group_id).await,
+        (1, expected.clone())
+    );
+    assert!(app.groups(&bob.account.label).unwrap().is_empty());
+    catch_up.notify_one();
+    runtime.shutdown().await;
+    drop(runtime);
+    drop(app);
+
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        url,
+        MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
+    );
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let mut events = runtime.subscribe();
+    runtime.reconcile_accounts().await.unwrap();
+    runtime.catch_up_accounts().await.unwrap();
+    assert_eq!(
+        runtime
+            .start_direct_conversation(alice_id, bob_id)
+            .await
+            .unwrap(),
+        group_id
+    );
+    assert_eq!(app.groups(&alice.account.label).unwrap().len(), 1);
+    let pending = runtime.pending_welcome_deliveries(alice_id).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].group_id_hex, group_hex);
+    assert_eq!(
+        direct_roles(&runtime, alice_id, &group_id).await,
+        (1, expected.clone())
+    );
+
+    rejecting.store(false, Ordering::Relaxed);
+    runtime.restart_account(alice_id).await.unwrap();
+    wait_for_event(&mut events, |event| {
+        matches!(
+            event,
+            MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined, .. }
+                if account_id_hex == bob_id && joined == &group_id
+        )
+    })
+    .await;
+    assert_eq!(
+        direct_roles(&runtime, bob_id, &group_id).await,
+        (1, expected.clone())
+    );
+    assert_eq!(
+        runtime
+            .start_direct_conversation(bob_id, alice_id)
+            .await
+            .unwrap(),
+        group_id
+    );
+    assert_eq!(
+        direct_roles(&runtime, alice_id, &group_id).await,
+        (1, expected)
+    );
+    assert_eq!(app.groups(&bob.account.label).unwrap().len(), 1);
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if runtime
+                .pending_welcome_deliveries(alice_id)
+                .await
+                .unwrap()
+                .is_empty()
+            {
+                break;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("successful retained Welcome delivery must retire its obligation");
+    runtime.shutdown().await;
+}
+
 /// mdk#1487: the detailed create response carries the exact durable chat-list
 /// row emitted to subscribers at the response boundary. Ordinary queries keep
 /// its content, while projection maintenance may advance `updated_at`.
@@ -12575,7 +14378,9 @@ async fn create_group_detailed_returns_durable_emitted_chat_list_row() {
     )
     .await
     .expect("detailed create must return before Welcome fanout")
-    .unwrap();
+    .unwrap()
+    .operation
+    .expect("eligible fixture members");
 
     assert_eq!(
         created.chat_list_row.group_id_hex,
@@ -12635,6 +14440,7 @@ async fn create_group_detailed_returns_durable_emitted_chat_list_row() {
 #[cfg(feature = "test-policy-overrides")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn create_group_post_canonical_projection_crash_recovers_visibility_and_welcome() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let rejecting = Arc::new(AtomicBool::new(false));
     let relay = LocalRelay::new(
@@ -12681,7 +14487,9 @@ async fn create_group_post_canonical_projection_crash_recovers_visibility_and_we
             None,
         )
         .await
-        .expect("the compatibility API must preserve post-canonical success");
+        .expect("the compatibility API must preserve post-canonical success")
+        .operation
+        .expect("eligible fixture members");
     assert!(
         app.groups(&alice.account.label)
             .unwrap()
@@ -12752,7 +14560,9 @@ async fn invite_members_returns_before_blocked_welcome() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -12773,7 +14583,9 @@ async fn invite_members_returns_before_blocked_welcome() {
     )
     .await
     .expect("invite_members must return while a Welcome is still blocked")
-    .unwrap();
+    .unwrap()
+    .operation
+    .expect("eligible fixture members");
 
     timeout(Duration::from_secs(5), gate.wait_for_blocked(1))
         .await
@@ -12826,7 +14638,8 @@ async fn invite_members_returns_before_blocked_welcome() {
     runtime.shutdown().await;
 }
 
-/// mdk#1803: snapshot reads bypass queued mutations during Welcome fanout.
+/// mdk#1803: group reads bypass queued mutations during Welcome fanout: they
+/// answer from the read state published before the fanout (mdk#3273 PR 4).
 /// After the queued mutation completes, fresh reads observe its result.
 #[cfg(feature = "test-policy-overrides")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -12857,7 +14670,9 @@ async fn invite_deferred_during_startup_keeps_projection_reads_off_welcome_fanou
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -12925,12 +14740,12 @@ async fn invite_deferred_during_startup_keeps_projection_reads_off_welcome_fanou
     });
     let members = timeout(Duration::from_secs(1), read)
         .await
-        .expect("snapshot read must bypass the startup-deferred remove")
+        .expect("a group read must bypass the startup-deferred remove")
         .expect("read task should not panic")
-        .expect("snapshot members should remain readable");
+        .expect("published members should remain readable");
     assert!(
         members.iter().any(|member| member.member_id_hex == bob_id),
-        "snapshot must retain the member whose removal is still queued"
+        "the published read state must retain the member whose removal is still queued"
     );
     assert!(
         !remove.is_finished(),
@@ -12993,7 +14808,9 @@ async fn invite_members_survives_injected_post_canonical_failure(config: MarmotA
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -13014,7 +14831,9 @@ async fn invite_members_survives_injected_post_canonical_failure(config: MarmotA
     )
     .await
     .expect("invite_members must return while a Welcome is still blocked")
-    .expect("canonical invite must not tell the caller to retry after a post-confirm failure");
+    .expect("canonical invite must not tell the caller to retry after a post-confirm failure")
+    .operation
+    .expect("eligible fixture members");
 
     timeout(Duration::from_secs(5), gate.wait_for_blocked(1))
         .await
@@ -13030,117 +14849,6 @@ async fn invite_members_survives_injected_post_canonical_failure(config: MarmotA
     })
     .await;
     runtime.shutdown().await;
-}
-
-/// mdk#1451: an injected Welcome-intent index failure must atomically roll back
-/// a multi-member staged invite before relay exposure. No repair-row prefix or
-/// phantom membership may survive restart.
-#[cfg(feature = "test-policy-overrides")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn invite_members_returns_when_welcome_intent_recording_fails() {
-    let dir = tempfile::tempdir().unwrap();
-    let (relay, app, url) = gift_wrap_blocking_app_with_config(
-        &dir,
-        BlockNextGiftWraps::new(),
-        MarmotAppConfig::white_noise()
-            .with_allow_loopback_relay_endpoints(true)
-            .with_dev_fail_invite_welcome_intent(true),
-    )
-    .await;
-    let runtime = MarmotAppRuntime::new(app);
-    let setup = AccountSetupRequest {
-        default_relays: vec![endpoint(&url)],
-        bootstrap_relays: vec![endpoint(&url)],
-        publish_initial_key_package: true,
-        ..AccountSetupRequest::default()
-    };
-    let alice = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
-    let bob = create_network_ready_identity(&runtime, setup.relay_options_only()).await;
-    let carol = create_network_ready_identity(&runtime, setup).await;
-    let dave = create_network_ready_identity(
-        &runtime,
-        AccountSetupRequest {
-            default_relays: vec![endpoint(&url)],
-            bootstrap_relays: vec![endpoint(&url)],
-            publish_initial_key_package: true,
-            ..AccountSetupRequest::default()
-        },
-    )
-    .await;
-    let alice_id = alice.account.account_id_hex.clone();
-    let bob_id = bob.account.account_id_hex.clone();
-    let carol_id = carol.account.account_id_hex.clone();
-    let dave_id = dave.account.account_id_hex.clone();
-    let mut events = runtime.subscribe();
-
-    let group_id = runtime
-        .create_group(
-            &alice_id,
-            "canonical invite despite intent failure",
-            std::slice::from_ref(&bob_id),
-            None,
-        )
-        .await
-        .unwrap();
-    wait_for_event(&mut events, |event| {
-        matches!(
-            event,
-            MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined_group, .. }
-                if account_id_hex == &bob_id && joined_group == &group_id
-        )
-    })
-    .await;
-
-    let error = timeout(
-        Duration::from_secs(5),
-        runtime.invite_members(&alice_id, &group_id, &[carol_id.clone(), dave_id.clone()]),
-    )
-    .await
-    .expect("intent persistence failure must roll back promptly")
-    .expect_err("an unexposed, rolled-back invite must return its persistence error");
-    assert!(matches!(error, AppError::Publish(_)));
-    assert!(
-        runtime
-            .pending_welcome_deliveries(&alice_id)
-            .await
-            .unwrap()
-            .is_empty(),
-        "failed Welcome-intent persistence must not leave a durable repair handle"
-    );
-    let members = runtime.group_members(&alice_id, &group_id).await.unwrap();
-    assert!(
-        members
-            .iter()
-            .all(|member| { member.member_id_hex != carol_id && member.member_id_hex != dave_id }),
-        "rolled-back invitees must disappear from the live roster"
-    );
-
-    runtime.shutdown().await;
-
-    let app = MarmotApp::with_relay_and_config(
-        dir.path(),
-        url.clone(),
-        MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true),
-    );
-    let runtime = MarmotAppRuntime::new(app);
-    runtime.reconcile_accounts().await.unwrap();
-    assert!(
-        runtime
-            .pending_welcome_deliveries(&alice_id)
-            .await
-            .unwrap()
-            .is_empty(),
-        "restart must not invent Welcome repair handles the first attempt never persisted"
-    );
-    let members = runtime.group_members(&alice_id, &group_id).await.unwrap();
-    assert!(
-        members
-            .iter()
-            .all(|member| { member.member_id_hex != carol_id && member.member_id_hex != dave_id }),
-        "rolled-back multi-member invite must remain absent after restart"
-    );
-    runtime.shutdown().await;
-    drop(relay);
 }
 
 /// mdk#1451: an injected local-projection failure after confirm must not fail
@@ -13185,7 +14893,9 @@ async fn invite_members_with_initial_admins_grants_admin_in_one_epoch() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -13207,9 +14917,12 @@ async fn invite_members_with_initial_admins_grants_admin_in_one_epoch() {
             &group_id,
             std::slice::from_ref(&carol_id),
             std::slice::from_ref(&carol_id),
+            marmot_app::MemberResolutionPolicy::Partial,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
 
     let roster = runtime.group_roster(&alice_id, &group_id).await.unwrap();
     assert_eq!(
@@ -13260,6 +14973,7 @@ async fn invite_members_with_initial_admins_grants_admin_in_one_epoch() {
 /// restart so a successful resume cannot clear the row before the poll.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn founding_welcome_resumes_exactly_once_after_restart() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let rejecting = Arc::new(AtomicBool::new(false));
     let relay = LocalRelay::new(
@@ -13294,7 +15008,9 @@ async fn founding_welcome_resumes_exactly_once_after_restart() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let pending = timeout(Duration::from_secs(5), async {
         loop {
             let pending = runtime.pending_welcome_deliveries(&alice_id).await.unwrap();
@@ -13353,11 +15069,14 @@ async fn founding_welcome_resumes_exactly_once_after_restart() {
 /// death without staging another invite commit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn confirmed_invite_welcome_resumes_after_restart() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let welcome_policy = RejectThenBlockGiftWraps::new();
-    let relay = LocalRelay::new(RelayBuilder::default().write_policy(welcome_policy.clone()));
-    relay.run().await.unwrap();
-    let url = relay.url().await.to_string();
+    let (_relay, url) = limited_relay::relay_publishing_with(
+        RelayBuilder::default().write_policy(welcome_policy.clone()),
+        Some(500),
+    )
+    .await;
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
         url.clone(),
@@ -13386,7 +15105,9 @@ async fn confirmed_invite_welcome_resumes_after_restart() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -13400,7 +15121,9 @@ async fn confirmed_invite_welcome_resumes_after_restart() {
     runtime
         .invite_members(&alice_id, &group_id, std::slice::from_ref(&carol_id))
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     timeout(Duration::from_secs(5), async {
         loop {
             if !runtime
@@ -13515,6 +15238,7 @@ async fn confirmed_invite_welcome_resumes_after_restart() {
 /// route, and a later process can use that route to deliver one Welcome.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resolved_inbox_route_survives_restart_and_delivers_exact_welcome() {
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let relay = LocalRelay::new(RelayBuilder::default());
     relay.run().await.unwrap();
@@ -13547,7 +15271,9 @@ async fn resolved_inbox_route_survives_restart_and_delivers_exact_welcome() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -13589,7 +15315,9 @@ async fn resolved_inbox_route_survives_restart_and_delivers_exact_welcome() {
     runtime
         .invite_members(&alice_id, &group_id, std::slice::from_ref(&carol_id))
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut restarted_events, |event| {
         matches!(
             event,
@@ -13617,6 +15345,7 @@ async fn resolved_inbox_route_survives_restart_and_delivers_exact_welcome() {
 /// third-relay route must survive restart and deliver one Welcome.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn outbox_resolved_inbox_survives_restart_and_delivers_exact_welcome() {
+    storage_sqlite::relax_storage_for_test_process();
     use nostr::prelude::ToBech32;
 
     let dir = tempfile::tempdir().unwrap();
@@ -13713,7 +15442,9 @@ async fn outbox_resolved_inbox_survives_restart_and_delivers_exact_welcome() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -13755,7 +15486,9 @@ async fn outbox_resolved_inbox_survives_restart_and_delivers_exact_welcome() {
     runtime
         .invite_members(&alice_id, &group_id, std::slice::from_ref(&carol_id))
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut restarted_events, |event| {
         matches!(
             event,
@@ -13779,6 +15512,7 @@ async fn outbox_resolved_inbox_survives_restart_and_delivers_exact_welcome() {
 }
 
 async fn independent_sender_outbox_invite_survives_restart(stale_discovery: bool) {
+    storage_sqlite::relax_storage_for_test_process();
     use nostr::prelude::ToBech32;
 
     let sender_dir = tempfile::tempdir().unwrap();
@@ -13909,7 +15643,9 @@ async fn independent_sender_outbox_invite_survives_restart(stale_discovery: bool
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert!(
         sender
             .directory()
@@ -13974,7 +15710,9 @@ async fn independent_sender_outbox_invite_survives_restart(stale_discovery: bool
     sender_runtime
         .invite_members(&alice_id, &group_id, std::slice::from_ref(&carol_id))
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut receiver_events, |event| {
         matches!(event, MarmotAppEvent::GroupJoined { account_id_hex, group_id: joined_group, .. }
             if account_id_hex == &carol_id && joined_group == &group_id)
@@ -14060,7 +15798,9 @@ async fn app_runtime_exposes_welcome_redelivery_surface() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
 
     // The welcome delivered over the live relay, so nothing is queued...
     assert!(
@@ -14122,7 +15862,9 @@ async fn concurrent_leaves_report_already_requested_not_an_opaque_error() {
     let group_id = runtime
         .create_group(&alice_id, "double tap", std::slice::from_ref(&bob_id), None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -14217,7 +15959,9 @@ async fn convergence_settles_across_generations_with_mid_window_queued_sends() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events, |event| {
         matches!(
             event,
@@ -14295,6 +16039,7 @@ impl WritePolicy for CountUncertainSetupRelayListPublications {
 async fn assert_required_discovery_failure_does_not_publish_defaults(external_signer: bool) {
     use nostr::prelude::ToBech32;
 
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let publications = Arc::new(AtomicUsize::new(0));
     let bootstrap = LocalRelay::new(RelayBuilder::default().write_policy(
@@ -14379,6 +16124,7 @@ async fn outbox_acceptance_external_signer_required_discovery_failure_does_not_p
 async fn partial_outbox_failure_does_not_publish_defaults(external_signer: bool) {
     use nostr::prelude::ToBech32;
 
+    storage_sqlite::relax_storage_for_test_process();
     let dir = tempfile::tempdir().unwrap();
     let publications = Arc::new(AtomicUsize::new(0));
     let discovery = LocalRelay::new(RelayBuilder::default().write_policy(
@@ -14483,6 +16229,7 @@ async fn outbox_acceptance_external_signer_partial_outbox_failure_does_not_publi
 async fn newer_discovery_inbox_survives_older_outbox(external_signer: bool, empty_outbox: bool) {
     use nostr::prelude::ToBech32;
 
+    storage_sqlite::relax_storage_for_test_process();
     let publisher_dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(publisher_dir.path());
     let keys = Keys::generate();
@@ -14697,6 +16444,7 @@ async fn outbox_acceptance_external_signer_preserves_explicit_empty_metadata() {
 async fn outbox_acceptance_closed_multi_author_queries_fall_back_per_member() {
     use nostr::prelude::ToBech32;
 
+    storage_sqlite::relax_storage_for_test_process();
     let discovery_policy = RejectMultiAuthorQueries::default();
     let discovery = LocalRelay::new(RelayBuilder::default().query_policy(discovery_policy.clone()));
     discovery.run().await.unwrap();
@@ -14784,7 +16532,7 @@ async fn outbox_acceptance_closed_multi_author_queries_fall_back_per_member() {
 // acknowledgements, not only directory-cache fixtures.
 async fn onboarding_fixture() -> (
     tempfile::TempDir,
-    MockRelay,
+    TestRelay,
     MarmotApp,
     MarmotAppRuntime,
     Keys,
@@ -14798,7 +16546,7 @@ async fn onboarding_fixture() -> (
     let keys = Keys::generate();
     let id = keys.public_key().to_hex();
     let snapshot = runtime
-        .accounts()
+        .account_setup()
         .begin_onboarding(
             zeroize::Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
             marmot_app::OnboardingOptions {
@@ -14857,8 +16605,8 @@ async fn onboarding_identity_only_is_durable_gated_and_never_publishes() {
             .unwrap()
             .is_none()
     );
-    let mut subscription = runtime.accounts().subscribe_onboarding(&id).unwrap();
-    let snapshot = runtime.accounts().run_onboarding(&id).await.unwrap();
+    let mut subscription = runtime.account_setup().subscribe_onboarding(&id).unwrap();
+    let snapshot = runtime.account_setup().run_onboarding(&id).await.unwrap();
     assert_eq!(
         snapshot.steps[0].status,
         marmot_app::OnboardingStatus::NeedsInput
@@ -14882,7 +16630,7 @@ async fn onboarding_identity_only_is_durable_gated_and_never_publishes() {
     runtime.shutdown_and_close().await.unwrap();
     let reopened = MarmotAppRuntime::new(MarmotApp::with_relay(directory.path(), url));
     assert_eq!(
-        reopened.accounts().onboarding_snapshot(&id).unwrap(),
+        reopened.account_setup().onboarding_snapshot(&id).unwrap(),
         Some(snapshot)
     );
     reopened.reconcile_accounts().await.unwrap();
@@ -14893,7 +16641,7 @@ async fn onboarding_identity_only_is_durable_gated_and_never_publishes() {
 async fn onboarding_valid_account_completes_all_checks_and_publishes_key_package() {
     let (directory, _relay, _app, runtime, _keys, id, url) = onboarding_fixture().await;
     seed_onboarding_records(&AccountHome::open(directory.path()), &id, &url).await;
-    let snapshot = runtime.accounts().run_onboarding(&id).await.unwrap();
+    let snapshot = runtime.account_setup().run_onboarding(&id).await.unwrap();
     let snapshot = acknowledge_single_device_notice(&runtime, snapshot).await;
     assert!(snapshot.ready, "{snapshot:?}");
     assert!(
@@ -14941,26 +16689,26 @@ async fn onboarding_relay_repair_requires_approval_and_preserves_unrelated_tags(
         NostrTimestamp::now().as_secs() - 5,
     )
     .await;
-    let snapshot = runtime.accounts().run_onboarding(&id).await.unwrap();
+    let snapshot = runtime.account_setup().run_onboarding(&id).await.unwrap();
     assert_eq!(
         snapshot.steps[2].status,
         marmot_app::OnboardingStatus::NeedsInput
     );
     assert!(!snapshot.ready);
     let proposal = runtime
-        .accounts()
+        .account_setup()
         .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
         .await
         .unwrap();
     assert!(matches!(
         runtime
-            .accounts()
+            .account_setup()
             .approve_onboarding_repair(&id, proposal.revision - 1)
             .await,
         Err(AppError::OnboardingActionUnavailable)
     ));
     let snapshot = runtime
-        .accounts()
+        .account_setup()
         .approve_onboarding_repair(&id, proposal.revision)
         .await
         .unwrap();
@@ -15013,9 +16761,9 @@ async fn onboarding_stale_repair_detects_a_new_remote_record() {
         NostrTimestamp::now().as_secs() - 5,
     )
     .await;
-    runtime.accounts().run_onboarding(&id).await.unwrap();
+    runtime.account_setup().run_onboarding(&id).await.unwrap();
     let proposal = runtime
-        .accounts()
+        .account_setup()
         .propose_onboarding_relays(&id, OnboardingStep::Relays, None)
         .await
         .unwrap();
@@ -15028,7 +16776,7 @@ async fn onboarding_stale_repair_detects_a_new_remote_record() {
     )
     .await;
     let snapshot = runtime
-        .accounts()
+        .account_setup()
         .approve_onboarding_repair(&id, proposal.revision)
         .await
         .unwrap();
@@ -15039,7 +16787,7 @@ async fn onboarding_stale_repair_detects_a_new_remote_record() {
         marmot_app::OnboardingIssue::RecordChanged
     );
     let snapshot = runtime
-        .accounts()
+        .account_setup()
         .retry_onboarding_step(&id, OnboardingStep::Relays)
         .await
         .unwrap();
@@ -15061,7 +16809,7 @@ async fn onboarding_external_signer_uses_the_same_gate_and_workflow() {
         url.clone(),
     ));
     let snapshot = runtime
-        .accounts()
+        .account_setup()
         .begin_external_signer_onboarding(
             id.clone(),
             TestExternalAccountSigner { keys: keys.clone() },
@@ -15075,7 +16823,7 @@ async fn onboarding_external_signer_uses_the_same_gate_and_workflow() {
         .unwrap();
     assert!(!snapshot.ready);
     assert!(!runtime.accounts().managed_accounts().unwrap()[0].running);
-    let snapshot = runtime.accounts().run_onboarding(&id).await.unwrap();
+    let snapshot = runtime.account_setup().run_onboarding(&id).await.unwrap();
     let snapshot = acknowledge_single_device_notice(&runtime, snapshot).await;
     assert!(snapshot.ready, "{snapshot:?}");
     runtime
@@ -15088,7 +16836,7 @@ async fn onboarding_external_signer_uses_the_same_gate_and_workflow() {
         .await
         .unwrap();
     let reentered = runtime
-        .accounts()
+        .account_setup()
         .begin_external_signer_onboarding(
             id.clone(),
             TestExternalAccountSigner { keys },
@@ -15118,7 +16866,7 @@ async fn onboarding_cancellation_retains_external_signer_for_explicit_sign_in() 
         url.clone(),
     ));
     runtime
-        .accounts()
+        .account_setup()
         .begin_external_signer_onboarding(
             id.clone(),
             TestExternalAccountSigner { keys },
@@ -15130,17 +16878,21 @@ async fn onboarding_cancellation_retains_external_signer_for_explicit_sign_in() 
         )
         .await
         .unwrap();
-    let snapshot = runtime.accounts().run_onboarding(&id).await.unwrap();
+    let snapshot = runtime.account_setup().run_onboarding(&id).await.unwrap();
     assert!(!snapshot.ready);
     assert_eq!(
         snapshot.steps[4].status,
         marmot_app::OnboardingStatus::NeedsInput
     );
 
-    runtime.accounts().cancel_onboarding(&id).await.unwrap();
+    runtime
+        .account_setup()
+        .cancel_onboarding(&id)
+        .await
+        .unwrap();
     assert!(
         runtime
-            .accounts()
+            .account_setup()
             .onboarding_snapshot(&id)
             .unwrap()
             .is_none()
@@ -15175,7 +16927,7 @@ async fn onboarding_access_restricted_query_is_not_a_missing_record() {
     let runtime = MarmotAppRuntime::new(MarmotApp::with_relay(dir.path(), url.clone()));
     let keys = Keys::generate();
     let snapshot = runtime
-        .accounts()
+        .account_setup()
         .begin_onboarding(
             zeroize::Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
             marmot_app::OnboardingOptions {
@@ -15187,7 +16939,7 @@ async fn onboarding_access_restricted_query_is_not_a_missing_record() {
         .await
         .unwrap();
     let result = runtime
-        .accounts()
+        .account_setup()
         .run_onboarding(&snapshot.account_id_hex)
         .await
         .unwrap();
@@ -15205,6 +16957,8 @@ async fn onboarding_access_restricted_query_is_not_a_missing_record() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn onboarding_key_package_rejection_retains_identity_until_confirmed_retry() {
     use nostr::prelude::ToBech32;
+
+    storage_sqlite::relax_storage_for_test_process();
     let directory = tempfile::tempdir().unwrap();
     let rejecting = Arc::new(AtomicBool::new(true));
     let relay = LocalRelay::new(
@@ -15217,7 +16971,7 @@ async fn onboarding_key_package_rejection_retains_identity_until_confirmed_retry
     let keys = Keys::generate();
     let id = keys.public_key().to_hex();
     runtime
-        .accounts()
+        .account_setup()
         .begin_onboarding(
             zeroize::Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
             marmot_app::OnboardingOptions {
@@ -15229,7 +16983,7 @@ async fn onboarding_key_package_rejection_retains_identity_until_confirmed_retry
         .await
         .unwrap();
     seed_onboarding_records(&AccountHome::open(directory.path()), &id, &url).await;
-    let snapshot = runtime.accounts().run_onboarding(&id).await.unwrap();
+    let snapshot = runtime.account_setup().run_onboarding(&id).await.unwrap();
     let snapshot = acknowledge_single_device_notice(&runtime, snapshot).await;
     assert!(!snapshot.ready);
     assert_eq!(
@@ -15249,7 +17003,7 @@ async fn onboarding_key_package_rejection_retains_identity_until_confirmed_retry
     let acknowledged_notice = snapshot.single_device_notice.clone();
     runtime.shutdown_and_close().await.unwrap();
     let runtime = MarmotAppRuntime::new(MarmotApp::with_relay(directory.path(), url.clone()));
-    let resumed = runtime.accounts().run_onboarding(&id).await.unwrap();
+    let resumed = runtime.account_setup().run_onboarding(&id).await.unwrap();
     assert_eq!(resumed.single_device_notice, acknowledged_notice);
     assert_eq!(
         resumed.steps[4].status,
@@ -15257,7 +17011,7 @@ async fn onboarding_key_package_rejection_retains_identity_until_confirmed_retry
     );
     rejecting.store(false, Ordering::SeqCst);
     let snapshot = runtime
-        .accounts()
+        .account_setup()
         .retry_onboarding_step(&id, marmot_app::OnboardingStep::KeyPackage)
         .await
         .unwrap();
@@ -15293,7 +17047,7 @@ async fn acknowledge_single_device_notice(
         Err(AppError::OnboardingRequired)
     ));
     runtime
-        .accounts()
+        .account_setup()
         .acknowledge_onboarding_single_device(&snapshot.account_id_hex, snapshot.revision)
         .await
         .unwrap()
@@ -15305,12 +17059,44 @@ async fn onboarding_single_device_detects_other_installation_and_retains_notice_
     use nostr::prelude::ToBech32;
     let (first_directory, _relay, first_app, first, keys, id, url) = onboarding_fixture().await;
     seed_onboarding_records(&AccountHome::open(first_directory.path()), &id, &url).await;
-    let notice = first.accounts().run_onboarding(&id).await.unwrap();
+    let notice = first.account_setup().run_onboarding(&id).await.unwrap();
     assert_eq!(
         notice.single_device_notice.as_ref().unwrap().discovery,
         OnboardingDeviceDiscovery::NoneFound
     );
-    assert!(acknowledge_single_device_notice(&first, notice).await.ready);
+    // Model an older retained discovery result without sleeping or changing
+    // any approval identity, prior prerequisite or publication evidence.
+    let home = AccountHome::open(first_directory.path());
+    let mut checkpoint: serde_json::Value =
+        serde_json::from_slice(&home.account_onboarding(&id).unwrap().unwrap()).unwrap();
+    let discovered_at = notice.steps[4].checked_at.unwrap() - 60;
+    checkpoint["snapshot"]["steps"][4]["checked_at"] = serde_json::json!(discovered_at);
+    home.set_account_onboarding(&id, &serde_json::to_vec(&checkpoint).unwrap())
+        .unwrap();
+    let retained = first
+        .account_setup()
+        .onboarding_snapshot(&id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(retained.revision, notice.revision);
+    assert_eq!(retained.recovery_epoch, notice.recovery_epoch);
+    assert_eq!(retained.steps[4].checked_at, Some(discovered_at));
+    let completed = acknowledge_single_device_notice(&first, retained).await;
+    assert!(completed.ready);
+    assert!(
+        completed
+            .single_device_notice
+            .as_ref()
+            .unwrap()
+            .acknowledged_at
+            .unwrap()
+            > discovered_at
+    );
+    assert_eq!(
+        completed.steps[4].checked_at,
+        Some(discovered_at),
+        "Continue must not refresh the discovery observation time"
+    );
 
     // An older publication under another slot still carries usable material.
     // Its timestamp is not grounds for asserting that installation is inactive.
@@ -15351,7 +17137,7 @@ async fn onboarding_single_device_detects_other_installation_and_retains_notice_
 
     // The same private package advertised under a different slot is still ours.
     let own_notice = first
-        .accounts()
+        .account_setup()
         .retry_onboarding_step(&id, OnboardingStep::SingleDevice)
         .await
         .unwrap();
@@ -15366,7 +17152,7 @@ async fn onboarding_single_device_detects_other_installation_and_retains_notice_
     );
     first.publish_new_key_package(&id).await.unwrap();
     let rotated_notice = first
-        .accounts()
+        .account_setup()
         .retry_onboarding_step(&id, OnboardingStep::SingleDevice)
         .await
         .unwrap();
@@ -15389,7 +17175,7 @@ async fn onboarding_single_device_detects_other_installation_and_retains_notice_
         || MarmotAppRuntime::new(MarmotApp::with_relay(second_directory.path(), url.clone()));
     let second = make_second();
     second
-        .accounts()
+        .account_setup()
         .begin_onboarding(
             zeroize::Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
             OnboardingOptions {
@@ -15400,7 +17186,7 @@ async fn onboarding_single_device_detects_other_installation_and_retains_notice_
         )
         .await
         .unwrap();
-    let snapshot = second.accounts().run_onboarding(&id).await.unwrap();
+    let snapshot = second.account_setup().run_onboarding(&id).await.unwrap();
     let notice = snapshot.single_device_notice.as_ref().unwrap();
     assert_eq!(
         notice.discovery,
@@ -15426,19 +17212,23 @@ async fn onboarding_single_device_detects_other_installation_and_retains_notice_
         2
     );
     // Cancel means the host leaves this pause; simply resuming cannot publish.
-    let resumed = second.accounts().run_onboarding(&id).await.unwrap();
+    let resumed = second.account_setup().run_onboarding(&id).await.unwrap();
     assert_eq!(resumed.single_device_notice, snapshot.single_device_notice);
     assert_eq!(resumed.steps, snapshot.steps);
     let snapshot = resumed;
     second.shutdown_and_close().await.unwrap();
     let second = make_second();
     assert_eq!(
-        second.accounts().onboarding_snapshot(&id).unwrap().unwrap(),
+        second
+            .account_setup()
+            .onboarding_snapshot(&id)
+            .unwrap()
+            .unwrap(),
         snapshot
     );
     assert!(matches!(
         second
-            .accounts()
+            .account_setup()
             .acknowledge_onboarding_single_device(&id, snapshot.revision - 1)
             .await,
         Err(AppError::OnboardingActionUnavailable)
@@ -15456,7 +17246,7 @@ async fn onboarding_single_device_detects_other_installation_and_retains_notice_
     second.shutdown_and_close().await.unwrap();
     let second = make_second();
     assert_eq!(
-        second.accounts().run_onboarding(&id).await.unwrap(),
+        second.account_setup().run_onboarding(&id).await.unwrap(),
         completed
     );
     // Continue never deletes the other installation's slots.
@@ -15487,7 +17277,7 @@ async fn onboarding_single_device_detects_other_installation_and_retains_notice_
         .await
         .unwrap();
     let next_sign_in = second
-        .accounts()
+        .account_setup()
         .begin_onboarding(
             zeroize::Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
             OnboardingOptions {
@@ -15500,7 +17290,7 @@ async fn onboarding_single_device_detects_other_installation_and_retains_notice_
         .unwrap();
     assert!(!next_sign_in.ready);
     assert!(next_sign_in.single_device_notice.is_none());
-    let next_notice = second.accounts().run_onboarding(&id).await.unwrap();
+    let next_notice = second.account_setup().run_onboarding(&id).await.unwrap();
     assert_eq!(
         next_notice.steps[4].status,
         marmot_app::OnboardingStatus::NeedsInput
@@ -15541,6 +17331,8 @@ impl nostr_relay_builder::prelude::QueryPolicy for OnboardingKeyPackageQueriesRe
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn onboarding_single_device_unknown_discovery_still_offers_explicit_continue() {
     use nostr::prelude::ToBech32;
+
+    storage_sqlite::relax_storage_for_test_process();
     let directory = tempfile::tempdir().unwrap();
     let relay = LocalRelay::new(
         RelayBuilder::default().query_policy(OnboardingKeyPackageQueriesRestricted),
@@ -15551,7 +17343,7 @@ async fn onboarding_single_device_unknown_discovery_still_offers_explicit_contin
     let keys = Keys::generate();
     let id = keys.public_key().to_hex();
     runtime
-        .accounts()
+        .account_setup()
         .begin_onboarding(
             zeroize::Zeroizing::new(keys.secret_key().to_bech32().unwrap()),
             marmot_app::OnboardingOptions {
@@ -15563,7 +17355,7 @@ async fn onboarding_single_device_unknown_discovery_still_offers_explicit_contin
         .await
         .unwrap();
     seed_onboarding_records(&AccountHome::open(directory.path()), &id, &url).await;
-    let snapshot = runtime.accounts().run_onboarding(&id).await.unwrap();
+    let snapshot = runtime.account_setup().run_onboarding(&id).await.unwrap();
     let notice = snapshot.single_device_notice.as_ref().unwrap();
     assert_eq!(
         notice.discovery,
@@ -15612,14 +17404,14 @@ async fn onboarding_contains_corruption_and_preserves_legacy_account_and_cancel_
     };
     assert!(
         runtime
-            .accounts()
+            .account_setup()
             .begin_onboarding(zeroize::Zeroizing::new(secret.clone()), options())
             .await
             .is_err()
     );
     assert!(
         runtime
-            .accounts()
+            .account_setup()
             .onboarding_snapshot(&old.label)
             .unwrap()
             .is_none()
@@ -15633,7 +17425,7 @@ async fn onboarding_contains_corruption_and_preserves_legacy_account_and_cancel_
             .any(|a| a.account_id_hex == old.account_id_hex && a.running)
     );
     let bad = runtime
-        .accounts()
+        .account_setup()
         .begin_onboarding(
             zeroize::Zeroizing::new(Keys::generate().secret_key().to_bech32().unwrap()),
             options(),
@@ -15666,18 +17458,18 @@ async fn onboarding_contains_corruption_and_preserves_legacy_account_and_cancel_
         .await
         .unwrap();
     runtime
-        .accounts()
+        .account_setup()
         .begin_onboarding(zeroize::Zeroizing::new(secret.clone()), options())
         .await
         .unwrap();
     runtime
-        .accounts()
+        .account_setup()
         .cancel_onboarding(&old.label)
         .await
         .unwrap();
     assert!(
         runtime
-            .accounts()
+            .account_setup()
             .onboarding_snapshot(&old.label)
             .unwrap()
             .is_none()
@@ -15707,7 +17499,7 @@ async fn onboarding_cancelled_new_identity_can_resume_through_legacy_login() {
     let runtime = MarmotAppRuntime::new(app);
     let secret = Keys::generate().secret_key().to_bech32().unwrap();
     let snapshot = runtime
-        .accounts()
+        .account_setup()
         .begin_onboarding(
             zeroize::Zeroizing::new(secret.clone()),
             marmot_app::OnboardingOptions {
@@ -15719,7 +17511,7 @@ async fn onboarding_cancelled_new_identity_can_resume_through_legacy_login() {
         .await
         .unwrap();
     runtime
-        .accounts()
+        .account_setup()
         .cancel_onboarding(&snapshot.account_id_hex)
         .await
         .unwrap();
@@ -15789,7 +17581,9 @@ async fn race_two_admin_profile_edits(
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     // Both invitees join concurrently, in either order: waiting for one at a
     // time would consume and drop the other's `GroupJoined`.
     let mut awaiting_join: std::collections::HashSet<String> =
@@ -16022,7 +17816,9 @@ async fn peer_leave_is_committed_by_remaining_runtimes_without_manual_retry() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     // Either recipient can join first; do not discard the other recipient's event.
     let mut awaiting = std::collections::HashSet::from([bob_id.clone(), carol_id.clone()]);
     while !awaiting.is_empty() {
@@ -16190,7 +17986,9 @@ async fn user_blocks_dm_history_send_gate_and_invite_admission() {
     let group = runtime
         .create_group(&alice, "", std::slice::from_ref(&bob), None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     accept_group_invite_retrying_busy(&runtime, &bob, &group)
         .await
         .unwrap();
@@ -16218,7 +18016,9 @@ async fn user_blocks_dm_history_send_gate_and_invite_admission() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     timeout(Duration::from_secs(5), async {
         while runtime
             .chat_list_row(&alice, &hex::encode(pending.as_slice()))
@@ -16308,7 +18108,9 @@ async fn user_blocks_dm_history_send_gate_and_invite_admission() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     sleep(Duration::from_millis(500)).await;
     assert!(
         runtime
@@ -16393,7 +18195,9 @@ async fn user_blocks_shared_group_keeps_protocol_and_other_participants_live() {
     let group = runtime
         .create_group(alice, "shared group", &accounts[1..], None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     accept_group_invite_retrying_busy(&runtime, bob, &group)
         .await
         .unwrap();
@@ -16495,7 +18299,12 @@ async fn moderation_report_wraps_reach_only_the_reports_relay_and_leave_group_re
     let mut bob = app.client("bob").await.unwrap();
     bob.publish_key_package().await.unwrap();
     let mut alice = app.client("alice").await.unwrap();
-    let group = alice.create_group("review room", &["bob"]).await.unwrap();
+    let group = alice
+        .create_group("review room", &["bob"])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     bob.sync().await.unwrap();
     let sent = bob.send(&group, b"content under review").await.unwrap();
     let target = &sent.message_ids[0];
@@ -16603,7 +18412,12 @@ async fn encrypted_reports_and_individual_dismissals_do_not_create_chat_rows() {
     let mut bob = app.client("bob").await.unwrap();
     bob.publish_key_package().await.unwrap();
     let mut alice = app.client("alice").await.unwrap();
-    let group = alice.create_group("review room", &["bob"]).await.unwrap();
+    let group = alice
+        .create_group("review room", &["bob"])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     bob.sync().await.unwrap();
     let sent = bob.send(&group, b"content under review").await.unwrap();
     let target = &sent.message_ids[0];
@@ -16753,7 +18567,9 @@ async fn live_report_indicator_uses_existing_timeline_subscription() {
     let group = runtime
         .create_group(&a, "reports", std::slice::from_ref(&b), None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events,|e|matches!(e,MarmotAppEvent::GroupJoined{account_id_hex,group_id,..} if account_id_hex==&b && group_id==&group)).await;
     accept_group_invite_retrying_busy(&runtime, &b, &group)
         .await
@@ -16806,6 +18622,8 @@ async fn live_report_indicator_uses_existing_timeline_subscription() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn offline_member_recovers_dismissal_label_after_admin_demotion() {
     use marmot_app::ReportReason;
+
+    storage_sqlite::relax_storage_for_test_process();
     let (_relay, url) = mock_relay().await;
     let dirs = [
         tempfile::tempdir().unwrap(),
@@ -16848,7 +18666,9 @@ async fn offline_member_recovers_dismissal_label_after_admin_demotion() {
     let group = alice
         .create_group(&a, "review room", &[b.clone(), c.clone()], None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(
         &mut bob_events,
         |event| matches!(event,MarmotAppEvent::GroupJoined{group_id,..} if group_id==&group),

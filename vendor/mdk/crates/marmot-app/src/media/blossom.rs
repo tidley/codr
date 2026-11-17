@@ -19,13 +19,16 @@ use super::host_safety::{
     is_loopback_host, parse_profile_image_fetch_url, parse_profile_image_redirect_url,
     reject_non_public_ip, validate_blossom_fetch_url,
 };
-use crate::app_telemetry::{AppPerformanceOperation, AppPerformanceTelemetry};
 use crate::{AppError, unix_now_seconds};
+use marmot_observability::AppPerformanceOperation;
+use marmot_observability::PerformanceRecorder;
 
 #[cfg(test)]
 use cgka_traits::app_components::ENCRYPTED_MEDIA_ENDPOINT_URL_MAX_LEN;
 
 const BLOSSOM_UPLOAD_AUTH_TTL: Duration = Duration::from_secs(10 * 60);
+/// How long one Blossom delete may take.
+const BLOSSOM_DELETE_TIMEOUT: Duration = Duration::from_secs(60);
 const BLOSSOM_UPLOAD_CONTENT_TYPE: &str = "application/octet-stream";
 const MAX_BLOSSOM_ERROR_BODY_BYTES: u64 = 1024;
 pub(crate) const MAX_BLOSSOM_DESCRIPTOR_BYTES: u64 = 16 * 1024;
@@ -126,6 +129,8 @@ struct MediaOriginSlot {
 struct BlossomHttpTransportInner {
     origins: StdMutex<HashMap<MediaOrigin, MediaOriginSlot>>,
     resolver: DnsResolver,
+    #[cfg(test)]
+    pools_built: std::sync::atomic::AtomicUsize,
 }
 
 /// Per-account HTTP setup shared by compatible Blossom transfers.
@@ -194,6 +199,8 @@ impl BlossomHttpTransport {
             inner: Arc::new(BlossomHttpTransportInner {
                 origins: StdMutex::new(HashMap::new()),
                 resolver,
+                #[cfg(test)]
+                pools_built: std::sync::atomic::AtomicUsize::new(0),
             }),
             allow_loopback_http,
             address_lease,
@@ -339,12 +346,28 @@ impl BlossomHttpTransport {
             }
             MediaHttpKind::Upload => build_pinned_media_upload_client(pin.clone())?,
         };
+        #[cfg(test)]
+        self.inner
+            .pools_built
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         *generation = Some(CachedMediaClient {
             client: client.clone(),
             pin,
             expires_at,
         });
         Ok(client)
+    }
+
+    #[cfg(test)]
+    /// Count the pinned clients, and so connection pools, this transport built.
+    ///
+    /// hyper hands a finished HTTP/1 connection back to its pool from a spawned
+    /// task, so a request sent right after a response can dial a second socket
+    /// through the same pool. Accepted-socket counts cannot prove pool reuse.
+    pub(super) fn pools_built(&self) -> usize {
+        self.inner
+            .pools_built
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Reuse the same safe origin cache through a view that rejects loopback
@@ -508,8 +531,10 @@ async fn upload_blossom_body(
     // server that cannot prove it stored this exact body fails over.
     require_descriptor_digest_and_size: bool,
 ) -> Result<String, AppError> {
-    let (upload_url, server_host) = blossom_upload_endpoint(server)?;
-    let authorization = blossom_authorization_header(signer, &server_host, blob_hash_hex).await?;
+    let (upload_url, server_host) = blossom_endpoint(server, "upload")?;
+    let authorization =
+        blossom_authorization_header(signer, &server_host, blob_hash_hex, "upload", "Upload Blob")
+            .await?;
     let upload_transport = BlossomHttpTransport {
         kind: MediaHttpKind::Upload,
         ..transport.clone()
@@ -585,6 +610,42 @@ async fn upload_blossom_body(
     Ok(url)
 }
 
+/// Deletes the blob `blob_hash_hex` from `server` (BUD-02 `DELETE
+/// /<sha256>`), authorized as the signer's account, through the dial-safe
+/// transport. A server that no longer holds it has deleted it.
+pub(crate) async fn delete_blossom_blob(
+    server: &str,
+    blob_hash_hex: &str,
+    signer: &dyn MarmotNostrSigner,
+    transport: &BlossomHttpTransport,
+) -> Result<(), AppError> {
+    let (url, server_host) = blossom_endpoint(server, blob_hash_hex)?;
+    let authorization =
+        blossom_authorization_header(signer, &server_host, blob_hash_hex, "delete", "Delete Blob")
+            .await?;
+    let transport = BlossomHttpTransport {
+        kind: MediaHttpKind::Upload,
+        ..transport.clone()
+    };
+    let response = transport
+        .client_for_url(&url)
+        .await?
+        .delete(url)
+        .timeout(BLOSSOM_DELETE_TIMEOUT)
+        .header(reqwest::header::AUTHORIZATION, authorization)
+        .send()
+        .await
+        .map_err(reqwest_blob_error)?;
+    let status = response.status();
+    if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(());
+    }
+    Err(AppError::BlobStore(format!(
+        "delete returned HTTP {}",
+        status.as_u16()
+    )))
+}
+
 async fn blossom_upload_status_error(response: reqwest::Response) -> AppError {
     let status = response.status().as_u16();
     let header_reason = response
@@ -654,6 +715,94 @@ pub(crate) async fn fetch_blossom_blob(
 ) -> Result<Vec<u8>, AppError> {
     let transport = BlossomHttpTransport::new(allow_loopback_http);
     fetch_blossom_blob_with_transport(url, &transport).await
+}
+
+/// Hardened bounded Blossom fetch shared by encrypted media and smaller public
+/// assets such as stickers. Callers choose a domain-specific byte ceiling;
+/// URL, redirect, DNS/IP pinning, timeout, proxy, and content-encoding policy
+/// remain identical to [`fetch_blossom_blob`].
+pub(crate) async fn fetch_blossom_blob_limited(
+    url: &str,
+    max_bytes: u64,
+    allow_loopback_http: bool,
+) -> Result<Vec<u8>, AppError> {
+    let transport = BlossomHttpTransport::new(allow_loopback_http).with_download_limit(max_bytes);
+    fetch_blossom_blob_limited_with_transport(url, &transport).await
+}
+
+/// Bounded fetch of a public image named by someone else (a custom emoji in a
+/// NIP-51 set): the same URL, DNS-pinning, redirect, proxy and timeout policy
+/// as [`fetch_blossom_blob_limited`], returning the response's `Content-Type`
+/// so the caller can check it against the bytes' magic numbers.
+pub(crate) async fn fetch_public_image_limited(
+    url: &str,
+    max_bytes: u64,
+    allow_loopback_http: bool,
+) -> Result<(Vec<u8>, Option<String>), PublicImageFetchError> {
+    let transport = BlossomHttpTransport::new(allow_loopback_http).with_download_limit(max_bytes);
+    fetch_blossom_blob_bounded_classified(
+        url,
+        &transport,
+        None,
+        tokio::time::Instant::now() + transport.transfer_timeout,
+        transport.download_limit,
+    )
+    .await
+    .map(|blob| (blob.bytes, blob.content_type))
+    .map_err(|failure| match failure {
+        AttachmentDownloadFailure::SizeLimit(..) => PublicImageFetchError::TooLarge,
+        failure => match failure.into_error() {
+            // The in-memory body reader reports a declared or streamed
+            // overrun as a stopped `BlobStore` failure with this wording.
+            AppError::BlobStore(detail) if detail.starts_with("download exceeds ") => {
+                PublicImageFetchError::TooLarge
+            }
+            AppError::UnsafeMediaFetch(_) => PublicImageFetchError::Refused,
+            _ => PublicImageFetchError::Failed,
+        },
+    })
+}
+
+/// Why [`fetch_public_image_limited`] returned no bytes. Details stay out:
+/// they can name the host the set author chose.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PublicImageFetchError {
+    /// The body exceeded the caller's ceiling (declared or streamed).
+    TooLarge,
+    /// The URL failed the destination policy before anything was dialed.
+    Refused,
+    /// Anything else: DNS, connect, TLS, HTTP status, redirect, timeout.
+    Failed,
+}
+
+/// The response's media type without parameters, lowercased, when it is a
+/// short printable header value.
+fn response_content_type(response: &reqwest::Response) -> Option<String> {
+    let value = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)?
+        .to_str()
+        .ok()?;
+    let media_type = value.split(';').next()?.trim();
+    (!media_type.is_empty() && media_type.len() <= 128).then(|| media_type.to_ascii_lowercase())
+}
+
+/// The overall deadline is the transport's transfer bound, like every other
+/// download; candidate startup keeps its own shorter bound inside the fetch.
+/// The byte ceiling is the transport's clamped limit, never a caller value
+/// above the encrypted-media maximum.
+pub(super) async fn fetch_blossom_blob_limited_with_transport(
+    url: &str,
+    transport: &BlossomHttpTransport,
+) -> Result<Vec<u8>, AppError> {
+    fetch_blossom_blob_bounded(
+        url,
+        transport,
+        None,
+        tokio::time::Instant::now() + transport.transfer_timeout,
+        transport.download_limit,
+    )
+    .await
 }
 
 /// Fetch a bounded blob through a caller-owned transport without collecting
@@ -1042,7 +1191,7 @@ pub(crate) async fn fetch_blossom_file_with_transport(
 pub(super) async fn fetch_blossom_blob_with_observer(
     url: &str,
     transport: &BlossomHttpTransport,
-    telemetry: Option<&AppPerformanceTelemetry>,
+    telemetry: Option<&PerformanceRecorder>,
 ) -> Result<Vec<u8>, AppError> {
     fetch_blossom_blob_with_observer_until(
         url,
@@ -1059,7 +1208,7 @@ pub(super) async fn fetch_blossom_blob_with_observer(
 pub(super) async fn fetch_blossom_blob_with_observer_until(
     url: &str,
     transport: &BlossomHttpTransport,
-    telemetry: Option<&AppPerformanceTelemetry>,
+    telemetry: Option<&PerformanceRecorder>,
     deadline: tokio::time::Instant,
 ) -> Result<Vec<u8>, AppError> {
     fetch_blossom_blob_bounded(
@@ -1076,7 +1225,7 @@ pub(super) async fn fetch_blossom_blob_with_observer_until(
 pub(super) async fn fetch_blossom_blob_bounded(
     url: &str,
     transport: &BlossomHttpTransport,
-    telemetry: Option<&AppPerformanceTelemetry>,
+    telemetry: Option<&PerformanceRecorder>,
     deadline: tokio::time::Instant,
     max_bytes: u64,
 ) -> Result<Vec<u8>, AppError> {
@@ -1093,12 +1242,15 @@ pub(super) struct FetchedBlob {
     pub response_url: Url,
     /// The body contains saved checkpoint bytes and may need one clean retry.
     pub resumed: bool,
+    /// The final response's `Content-Type`, when it sent a readable one. A
+    /// body completed from a saved checkpoint has none.
+    pub content_type: Option<String>,
 }
 
 pub(super) async fn fetch_blossom_blob_classified_until(
     url: &str,
     transport: &BlossomHttpTransport,
-    telemetry: Option<&AppPerformanceTelemetry>,
+    telemetry: Option<&PerformanceRecorder>,
     deadline: tokio::time::Instant,
 ) -> Result<FetchedBlob, AttachmentDownloadFailure> {
     fetch_blossom_blob_bounded_classified(
@@ -1114,7 +1266,7 @@ pub(super) async fn fetch_blossom_blob_classified_until(
 pub(super) async fn fetch_blossom_blob_bounded_classified(
     url: &str,
     transport: &BlossomHttpTransport,
-    telemetry: Option<&AppPerformanceTelemetry>,
+    telemetry: Option<&PerformanceRecorder>,
     deadline: tokio::time::Instant,
     max_bytes: u64,
 ) -> Result<FetchedBlob, AttachmentDownloadFailure> {
@@ -1238,7 +1390,7 @@ pub(super) async fn fetch_http_with_bounded_redirects<C, CFut, R>(
     max_body_bytes: u64,
     deadline: tokio::time::Instant,
     startup_timeout: Option<Duration>,
-    telemetry: Option<&AppPerformanceTelemetry>,
+    telemetry: Option<&PerformanceRecorder>,
     client_for_url: C,
     redirect_target: R,
 ) -> Result<Vec<u8>, AppError>
@@ -1265,7 +1417,7 @@ pub(super) async fn fetch_http_classified<C, CFut, R>(
     max_body_bytes: u64,
     deadline: tokio::time::Instant,
     startup_timeout: Option<Duration>,
-    telemetry: Option<&AppPerformanceTelemetry>,
+    telemetry: Option<&PerformanceRecorder>,
     client_for_url: C,
     redirect_target: R,
 ) -> Result<Vec<u8>, AttachmentDownloadFailure>
@@ -1294,7 +1446,7 @@ async fn fetch_http_resumable<C, CFut, R>(
     max_body_bytes: u64,
     deadline: tokio::time::Instant,
     startup_timeout: Option<Duration>,
-    telemetry: Option<&AppPerformanceTelemetry>,
+    telemetry: Option<&PerformanceRecorder>,
     resume: Option<&Arc<super::attachment_resume::AttachmentResume>>,
     mut client_for_url: C,
     mut redirect_target: R,
@@ -1350,6 +1502,7 @@ where
                 bytes: partial.expect("checked").1,
                 response_url: current,
                 resumed: true,
+                content_type: None,
             });
         }
         // DNS/host setup is network work too: failed resolution must consume
@@ -1473,6 +1626,7 @@ where
             }
         };
         let status = response.status();
+        let content_type = response_content_type(&response);
         if status.is_server_error() && !retried {
             retried = true;
             drop(response);
@@ -1554,6 +1708,7 @@ where
                     bytes,
                     response_url: current,
                     resumed,
+                    content_type,
                 });
             }
         }
@@ -1572,6 +1727,7 @@ where
                 bytes,
                 response_url: current,
                 resumed: false,
+                content_type,
             });
         }
         if !status.is_redirection() {
@@ -1869,7 +2025,7 @@ async fn read_limited_blossom_body_until(
     response: reqwest::Response,
     max_bytes: u64,
     first_byte_deadline: Option<tokio::time::Instant>,
-    telemetry: Option<&AppPerformanceTelemetry>,
+    telemetry: Option<&PerformanceRecorder>,
 ) -> Result<Vec<u8>, AttachmentDownloadFailure> {
     if let Some(content_length) = response.content_length()
         && content_length > max_bytes
@@ -1980,7 +2136,7 @@ async fn read_limited_blossom_body_until(
 
 /// Record one fixed phase without accepting caller-controlled labels.
 fn record_download_phase(
-    telemetry: Option<&AppPerformanceTelemetry>,
+    telemetry: Option<&PerformanceRecorder>,
     operation: AppPerformanceOperation,
     started_at: Instant,
     success: bool,
@@ -1990,7 +2146,14 @@ fn record_download_phase(
     }
 }
 
-fn blossom_upload_endpoint(server: &str) -> Result<(Url, String), AppError> {
+/// Apply the real transport's static contact policy to the actual upload URL.
+/// DNS resolution and connection failures remain the transfer's responsibility.
+pub(crate) fn blossom_upload_endpoint_allowed(server: &str, allow_loopback_http: bool) -> bool {
+    blossom_endpoint(server, "upload")
+        .is_ok_and(|(url, _)| validate_blossom_fetch_url(&url, allow_loopback_http).is_ok())
+}
+
+fn blossom_endpoint(server: &str, leaf: &str) -> Result<(Url, String), AppError> {
     let mut url = Url::parse(server.trim())
         .map_err(|_| AppError::BlobStore("invalid Blossom server URL".into()))?;
     match url.scheme() {
@@ -2005,17 +2168,22 @@ fn blossom_upload_endpoint(server: &str) -> Result<(Url, String), AppError> {
         .host_str()
         .ok_or_else(|| AppError::BlobStore("Blossom server URL is missing a host".into()))?
         .to_ascii_lowercase();
-    url.set_path("upload");
+    set_blossom_path(&mut url, leaf);
+    Ok((url, host))
+}
+
+fn set_blossom_path(url: &mut Url, leaf: &str) {
+    let path = format!("{}/{}", url.path().trim_end_matches('/'), leaf);
+    url.set_path(&path);
     url.set_query(None);
     url.set_fragment(None);
-    Ok((url, host))
 }
 
 pub(crate) fn blossom_blob_url(server: &str, encrypted_hash_hex: &str) -> String {
     blossom_blob_url_with_extension(server, encrypted_hash_hex, Some(".bin"))
 }
 
-fn blossom_blob_url_with_extension(
+pub(super) fn blossom_blob_url_with_extension(
     server: &str,
     hash_hex: &str,
     extension: Option<&str>,
@@ -2023,9 +2191,7 @@ fn blossom_blob_url_with_extension(
     let suffix = extension.unwrap_or_default();
     match Url::parse(server.trim()) {
         Ok(mut url) => {
-            url.set_path(&format!("{hash_hex}{suffix}"));
-            url.set_query(None);
-            url.set_fragment(None);
+            set_blossom_path(&mut url, &format!("{hash_hex}{suffix}"));
             url.to_string()
         }
         Err(_) => format!("{}/{}{}", server.trim_end_matches('/'), hash_hex, suffix),
@@ -2043,15 +2209,19 @@ pub(crate) fn blossom_content_hash_from_url(url: &str) -> Option<String> {
     })
 }
 
+/// A kind 24242 authorization for the BUD-01 `verb` on `encrypted_hash_hex`
+/// at `server_host`, with `content` as its human-readable description.
 async fn blossom_authorization_header(
     signer: &dyn MarmotNostrSigner,
     server_host: &str,
     encrypted_hash_hex: &str,
+    verb: &str,
+    content: &str,
 ) -> Result<String, AppError> {
     let now = unix_now_seconds();
     let expiration = now + BLOSSOM_UPLOAD_AUTH_TTL.as_secs();
     let tags = [
-        Tag::parse(["t", "upload"]),
+        Tag::parse(["t", verb]),
         Tag::parse(["expiration", &expiration.to_string()]),
         Tag::parse(["x", encrypted_hash_hex]),
         Tag::parse(["server", server_host]),
@@ -2063,7 +2233,7 @@ async fn blossom_authorization_header(
         .get_public_key()
         .await
         .map_err(|err| crate::external_signer_error(err, "Blossom auth public key"))?;
-    let mut unsigned = EventBuilder::new(Kind::Custom(24242), "Upload Blob")
+    let mut unsigned = EventBuilder::new(Kind::Custom(24242), content)
         .tags(tags)
         .custom_created_at(NostrTimestamp::from(now))
         .finalize_unsigned(public_key);
@@ -2097,5 +2267,50 @@ fn reqwest_upload_error(err: reqwest::Error) -> AppError {
         AppError::MediaUploadTimedOut
     } else {
         reqwest_blob_error(err)
+    }
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use super::*;
+
+    #[test]
+    fn blossom_operation_urls_preserve_the_server_base_path() {
+        let hash = "ab".repeat(32);
+        for (server, root) in [
+            ("https://media.example", "https://media.example"),
+            ("https://media.example/", "https://media.example"),
+            ("https://media.example/media", "https://media.example/media"),
+            (
+                "https://media.example/media/?q=1#part",
+                "https://media.example/media",
+            ),
+            (
+                "  https://MEDIA.EXAMPLE:443/nested/%2Ffiles///?q=1#part  ",
+                "https://media.example/nested/%2Ffiles",
+            ),
+            (
+                "http://127.0.0.1:8080/media/",
+                "http://127.0.0.1:8080/media",
+            ),
+        ] {
+            let (upload, _) = blossom_endpoint(server, "upload").unwrap();
+            let (delete, _) = blossom_endpoint(server, &hash).unwrap();
+            assert_eq!(
+                (
+                    upload.to_string(),
+                    blossom_blob_url_with_extension(server, &hash, None),
+                    blossom_blob_url(server, &hash),
+                    delete.to_string(),
+                ),
+                (
+                    format!("{root}/upload"),
+                    format!("{root}/{hash}"),
+                    format!("{root}/{hash}.bin"),
+                    format!("{root}/{hash}"),
+                ),
+                "upload, synthesized fetch and deletion must stay under the configured server base",
+            );
+        }
     }
 }

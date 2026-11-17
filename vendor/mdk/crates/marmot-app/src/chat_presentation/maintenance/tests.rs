@@ -69,7 +69,7 @@ fn title(account: &SqliteAppStorage, id: &str) -> PresentationText {
 }
 #[test]
 fn cached_before_creation_and_later_profile_changes_apply_without_a_subscriber() {
-    let account = SqliteAccountStorage::in_memory().unwrap();
+    let account = SqliteAccountStorage::in_memory_for_test().unwrap();
     let account_app = account.app_storage();
     let shared = SqliteSharedStorage::in_memory().unwrap();
     profile(&shared, Some("First"));
@@ -83,7 +83,7 @@ fn cached_before_creation_and_later_profile_changes_apply_without_a_subscriber()
 
 #[test]
 fn dirty_same_subject_display_survives_until_maintenance_and_new_titles_notify_once() {
-    let account = SqliteAccountStorage::in_memory().unwrap();
+    let account = SqliteAccountStorage::in_memory_for_test().unwrap();
     let account_app = account.app_storage();
     let shared = SqliteSharedStorage::in_memory().unwrap();
     profile(&shared, Some("Peer"));
@@ -137,9 +137,11 @@ fn dirty_same_subject_display_survives_until_maintenance_and_new_titles_notify_o
 
 #[test]
 fn restart_mid_fanout_and_coalesced_newer_profiles_do_not_skip_other_identities() {
+    // This fixture can run before an app constructor. SQLCipher's allocator opt-in is sticky.
+    storage_sqlite::relax_storage_for_test_process();
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("account.db");
-    let key = storage_sqlite::SqlCipherKey::new("presentation test key").unwrap();
+    let key = storage_sqlite::SqlCipherKey::raw([0x42; 32]);
     let account = SqliteAccountStorage::open_encrypted(&path, &key).unwrap();
     let shared = SqliteSharedStorage::in_memory().unwrap();
     profile(&shared, Some("Original"));
@@ -204,7 +206,7 @@ fn restart_mid_fanout_and_coalesced_newer_profiles_do_not_skip_other_identities(
 
 #[test]
 fn removal_store_replacement_and_new_dependency_after_watermark_clear_stale_data() {
-    let account = SqliteAccountStorage::in_memory().unwrap();
+    let account = SqliteAccountStorage::in_memory_for_test().unwrap();
     let account_app = account.app_storage();
     let shared = SqliteSharedStorage::in_memory().unwrap();
     profile(&shared, Some("Cached"));
@@ -247,7 +249,7 @@ fn removal_store_replacement_and_new_dependency_after_watermark_clear_stale_data
 
 #[test]
 fn named_pair_depends_on_peer_avatar_and_membership_changes_clear_old_peer_immediately() {
-    let account = SqliteAccountStorage::in_memory().unwrap();
+    let account = SqliteAccountStorage::in_memory_for_test().unwrap();
     let account_app = account.app_storage();
     let shared = SqliteSharedStorage::in_memory().unwrap();
     profile(&shared, Some("Peer"));
@@ -294,7 +296,7 @@ fn named_pair_depends_on_peer_avatar_and_membership_changes_clear_old_peer_immed
 
 #[test]
 fn unrelated_directory_history_is_skipped_and_new_unrelated_changes_are_batched() {
-    let account = SqliteAccountStorage::in_memory().unwrap();
+    let account = SqliteAccountStorage::in_memory_for_test().unwrap();
     let account_app = account.app_storage();
     let shared = SqliteSharedStorage::in_memory().unwrap();
     for i in 0..250 {
@@ -340,7 +342,7 @@ fn unrelated_directory_history_is_skipped_and_new_unrelated_changes_are_batched(
 
 #[test]
 fn rejected_pending_presentation_yields_until_new_evidence_allows_progress() {
-    let account = SqliteAccountStorage::in_memory().unwrap();
+    let account = SqliteAccountStorage::in_memory_for_test().unwrap();
     let account_app = account.app_storage();
     let shared = SqliteSharedStorage::in_memory().unwrap();
     profile(&shared, Some("First"));
@@ -397,9 +399,9 @@ fn rejected_pending_presentation_yields_until_new_evidence_allows_progress() {
 
 #[test]
 fn account_catchup_and_replacement_cannot_restore_another_accounts_deleted_chat() {
-    let first = SqliteAccountStorage::in_memory().unwrap();
+    let first = SqliteAccountStorage::in_memory_for_test().unwrap();
     let first_app = first.app_storage();
-    let second = SqliteAccountStorage::in_memory().unwrap();
+    let second = SqliteAccountStorage::in_memory_for_test().unwrap();
     let second_app = second.app_storage();
     let shared = SqliteSharedStorage::in_memory().unwrap();
     profile(&shared, Some("Initial"));
@@ -464,7 +466,7 @@ fn account_catchup_and_replacement_cannot_restore_another_accounts_deleted_chat(
             .unwrap()
             .is_empty()
     );
-    let replacement_account = SqliteAccountStorage::in_memory().unwrap();
+    let replacement_account = SqliteAccountStorage::in_memory_for_test().unwrap();
     seed(&replacement_account.app_storage(), "11", "");
     drain(&replacement_account, &replacement);
     assert_eq!(
@@ -478,7 +480,7 @@ fn account_catchup_and_replacement_cannot_restore_another_accounts_deleted_chat(
 
 #[test]
 fn named_pair_roster_matches_durable_order_and_unchanged_hydration_stays_clean() {
-    let account = SqliteAccountStorage::in_memory().unwrap();
+    let account = SqliteAccountStorage::in_memory_for_test().unwrap();
     let account_app = account.app_storage();
     let shared = SqliteSharedStorage::in_memory().unwrap();
     seed(&account_app, "11", "Named pair");
@@ -525,7 +527,7 @@ fn named_pair_roster_matches_durable_order_and_unchanged_hydration_stays_clean()
 
 #[test]
 fn avatar_maintenance_tracks_profile_removal_without_a_screen_subscription() {
-    let account = SqliteAccountStorage::in_memory().unwrap();
+    let account = SqliteAccountStorage::in_memory_for_test().unwrap();
     let account_app = account.app_storage();
     let shared = SqliteSharedStorage::in_memory().unwrap();
     profile(&shared, Some("Avatar"));

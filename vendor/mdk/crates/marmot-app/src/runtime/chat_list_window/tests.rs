@@ -15,12 +15,22 @@ impl Fixture {
         Self::with_base_rows(count, true)
     }
     fn with_base_rows(count: usize, prepared: bool) -> Self {
+        Self::build(count, prepared, None)
+    }
+    /// Chat-list time starts at `base_ms` and follows tokio's paused clock.
+    fn at(count: usize, base_ms: i64) -> Self {
+        Self::build(count, true, Some(base_ms))
+    }
+    fn build(count: usize, prepared: bool, clock_base_ms: Option<i64>) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let account = AccountHome::open(dir.path())
             .create_account("alice")
             .unwrap();
-        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        let mut app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(Arc::new(crate::tests::ScriptedPushRelayClient::default()));
+        if let Some(base_ms) = clock_base_ms {
+            app = app.with_virtual_chat_list_clock(base_ms);
+        }
         app.ensure_account_state("alice").unwrap();
         let store = app.account_storage("alice").unwrap();
         let groups = (0..count)
@@ -460,18 +470,13 @@ async fn archive_and_anchor_loss_recover_neighbors_then_reset_without_stale_spli
 // Overflows the invalidation broadcast without yielding so the window must
 // recover from lag; only one thread guarantees it cannot drain meanwhile.
 #[tokio::test(flavor = "current_thread")]
-async fn lag_and_cancelled_receiver_recover_without_new_events_and_mutes_expire() {
+async fn lag_and_cancelled_receiver_recover_without_new_events() {
     let f = Fixture::new(20);
-    f.store
-        .app_storage()
-        .set_chat_muted("0000", Some(crate::notifications::unix_now_ms() + 1500))
-        .unwrap();
     let mut sub = f
         .runtime
         .open_chat_list_window("alice", ChatListView::Chats, Some(10))
         .await
         .unwrap();
-    assert!(sub.snapshot.rows[0].row.muted);
     assert!(
         tokio::time::timeout(Duration::from_millis(20), sub.recv())
             .await
@@ -494,9 +499,6 @@ async fn lag_and_cancelled_receiver_recover_without_new_events_and_mutes_expire(
     }
     let unread = next(&mut sub).await;
     assert!(unread.rows[0].row.has_unread);
-    let unmuted = next(&mut sub).await;
-    assert!(!unmuted.rows[0].row.muted);
-    assert!(unmuted.sequence > unread.sequence);
     f.runtime.shutdown_and_close().await.unwrap();
     assert!(sub.recv().await.unwrap().is_none());
 }
@@ -774,7 +776,12 @@ async fn authoritative_worker_acceptance_preserves_archive_and_rejoin_restores_o
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(Arc::new(crate::tests::ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let group = client.create_group("Invite", &[]).await.unwrap();
+    let group = client
+        .create_group("Invite", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let id = hex::encode(group.as_slice());
     // Install the invitation's persisted confirmation state, as inbound projection does.
     client.state.groups[0].pending_confirmation = true;
@@ -1012,7 +1019,9 @@ async fn invalid_window_query_is_distinct_from_readiness() {
         label: "alice".into(),
         account_id: f.account_id.clone(),
         store_epoch: vec![],
-        view: ChatListView::Chats,
+        query: ChatListView::Chats.into(),
+        drafts_anywhere: false,
+        profiles_anywhere: false,
     };
     let result = reader
         .read(
@@ -1111,7 +1120,9 @@ async fn declined_invitation_rejoins_through_real_client_flow_and_restores_chats
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(relay.clone());
     remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
-    let plane = MarmotRelayPlane::new(None, relay);
+    let plane = MarmotRelayPlane::new(None, relay.clone());
+    // This scripted participant has no socket forwarder to report EOSE.
+    // Let ordinary native ingress release its initial stored-event batches.
     let mut alice = app
         .client_with_relay_plane("alice", &plane, None)
         .await
@@ -1124,7 +1135,9 @@ async fn declined_invitation_rejoins_through_real_client_flow_and_restores_chats
     let group = alice
         .create_group("Invite", &[&bob.account_id_hex])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert!(
         bob_client
             .sync()
@@ -1167,7 +1180,9 @@ async fn declined_invitation_rejoins_through_real_client_flow_and_restores_chats
     alice
         .invite_members(&group, &[&bob.account_id_hex])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert!(
         bob_client
             .sync()
@@ -1480,9 +1495,7 @@ async fn draft_preview_updates_both_list_contracts_without_reordering_or_network
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn chat_list_draft_acceptance_rollback_and_lag_use_authoritative_store() {
-    use cgka_traits::storage::{
-        GroupStorage, OutboundIntentStorage, QueuedOutboundIntent, StorageProvider,
-    };
+    use cgka_traits::storage::{OutboundIntentStorage, QueuedOutboundIntent, StorageProvider};
     use cgka_traits::{GroupId, MessageId, SendIntent};
     let f = Fixture::new(1);
     f.app
@@ -1509,7 +1522,9 @@ async fn chat_list_draft_acceptance_rollback_and_lag_use_authoritative_store() {
             disbanded: None,
             join_epoch: cgka_traits::EpochId(0),
             local_copy_install_epoch: cgka_traits::EpochId(0),
+            self_removed_sibling_slots: Default::default(),
             local_copy_welcome_created_at: None,
+            device_roster_departures: Vec::new(),
         })
         .unwrap();
     let intent = QueuedOutboundIntent {
@@ -1592,7 +1607,8 @@ fn chat_list_leave_hint_agrees_with_conversation_authority_for_projected_states(
         .chat_list_row("0000")
         .unwrap()
         .unwrap();
-    // Compare independently implemented public policies, including admin preflight.
+    // Compare availability when Leave is eligible for either role. A coarse row
+    // does not load the admin roster; the detailed capability refuses a last admin.
     // Engine-only facts are deliberately tested separately below: list rendering
     // must not hydrate an engine just to obtain those facts.
     for membership in [
@@ -1621,20 +1637,26 @@ fn chat_list_leave_hint_agrees_with_conversation_authority_for_projected_states(
                                 is_member: membership == SelfMembership::Member,
                                 self_membership: membership,
                                 is_admin: admin,
-                                admin_count: 1,
+                                admin_count: 2,
                                 pending_confirmation: pending,
                                 leave_request_pending: leaving,
+                                leave_blocked: false,
                                 lifecycle: lifecycle.into(),
                                 unrecoverable: false,
                                 disbanding,
                                 disbanding_enabled: false,
                                 has_disbanding_blockers: false,
+                                admin_leave_steps_down: false,
                             };
                             let capabilities = authority.capabilities();
+                            // A pending invitation departs through Decline,
+                            // which an admin invitee also demotes before.
                             assert_eq!(
                                 ChatListRowActions::for_row(&row).can_start_leave,
-                                capabilities.can_leave
-                                    || capabilities.requires_self_demote_before_leave,
+                                capabilities.participation
+                                    != ConversationParticipation::PendingInvitation
+                                    && (capabilities.can_leave
+                                        || capabilities.requires_self_demote_before_leave),
                                 "{authority:?}"
                             );
                         }
@@ -1661,14 +1683,403 @@ fn chat_list_leave_hint_agrees_with_conversation_authority_for_projected_states(
             admin_count: 1,
             pending_confirmation: false,
             leave_request_pending: false,
+            leave_blocked: false,
             lifecycle: row.lifecycle_state.into(),
             unrecoverable,
             disbanding: false,
             disbanding_enabled: false,
             has_disbanding_blockers: false,
+            admin_leave_steps_down: false,
         }
         .capabilities();
         assert_eq!(capabilities.participation, participation);
         assert!(!capabilities.can_leave && !capabilities.requires_self_demote_before_leave);
     }
+}
+
+fn filtered(filter: ChatListFilter) -> ChatListViewQuery {
+    ChatListViewQuery {
+        view: ChatListView::Chats,
+        filter: Some(filter),
+    }
+}
+
+/// Drafts otherwise wake a window only for visible rows. A filter on drafts
+/// must re-read when a chat off screen gains or loses one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_draft_filtered_window_rereads_on_an_off_screen_draft_change() {
+    let f = Fixture::new(5);
+    let mut window = f
+        .runtime
+        .open_chat_list_window(
+            "alice",
+            filtered(ChatListFilter::Condition(ChatListCondition::HasDraft)),
+            Some(3),
+        )
+        .await
+        .unwrap();
+    assert!(window.snapshot.rows.is_empty());
+    f.app
+        .save_message_draft("alice", "0003", "later", None, vec![])
+        .unwrap();
+    assert_eq!(ids(&next(&mut window).await), ["0003"]);
+    f.app.delete_message_draft("alice", "0003").unwrap();
+    assert!(next(&mut window).await.rows.is_empty());
+    f.runtime.shutdown_and_close().await.unwrap();
+}
+
+/// A text window opens once the view's search text is ready, and when a peer
+/// renames, the chats that now match enter the window, though none was on
+/// screen before. No account worker runs here: the text read catches search
+/// text up itself, for a live window and for a one-shot ID read. A named
+/// direct chat, titled by its group name, matches by its peer's profile name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_text_filtered_window_picks_up_an_off_screen_peer_profile_change() {
+    // Every third chat is a direct chat with the same peer and no group name.
+    let f = Fixture::new(12);
+    f.mutate("0004", |group| group.profile_name = "Book club".into());
+    let query = filtered(ChatListFilter::Text("zebra".into()));
+    let mut window = f
+        .runtime
+        .open_chat_list_window("alice", query.clone(), Some(3))
+        .await
+        .unwrap();
+    assert!(window.snapshot.rows.is_empty());
+    let rename = |name: &str, created_at| {
+        f.app
+            .directory()
+            .save_directory_entry_for_test(&UserDirectoryRecord {
+                account_id_hex: "bb".repeat(32),
+                npub: "fixture".into(),
+                local_account: None,
+                profile: Some(UserProfileMetadata {
+                    name: Some(name.into()),
+                    created_at,
+                    ..Default::default()
+                }),
+                follows: vec![],
+                follow_source_relays: vec![],
+                relay_lists: AccountRelayListStatus::empty(),
+                key_package: None,
+            })
+            .unwrap()
+    };
+    rename("Zebra Crossing", 200);
+    let direct = ["0001", "0004", "0007", "000a"];
+    let updated = next_where(&mut window, |w| !w.rows.is_empty()).await;
+    let all = f
+        .runtime
+        .chat_list_ids("alice", query.clone())
+        .await
+        .unwrap();
+    let mut sorted = all.clone();
+    sorted.sort();
+    assert_eq!(sorted, direct);
+    assert_eq!(ids(&updated), all[..3]);
+    // An ID read straight after a rename sees it, whether or not the window
+    // has caught up yet.
+    rename("Yak", 300);
+    assert_eq!(
+        f.runtime.chat_list_ids("alice", query).await.unwrap(),
+        Vec::<String>::new()
+    );
+    f.runtime.shutdown_and_close().await.unwrap();
+}
+
+/// Search readiness follows the committed catch-up checkpoint, not a step's
+/// result: once a step has selected a renamed peer for fan-out, its chats are
+/// neither refreshed nor marked pending, and only the checkpoint shows the
+/// catch-up is still owed. A text read that lost that step to another caller
+/// must see the same.
+#[test]
+fn search_catch_up_is_owed_until_a_selected_peer_is_fanned_out() {
+    use crate::chat_presentation::maintenance::{maintain, search_catch_up_owed};
+    let f = Fixture::new(6);
+    let shared = f.app.shared_storage().unwrap();
+    let app = f.store.app_storage();
+    while maintain(&f.store, &shared, &f.account_id).unwrap() {}
+    assert!(!search_catch_up_owed(&app, &shared).unwrap());
+    f.app
+        .directory()
+        .save_directory_entry_for_test(&UserDirectoryRecord {
+            account_id_hex: "bb".repeat(32),
+            npub: "fixture".into(),
+            local_account: None,
+            profile: Some(UserProfileMetadata {
+                name: Some("Zebra".into()),
+                created_at: 200,
+                ..Default::default()
+            }),
+            follows: vec![],
+            follow_source_relays: vec![],
+            relay_lists: AccountRelayListStatus::empty(),
+            key_package: None,
+        })
+        .unwrap();
+    assert!(search_catch_up_owed(&app, &shared).unwrap());
+    assert!(maintain(&f.store, &shared, &f.account_id).unwrap());
+    assert!(
+        app.chat_presentation_checkpoint()
+            .unwrap()
+            .state
+            .active
+            .is_some()
+    );
+    assert!(
+        app.chat_list_pending_search_text(ChatListView::Chats, 100)
+            .unwrap()
+            .is_empty(),
+        "the selected peer's chats are not pending"
+    );
+    assert!(search_catch_up_owed(&app, &shared).unwrap());
+    while maintain(&f.store, &shared, &f.account_id).unwrap() {}
+    assert!(!search_catch_up_owed(&app, &shared).unwrap());
+}
+
+/// A window's preparation stores nothing once the catch-up checkpoint has
+/// moved since it read profiles: the step that moved it may have passed a
+/// change to a peer the pending chat did not depend on yet. The chat stays
+/// pending and a fresh read stores it.
+#[test]
+fn a_window_batch_read_before_a_catch_up_step_is_read_again() {
+    use crate::chat_presentation::maintenance::{commit_window_batch, maintain, read_window_batch};
+    let f = Fixture::new(6);
+    let shared = f.app.shared_storage().unwrap();
+    let app = f.store.app_storage();
+    while maintain(&f.store, &shared, &f.account_id).unwrap() {}
+    f.mutate("0001", |group| group.profile_name = "Pals".into());
+    let pending = || {
+        app.chat_list_pending_search_text(ChatListView::Chats, 100)
+            .unwrap()
+    };
+    assert_eq!(pending(), ["0001"]);
+    let batch = read_window_batch(&app, &shared, &f.account_id, &["0001".into()]).unwrap();
+    // Meanwhile another caller's catch-up step passes a directory change.
+    f.app
+        .directory()
+        .save_directory_entry_for_test(&UserDirectoryRecord {
+            account_id_hex: "cc".repeat(32),
+            npub: "fixture".into(),
+            local_account: None,
+            profile: Some(UserProfileMetadata {
+                name: Some("Zebra".into()),
+                created_at: 200,
+                ..Default::default()
+            }),
+            follows: vec![],
+            follow_source_relays: vec![],
+            relay_lists: AccountRelayListStatus::empty(),
+            key_package: None,
+        })
+        .unwrap();
+    let checkpoint = app.chat_presentation_checkpoint().unwrap();
+    let mut next = checkpoint.state.clone();
+    next.revision = shared.directory_presentation_version().unwrap().revision;
+    assert!(
+        app.commit_chat_presentation_batch(&checkpoint, &next, &[])
+            .unwrap()
+    );
+    assert!(!commit_window_batch(&app, &batch).unwrap(), "read again");
+    assert_eq!(pending(), ["0001"]);
+    let batch = read_window_batch(&app, &shared, &f.account_id, &["0001".into()]).unwrap();
+    assert!(commit_window_batch(&app, &batch).unwrap());
+    assert!(pending().is_empty());
+}
+
+/// Chats enter and leave a filtered window as the filtered fact changes, the
+/// window always equals the head of the same query's complete ID set, and no
+/// row appears twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn filtered_window_tracks_chats_entering_and_leaving_without_duplicates() {
+    let f = Fixture::new(30);
+    let query = filtered(ChatListFilter::All(vec![
+        ChatListFilter::Condition(ChatListCondition::ManualUnread),
+        // Host IDs are normalized before the read.
+        ChatListFilter::Not(Box::new(ChatListFilter::GroupIds(vec!["001A".into()]))),
+    ]));
+    let mut window = f
+        .runtime
+        .open_chat_list_window("alice", query.clone(), Some(4))
+        .await
+        .unwrap();
+    assert!(window.snapshot.rows.is_empty());
+    let check = |snapshot: &ChatListWindowSnapshot, all: &[String]| {
+        let shown = ids(snapshot);
+        let unique = shown.iter().collect::<std::collections::HashSet<_>>();
+        assert_eq!(unique.len(), shown.len(), "duplicate rows: {shown:?}");
+        assert_eq!(
+            shown,
+            all[..shown.len()]
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(snapshot.has_more_after, all.len() > shown.len());
+    };
+    let mut entered = Vec::new();
+    let mut current = window.snapshot.clone();
+    for id in ["0012", "0003", "001a", "0017", "0008", "001c"] {
+        f.mark_unread(id);
+        if id != "001a" {
+            entered.push(id);
+        }
+        let all = f
+            .runtime
+            .chat_list_ids("alice", query.clone())
+            .await
+            .unwrap();
+        let mut expected = entered.clone();
+        expected.sort();
+        assert_eq!(all, expected);
+        let head = all[..all.len().min(4)]
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let more = all.len() > head.len();
+        // An excluded chat changes nothing, so no replacement is published.
+        if ids(&current) != head || current.has_more_after != more {
+            current = next_where(&mut window, |w| ids(w) == head && w.has_more_after == more).await;
+        }
+        check(&current, &all);
+    }
+    // Hold the second row as the anchor, then make it leave the filter: the
+    // window recovers on a neighbor rather than splicing a stale page.
+    let handle = window.window_handle();
+    let anchored = handle
+        .set_visible_anchor(current.sequence, "0008")
+        .await
+        .unwrap();
+    assert!(matches!(
+        anchored.anchor,
+        ChatListAnchorOutcome::Retained { index: 1, .. }
+    ));
+    f.store
+        .app_storage()
+        .set_chat_manually_unread(&f.account_id, "0008", false, &|_, _| false)
+        .unwrap();
+    f.signal();
+    let left = next_where(&mut window, |w| !ids(w).contains(&"0008")).await;
+    assert!(matches!(
+        left.anchor,
+        ChatListAnchorOutcome::Recovered { .. }
+    ));
+    let all = f
+        .runtime
+        .chat_list_ids("alice", query.clone())
+        .await
+        .unwrap();
+    assert_eq!(all, ["0003", "0012", "0017", "001c"]);
+    check(&left, &all);
+    assert_eq!(
+        f.runtime
+            .revalidate_chat_list_ids(
+                "alice",
+                query,
+                vec!["001C".into(), "0008".into(), "001a".into()]
+            )
+            .await
+            .unwrap(),
+        ["001c"]
+    );
+    f.runtime.shutdown_and_close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invalid_queries_fail_before_any_read() {
+    let f = Fixture::new(2);
+    let too_many = filtered(ChatListFilter::GroupIds(vec![
+        "00".into();
+        MAX_CHAT_LIST_FILTER_GROUP_IDS
+            + 1
+    ]));
+    assert!(matches!(
+        f.runtime.open_chat_list_window("alice", too_many.clone(), None).await,
+        Err(ChatListWindowError::App(error))
+            if matches!(error.as_ref(), AppError::InvalidChatListQuery(ChatListQueryError::TooManyGroupIds))
+    ));
+    assert!(matches!(
+        f.runtime.chat_list_ids("alice", too_many).await,
+        Err(AppError::InvalidChatListQuery(
+            ChatListQueryError::TooManyGroupIds
+        ))
+    ));
+    assert!(matches!(
+        f.runtime
+            .chat_list_ids(
+                "alice",
+                filtered(ChatListFilter::GroupIds(vec!["zz".into()]))
+            )
+            .await,
+        Err(AppError::Hex(_))
+    ));
+    // Message text scans history: select-all accepts it, a window refuses it.
+    let messages = filtered(ChatListFilter::Not(Box::new(ChatListFilter::MessageText(
+        "anything".into(),
+    ))));
+    assert!(matches!(
+        f.runtime.open_chat_list_window("alice", messages.clone(), None).await,
+        Err(ChatListWindowError::App(error))
+            if matches!(error.as_ref(), AppError::InvalidChatListQuery(ChatListQueryError::MessageTextInWindow))
+    ));
+    assert_eq!(
+        f.runtime
+            .chat_list_ids("alice", messages)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    f.runtime.shutdown_and_close().await.unwrap();
+}
+
+/// Nothing is written when a mute expires. A visible row's mute icon, a Muted
+/// window and an unmuted window still change at the expiry, in virtual time:
+/// never before it, and within the window's invalidation coalescing after it.
+/// The unmuted window never showed the chat, so only the expiry its read
+/// reported for the whole view can wake it.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn mute_expiry_changes_windows_at_expiry_even_off_screen() {
+    const BASE_MS: i64 = 1_700_000_000_000;
+    const EXPIRY: Duration = Duration::from_secs(60);
+    // The window waits this long after an invalidation before it re-reads.
+    const COALESCED: Duration = Duration::from_millis(10);
+    let f = Fixture::at(20, BASE_MS);
+    let store = f.store.app_storage();
+    store
+        .set_chat_muted("0000", Some(BASE_MS + EXPIRY.as_millis() as i64))
+        .unwrap();
+    store.set_chat_muted("0001", None).unwrap();
+    let started = tokio::time::Instant::now();
+    let open = |query: ChatListViewQuery| f.runtime.open_chat_list_window("alice", query, Some(5));
+    let mut plain = open(ChatListView::Chats.into()).await.unwrap();
+    let mut muted = open(filtered(ChatListFilter::Condition(
+        ChatListCondition::Muted,
+    )))
+    .await
+    .unwrap();
+    let mut unmuted = open(filtered(ChatListFilter::Not(Box::new(
+        ChatListFilter::Condition(ChatListCondition::Muted),
+    ))))
+    .await
+    .unwrap();
+    assert!(plain.snapshot.rows[0].row.muted);
+    assert_eq!(ids(&muted.snapshot), ["0000", "0001"]);
+    assert!(!ids(&unmuted.snapshot).contains(&"0000"));
+    let at_expiry = |elapsed: Duration| (EXPIRY..=EXPIRY + COALESCED).contains(&elapsed);
+    // A millisecond early, nothing has changed.
+    assert!(
+        tokio::time::timeout(EXPIRY - Duration::from_millis(1), muted.recv())
+            .await
+            .is_err()
+    );
+    let left = next(&mut muted).await;
+    assert!(at_expiry(started.elapsed()), "{:?}", started.elapsed());
+    assert_eq!(ids(&left), ["0001"]);
+    let entered = next(&mut unmuted).await;
+    assert!(at_expiry(started.elapsed()), "{:?}", started.elapsed());
+    assert_eq!(ids(&entered)[0], "0000");
+    let row = next(&mut plain).await;
+    assert!(at_expiry(started.elapsed()), "{:?}", started.elapsed());
+    assert!(!row.rows[0].row.muted);
+    f.runtime.shutdown_and_close().await.unwrap();
 }

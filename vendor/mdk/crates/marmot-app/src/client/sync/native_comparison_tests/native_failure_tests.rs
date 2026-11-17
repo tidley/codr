@@ -1,4 +1,4 @@
-use super::super::comparison_job::MAX_COMPARISON_ADMISSION_PER_TURN;
+use super::super::MAX_NATIVE_ADMISSION_PER_TURN;
 use super::*;
 
 fn fault_connection(client: &AppClient) -> rusqlite::Connection {
@@ -9,6 +9,7 @@ fn fault_connection(client: &AppClient) -> rusqlite::Connection {
     let key = app
         .sqlcipher_key(label, &keys, &path, crate::SqlcipherDatabaseKind::Session)
         .unwrap();
+    storage_sqlite::expect_uncounted_writes_for_test(&path);
     let connection = rusqlite::Connection::open(path).unwrap();
     storage_sqlite::open_hardened_sqlcipher(
         &connection,
@@ -146,13 +147,26 @@ async fn held_native_restores_cursor() {
     fixture.receiver = client_on_app_relay_plane(&app, "receiver").await;
     fixture.receiver.prepare_transport().await.unwrap();
     lease_native(&mut fixture.receiver, &fixture.group, vec![event.clone()]).await;
-    fixture.receiver.admit_native_turn().await.unwrap();
-    assert!(
-        app.load_state("receiver")
-            .unwrap()
-            .last_transport_timestamp
-            .is_some_and(|cursor| cursor >= event.event.created_at)
-    );
+    // A turn defers the save it owes while the reopened plane's replay
+    // admission settles, or while another plane task holds the state the
+    // cursor seal reads without waiting. The intent survives the deferral, so
+    // later turns save it without another delivery.
+    timeout(Duration::from_secs(10), async {
+        loop {
+            fixture.receiver.admit_native_turn().await.unwrap();
+            if app
+                .load_state("receiver")
+                .unwrap()
+                .last_transport_timestamp
+                .is_some_and(|cursor| cursor >= event.event.created_at)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the redelivered duplicate restores the cursor save");
     assert_eq!(visible_messages(&fixture.receiver, &fixture.group).len(), 1);
     assert!(
         fixture
@@ -162,195 +176,6 @@ async fn held_native_restores_cursor() {
             .is_empty(),
         "an already-held replay repairs its floor without duplicate plaintext notifications"
     );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn live_check_counts_ingest() {
-    let mut fixture = crypto_fixture().await;
-    let (events, expected) = encrypted_texts(&mut fixture.sender, &fixture.group).await;
-    let app = fixture.receiver.app.clone();
-    drop(fixture.receiver);
-    fixture.receiver = client_on_app_relay_plane(&app, "receiver").await;
-    fixture.receiver.set_audit_recording(true);
-    // Start a real source generation without synchronizing its owner yet.
-    // The first live ingest must checkpoint that generation after MLS commits.
-    fixture.receiver.open_native_ingress().await.unwrap();
-    fixture
-        .receiver
-        .runtime
-        .activate_transport(None)
-        .await
-        .unwrap();
-    let delivery = fixture
-        .receiver
-        .adapter
-        .recovered_deliveries(events[0].clone())
-        .await
-        .unwrap()
-        .pop()
-        .unwrap();
-    let routes_before = fixture.receiver.pending_runtime_group_subscription_refresh;
-    let connection = fault_connection(&fixture.receiver);
-    connection.execute_batch(
-        "CREATE TRIGGER fail_live_check BEFORE UPDATE OF scope_payload ON account_recovery_scopes
-         BEGIN SELECT RAISE(FAIL, 'injected live replay checkpoint failure'); END;",
-    ).unwrap();
-
-    let failure = fixture
-        .receiver
-        .ingest_received_delivery_with_partial(delivery.clone())
-        .await
-        .unwrap_err();
-    assert!(
-        failure
-            .source
-            .to_string()
-            .contains("injected live replay checkpoint failure")
-    );
-    let messages = visible_messages(&fixture.receiver, &fixture.group);
-    assert_eq!(messages.len(), 1);
-    assert_eq!(
-        expected.get(&messages[0].message_id_hex),
-        Some(&messages[0].plaintext)
-    );
-    assert_eq!(
-        fixture.receiver.pending_runtime_group_subscription_refresh, routes_before,
-        "a plaintext ingest does not dirty membership routes"
-    );
-    let drains = crate::client::audit_recovery::recorded_v5_rows(&app, "sync_drain");
-    assert_eq!(drains.len(), 1);
-    assert_eq!(
-        drains[0]["event"]["deliveries"], 1,
-        "the failed live cursor check must count the already-durable delivery"
-    );
-
-    connection
-        .execute_batch("DROP TRIGGER fail_live_check")
-        .unwrap();
-    let retry = fixture
-        .receiver
-        .ingest_received_delivery_with_partial(delivery)
-        .await
-        .unwrap();
-    assert!(retry.messages.is_empty());
-    assert_eq!(visible_messages(&fixture.receiver, &fixture.group).len(), 1);
-}
-
-async fn mixed_network(
-    client: &mut AppClient,
-    compared: Vec<NostrRelayEvent>,
-) -> (
-    AttemptGrant,
-    super::super::comparison_job::ComparisonExecution,
-    TransportReconciliationRoute,
-    super::super::comparison_job::ComparisonNetworkResult,
-) {
-    client.request_bounded_comparison().unwrap();
-    let mut permit = ExplicitRecoveryPermit::default();
-    let grant = client
-        .authorize_account_recovery(
-            Some(&mut permit),
-            EpochBackfillExecutionSeam::ExplicitCatchUp,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    let route = grant
-        .inventory
-        .iter()
-        .find_map(|item| match item.route {
-            TransportReconciliationRoute::Group(_) => Some(item.route.clone()),
-            TransportReconciliationRoute::Inbox => None,
-        })
-        .unwrap();
-    script_subset(client, route.clone(), compared);
-    let execution = client.begin_comparison_grant(&grant).await.unwrap();
-    let credit = Arc::new(tokio::sync::Semaphore::new(1))
-        .try_acquire_owned()
-        .unwrap();
-    let mut network = ComparisonNetworkJob::start(
-        client,
-        &grant,
-        credit,
-        tokio::time::Instant::now() + Duration::from_secs(30),
-        None,
-    )
-    .unwrap();
-    let (_credit, result) = timeout(Duration::from_secs(30), network.wait())
-        .await
-        .unwrap()
-        .unwrap();
-    (grant, execution, route, result)
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mixed_error_keeps_input() {
-    let mut fixture = crypto_fixture().await;
-    let (mut events, expected) = encrypted_texts(&mut fixture.sender, &fixture.group).await;
-    events.truncate(2);
-    events.sort_by_key(|event| (event.event.created_at, event.event.id.clone()));
-    let (grant, execution, route, network) =
-        mixed_network(&mut fixture.receiver, vec![events[1].clone()]).await;
-    let storage = fixture
-        .receiver
-        .app
-        .account_storage("receiver")
-        .unwrap()
-        .app_storage();
-    let cursor = storage
-        .transport_reconciliation_replay_cursor(&route)
-        .unwrap();
-    let connection = fault_connection(&fixture.receiver);
-    fail_message(&connection, &fixture.group);
-    lease_native(
-        &mut fixture.receiver,
-        &fixture.group,
-        vec![events[0].clone()],
-    )
-    .await;
-    assert!(
-        fixture
-            .receiver
-            .admit_comparison_inline(None, grant, execution, network)
-            .await
-            .is_err()
-    );
-    assert_eq!(
-        storage
-            .transport_reconciliation_replay_cursor(&route)
-            .unwrap(),
-        cursor
-    );
-    assert!(
-        fixture
-            .receiver
-            .recovery_owner
-            .native_batch
-            .as_ref()
-            .unwrap()
-            .delivery()
-            .is_some()
-    );
-    assert!(fixture.receiver.next_event().await.is_err());
-    assert!(visible_messages(&fixture.receiver, &fixture.group).is_empty());
-    connection
-        .execute_batch("DROP TRIGGER fail_native_message")
-        .unwrap();
-    let summary = fixture.receiver.next_event().await.unwrap();
-    assert_eq!(summary.messages.len(), 1);
-    assert_eq!(
-        expected.get(&summary.messages[0].message_id_hex),
-        Some(&summary.messages[0].plaintext)
-    );
-    fixture.receiver.admit_native_turn().await.unwrap();
-    assert!(
-        fixture
-            .receiver
-            .take_pending_applied_sync_summary()
-            .messages
-            .is_empty()
-    );
-    assert_eq!(visible_messages(&fixture.receiver, &fixture.group).len(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -486,9 +311,9 @@ async fn native_error_stays_visible() {
 async fn native_receipts_yield() {
     let mut fixture = crypto_fixture().await;
     let (mut events, _) = encrypted_texts(&mut fixture.sender, &fixture.group).await;
-    events.truncate(4 * MAX_COMPARISON_ADMISSION_PER_TURN + 1);
+    events.truncate(4 * MAX_NATIVE_ADMISSION_PER_TURN + 1);
     events.sort_by_key(|event| (event.event.created_at, event.event.id.clone()));
-    let held = 3 * MAX_COMPARISON_ADMISSION_PER_TURN;
+    let held = 3 * MAX_NATIVE_ADMISSION_PER_TURN;
     for event in &events[..held] {
         let deliveries = fixture
             .receiver
@@ -528,7 +353,7 @@ async fn native_receipts_yield() {
             .take_pending_applied_sync_summary()
             .messages
             .len(),
-        MAX_COMPARISON_ADMISSION_PER_TURN
+        MAX_NATIVE_ADMISSION_PER_TURN
     );
     assert!(fixture.receiver.admit_native_turn().await.unwrap());
     assert_eq!(
@@ -550,7 +375,7 @@ async fn native_receipts_yield() {
     );
     assert_eq!(
         visible_messages(&fixture.receiver, &fixture.group).len(),
-        held + MAX_COMPARISON_ADMISSION_PER_TURN + 1
+        held + MAX_NATIVE_ADMISSION_PER_TURN + 1
     );
 }
 
@@ -570,14 +395,16 @@ async fn native_error_keeps_fairness() {
         .sender
         .create_group("independent native backlog", &[&receiver_id])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     fixture.receiver.sync().await.unwrap();
     let (mut healthy_events, healthy_expected) =
         encrypted_texts(&mut fixture.sender, &healthy_group).await;
     // More than two turns must remain eligible independently of the failing
     // group. Whichever ready ticket wins first, it cannot drain this backlog
     // before the other group's first failed turn.
-    let healthy_count = 2 * MAX_COMPARISON_ADMISSION_PER_TURN + 1;
+    let healthy_count = 2 * MAX_NATIVE_ADMISSION_PER_TURN + 1;
     healthy_events.truncate(healthy_count);
     let connection = fault_connection(&fixture.receiver);
     fail_message(&connection, &fixture.group);
@@ -760,94 +587,282 @@ async fn native_error_keeps_fairness() {
     runtime.shutdown_and_close().await.unwrap();
 }
 
+/// A real Welcome's post-join history prerequisite must progress under the
+/// new owner once ordinary count/boundary evidence is settled. Cursor and
+/// projection tests do not assert the engine maintenance/history-fetch handoff.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mixed_receipts_yield() {
+async fn runner_owned_history_starts_grace_without_fabricating_coverage() {
     let mut fixture = crypto_fixture().await;
-    let (mut events, _) = encrypted_texts(&mut fixture.sender, &fixture.group).await;
-    events.truncate(4 * MAX_COMPARISON_ADMISSION_PER_TURN + 1);
-    events.sort_by_key(|event| (event.event.created_at, event.event.id.clone()));
-    let held = 3 * MAX_COMPARISON_ADMISSION_PER_TURN;
-    for event in &events[..held] {
-        let deliveries = fixture
-            .receiver
-            .adapter
-            .recovered_deliveries(event.clone())
-            .await
-            .unwrap();
-        fixture
-            .receiver
-            .admit_recovered_delivery(
-                &deliveries[0],
-                crate::client::sync::InventoryWrite::Immediate,
-            )
-            .await
-            .unwrap();
-    }
-    fixture.receiver.take_pending_applied_sync_summary();
-    let (grant, mut execution, _, network) =
-        mixed_network(&mut fixture.receiver, events[held..].to_vec()).await;
-    lease_native(&mut fixture.receiver, &fixture.group, events).await;
-    let mut admission = fixture
+    fixture
         .receiver
-        .accept_comparison_network(&grant, &mut execution, network)
+        .advance_post_join_maintenance_subscriptions()
+        .await
+        .unwrap();
+    fixture.receiver.sync().await.unwrap();
+    fixture
+        .receiver
+        .advance_post_join_maintenance_subscriptions()
+        .await
+        .unwrap();
+    let status = fixture.receiver.maintenance_status(&fixture.group).unwrap();
+    let post_join = status
+        .obligations
+        .iter()
+        .find(|job| job.trigger == cgka_traits::MaintenanceTrigger::PostJoin)
+        .expect("real Welcome created the post-join obligation");
+    assert_eq!(
+        post_join.phase,
+        cgka_traits::MaintenancePhase::Grace,
+        "runner-owned history must supply the post-join boundary without an old comparison grant"
+    );
+    let fetch = fixture
+        .receiver
+        .runtime
+        .post_join_history_fetch(&fixture.group)
+        .unwrap()
+        .expect("the joined copy owns its fetch");
+    assert_eq!(
+        fetch.completion.map(|value| value.outcome),
+        None,
+        "a scripted empty EOSE without a sweep backend cannot certify history"
+    );
+    let before = post_join.clone();
+    let app = fixture.receiver.app.clone();
+    drop(fixture.receiver);
+    let mut receiver = client_on_app_relay_plane(&app, "receiver").await;
+    receiver.prepare_transport().await.unwrap();
+    receiver
+        .advance_post_join_maintenance_subscriptions()
+        .await
+        .unwrap();
+    let after = receiver
+        .runtime
+        .maintenance_obligations_for_group(&fixture.group)
+        .unwrap()
+        .into_iter()
+        .find(|job| job.trigger == cgka_traits::MaintenanceTrigger::PostJoin)
+        .unwrap();
+    assert_eq!(
+        after.eose_deadline_at, before.eose_deadline_at,
+        "unfinished collection does not move maintenance's EOSE deadline on reopen"
+    );
+    assert_eq!(
+        after.grace_until, before.grace_until,
+        "unfinished collection does not restart grace on reopen"
+    );
+    assert_eq!(
+        receiver
+            .runtime
+            .post_join_history_fetch(&fixture.group)
+            .unwrap(),
+        Some(fetch),
+        "reopening an unfinished fetch preserves its durable identity and deadline"
+    );
+}
+
+use crate::tests::limited_relay as post_join_relay;
+
+/// Actual SDK acquisition, encrypted history admission, durable completion,
+/// and client replacement at the app handoff. The capped relay supplies wire
+/// evidence, not the asserted maintenance or fetched state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runner_owned_history_releases_post_join_maintenance() {
+    let (_relay, url) = post_join_relay::mock_relay().await;
+    let dir = tempfile::tempdir().unwrap();
+    let home = crate::AccountHome::open(dir.path());
+    home.create_account("sender").unwrap();
+    let recipient = home.create_account("receiver").unwrap();
+    let config = crate::MarmotAppConfig::white_noise().with_allow_loopback_relay_endpoints(true);
+    let app = crate::MarmotApp::with_relay_and_config(dir.path(), &url, config);
+    remember_test_member_inbox(&app, &recipient.account_id_hex, &url);
+    let mut receiver = client_on_app_relay_plane(&app, "receiver").await;
+    receiver.publish_key_package().await.unwrap();
+    receiver.prepare_transport().await.unwrap();
+    let mut sender = client_on_app_relay_plane(&app, "sender").await;
+    let group = sender
+        .create_group("runner post-join history", &[&recipient.account_id_hex])
         .await
         .unwrap()
-        .unwrap();
-    for _ in 0..3 {
-        assert!(
-            !fixture
-                .receiver
-                .admit_comparison_turn(&grant, &mut execution, &mut admission)
-                .await
-                .unwrap()
-        );
-        assert!(admission.progressed);
-        assert_eq!(
-            visible_messages(&fixture.receiver, &fixture.group).len(),
-            held,
-            "a mixed turn yields after four native receipt skips instead of draining the prefix"
-        );
-    }
-    let mut previous = held;
-    let mut done = false;
-    for _ in 0..8 {
-        done = fixture
-            .receiver
-            .admit_comparison_turn(&grant, &mut execution, &mut admission)
-            .await
-            .unwrap();
-        let count = visible_messages(&fixture.receiver, &fixture.group).len();
-        assert!(
-            count - previous <= MAX_COMPARISON_ADMISSION_PER_TURN,
-            "native and comparison still share four actual ingests after the held prefix"
-        );
-        previous = count;
-        if done {
-            break;
-        }
-    }
-    assert!(
-        done,
-        "native receipts must not inflate comparison remaining-attempt counts"
-    );
-    let outcome = fixture
-        .receiver
-        .finish_comparison_grant(grant, execution, Some(admission))
+        .operation
+        .expect("eligible fixture members");
+    sender
+        .send(&group, b"history before the join")
         .await
         .unwrap();
-    let mut summary = match outcome {
-        EpochBackfillRunOutcome::Completed(summary)
-        | EpochBackfillRunOutcome::Incomplete(summary) => summary,
-        _ => panic!("the comparison must settle its actual fetched events"),
-    };
-    while fixture.receiver.admit_native_turn().await.unwrap() {}
-    summary.merge(fixture.receiver.take_pending_applied_sync_summary());
+    timeout(Duration::from_secs(15), async {
+        loop {
+            receiver.sync().await.unwrap();
+            receiver
+                .advance_post_join_maintenance_subscriptions()
+                .await
+                .unwrap();
+            if receiver
+                .runtime
+                .post_join_history_fetch(&group)
+                .unwrap()
+                .is_some_and(|fetch| fetch.completion.is_some())
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("bounded new-owner collection finishes without a comparison grant");
+    let fetch = receiver
+        .runtime
+        .post_join_history_fetch(&group)
+        .unwrap()
+        .unwrap();
     assert_eq!(
-        summary.messages.len(),
-        MAX_COMPARISON_ADMISSION_PER_TURN + 1
+        fetch.completion.as_ref().map(|value| value.outcome),
+        Some(cgka_traits::PostJoinHistoryFetchOutcome::Fetched)
+    );
+    assert!(
+        app.messages("receiver")
+            .unwrap()
+            .iter()
+            .any(|message| message.plaintext == "history before the join"),
+        "fetched means the encrypted input was admitted and persisted"
+    );
+    let before = receiver
+        .runtime
+        .maintenance_obligations_for_group(&group)
+        .unwrap()
+        .into_iter()
+        .find(|job| job.trigger == cgka_traits::MaintenanceTrigger::PostJoin)
+        .unwrap();
+    assert_eq!(before.phase, cgka_traits::MaintenancePhase::Grace);
+    assert!(before.eose_deadline_at.is_some());
+    let account = receiver.adapter.account_id().clone();
+    drop(receiver);
+    app.relay_plane
+        .deactivate_account_context(&account)
+        .await
+        .unwrap();
+    let mut receiver = client_on_app_relay_plane(&app, "receiver").await;
+    receiver.prepare_transport().await.unwrap();
+    receiver
+        .advance_post_join_maintenance_subscriptions()
+        .await
+        .unwrap();
+    assert_eq!(
+        receiver.runtime.post_join_history_fetch(&group).unwrap(),
+        Some(fetch),
+        "reopen retains this copy's completed fetch"
+    );
+    let after = receiver
+        .runtime
+        .maintenance_obligations_for_group(&group)
+        .unwrap()
+        .into_iter()
+        .find(|job| job.trigger == cgka_traits::MaintenanceTrigger::PostJoin)
+        .unwrap();
+    assert_eq!(
+        after.eose_deadline_at, before.eose_deadline_at,
+        "reopen does not move the EOSE deadline"
     );
     assert_eq!(
-        visible_messages(&fixture.receiver, &fixture.group).len(),
-        held + MAX_COMPARISON_ADMISSION_PER_TURN + 1
+        after.grace_until, before.grace_until,
+        "reopen does not restart grace"
+    );
+    assert!(
+        receiver
+            .history_recovery
+            .test_state()
+            .runner_post_join
+            .is_empty(),
+        "a fetched copy in grace does not re-arm history on reopen"
+    );
+}
+
+/// Retained-window coverage is valid evidence, but is not the whole range
+/// requested by an older Welcome. A raw boundary may start grace without
+/// turning that partial range into a fetched-history claim.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runner_post_join_retained_coverage_cannot_complete_an_older_welcome() {
+    use cgka_traits::Timestamp;
+    use cgka_traits::storage::{GroupStorage, MaintenanceStorage};
+    use storage_sqlite::{
+        RecoveryCoverageProof, RecoveryCoverageSlice, TransportReconciliationRoute,
+    };
+    let fixture = crypto_fixture().await;
+    let app = fixture.receiver.app.clone();
+    let storage = app.account_storage("receiver").unwrap();
+    let now = unix_now_seconds();
+    let retained = now.saturating_sub(storage_sqlite::TRANSPORT_RECONCILIATION_RETENTION_SECS);
+    let mut record = storage.get_group(&fixture.group).unwrap();
+    record.local_copy_welcome_created_at = Some(Timestamp(retained.saturating_sub(600)));
+    storage.put_group(&record).unwrap();
+    drop(fixture.receiver);
+    let mut receiver = client_on_app_relay_plane(&app, "receiver").await;
+    receiver.prepare_transport().await.unwrap();
+    receiver
+        .advance_post_join_maintenance_subscriptions()
+        .await
+        .unwrap();
+    receiver.sync().await.unwrap();
+    receiver
+        .advance_post_join_maintenance_subscriptions()
+        .await
+        .unwrap();
+    let route = receiver
+        .recovery_runner_routes()
+        .into_iter()
+        .find(|route| {
+            route.group_id.as_deref() == Some(fixture.group.as_slice())
+                && route.goal_until.is_none()
+        })
+        .unwrap();
+    assert!(matches!(
+        route.route,
+        TransportReconciliationRoute::Group(_)
+    ));
+    // Input to the completion owner: a real ledger certificate for exactly
+    // the retained range, with no certificate for the older requested prefix.
+    storage
+        .app_storage()
+        .record_recovery_coverage(
+            &[RecoveryCoverageSlice {
+                route: &route.route,
+                relay: &route.required[0],
+                since_seconds: retained,
+                until_seconds: unix_now_seconds(),
+                proof: RecoveryCoverageProof::SweepSlice,
+            }],
+            unix_now_seconds(),
+        )
+        .unwrap();
+    receiver
+        .advance_post_join_maintenance_subscriptions()
+        .await
+        .unwrap();
+    assert!(
+        receiver
+            .runtime
+            .post_join_history_fetch(&fixture.group)
+            .unwrap()
+            .unwrap()
+            .completion
+            .is_none(),
+        "a retained-only proof must not certify the older Welcome's whole history"
+    );
+    let mut maintenance = storage.group_maintenance(&fixture.group).unwrap().unwrap();
+    maintenance.post_join_history.as_mut().unwrap().deadline_at =
+        Some(Timestamp(unix_now_seconds().saturating_sub(1)));
+    storage.put_group_maintenance(&maintenance).unwrap();
+    receiver
+        .advance_post_join_maintenance_subscriptions()
+        .await
+        .unwrap();
+    assert_eq!(
+        receiver
+            .runtime
+            .post_join_history_fetch(&fixture.group)
+            .unwrap()
+            .unwrap()
+            .completion
+            .map(|value| value.outcome),
+        Some(cgka_traits::PostJoinHistoryFetchOutcome::DeadlineExpired),
+        "a raw partial boundary does not disable the unanswered whole-range deadline"
     );
 }

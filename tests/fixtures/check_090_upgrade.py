@@ -1,5 +1,4 @@
 """Run the frozen old updater against a real test executable, without services."""
-import hashlib
 import os
 from pathlib import Path
 import shutil
@@ -35,8 +34,7 @@ def stage(url, name, destination, **kwargs):
     destination.chmod(0o700)
 with patch.object(legacy,"ngit",return_value={}),patch.object(legacy,"validate_view"),patch.object(legacy.install,"install_bundle",side_effect=stage):
     result=legacy.perform(job,request,controller)
-assert result["status"]=="installed",result
-assert calls==["validate","validate","stop bridge","start bridge"]
-with binary.open('rb') as a,installed.open('rb') as b:
-    assert hashlib.file_digest(a,'sha256').digest()==hashlib.file_digest(b,'sha256').digest()
-assert (job/"previous").read_bytes()==b"previous 0.9 worker"
+assert result["status"]=="failed",result
+assert calls==["validate"],calls
+assert installed.read_bytes()==b"previous 0.9 worker"
+assert not (job/"previous").exists()

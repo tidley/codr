@@ -1,0 +1,14 @@
+MDK 0.17.0 is MIT-licensed; see LICENSE.
+
+The combined executable also links the following MPL-2.0 Rust crates:
+  hpke-rs 0.8.0
+  hpke-rs-crypto 0.8.0
+  hpke-rs-rust-crypto 0.8.0
+
+See LICENSE-MPL-2.0. Their unmodified source packages are available at:
+  https://crates.io/crates/hpke-rs/0.8.0
+  https://crates.io/crates/hpke-rs-crypto/0.8.0
+  https://crates.io/crates/hpke-rs-rust-crypto/0.8.0
+
+Cargo.lock records the exact registry checksums. These replace Codr's old local
+HPKE 0.7 provider patch; the retired provider's code is not linked.

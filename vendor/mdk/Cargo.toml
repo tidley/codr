@@ -1,6 +1,5 @@
 [workspace]
 resolver = "3"
-exclude = ["vendor/hpke-rs-libcrux"]
 members = [
     "crates/agent-control",
     "crates/agent-connector",
@@ -9,22 +8,25 @@ members = [
 
 [workspace.package]
 edition = "2024"
-version = "0.14.0"
+version = "0.17.0"
 license = "MIT"
 publish = false
 
 [workspace.dependencies]
 # Offline audit-schema validation; never enable remote reference resolution.
 jsonschema = { version = "0.56.0", default-features = false }
-# OpenMLS family — exact-pinned to the draft-10 last-resort KeyPackage fix.
+# OpenMLS family — exact-pinned to an upstream main commit. It carries the
+# draft-10 last-resort KeyPackage encoding (openmls#2133), the RustCrypto 0.14 /
+# HPKE 0.8 provider (openmls#2249 and #2261; fixes RUSTSEC-2026-0387 and
+# RUSTSEC-2026-0330/0331), and the 0.9.1/0.9.2 security fixes, none of which
+# any OpenMLS release has together yet.
 # Keep every companion crate on the same repository commit to prevent source skew.
-# Migration: once an upstream OpenMLS release contains this fix, replace all five
-# git entries together with one matching upstream release series and remove the fork pin.
-openmls = { git = "https://github.com/erskingardner/openmls.git", rev = "59e7d3b27a7e95237879dd5478de1fd90eff7ada", features = ["extensions-draft"] }
-openmls_basic_credential = { git = "https://github.com/erskingardner/openmls.git", rev = "59e7d3b27a7e95237879dd5478de1fd90eff7ada" }
-openmls_memory_storage = { git = "https://github.com/erskingardner/openmls.git", rev = "59e7d3b27a7e95237879dd5478de1fd90eff7ada", features = ["extensions-draft"] }
-openmls_rust_crypto = { git = "https://github.com/erskingardner/openmls.git", rev = "59e7d3b27a7e95237879dd5478de1fd90eff7ada" }
-openmls_traits = { git = "https://github.com/erskingardner/openmls.git", rev = "59e7d3b27a7e95237879dd5478de1fd90eff7ada", features = ["extensions-draft"] }
+# Migration: once an upstream OpenMLS release contains all of them, replace all
+# four git entries together with that release series.
+openmls = { git = "https://github.com/openmls/openmls.git", rev = "6100df3fb1d8c3eeab53e349fcbd621f98c44fe2", features = ["extensions-draft"] }
+openmls_basic_credential = { git = "https://github.com/openmls/openmls.git", rev = "6100df3fb1d8c3eeab53e349fcbd621f98c44fe2" }
+openmls_rust_crypto = { git = "https://github.com/openmls/openmls.git", rev = "6100df3fb1d8c3eeab53e349fcbd621f98c44fe2", features = ["extensions-draft"] }
+openmls_traits = { git = "https://github.com/openmls/openmls.git", rev = "6100df3fb1d8c3eeab53e349fcbd621f98c44fe2", features = ["extensions-draft"] }
 tls_codec = "~0.5"
 
 # async
@@ -45,7 +47,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 hex = "0.4"
 base64 = "0.22"
-httpdate = "1.0"
 getrandom = "0.4"
 web-time = "1.1"
 hmac = "0.12"
@@ -76,6 +77,9 @@ sha2 = "0.10"
 url = "2"
 psl = "2"
 chacha20poly1305 = "0.10"
+# Device pairing's ephemeral key agreement. Already in the tree through
+# OpenMLS's HPKE provider; `static_secrets` lets a test pin the key bytes.
+x25519-dalek = { version = "3.0", default-features = false, features = ["precomputed-tables", "static_secrets", "zeroize"] }
 openssl = { version = "0.10", features = ["vendored"] }
 bytes = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "socks"] }
@@ -83,6 +87,9 @@ async-wsocket = "0.17"
 tokio-socks = "0.5.2"
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 zeroize = "1"
+# Recovery words for backups (mdk#2628 4.4): 12 BIP-39 English words. Already
+# in the lockfile through nostr's NIP-06 support.
+bip39 = { version = "2.2.2", default-features = false, features = ["std", "zeroize"] }
 keyring-core = "1"
 quinn = { version = "0.11", default-features = false, features = ["log", "runtime-tokio", "rustls-ring"] }
 rcgen = "0.14"
@@ -91,9 +98,9 @@ rustls = { version = "0.23.45", default-features = false, features = ["ring", "s
 # same anchors relay WebSockets and HTTP use (via tokio-tungstenite/reqwest).
 # The OS verifier needs JNI setup on Android that MarmotKit hosts never run.
 webpki-roots = "1.0"
-nostr = { git = "https://github.com/erskingardner/rust-nostr", rev = "48801bf6f2f1cd55bb1729e94159946c8832a786", default-features = false, features = ["std", "rand", "os-rng", "nip04", "nip49", "nip59"] }
-nostr-sdk = { git = "https://github.com/erskingardner/rust-nostr", rev = "48801bf6f2f1cd55bb1729e94159946c8832a786", features = ["local-relay"] }
-nostr-gossip = { git = "https://github.com/erskingardner/rust-nostr", rev = "48801bf6f2f1cd55bb1729e94159946c8832a786" }
+nostr = { git = "https://github.com/erskingardner/rust-nostr", rev = "e93cc06b5624f06c21ecd8111a124176eb0c7589", default-features = false, features = ["std", "rand", "os-rng", "nip04", "nip49", "nip59"] }
+nostr-sdk = { git = "https://github.com/erskingardner/rust-nostr", rev = "e93cc06b5624f06c21ecd8111a124176eb0c7589", features = ["local-relay"] }
+nostr-gossip = { git = "https://github.com/erskingardner/rust-nostr", rev = "e93cc06b5624f06c21ecd8111a124176eb0c7589" }
 nostr-relay-builder = "0.44"
 # OTLP export (behind the marmot-app `otlp-export` feature): map pre-aggregated
 # relay telemetry straight to the OTLP protobuf and POST it over the existing
@@ -109,37 +116,40 @@ uuid = { version = "1", features = ["v4"] }
 proptest = "1"
 insta = { version = "1", features = ["json"] }
 stateright = "0.31.0"
-test-log = { version = "0.2", features = ["trace"] }
 criterion = { version = "0.5", features = ["async_tokio"] }
 
 # workspace-internal
-fs-private = { git = "https://github.com/marmot-protocol/mdk.git", rev = "3fb4b4759ac676b0c21c4c3527074866c9fa4c89" }
-media-store = { git = "https://github.com/marmot-protocol/mdk.git", rev = "3fb4b4759ac676b0c21c4c3527074866c9fa4c89" }
-nostr-directory = { git = "https://github.com/marmot-protocol/mdk.git", rev = "3fb4b4759ac676b0c21c4c3527074866c9fa4c89" }
-cgka-traits = { git = "https://github.com/marmot-protocol/mdk.git", rev = "3fb4b4759ac676b0c21c4c3527074866c9fa4c89" }
-cgka-engine = { git = "https://github.com/marmot-protocol/mdk.git", rev = "3fb4b4759ac676b0c21c4c3527074866c9fa4c89" }
-cgka-session = { git = "https://github.com/marmot-protocol/mdk.git", rev = "3fb4b4759ac676b0c21c4c3527074866c9fa4c89" }
-storage-sqlite = { git = "https://github.com/marmot-protocol/mdk.git", rev = "3fb4b4759ac676b0c21c4c3527074866c9fa4c89" }
-transport-nostr-peeler = { git = "https://github.com/marmot-protocol/mdk.git", rev = "3fb4b4759ac676b0c21c4c3527074866c9fa4c89" }
-transport-nostr-adapter = { git = "https://github.com/marmot-protocol/mdk.git", rev = "3fb4b4759ac676b0c21c4c3527074866c9fa4c89" }
-transport-nostr = { git = "https://github.com/marmot-protocol/mdk.git", rev = "3fb4b4759ac676b0c21c4c3527074866c9fa4c89" }
-transport-quic-stream = { git = "https://github.com/marmot-protocol/mdk.git", rev = "3fb4b4759ac676b0c21c4c3527074866c9fa4c89" }
-transport-quic-broker = { git = "https://github.com/marmot-protocol/mdk.git", rev = "3fb4b4759ac676b0c21c4c3527074866c9fa4c89" }
-agent-stream-compose = { git = "https://github.com/marmot-protocol/mdk.git", rev = "3fb4b4759ac676b0c21c4c3527074866c9fa4c89" }
+fs-private = { git = "https://github.com/marmot-protocol/mdk.git", rev = "4df811aea99269b437a6023be9446a5141e93cbe" }
+media-store = { git = "https://github.com/marmot-protocol/mdk.git", rev = "4df811aea99269b437a6023be9446a5141e93cbe" }
+nostr-directory = { git = "https://github.com/marmot-protocol/mdk.git", rev = "4df811aea99269b437a6023be9446a5141e93cbe" }
+cgka-traits = { git = "https://github.com/marmot-protocol/mdk.git", rev = "4df811aea99269b437a6023be9446a5141e93cbe" }
+cgka-engine = { git = "https://github.com/marmot-protocol/mdk.git", rev = "4df811aea99269b437a6023be9446a5141e93cbe" }
+marmot-session = { git = "https://github.com/marmot-protocol/mdk.git", rev = "4df811aea99269b437a6023be9446a5141e93cbe" }
+storage-sqlite = { git = "https://github.com/marmot-protocol/mdk.git", rev = "4df811aea99269b437a6023be9446a5141e93cbe" }
+sonar-stickers = { version = "0.1.0", features = ["nostr"] }
+cgka-conformance-simulator = { git = "https://github.com/marmot-protocol/mdk.git", rev = "4df811aea99269b437a6023be9446a5141e93cbe" }
+transport-nostr-peeler = { git = "https://github.com/marmot-protocol/mdk.git", rev = "4df811aea99269b437a6023be9446a5141e93cbe" }
+transport-nostr-adapter = { git = "https://github.com/marmot-protocol/mdk.git", rev = "4df811aea99269b437a6023be9446a5141e93cbe" }
+transport-nostr = { git = "https://github.com/marmot-protocol/mdk.git", rev = "4df811aea99269b437a6023be9446a5141e93cbe" }
+transport-quic-stream = { git = "https://github.com/marmot-protocol/mdk.git", rev = "4df811aea99269b437a6023be9446a5141e93cbe" }
+transport-quic-broker = { git = "https://github.com/marmot-protocol/mdk.git", rev = "4df811aea99269b437a6023be9446a5141e93cbe" }
+agent-stream-compose = { git = "https://github.com/marmot-protocol/mdk.git", rev = "4df811aea99269b437a6023be9446a5141e93cbe" }
 agent-control = { path = "crates/agent-control" }
-marmot-forensics = { git = "https://github.com/marmot-protocol/mdk.git", rev = "3fb4b4759ac676b0c21c4c3527074866c9fa4c89" }
-marmot-markdown = { git = "https://github.com/marmot-protocol/mdk.git", rev = "3fb4b4759ac676b0c21c4c3527074866c9fa4c89" }
-marmot-account = { git = "https://github.com/marmot-protocol/mdk.git", rev = "3fb4b4759ac676b0c21c4c3527074866c9fa4c89" }
+marmot-forensics = { git = "https://github.com/marmot-protocol/mdk.git", rev = "4df811aea99269b437a6023be9446a5141e93cbe" }
+marmot-markdown-ast = { git = "https://github.com/marmot-protocol/mdk.git", rev = "4df811aea99269b437a6023be9446a5141e93cbe" }
+marmot-markdown = { git = "https://github.com/marmot-protocol/mdk.git", rev = "4df811aea99269b437a6023be9446a5141e93cbe" }
+marmot-account = { git = "https://github.com/marmot-protocol/mdk.git", rev = "4df811aea99269b437a6023be9446a5141e93cbe" }
+marmot-pairing = { git = "https://github.com/marmot-protocol/mdk.git", rev = "4df811aea99269b437a6023be9446a5141e93cbe" }
+marmot-observability = { git = "https://github.com/marmot-protocol/mdk.git", rev = "4df811aea99269b437a6023be9446a5141e93cbe" }
 marmot-app = { path = "crates/marmot-app" }
+marmot-uniffi = { git = "https://github.com/marmot-protocol/mdk.git", rev = "4df811aea99269b437a6023be9446a5141e93cbe" }
+marmot-uniffi-macros = { git = "https://github.com/marmot-protocol/mdk.git", rev = "4df811aea99269b437a6023be9446a5141e93cbe" }
+marmot-terminal-harness = { git = "https://github.com/marmot-protocol/mdk.git", rev = "4df811aea99269b437a6023be9446a5141e93cbe" }
 
 # hax-lib-macros 0.3.7 still declares the unmaintained proc-macro-error2
 # dependency under cfg(hax). Pin the upstream removal until the next hax
 # release contains it, then remove this patch and update the libcrux path.
 [patch.crates-io]
-# HPKE 0.7 pins vulnerable libcrux-kem 0.0.9. This unchanged 0.7 provider
-# selects fixed KEM 0.0.10; remove once a compatible published HPKE provider
-# carries the fix. Provenance and regression commands: vendor/hpke-rs-libcrux/BACKPORT.md.
-hpke-rs-libcrux = { path = "vendor/hpke-rs-libcrux" }
 hax-lib-macros = { git = "https://github.com/cryspen/hax.git", rev = "8f9cb576e58f6cc7e9ed249a7d4439b0f7ed0da7" }
 # libsqlite3-sys 0.38.2 still bundles SQLCipher 4.14.0, whose enhanced
 # memory-security allocator emits one WARN for every mlock failure. Pin the
@@ -152,6 +162,13 @@ libsqlite3-sys = { git = "https://github.com/rusqlite/rusqlite.git", rev = "5ae7
 # unchanged. `test` inherits these overrides from `dev`.
 [profile.dev.package."*"]
 debug = false
+
+# Build the bundled SQLCipher C code optimized in dev and test builds too. Every
+# test that opens a database replays the migrations, and at -O0 SQLite's own SQL
+# parsing was a fifth of the workspace test lane's CPU (mdk#2738). Release
+# builds already optimize it.
+[profile.dev.package.libsqlite3-sys]
+opt-level = 3
 
 # Standard release profile for MarmotKit and other workspace release consumers.
 # Thin LTO with one codegen unit is the measured candidate; do not add a custom

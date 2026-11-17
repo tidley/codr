@@ -2,14 +2,18 @@
 //! automatic recovery stopped retrying, and the opaque ids hosts dismiss them
 //! with. See `docs/marmot-architecture/further-context/account-recovery.md`.
 use serde::{Deserialize, Serialize};
-use storage_sqlite::{ParkedRecoveryObligation, RecoveryCause, RecoveryDemandTicket};
+use sha2::{Digest, Sha256};
+use storage_sqlite::{
+    ParkedRecoveryObligation, RecoveryCause, RecoveryDemandTicket, TransportReconciliationRoute,
+};
 
 use crate::AppError;
 
 /// Why recovery parked. Hosts choose wording from this; it carries no
-/// identities. Current policy parks the first five causes. `KnownEvent` and
-/// `MaintenanceBoundary` are reserved for demand that may park in a later
-/// policy, so exhaustive host switches stay source-compatible.
+/// identities. Current epoch-gap exhaustion emits `EpochGap`; a rejoin emits
+/// `BeforeRejoin`. Other labels preserve compatibility, so keep exhaustive
+/// matches: `UnprovenHistory` is no longer produced, and `KnownEvent` and
+/// `MaintenanceBoundary` remain reserved for parking policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HistoryNoticeCause {
@@ -31,6 +35,21 @@ pub enum HistoryNoticeCause {
     KnownEvent,
     /// A post-join maintenance boundary was never observed.
     MaintenanceBoundary,
+    /// No longer produced (mdk#3308); kept so hosts' exhaustive matches and
+    /// stored values still decode. Earlier releases raised it when the
+    /// recovery runner could not prove history on a route's relays: a
+    /// group's or the account inbox's. The runner now probes such relays
+    /// quietly, and no notice shows without evidence that messages are
+    /// missing.
+    UnprovenHistory,
+    /// The device rejoined the group (`group_id_hex` names it): a Welcome
+    /// installed a new copy in place of its old one. That is an automatic
+    /// rejoin after the old copy could not be repaired, a reentry after a
+    /// trusted removal, or a fork discarded with the user's consent, whose old
+    /// copy may still have worked. Messages from before the rejoin that this
+    /// device had not received are unavailable to it, and recovery stopped
+    /// fetching them. One notice per rejoin.
+    BeforeRejoin,
 }
 
 impl HistoryNoticeCause {
@@ -44,6 +63,8 @@ impl HistoryNoticeCause {
             Self::ExplicitRepair => "explicit_repair",
             Self::KnownEvent => "known_event",
             Self::MaintenanceBoundary => "maintenance_boundary",
+            Self::UnprovenHistory => "unproven_history",
+            Self::BeforeRejoin => "before_rejoin",
         }
     }
 
@@ -83,7 +104,53 @@ pub struct HistoryNotice {
     pub parked_at_ms: Option<u64>,
 }
 
+/// The account's recovery as the runner sees it: what it is still fetching,
+/// and every "history may be incomplete" notice. Hosts re-read it on
+/// `RecoveryStatusChanged`. The recovery runner supplies the groups and inbox
+/// whose history it is still fetching; notices are [`HistoryNotice`]s as
+/// `history_notices` lists them.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountRecoveryStatus {
+    /// Groups whose history is still being fetched, as lowercase hex group
+    /// ids, sorted.
+    pub catching_up_group_ids_hex: Vec<String>,
+    /// The account inbox's history (Welcomes) is still being fetched.
+    pub inbox_catching_up: bool,
+    /// Every current notice, as `history_notices` lists them.
+    pub notices: Vec<HistoryNotice>,
+}
+
 const NOTICE_ID_BYTES: usize = 24;
+
+/// A domain-separated hash of a coverage-ledger route, so an id never names
+/// it. Ledger-parked routes' notice ids carried it before mdk#3308; the
+/// recovery runner's audit rows reference it as a route's `obligation_ref`.
+pub(crate) fn ledger_route_tag(route: &TransportReconciliationRoute) -> [u8; 16] {
+    let mut hash = Sha256::new();
+    hash.update(b"marmot-app/history-notice/ledger-route/v1");
+    match route {
+        TransportReconciliationRoute::Inbox => hash.update([0]),
+        TransportReconciliationRoute::Group(nostr_group_id) => {
+            hash.update([1]);
+            hash.update(nostr_group_id);
+        }
+    }
+    let mut tag = [0; 16];
+    tag.copy_from_slice(&hash.finalize()[..16]);
+    tag
+}
+
+/// What a rejoin notice's ids carry in place of an obligation id: a
+/// domain-separated hash of the group, so the id never names it. With the
+/// notice's revision it is the notice's ticket.
+pub(crate) fn rejoin_group_tag(group_id: &[u8]) -> [u8; 16] {
+    let mut hash = Sha256::new();
+    hash.update(b"marmot-app/history-notice/rejoin/v1");
+    hash.update(group_id);
+    let mut tag = [0; 16];
+    tag.copy_from_slice(&hash.finalize()[..16]);
+    tag
+}
 
 pub(crate) fn encode_notice_id(ticket: RecoveryDemandTicket) -> String {
     let mut bytes = [0_u8; NOTICE_ID_BYTES];
@@ -165,5 +232,31 @@ mod tests {
                 "maintenance_boundary",
             ]
         );
+        assert_eq!(
+            HistoryNoticeCause::UnprovenHistory.as_str(),
+            "unproven_history"
+        );
+        assert_eq!(HistoryNoticeCause::BeforeRejoin.as_str(), "before_rejoin");
+    }
+
+    #[test]
+    fn ledger_route_tags_are_distinct_and_stable() {
+        let inbox = ledger_route_tag(&TransportReconciliationRoute::Inbox);
+        let group = ledger_route_tag(&TransportReconciliationRoute::Group([7; 32]));
+        assert_ne!(inbox, group);
+        assert_ne!(
+            group,
+            ledger_route_tag(&TransportReconciliationRoute::Group([8; 32]))
+        );
+        assert_eq!(
+            group,
+            ledger_route_tag(&TransportReconciliationRoute::Group([7; 32]))
+        );
+        assert_ne!(&group[..], &[7; 16][..], "the tag names its route");
+        let rejoin = rejoin_group_tag(&[7; 16]);
+        assert_eq!(rejoin, rejoin_group_tag(&[7; 16]));
+        assert_ne!(rejoin, rejoin_group_tag(&[8; 16]));
+        assert_ne!(&rejoin[..], &[7; 16][..], "the tag names its group");
+        assert_ne!(rejoin, group, "rejoin and ledger tags never collide");
     }
 }

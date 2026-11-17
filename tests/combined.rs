@@ -11,7 +11,7 @@ use std::{
 fn config(root: &Path) -> BridgeConfig {
     serde_json::from_value(json!({
         "phone_npub":bech32::encode("npub",[0x11u8;32].to_base32(),bech32::Variant::Bech32).unwrap(),
-        "herdr_socket":root.join("herdr.sock"),"wn_agent_socket":root.join("mdk/dev/control.sock"),
+        "herdr_socket":root.join("herdr.sock"),"wn_agent_socket":root.join("mdk/dev/s"),
         "state_path":root.join("state.json"),"account_id_hex":"aa".repeat(32)
     })).unwrap()
 }
@@ -95,63 +95,94 @@ async fn combined_runtime_rejects_relative_or_missing_account_homes() {
 }
 
 #[tokio::test]
-async fn combined_runtime_keeps_desktop_reads_available_after_messaging_startup_failure() {
-    use tokio::io::AsyncWriteExt;
-    let temp = tempfile::tempdir().unwrap();
-    let root = temp.path().canonicalize().unwrap();
-    let settings = config(&root);
-    let home = root.join("mdk");
-    std::fs::DirBuilder::new()
-        .mode(0o700)
-        .create(&home)
-        .unwrap();
-    std::fs::write(home.join("shared.sqlite3"), b"invalid fixture database").unwrap();
-    let path = root.join("config.toml");
-    std::fs::write(&path,format!("phone_npub = {:?}\naccount_id_hex = {:?}\nherdr_socket = {:?}\nwn_agent_socket = {:?}\nstate_path = {:?}\n",settings.phone_npub,settings.account_id_hex,settings.herdr_socket,settings.wn_agent_socket,settings.state_path)).unwrap();
-    struct Child(std::process::Child);
-    impl Drop for Child {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
+async fn combined_process_exits_unsuccessfully_after_messaging_failure() {
+    for after_ready in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let settings = config(&root);
+        let mut saved = herdr_white_noise_bridge::BridgeState::default();
+        saved.mappings.insert(
+            "retained-chat".into(),
+            herdr_white_noise_bridge::state::Mapping {
+                group_id_hex: Some("bb".repeat(16)),
+                seen_messages: vec!["retained-receipt".into()],
+                ..Default::default()
+            },
+        );
+        saved.save(&settings.state_path).unwrap();
+        let home = root.join("mdk");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&home)
+            .unwrap();
+        if !after_ready {
+            std::fs::write(home.join("shared.sqlite3"), b"invalid fixture database").unwrap();
+        }
+        let path = root.join("config.toml");
+        std::fs::write(&path,format!("phone_npub = {:?}\naccount_id_hex = {:?}\nherdr_socket = {:?}\nwn_agent_socket = {:?}\nstate_path = {:?}\n",settings.phone_npub,settings.account_id_hex,settings.herdr_socket,settings.wn_agent_socket,settings.state_path)).unwrap();
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = Child(
+            Command::new(env!("CARGO_BIN_EXE_herdr-white-noise-bridge"))
+                .arg("--config")
+                .arg(path)
+                .args(["run", "--portr", "--messaging-home"])
+                .arg(&home)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        if after_ready {
+            let socket = Socket {
+                path: settings.wn_agent_socket.clone(),
+            };
+            tokio::time::timeout(Duration::from_secs(15), async {
+                loop {
+                    assert!(child.0.try_wait().unwrap().is_none());
+                    if socket.marmot(json!({"type":"account_list"})).await.is_ok() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap();
+            // Lose only this synthetic fixture's socket, not its persisted account home.
+            std::fs::remove_file(&settings.wn_agent_socket).unwrap();
+        }
+        let status = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("messaging failure must terminate the combined process for supervisor recovery");
+        assert!(!status.success());
+        let after = herdr_white_noise_bridge::BridgeState::load(&settings.state_path).unwrap();
+        assert_eq!(
+            after.mappings["retained-chat"].group_id_hex,
+            saved.mappings["retained-chat"].group_id_hex
+        );
+        assert_eq!(
+            after.mappings["retained-chat"].seen_messages,
+            saved.mappings["retained-chat"].seen_messages
+        );
+        if !after_ready {
+            assert_eq!(
+                std::fs::read(home.join("shared.sqlite3")).unwrap(),
+                b"invalid fixture database"
+            );
         }
     }
-    let mut child = Child(
-        Command::new(env!("CARGO_BIN_EXE_herdr-white-noise-bridge"))
-            .arg("--config")
-            .arg(path)
-            .args(["run", "--portr", "--messaging-home"])
-            .arg(&home)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .unwrap(),
-    );
-    tokio::time::timeout(Duration::from_secs(15), async {
-        loop {
-            assert!(child.0.try_wait().unwrap().is_none());
-            if let Ok(mut socket) = tokio::net::UnixStream::connect(
-                herdr_white_noise_bridge::porter::socket_path(&settings.state_path),
-            )
-            .await
-            {
-                socket
-                    .write_all(b"{\"version\":1,\"method\":\"watch\"}\n")
-                    .await
-                    .unwrap();
-                let response = herdr_white_noise_bridge::wire::read_line(
-                    &mut tokio::io::BufReader::new(socket),
-                )
-                .await
-                .unwrap();
-                assert_eq!(response["event"], "ready");
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap();
-    assert!(child.0.try_wait().unwrap().is_none());
 }
 
 #[tokio::test]

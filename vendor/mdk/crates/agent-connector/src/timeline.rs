@@ -78,6 +78,7 @@ impl AgentConnector {
                     after_message_id: after.as_ref().map(|cursor| cursor.message_id_hex.clone()),
                     limit: Some(limit as usize),
                 },
+                ..Default::default()
             },
         )?;
         bounded_timeline_page_response(
@@ -285,6 +286,9 @@ mod tests {
             deletion_source: Default::default(),
             deleted_by_message_id_hex: None,
             invalidation_status: None,
+            recipient_confirmed: false,
+            imported_from: None,
+            history_import_provenance: None,
         }
     }
 

@@ -7,8 +7,18 @@ async fn group_fixture() -> (tempfile::TempDir, MarmotApp, GroupId, GroupId) {
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     app.account_home().create_account("alice").unwrap();
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("target", &[]).await.unwrap();
-    let other_id = client.create_group("other", &[]).await.unwrap();
+    let group_id = client
+        .create_group("target", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    let other_id = client
+        .create_group("other", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     drop(client);
     let id_hex = hex::encode(group_id.as_slice());
     let mut state = app.load_state("alice").unwrap();
@@ -39,6 +49,7 @@ fn group_connection(app: &MarmotApp) -> rusqlite::Connection {
     let key = app
         .sqlcipher_key("alice", &keys, &path, SqlcipherDatabaseKind::Session)
         .unwrap();
+    storage_sqlite::expect_uncounted_writes_for_test(&path);
     let connection = rusqlite::Connection::open(path).unwrap();
     storage_sqlite::open_hardened_sqlcipher(
         &connection,
@@ -76,6 +87,7 @@ async fn keyed_group_matches_list() {
             group_id: group_id.clone(),
             requested_at_ms: 42,
             last_proposed_epoch: None,
+            blocked: None,
         })
         .unwrap();
     for status in [

@@ -1,6 +1,6 @@
 repository = "https://github.com/marmot-protocol/mdk.git"
-revision = "3fb4b4759ac676b0c21c4c3527074866c9fa4c89"
-version = "0.14.0"
+revision = "4df811aea99269b437a6023be9446a5141e93cbe"
+version = "0.17.0"
 # Update this contract before any incompatible MDK account-storage change.
-storage_cohort = "mdk-0.14"
+storage_cohort = "mdk-0.17"
 patch = "patches/mdk-codr.patch"

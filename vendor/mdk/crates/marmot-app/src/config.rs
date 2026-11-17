@@ -1,15 +1,16 @@
 use std::time::Duration;
 
-use marmot_account::MaintenanceTiming;
+use marmot_session::MaintenanceTiming;
 
 use crate::deployment::{MarmotDeployment, OpenRankingProvider};
+use marmot_observability::{
+    DEFAULT_EXPORT_INTERVAL, RelayTelemetryExportConfig, RelayTelemetryRuntimeConfig, trim_optional,
+};
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_DIRECTORY_MAX_FUTURE_SKEW: Duration = Duration::from_secs(5 * 60);
 const COMPILED_RELAY_TELEMETRY_OTLP_ENDPOINT: Option<&str> =
     option_env!("MARMOT_RELAY_TELEMETRY_OTLP_ENDPOINT");
-const COMPILED_AUDIT_LOG_TRACKER_ENDPOINT: Option<&str> =
-    option_env!("MARMOT_AUDIT_LOG_TRACKER_ENDPOINT");
 
 /// Policy for advancing the account's durable transport cursor
 /// (`last_transport_timestamp`) from ingested deliveries.
@@ -86,9 +87,16 @@ pub struct MarmotAppConfig {
     /// `None` leaves reporting unconfigured. An invalid value is rejected whole at first use
     /// and also leaves reporting unconfigured; see `MarmotApp::set_moderation_report_config`.
     pub moderation_report_config: Option<crate::ModerationReportConfig>,
-    /// Optional public client label for newly prepared KeyPackage events.
-    /// None leaves publications untagged; signed retries retain their original tags.
+    /// Optional public client label for newly prepared KeyPackage events, published
+    /// trimmed as the only value of one `client` tag. None, or a label that is blank
+    /// or longer than 64 bytes once trimmed, leaves publications untagged; signed
+    /// retries retain their original tags.
     pub key_package_client_name: Option<String>,
+    /// Optional short name of the platform this device runs on, such as
+    /// `iOS`, which it writes with `key_package_client_name` into its own
+    /// entry in its device group's roster (mdk#2628 3.6). None, or a name
+    /// blank or longer than 64 bytes once trimmed, writes none.
+    pub device_platform: Option<String>,
     /// Automatic acquisition defaults on with bounded resource limits.
     /// None disables automatic acquisition; frozen runtimes always disable it.
     /// Per-account native policy overrides are durable.
@@ -161,32 +169,23 @@ pub struct MarmotAppConfig {
     /// chat projection and per-group read behavior, without changing startup
     /// timing in normal builds. Commands are still served during the delay.
     pub dev_startup_hydration_batch_delay_ms: Option<u64>,
-    /// Dev/test-only override that forces group-read snapshot capture to fail.
-    /// Honored only with `test-policy-overrides`; this exercises the account
-    /// worker's degraded catch-up path without corrupting a real database.
-    pub dev_force_group_read_snapshot_failure: bool,
-    /// Dev/test-only override that fails invite Welcome-intent recording.
-    /// Honored only with `test-policy-overrides`; this proves a canonical
-    /// invite still returns success and attempts Welcome fanout.
-    pub dev_fail_invite_welcome_intent: bool,
     /// Dev/test-only override that fails the app projection transaction after
     /// a founding group is already canonical. Honored only with
     /// `test-policy-overrides`; restart tests use it to exercise the sole
     /// remaining post-canonical write boundary.
     pub dev_fail_create_local_projection: bool,
+    /// Explicit dev switch that advertises the device roster
+    /// (`marmot.account.device-roster.v1`), so this device can create and join
+    /// its account's device group (mdk#2628 item 3.1). Honored only with
+    /// `dev-device-groups` or policy tests; off by default.
+    pub dev_device_groups: bool,
     /// Dev/test-only override that fails invite local projection refresh.
     /// Honored only with `test-policy-overrides`; this proves a canonical
     /// invite still returns success and attempts Welcome fanout.
     pub dev_fail_invite_local_refresh: bool,
-    /// Dev/test-only override for the base interval a recovery attempt waits
-    /// before an automatic seam may start another
-    /// ([`crate::EPOCH_BACKFILL_RETRY_BACKOFF`]). Honored only with
-    /// `test-policy-overrides`; this lets a test exercise both sides of the
-    /// cooldown without spending it in wall-clock.
-    pub dev_epoch_backfill_retry_backoff_ms: Option<u64>,
     /// Dev/test-only override for how long a group wedged at one stalled epoch
     /// must wait between paced re-arms
-    /// ([`crate::client::epoch_stall::EPOCH_STALL_WEDGE_REARM_INTERVAL_MS`]).
+    /// ([`crate::client::history_recovery::epoch_stall::EPOCH_STALL_WEDGE_REARM_INTERVAL_MS`]).
     /// Honored only with `test-policy-overrides`; the production interval is an
     /// hour, so this is the only way a test can reach the second and third
     /// re-arm of a frozen device without sleeping through them.
@@ -236,28 +235,27 @@ pub struct MarmotAppConfig {
     pub directory_search_fallback_seeds: Vec<String>,
 }
 
-/// Compiled or app-level default collector URLs for product analytics,
-/// production telemetry export and forensic audit-log tracker uploads.
-/// Deployment services such as media servers and Open Ranking live on
-/// [`MarmotDeployment`].
+/// Compiled or app-level default collector URLs for product analytics and
+/// production telemetry export. Deployment services such as media servers
+/// and Open Ranking live on [`MarmotDeployment`]. Audit delivery has no
+/// default destination; hosts configure it at runtime.
 ///
 /// Defaults are intentionally separate from bearer tokens. Host apps supply
 /// credentials at runtime, while the MDK/Marmot build owns stable
 /// first-party URLs. `MarmotAppConfig::default()` reads these from
-/// `MARMOT_PRODUCT_ANALYTICS_EVENTS_ENDPOINT`,
-/// `MARMOT_RELAY_TELEMETRY_OTLP_ENDPOINT` and
-/// `MARMOT_AUDIT_LOG_TRACKER_ENDPOINT` at compile time.
+/// `MARMOT_PRODUCT_ANALYTICS_EVENTS_ENDPOINT` and
+/// `MARMOT_RELAY_TELEMETRY_OTLP_ENDPOINT` at compile time.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MarmotServiceEndpoints {
     pub product_analytics_events_endpoint: Option<String>,
     pub relay_telemetry_otlp_endpoint: Option<String>,
-    pub audit_log_tracker_endpoint: Option<String>,
 }
 
 impl Default for MarmotAppConfig {
     fn default() -> Self {
         Self {
             key_package_client_name: None,
+            device_platform: None,
             attachment_acquisition: Some(AttachmentAcquisitionPolicy::default()),
             attachment_acquisition_mode: AttachmentAcquisitionMode::default(),
             moderation_report_config: None,
@@ -273,11 +271,9 @@ impl Default for MarmotAppConfig {
             dev_scheduled_convergence_delay_ms: None,
             dev_maintenance_timing: None,
             dev_startup_hydration_batch_delay_ms: None,
-            dev_force_group_read_snapshot_failure: false,
-            dev_fail_invite_welcome_intent: false,
             dev_fail_create_local_projection: false,
+            dev_device_groups: false,
             dev_fail_invite_local_refresh: false,
-            dev_epoch_backfill_retry_backoff_ms: None,
             dev_epoch_stall_wedge_rearm_interval_ms: None,
             dev_fail_sync_before_delivery: None,
             dev_fail_sync_before_boundary_save: None,
@@ -308,6 +304,11 @@ impl MarmotAppConfig {
 
     pub fn with_key_package_client_name(mut self, name: Option<String>) -> Self {
         self.key_package_client_name = name;
+        self
+    }
+
+    pub fn with_device_platform(mut self, platform: Option<String>) -> Self {
+        self.device_platform = platform;
         self
     }
 
@@ -429,22 +430,15 @@ impl MarmotAppConfig {
         self
     }
 
-    /// Force group-read snapshot capture to fail in test-policy builds.
-    /// Normal builds ignore this field.
-    pub fn with_dev_force_group_read_snapshot_failure(mut self, enabled: bool) -> Self {
-        self.dev_force_group_read_snapshot_failure = enabled;
-        self
-    }
-
-    /// Fail invite Welcome-intent recording in test-policy builds.
-    /// Normal builds ignore this field.
-    pub fn with_dev_fail_invite_welcome_intent(mut self, enabled: bool) -> Self {
-        self.dev_fail_invite_welcome_intent = enabled;
-        self
-    }
-
     pub fn with_dev_fail_create_local_projection(mut self, enabled: bool) -> Self {
         self.dev_fail_create_local_projection = enabled;
+        self
+    }
+
+    /// Advertise the device roster in explicit dev builds or policy tests.
+    /// Ordinary builds ignore this field.
+    pub fn with_dev_device_groups(mut self, enabled: bool) -> Self {
+        self.dev_device_groups = enabled;
         self
     }
 
@@ -452,13 +446,6 @@ impl MarmotAppConfig {
     /// Normal builds ignore this field.
     pub fn with_dev_fail_invite_local_refresh(mut self, enabled: bool) -> Self {
         self.dev_fail_invite_local_refresh = enabled;
-        self
-    }
-
-    /// Pace unconfirmed epoch-gap backfill retries `ms` apart in test-policy
-    /// builds. Normal builds ignore this field.
-    pub fn with_dev_epoch_backfill_retry_backoff_ms(mut self, ms: u64) -> Self {
-        self.dev_epoch_backfill_retry_backoff_ms = Some(ms);
         self
     }
 
@@ -515,7 +502,6 @@ impl MarmotServiceEndpoints {
             .map(str::to_owned),
             relay_telemetry_otlp_endpoint: COMPILED_RELAY_TELEMETRY_OTLP_ENDPOINT
                 .map(str::to_owned),
-            audit_log_tracker_endpoint: COMPILED_AUDIT_LOG_TRACKER_ENDPOINT.map(str::to_owned),
         }
         .normalize()
     }
@@ -524,15 +510,10 @@ impl MarmotServiceEndpoints {
         self.product_analytics_events_endpoint =
             trim_optional(self.product_analytics_events_endpoint);
         self.relay_telemetry_otlp_endpoint = trim_optional(self.relay_telemetry_otlp_endpoint);
-        self.audit_log_tracker_endpoint = trim_optional(self.audit_log_tracker_endpoint);
         self
     }
 }
 
-/// Default export poll/push interval. Coarse on purpose: the data is
-/// aggregate and cumulative, so a coarse window respects battery and metered
-/// networks without losing resolution.
-const DEFAULT_EXPORT_INTERVAL: Duration = Duration::from_secs(60);
 const MIN_EXPORT_INTERVAL: Duration = Duration::from_secs(10);
 const MAX_EXPORT_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
@@ -540,186 +521,6 @@ const MAX_EXPORT_INTERVAL: Duration = Duration::from_secs(60 * 60);
 pub struct RelayTelemetrySettings {
     pub export_enabled: bool,
     pub export_interval_seconds: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RelayTelemetryResource {
-    pub service_version: String,
-    pub service_instance_id: String,
-    pub deployment_environment: String,
-    pub tenant: String,
-    pub os_type: String,
-    pub os_version: String,
-    pub device_model_identifier: Option<String>,
-}
-
-/// Hand-written `Debug` below redacts `authorization_bearer_token` (the OTLP
-/// push credential) so a `{:?}` never prints it.
-#[derive(Clone, Default, PartialEq, Eq)]
-pub struct RelayTelemetryRuntimeConfig {
-    pub otlp_endpoint: Option<String>,
-    pub authorization_bearer_token: Option<String>,
-    pub resource: Option<RelayTelemetryResource>,
-}
-
-impl std::fmt::Debug for RelayTelemetryRuntimeConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RelayTelemetryRuntimeConfig")
-            .field("otlp_endpoint", &self.otlp_endpoint)
-            .field(
-                "authorization_bearer_token",
-                &self
-                    .authorization_bearer_token
-                    .as_ref()
-                    .map(|_| "<redacted>"),
-            )
-            .field("resource", &self.resource)
-            .finish()
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct AuditLogUploadSource {
-    /// System model identifier; never a user-assigned device name, hostname, or serial number.
-    pub hardware_model: Option<String>,
-    pub platform: Option<String>,
-    pub app_version: Option<String>,
-}
-
-/// Hand-written `Debug` below redacts `authorization_bearer_token` (the audit
-/// upload credential) so a `{:?}` never prints it.
-#[derive(Clone, Default, PartialEq, Eq)]
-pub struct AuditLogTrackerConfig {
-    pub endpoint: Option<String>,
-    pub authorization_bearer_token: Option<String>,
-    pub source: AuditLogUploadSource,
-}
-
-impl std::fmt::Debug for AuditLogTrackerConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AuditLogTrackerConfig")
-            .field("endpoint", &self.endpoint)
-            .field(
-                "authorization_bearer_token",
-                &self
-                    .authorization_bearer_token
-                    .as_ref()
-                    .map(|_| "<redacted>"),
-            )
-            .field("source", &self.source)
-            .finish()
-    }
-}
-
-impl RelayTelemetryResource {
-    fn has_required_attributes(&self) -> bool {
-        [
-            self.service_version.as_str(),
-            self.service_instance_id.as_str(),
-            self.deployment_environment.as_str(),
-            self.tenant.as_str(),
-            self.os_type.as_str(),
-            self.os_version.as_str(),
-        ]
-        .into_iter()
-        .all(|value| !value.trim().is_empty())
-    }
-
-    fn normalize(mut self) -> Result<Self, String> {
-        self.service_version = trim_required("service.version", self.service_version)?;
-        self.service_instance_id = self.service_instance_id.trim().to_owned();
-        self.deployment_environment =
-            trim_required("deployment.environment.name", self.deployment_environment)?;
-        self.tenant = trim_required("tenant", self.tenant)?;
-        self.os_type = trim_required("os.type", self.os_type)?;
-        self.os_version = trim_required("os.version", self.os_version)?;
-        self.device_model_identifier = self.device_model_identifier.and_then(|value| {
-            let value = value.trim().to_owned();
-            (!value.is_empty()).then_some(value)
-        });
-        Ok(self)
-    }
-}
-
-impl RelayTelemetryRuntimeConfig {
-    pub(crate) fn normalize(mut self) -> Result<Self, String> {
-        self.otlp_endpoint = trim_optional(self.otlp_endpoint);
-        self.authorization_bearer_token = trim_optional(self.authorization_bearer_token);
-        self.resource = self
-            .resource
-            .map(RelayTelemetryResource::normalize)
-            .transpose()?;
-        Ok(self)
-    }
-
-    fn normalize_for_export(mut self) -> Self {
-        self.otlp_endpoint = trim_optional(self.otlp_endpoint);
-        self.authorization_bearer_token = trim_optional(self.authorization_bearer_token);
-        self.resource = self
-            .resource
-            .and_then(|resource| RelayTelemetryResource::normalize(resource).ok());
-        self
-    }
-}
-
-impl AuditLogUploadSource {
-    fn normalize(mut self) -> Self {
-        self.hardware_model = trim_optional(self.hardware_model);
-        self.platform = trim_optional(self.platform);
-        self.app_version = trim_optional(self.app_version);
-        self
-    }
-}
-
-impl AuditLogTrackerConfig {
-    pub(crate) fn normalize(mut self) -> Result<Self, String> {
-        self.endpoint = trim_optional(self.endpoint);
-        self.authorization_bearer_token = trim_optional(self.authorization_bearer_token);
-        self.source = self.source.normalize();
-        if self
-            .endpoint
-            .as_deref()
-            .is_some_and(|endpoint| !endpoint_transport_allowed(endpoint))
-        {
-            return Err(
-                "audit log tracker endpoint must be https, or loopback http for local testing"
-                    .to_owned(),
-            );
-        }
-        Ok(self)
-    }
-
-    pub(crate) fn resolved_endpoint(&self, endpoints: &MarmotServiceEndpoints) -> Option<String> {
-        self.endpoint
-            .clone()
-            .or_else(|| endpoints.audit_log_tracker_endpoint.clone())
-            .and_then(|endpoint| trim_optional(Some(endpoint)))
-    }
-
-    pub(crate) fn upload_allowed_with_endpoints(&self, endpoints: &MarmotServiceEndpoints) -> bool {
-        self.resolved_endpoint(endpoints)
-            .as_deref()
-            .is_some_and(endpoint_transport_allowed)
-            && self
-                .authorization_bearer_token
-                .as_deref()
-                .is_some_and(|token| !token.trim().is_empty())
-    }
-}
-
-fn trim_optional(value: Option<String>) -> Option<String> {
-    value.and_then(|value| {
-        let value = value.trim().to_owned();
-        (!value.is_empty()).then_some(value)
-    })
-}
-
-fn trim_required(name: &str, value: String) -> Result<String, String> {
-    let value = value.trim().to_owned();
-    if value.is_empty() {
-        return Err(format!("{name} must not be empty"));
-    }
-    Ok(value)
 }
 
 impl Default for RelayTelemetrySettings {
@@ -760,171 +561,21 @@ impl RelayTelemetrySettings {
         runtime: RelayTelemetryRuntimeConfig,
         endpoints: &MarmotServiceEndpoints,
     ) -> RelayTelemetryExportConfig {
-        let runtime = runtime.normalize_for_export();
         RelayTelemetryExportConfig {
             enabled: self.export_enabled,
-            endpoint: runtime
-                .otlp_endpoint
-                .or_else(|| trim_optional(endpoints.relay_telemetry_otlp_endpoint.clone())),
+            endpoint: trim_optional(endpoints.relay_telemetry_otlp_endpoint.clone()),
             interval: Duration::from_secs(self.export_interval_seconds),
-            authorization_bearer_token: runtime.authorization_bearer_token,
-            resource: runtime.resource,
-        }
-    }
-}
-
-/// Opt-in configuration for relay-telemetry export.
-///
-/// Off by default. While `enabled` is `false` nothing is resolved or exported
-/// and the app behaves exactly as today. This is the single opt-in switch that
-/// gates relay-identity resolution and the OTLP exporter — see the privacy
-/// contract in `docs/marmot-architecture/relay-observability.md`.
-///
-/// The `endpoint` must be the full first-party Marmot-operated OTLP/HTTP
-/// metrics URL reached over TLS (`https`). Plain `http` is accepted only for
-/// loopback collectors used in local testing, so anything that actually leaves
-/// the device stays on TLS. Export is inert without an endpoint, and the
-/// exporter is not constructed for a non-TLS, non-loopback endpoint.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RelayTelemetryExportConfig {
-    /// Whether the user has opted in to relay-telemetry export. Off by default.
-    pub enabled: bool,
-    /// Full first-party OTLP/HTTP metrics URL. Must be `https`, except a
-    /// loopback `http` collector for local testing. `None` keeps export inert
-    /// even when `enabled`.
-    pub endpoint: Option<String>,
-    /// How often to poll the rollup and push.
-    pub interval: Duration,
-    /// Bearer token supplied by the host app at runtime from its build-time
-    /// platform secret. Never persisted by Marmot.
-    pub authorization_bearer_token: Option<String>,
-    /// Resource attributes supplied by the host app at runtime. Never persisted
-    /// by Marmot because these describe the binary/device shell.
-    pub resource: Option<RelayTelemetryResource>,
-}
-
-impl Default for RelayTelemetryExportConfig {
-    fn default() -> Self {
-        Self::disabled()
-    }
-}
-
-impl RelayTelemetryExportConfig {
-    /// A disabled (opt-out) configuration. This is also [`Default`].
-    pub fn disabled() -> Self {
-        Self {
-            enabled: false,
-            endpoint: None,
-            interval: DEFAULT_EXPORT_INTERVAL,
             authorization_bearer_token: None,
             resource: None,
         }
-    }
-
-    /// An opted-in configuration pushing to `endpoint` at the default interval.
-    pub fn enabled(endpoint: impl Into<String>) -> Self {
-        Self {
-            enabled: true,
-            endpoint: Some(endpoint.into()),
-            interval: DEFAULT_EXPORT_INTERVAL,
-            authorization_bearer_token: None,
-            resource: None,
-        }
-    }
-
-    /// Override the poll/push interval.
-    pub fn with_interval(mut self, interval: Duration) -> Self {
-        self.interval = interval;
-        self
-    }
-
-    pub fn with_runtime_config(mut self, runtime: RelayTelemetryRuntimeConfig) -> Self {
-        let runtime = runtime.normalize_for_export();
-        self.endpoint = runtime.otlp_endpoint.or(self.endpoint);
-        self.authorization_bearer_token = runtime.authorization_bearer_token;
-        self.resource = runtime.resource;
-        self
-    }
-
-    /// Whether export may actually run: opted in, an endpoint is configured, and
-    /// that endpoint is reachable over TLS (`https`). Plain `http` is allowed
-    /// only for loopback collectors used in local testing, so the privacy
-    /// contract's TLS requirement holds for anything that leaves the device.
-    ///
-    /// This is the single gate condition shared by the exporter constructor
-    /// (`RelayTelemetryExporter::new`) and relay-identity resolution.
-    pub(crate) fn export_allowed(&self) -> bool {
-        self.enabled
-            && self
-                .endpoint
-                .as_deref()
-                .is_some_and(|endpoint| parse_relay_telemetry_endpoint(endpoint).is_some())
-            && self
-                .authorization_bearer_token
-                .as_deref()
-                .is_some_and(|token| !token.trim().is_empty())
-            && self
-                .resource
-                .as_ref()
-                .is_some_and(RelayTelemetryResource::has_required_attributes)
-    }
-}
-
-impl transport_nostr::RelayExportGate for RelayTelemetryExportConfig {
-    fn export_allowed(&self) -> bool {
-        RelayTelemetryExportConfig::export_allowed(self)
-    }
-}
-
-/// Structural gate shared by exporter construction and each OTLP dial attempt.
-/// Keep the exact `localhost`/loopback-IP test contract; do not admit subdomains
-/// or grant loopback access because an ordinary hostname resolves there.
-pub(crate) fn parse_relay_telemetry_endpoint(endpoint: &str) -> Option<url::Url> {
-    let url = url::Url::parse(endpoint).ok()?;
-    let host = url.host()?;
-    if url.port_or_known_default()? == 0
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.fragment().is_some()
-        || !matches!(url.scheme(), "https" | "http")
-        || (url.scheme() == "http" && !host_is_loopback(host))
-    {
-        return None;
-    }
-    Some(url)
-}
-
-/// Accept `https` for any host; accept `http` only for a loopback host (a local
-/// test collector). Reject anything else, including unparseable endpoints.
-pub(crate) fn endpoint_transport_allowed(endpoint: &str) -> bool {
-    let Ok(url) = url::Url::parse(endpoint) else {
-        return false;
-    };
-    match url.scheme() {
-        "https" => true,
-        "http" => url.host().is_some_and(host_is_loopback),
-        _ => false,
-    }
-}
-
-pub(crate) fn endpoint_host_is_loopback(endpoint: &str) -> bool {
-    url::Url::parse(endpoint)
-        .ok()
-        .and_then(|url| url.host().map(host_is_loopback))
-        .unwrap_or(false)
-}
-
-fn host_is_loopback(host: url::Host<&str>) -> bool {
-    match host {
-        url::Host::Domain(domain) => domain.eq_ignore_ascii_case("localhost"),
-        url::Host::Ipv4(addr) => addr.is_loopback(),
-        url::Host::Ipv6(addr) => addr.is_loopback(),
+        .with_runtime_config(runtime)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use marmot_observability::RelayTelemetryResource;
 
     #[test]
     fn cursor_persistence_defaults_to_advance_and_is_opt_in() {
@@ -969,127 +620,6 @@ mod tests {
         let no_relays =
             default.with_open_ranking_provider(Some("https://rank.example".to_owned()), Vec::new());
         assert_eq!(no_relays.deployment.open_ranking, None);
-    }
-
-    fn runtime_config() -> RelayTelemetryRuntimeConfig {
-        RelayTelemetryRuntimeConfig {
-            otlp_endpoint: None,
-            authorization_bearer_token: Some("token".to_owned()),
-            resource: Some(RelayTelemetryResource {
-                service_version: "1.4.2".to_owned(),
-                service_instance_id: "8e1ca50b-05a2-4c31-a31c-1e69c75a9366".to_owned(),
-                deployment_environment: "staging".to_owned(),
-                tenant: "mdk-ios".to_owned(),
-                os_type: "ios".to_owned(),
-                os_version: "17.5".to_owned(),
-                device_model_identifier: None,
-            }),
-        }
-    }
-
-    #[test]
-    fn relay_export_gate_is_the_export_allowed_check() {
-        use transport_nostr::RelayExportGate;
-        let configs = [
-            RelayTelemetryExportConfig::disabled(),
-            RelayTelemetryExportConfig {
-                enabled: true,
-                ..Default::default()
-            },
-            RelayTelemetryExportConfig::enabled("https://otlp.example/v1/metrics")
-                .with_runtime_config(runtime_config()),
-        ];
-        let gates = configs
-            .iter()
-            .map(RelayExportGate::export_allowed)
-            .collect::<Vec<_>>();
-        assert_eq!(gates, [false, false, true]);
-        for config in &configs {
-            assert_eq!(
-                RelayExportGate::export_allowed(config),
-                config.export_allowed()
-            );
-        }
-    }
-
-    #[test]
-    fn export_allowed_requires_opt_in_endpoint_and_tls() {
-        // Off by default, and an endpoint alone does not enable export.
-        assert!(!RelayTelemetryExportConfig::disabled().export_allowed());
-        assert!(
-            !RelayTelemetryExportConfig {
-                enabled: true,
-                endpoint: None,
-                authorization_bearer_token: Some("token".to_owned()),
-                resource: runtime_config().resource,
-                ..Default::default()
-            }
-            .export_allowed()
-        );
-
-        // https is accepted; plain http to a remote host is rejected.
-        assert!(
-            RelayTelemetryExportConfig::enabled("https://otlp.example.org/v1/metrics")
-                .with_runtime_config(runtime_config())
-                .export_allowed()
-        );
-        assert!(
-            !RelayTelemetryExportConfig::enabled("http://otlp.example.org/v1/metrics")
-                .with_runtime_config(runtime_config())
-                .export_allowed()
-        );
-        assert!(
-            !RelayTelemetryExportConfig::enabled("ftp://otlp.example.org/v1/metrics")
-                .with_runtime_config(runtime_config())
-                .export_allowed()
-        );
-        assert!(
-            !RelayTelemetryExportConfig::enabled("not a url")
-                .with_runtime_config(runtime_config())
-                .export_allowed()
-        );
-        assert!(
-            !RelayTelemetryExportConfig::enabled("https://otlp.example.org/v1/metrics")
-                .export_allowed()
-        );
-
-        // http is allowed only for loopback collectors (local testing).
-        assert!(
-            RelayTelemetryExportConfig::enabled("http://127.0.0.1:4318/v1/metrics")
-                .with_runtime_config(runtime_config())
-                .export_allowed()
-        );
-        assert!(
-            RelayTelemetryExportConfig::enabled("http://[::1]:4318/v1/metrics")
-                .with_runtime_config(runtime_config())
-                .export_allowed()
-        );
-        assert!(
-            RelayTelemetryExportConfig::enabled("http://localhost:4318/v1/metrics")
-                .with_runtime_config(runtime_config())
-                .export_allowed()
-        );
-    }
-
-    #[test]
-    fn relay_telemetry_host_safety_rejects_invalid_structure() {
-        for endpoint in [
-            "https://user:password@collector.example/v1/metrics",
-            "https://user@collector.example/v1/metrics",
-            "https://collector.example/v1/metrics#fragment",
-            "https://collector.example:0/v1/metrics",
-            "https://collector.example:65536/v1/metrics",
-            "https:///",
-            "file:///v1/metrics",
-            "http://collector.example/v1/metrics",
-            "http://10.0.0.1/v1/metrics",
-            "http://dev.localhost/v1/metrics",
-        ] {
-            let mut config =
-                RelayTelemetryExportConfig::enabled(endpoint).with_runtime_config(runtime_config());
-            config.endpoint = Some(endpoint.to_owned());
-            assert!(!config.export_allowed(), "accepted invalid structure");
-        }
     }
 
     #[test]

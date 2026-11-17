@@ -17,7 +17,9 @@ async fn genuine_outgoing_upload_is_local_after_confirmed_send_and_restart() {
         let group = alice
             .create_group("outgoing retention", &["bob"])
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         bob.sync().await.unwrap();
         drop(alice);
         drop(bob);
@@ -205,6 +207,8 @@ fn outgoing_retained_subprocess_probe() {
     let Some(path) = std::env::var_os("MDK_ATTACHMENT_RETENTION_PROBE") else {
         return;
     };
+    // This fresh process does not inherit its parent's fixture opt-in.
+    storage_sqlite::relax_storage_for_test_process();
     let probe: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
     let app = MarmotApp::with_relay_and_config(
         probe["root"].as_str().unwrap(),

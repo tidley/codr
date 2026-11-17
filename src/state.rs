@@ -399,13 +399,21 @@ impl BridgeState {
     }
 
     fn enqueue_text(&mut self, group: &str, text: &str, request: Option<&str>) {
+        let text = crate::phone_markdown::readable_tables(text);
+        let converted = matches!(&text, std::borrow::Cow::Owned(_));
         // Keep each encrypted message below MDK's message-size ceiling.
-        let mut rest = text;
+        let mut rest = text.as_ref();
         let mut part = 0;
         while !rest.is_empty() {
             let mut end = rest.len().min(30000);
             while !rest.is_char_boundary(end) {
                 end -= 1;
+            }
+            if converted
+                && end < rest.len()
+                && let Some(newline) = rest[..end].rfind('\n')
+            {
+                end = newline + 1;
             }
             self.outbox.push(Outgoing {
                 id: request.map_or_else(

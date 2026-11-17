@@ -1,0 +1,2215 @@
+//! Sealed history deliveries (mdk#2628 4.2b and 4.2c, D76, D77): a chat's
+//! history sent through the device group to one sibling, by the device whose
+//! own Commit added it. The sender owes the history before it sends
+//! anything, and keeps owing it until every delivery reached a relay; a
+//! delivery withdrawn, or whose publish fails for good, makes it owed again.
+//! The receiver imports a delivery it can open once it holds the chat, and
+//! parks it until then. A history too long for inline deliveries goes
+//! through the chat's Blossom server. Imported rows name the device they came
+//! from, and each held chat's history state is listed for hosts (4.2d, D78).
+
+use std::collections::HashMap;
+use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use super::*;
+use crate::history_delivery::{
+    INLINE_BUNDLE_MAX_PLAINTEXT, KIND_HISTORY_DELIVERY, MAX_INLINE_BUNDLES,
+};
+use crate::messages::AppMessageIntent;
+use crate::{ChatHistoryImportState, HistoryImportSource, TimelineMessageQuery};
+use cgka_traits::app_components::BLOSSOM_LOCATOR_KIND_V1;
+use cgka_traits::storage::SiblingAddStorage as _;
+use sha2::{Digest as _, Sha256};
+use storage_sqlite::{ParkedBundle, SqliteAppStorage};
+
+/// A Blossom server on loopback: an upload keeps the blob by its SHA-256, a
+/// fetch serves it and a delete drops it, once a valid BUD-11 delete
+/// authorization for that blob allows it; `deleters` records who signed
+/// each. Uploads fail while `refuse_uploads` is set.
+pub(in crate::tests) struct LocalBlossom {
+    pub(in crate::tests) url: String,
+    pub(in crate::tests) blobs: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+    pub(in crate::tests) refuse_uploads: Arc<AtomicBool>,
+    pub(super) deleters: Arc<Mutex<Vec<String>>>,
+    pub(in crate::tests) reads: Arc<Mutex<Vec<String>>>,
+    get_gate: Arc<Mutex<Vec<BlossomHttpGate>>>,
+}
+
+struct BlossomHttpGate {
+    hash: String,
+    started: tokio::sync::oneshot::Sender<()>,
+    released: std::sync::mpsc::Receiver<()>,
+}
+
+pub(super) struct BlossomHttpHold {
+    started: tokio::sync::oneshot::Receiver<()>,
+    release: Option<std::sync::mpsc::Sender<()>>,
+}
+
+impl BlossomHttpHold {
+    pub(super) async fn entered(&mut self) {
+        (&mut self.started)
+            .await
+            .expect("the actual HTTP request reaches the server");
+    }
+
+    pub(super) fn release(mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+    }
+}
+
+impl Drop for BlossomHttpHold {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+    }
+}
+
+impl LocalBlossom {
+    /// Hold the next genuine upload before the server accepts its bytes.
+    pub(super) fn hold_upload(&self) -> BlossomHttpHold {
+        let (started, wait) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        self.get_gate.lock().unwrap().push(BlossomHttpGate {
+            hash: String::new(),
+            started,
+            released,
+        });
+        BlossomHttpHold {
+            started: wait,
+            release: Some(release),
+        }
+    }
+
+    /// Hold a real HTTP GET before serving its bytes; no client retry,
+    /// membership or cancellation decision is supplied by this fixture.
+    pub(super) fn hold_get(&self, hash: &str) -> BlossomHttpHold {
+        let (started, wait) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let mut gate = self.get_gate.lock().unwrap();
+        gate.push(BlossomHttpGate {
+            hash: hash.into(),
+            started,
+            released,
+        });
+        BlossomHttpHold {
+            started: wait,
+            release: Some(release),
+        }
+    }
+}
+
+pub(in crate::tests) fn local_blossom() -> LocalBlossom {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    let blobs = Arc::<Mutex<HashMap<String, Vec<u8>>>>::default();
+    let refuse_uploads = Arc::<AtomicBool>::default();
+    let deleters = Arc::<Mutex<Vec<String>>>::default();
+    let reads = Arc::<Mutex<Vec<String>>>::default();
+    let get_gate = Arc::<Mutex<Vec<BlossomHttpGate>>>::default();
+    let (served, refused, signed) = (blobs.clone(), refuse_uploads.clone(), deleters.clone());
+    let (read_log, gate) = (reads.clone(), get_gate.clone());
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let (served, refused, signed) = (served.clone(), refused.clone(), signed.clone());
+            let (reads, gate) = (read_log.clone(), gate.clone());
+            std::thread::spawn(move || {
+                serve_blossom(stream, &served, &refused, &signed, &reads, &gate)
+            });
+        }
+    });
+    LocalBlossom {
+        url,
+        blobs,
+        refuse_uploads,
+        deleters,
+        reads,
+        get_gate,
+    }
+}
+
+/// Who signed `authorization`, when it is a valid BUD-11 token to delete
+/// blob `hash`.
+fn delete_authorizer(authorization: &str, hash: &str) -> Option<String> {
+    use ::nostr::prelude::Event;
+    use base64::Engine as _;
+    let json = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(authorization.strip_prefix("Nostr ")?)
+        .ok()?;
+    let event = Event::from_json(json).ok()?;
+    event.verify().ok()?;
+    let tag = |name: &str| {
+        event.tags.iter().find_map(|tag| match tag.as_slice() {
+            [key, value, ..] if key == name => Some(value.clone()),
+            _ => None,
+        })
+    };
+    (event.kind.as_u16() == 24242
+        && tag("t").as_deref() == Some("delete")
+        && tag("x").as_deref() == Some(hash))
+    .then(|| event.pubkey.to_hex())
+}
+
+fn serve_blossom(
+    stream: std::net::TcpStream,
+    blobs: &Mutex<HashMap<String, Vec<u8>>>,
+    refuse_uploads: &AtomicBool,
+    deleters: &Mutex<Vec<String>>,
+    reads: &Mutex<Vec<String>>,
+    gate: &Mutex<Vec<BlossomHttpGate>>,
+) {
+    let mut reader = BufReader::new(stream);
+    let mut request = String::new();
+    let mut authorization = String::new();
+    let mut len = 0;
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+            return;
+        }
+        if line == "\r\n" {
+            break;
+        }
+        if request.is_empty() {
+            request = line;
+        } else if let Some((name, value)) = line.split_once(':') {
+            if name.eq_ignore_ascii_case("content-length") {
+                len = value.trim().parse().unwrap_or(0);
+            } else if name.eq_ignore_ascii_case("authorization") {
+                authorization = value.trim().to_owned();
+            }
+        }
+    }
+    let mut body = vec![0; len];
+    if reader.read_exact(&mut body).is_err() {
+        return;
+    }
+    let respond = |status: &str, body: &[u8]| {
+        let mut response = format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(body);
+        response
+    };
+    let mut parts = request.split_whitespace();
+    let response = match (parts.next(), parts.next()) {
+        (Some("PUT"), Some("/upload")) if refuse_uploads.load(Ordering::SeqCst) => {
+            respond("500 Internal Server Error", b"")
+        }
+        (Some("PUT"), Some("/upload")) => {
+            let held = {
+                let mut gates = gate.lock().unwrap();
+                gates
+                    .iter()
+                    .position(|held| held.hash.is_empty())
+                    .map(|position| gates.remove(position))
+            };
+            if let Some(held) = held {
+                let _ = held.started.send(());
+                let _ = held.released.recv();
+            }
+            let hash = hex::encode(Sha256::digest(&body));
+            blobs.lock().unwrap().insert(hash.clone(), body);
+            respond("200 OK", format!(r#"{{"sha256":"{hash}"}}"#).as_bytes())
+        }
+        (Some("GET"), Some(path)) => {
+            let hash = path[1..].strip_suffix(".bin").unwrap_or(&path[1..]);
+            reads.lock().unwrap().push(hash.into());
+            let held = {
+                let mut gate = gate.lock().unwrap();
+                gate.iter()
+                    .position(|held| held.hash == hash)
+                    .map(|position| gate.remove(position))
+            };
+            if let Some(held) = held {
+                let _ = held.started.send(());
+                let _ = held.released.recv();
+            }
+            match blobs.lock().unwrap().get(hash) {
+                Some(blob) => respond("200 OK", blob),
+                None => respond("404 Not Found", b""),
+            }
+        }
+        (Some("DELETE"), Some(path)) => match delete_authorizer(&authorization, &path[1..]) {
+            None => respond("401 Unauthorized", b""),
+            Some(signer) => {
+                deleters.lock().unwrap().push(signer);
+                match blobs.lock().unwrap().remove(&path[1..]) {
+                    Some(_) => respond("200 OK", b""),
+                    None => respond("404 Not Found", b""),
+                }
+            }
+        },
+        _ => respond("405 Method Not Allowed", b""),
+    };
+    let _ = reader.get_mut().write_all(&response);
+}
+
+/// Point `chat`'s encrypted-media endpoints at `server` alone.
+pub(in crate::tests) async fn use_blossom(
+    client: &mut AppClient,
+    chat: &GroupId,
+    locator_kind: &str,
+    server: &str,
+) {
+    client
+        .replace_encrypted_media_blob_endpoints(
+            chat,
+            vec![crate::AppBlobEndpoint {
+                locator_kind: locator_kind.to_owned(),
+                base_url: server.to_owned(),
+            }],
+        )
+        .await
+        .unwrap();
+}
+
+pub(super) fn storage(app: &MarmotApp) -> SqliteAppStorage {
+    app.account_storage("alice").unwrap().app_storage()
+}
+
+fn published_count(relay: &ScriptedPushRelayClient) -> usize {
+    relay.published_events.lock().unwrap().len()
+}
+
+pub(in crate::tests) async fn send_text(
+    client: &mut AppClient,
+    chat: &GroupId,
+    content: &str,
+) -> String {
+    client
+        .send_app_event(
+            chat,
+            AppMessageIntent::Chat {
+                content: content.to_owned(),
+            },
+        )
+        .await
+        .unwrap()
+        .0
+        .id
+}
+
+/// The phone edits the laptop's roster entry and the laptop takes the
+/// commit.
+async fn edit_laptop_entry(
+    devices: &mut Devices,
+    group: &GroupId,
+    edit: impl FnOnce(&mut DeviceEntryV1),
+) {
+    let laptop_slot = slot_of(&devices.laptop);
+    let mut cursor = published_count(&devices.relay);
+    let edited = devices
+        .phone
+        .runtime
+        .edit_device_roster_entry(group, &laptop_slot, &[], |entry| {
+            let before = (entry.label.clone(), entry.settings);
+            edit(entry);
+            if (entry.label.clone(), entry.settings) != before {
+                entry.rename_id = Some(rand::random());
+            }
+        })
+        .await
+        .unwrap();
+    assert!(matches!(edited, DeviceRosterEdit::Committed(_)));
+    deliver_new(&mut devices.laptop, &devices.relay, &mut cursor).await;
+    devices.laptop.sync().await.unwrap();
+}
+
+/// The phone names its own roster entry `label`, and the laptop takes the
+/// commit.
+async fn name_phone(devices: &mut Devices, group: &GroupId, label: &str) {
+    let phone_slot = slot_of(&devices.phone);
+    let mut cursor = published_count(&devices.relay);
+    let edited = devices
+        .phone
+        .runtime
+        .edit_device_roster_entry(group, &phone_slot, &[], |entry| {
+            entry.label = label.to_owned();
+            entry.rename_id = Some(rand::random());
+        })
+        .await
+        .unwrap();
+    assert!(matches!(edited, DeviceRosterEdit::Committed(_)));
+    deliver_new(&mut devices.laptop, &devices.relay, &mut cursor).await;
+    devices.laptop.sync().await.unwrap();
+}
+
+/// Capture the existing account worker's actual host notifications.
+fn device_group_events(client: &mut AppClient) -> Vec<crate::MarmotAppEvent> {
+    let (events, mut received) = tokio::sync::broadcast::channel(16);
+    let account_id_hex = hex::encode(client.runtime.self_id().as_slice());
+    let label = client.state.label.clone();
+    crate::runtime::account_worker::publish_device_group_changes(
+        client,
+        &events,
+        &account_id_hex,
+        &label,
+    );
+    let mut published = Vec::new();
+    loop {
+        match received.try_recv() {
+            Ok(event) => published.push(event),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => return published,
+            Err(error) => panic!("host notifications could not be observed: {error}"),
+        }
+    }
+}
+
+/// Whether the actual worker tells hosts to reread the latest import answer.
+fn device_group_seam(client: &mut AppClient) -> bool {
+    device_group_events(client).iter().any(|event| {
+        matches!(
+            event,
+            crate::MarmotAppEvent::ChatHistoryImportsChanged { .. }
+        )
+    })
+}
+
+/// What `client` lists of `chat`'s history from another device.
+fn history_state(client: &AppClient, chat: &GroupId) -> Vec<ChatHistoryImportState> {
+    let chat_hex = hex::encode(chat.as_slice());
+    client
+        .chat_history_imports()
+        .unwrap()
+        .into_iter()
+        .filter(|import| import.group_id_hex == chat_hex)
+        .map(|import| import.state)
+        .collect()
+}
+
+/// The phone as an imported row names it.
+fn phone_named(devices: &Devices, label: &str) -> HistoryImportSource {
+    HistoryImportSource {
+        device_slot_id_hex: hex::encode(slot_of(&devices.phone)),
+        device_label: label.to_owned(),
+    }
+}
+
+/// The phone adds the laptop's tagged KeyPackage to `chat`; the laptop joins.
+pub(super) async fn add_laptop(devices: &mut Devices, chat: &GroupId) {
+    let mut cursor = published_count(&devices.relay);
+    let key_package = published_key_package(&mut devices.laptop, &devices.relay).await;
+    let effects = devices
+        .phone
+        .runtime
+        .send(SendIntent::Invite {
+            group_id: chat.clone(),
+            key_packages: vec![key_package],
+            initial_admins: vec![],
+        })
+        .await
+        .unwrap();
+    devices
+        .phone
+        .observe_drained_session_events(&effects)
+        .await
+        .unwrap();
+    deliver_new(&mut devices.laptop, &devices.relay, &mut cursor).await;
+    devices.laptop.sync().await.unwrap();
+    devices.laptop.accept_group_invite(chat).unwrap();
+}
+
+/// Tagging devices whose laptop asks for history, and a chat the phone has
+/// one message in.
+async fn history_devices() -> (Devices, GroupId, GroupId, String) {
+    let (mut devices, group) = tagging_devices().await;
+    assert!(
+        roster(&devices.phone, &group).devices[&slot_of(&devices.laptop)]
+            .history_key
+            .is_some(),
+        "the laptop's history key rides on its tag-key commit"
+    );
+    edit_laptop_entry(&mut devices, &group, |entry| {
+        entry.settings.bring_history = true;
+    })
+    .await;
+    let chat = devices
+        .phone
+        .create_group("team", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    let first = send_text(&mut devices.phone, &chat, "before the laptop").await;
+    (devices, group, chat, first)
+}
+
+/// A real longer non-user branch drops the phone's local edit. None edits
+/// only the label; Some changes the history flag. No maintenance replays it.
+async fn lose_phone_edit(devices: &mut Devices, group: &GroupId, history: Option<bool>) {
+    use super::devices::{edit_own_entry, exchange};
+    // An Add can leave an announcement in the relay that only its sender
+    // has seen. Replay both prefixes before forking, rather than skipping
+    // those inputs with a cursor starting at the relay's current end.
+    let mut cursors = (0, 0);
+    exchange(
+        &mut devices.phone,
+        &mut devices.laptop,
+        &devices.relay,
+        group,
+        &mut cursors,
+    )
+    .await;
+    let slot = slot_of(&devices.laptop);
+    assert_eq!(
+        roster(&devices.phone, group),
+        roster(&devices.laptop, group),
+        "the fork starts from a shared roster"
+    );
+    if let Some(history) = history {
+        devices
+            .phone
+            .update_linked_device_settings(&hex::encode(slot), None, Some(history), None)
+            .await
+            .unwrap();
+    } else {
+        devices
+            .phone
+            .rename_linked_device(&hex::encode(slot), "Unrelated name")
+            .await
+            .unwrap();
+    }
+    edit_own_entry(&mut devices.laptop, group, &["fork-a", "fork-b"]).await;
+    exchange(
+        &mut devices.phone,
+        &mut devices.laptop,
+        &devices.relay,
+        group,
+        &mut cursors,
+    )
+    .await;
+    let entry = &roster(&devices.phone, group).devices[&slot];
+    let record = storage(&devices.phone_app)
+        .device_rename(&hex::encode(slot))
+        .unwrap()
+        .unwrap();
+    assert!(record.replaced.contains(&entry.rename_id));
+    assert!(
+        !record.written.contains(&entry.rename_id.unwrap()),
+        "the local edit is Lost"
+    );
+}
+
+/// A lost local history toggle waits for D37 before either disclosing history
+/// or irreversibly forgetting debt. Maintenance recovers before making that
+/// destination decision. An unrelated lost label does not hold history.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owed_history_waits_only_for_a_differing_local_history_toggle() {
+    for desired in [Some(false), Some(true), None] {
+        let (mut devices, group) = tagging_devices().await;
+        if desired != Some(true) {
+            edit_laptop_entry(&mut devices, &group, |entry| {
+                entry.settings.bring_history = true;
+            })
+            .await;
+        }
+        let chat = devices
+            .phone
+            .create_group("owed", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
+        send_text(&mut devices.phone, &chat, "owed history").await;
+        add_laptop(&mut devices, &chat).await;
+        lose_phone_edit(&mut devices, &group, desired).await;
+        let slot = slot_of(&devices.laptop);
+        assert_eq!(
+            roster(&devices.phone, &group).devices[&slot]
+                .settings
+                .bring_history,
+            desired != Some(true)
+        );
+        let phone_storage = storage(&devices.phone_app);
+        let deliveries = || {
+            phone_storage
+                .device_group_messages()
+                .unwrap()
+                .into_iter()
+                .filter(|(.., kind)| *kind == KIND_HISTORY_DELIVERY)
+                .count()
+        };
+        let before = deliveries();
+        devices.phone.drive_history_deliveries().await;
+        let Some(desired) = desired else {
+            assert!(
+                phone_storage
+                    .unsent_history_deliveries()
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                deliveries(),
+                before + 1,
+                "a lost label never holds the history flag"
+            );
+            continue;
+        };
+        assert_eq!(
+            phone_storage.unsent_history_deliveries().unwrap().len(),
+            1,
+            "pending toggle preserves existing debt in either direction"
+        );
+        assert_eq!(
+            deliveries(),
+            before,
+            "pending disable cannot disclose history"
+        );
+        devices.phone.run_due_maintenance().await.unwrap();
+        assert_eq!(
+            roster(&devices.phone, &group).devices[&slot]
+                .settings
+                .bring_history,
+            desired
+        );
+        assert!(
+            phone_storage
+                .unsent_history_deliveries()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            deliveries(),
+            before + usize::from(desired),
+            "once ready, current false forgets and current true sends"
+        );
+    }
+}
+
+/// The phone's confirmed Commit that adds the laptop to a chat owes the
+/// laptop that chat's history, once its entry asks for history. One delivery
+/// carries it; the laptop imports it, marked with the phone's slot, even
+/// though it holds a later device-group epoch than the delivery's. An add
+/// while the entry asks for none sends nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_device_that_adds_a_sibling_to_a_chat_sends_it_the_history() {
+    let (mut devices, group) = tagging_devices().await;
+    let phone_storage = storage(&devices.phone_app);
+    let quiet = devices
+        .phone
+        .create_group("quiet", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    send_text(&mut devices.phone, &quiet, "never sent").await;
+    add_laptop(&mut devices, &quiet).await;
+    let adds = devices
+        .phone_app
+        .account_storage("alice")
+        .unwrap()
+        .sibling_adds()
+        .unwrap();
+    assert_eq!(adds.len(), 1, "the add commit records the laptop");
+    assert_eq!(adds[0].slot, slot_of(&devices.laptop));
+    let before = published_count(&devices.relay);
+    devices.phone.drive_history_deliveries().await;
+    assert_eq!(
+        published_count(&devices.relay),
+        before,
+        "the laptop's entry asks for no history"
+    );
+    assert!(
+        phone_storage
+            .unsent_history_deliveries()
+            .unwrap()
+            .is_empty()
+    );
+
+    edit_laptop_entry(&mut devices, &group, |entry| {
+        entry.settings.bring_history = true;
+    })
+    .await;
+    let chat = devices
+        .phone
+        .create_group("team", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    let chat_hex = hex::encode(chat.as_slice());
+    let first = send_text(&mut devices.phone, &chat, "before the laptop").await;
+    add_laptop(&mut devices, &chat).await;
+    let laptop_storage = storage(&devices.laptop_app);
+    assert!(
+        laptop_storage
+            .timeline_message(&chat_hex, &first)
+            .unwrap()
+            .is_none()
+    );
+    // The laptop's second KeyPackage moved the device group on, and the phone
+    // sends before it takes that commit: the laptop reads who sent the
+    // delivery at the delivery's epoch, not its own later one.
+    assert!(
+        devices.laptop.runtime.group_record(&group).unwrap().epoch
+            > devices.phone.runtime.group_record(&group).unwrap().epoch
+    );
+    let before = published_count(&devices.relay);
+    devices.phone.drive_history_deliveries().await;
+    assert_eq!(published_count(&devices.relay), before + 1, "one delivery");
+    assert!(
+        phone_storage
+            .unsent_history_deliveries()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        devices
+            .phone_app
+            .account_storage("alice")
+            .unwrap()
+            .sibling_adds()
+            .unwrap()
+            .is_empty()
+    );
+    devices.laptop.take_pending_projection_updates();
+    deliver_all(&mut devices.laptop, &devices.relay).await;
+
+    let imported = laptop_storage
+        .timeline_message(&chat_hex, &first)
+        .unwrap()
+        .expect("imported");
+    assert_eq!(imported.plaintext, "before the laptop");
+    assert_eq!(
+        laptop_storage
+            .app_event_import_source(&chat_hex, &first)
+            .unwrap(),
+        Some(slot_of(&devices.phone))
+    );
+    assert!(
+        devices
+            .laptop
+            .take_pending_projection_updates()
+            .iter()
+            .any(|update| update.group_id_hex == chat_hex)
+    );
+    assert!(
+        laptop_storage
+            .device_group_messages()
+            .unwrap()
+            .iter()
+            .any(|(.., kind)| *kind == KIND_HISTORY_DELIVERY),
+        "the reader records the delivery, so its withdrawal owes no small state"
+    );
+    assert!(
+        devices
+            .laptop_app
+            .account_storage("alice")
+            .unwrap()
+            .sibling_adds()
+            .unwrap()
+            .is_empty(),
+        "only the adder owes the history"
+    );
+}
+
+/// A genuine history delivery whose import write fails stays in the retained
+/// projection and imports once ordinary projection replay can write again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_history_delivery_whose_import_write_fails_is_kept_on_retry() {
+    let (mut devices, _group, chat, first) = history_devices().await;
+    add_laptop(&mut devices, &chat).await;
+    let chat_hex = hex::encode(chat.as_slice());
+    let laptop_storage = storage(&devices.laptop_app);
+    let before = published_count(&devices.relay);
+    devices.phone.drive_history_deliveries().await;
+    let publications = devices.relay.published_events.lock().unwrap()[before..].to_vec();
+    let [event] = publications.as_slice() else {
+        panic!("one genuine carrier sends the inline history");
+    };
+    assert_eq!(
+        event.kind,
+        transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE
+    );
+
+    laptop_storage
+        .execute_batch_for_test(
+            "CREATE TRIGGER fail_history_import BEFORE INSERT ON app_event_imports
+             BEGIN SELECT RAISE(ABORT, 'injected history import failure'); END;",
+        )
+        .unwrap();
+    let account = devices.laptop_app.account_home().account("alice").unwrap();
+    let delivery = cgka_traits::TransportDelivery {
+        account_id: MemberId::new(hex::decode(&account.account_id_hex).unwrap()),
+        group_id_hint: None,
+        message: event.to_transport_message().unwrap(),
+        received_at: cgka_traits::Timestamp(unix_now_seconds()),
+        source: cgka_traits::TransportDeliverySource {
+            transport: cgka_traits::transport::TransportSource("nostr".into()),
+            plane: cgka_traits::TransportDeliveryPlane::Group,
+            endpoint: None,
+            subscription_id: None,
+            wire: None,
+        },
+    };
+    let failed = devices.laptop.ingest_received_delivery(delivery).await;
+    assert!(
+        laptop_storage
+            .timeline_message(&chat_hex, &first)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        laptop_storage
+            .app_event_import_source(&chat_hex, &first)
+            .unwrap(),
+        None
+    );
+
+    laptop_storage
+        .execute_batch_for_test("DROP TRIGGER fail_history_import")
+        .unwrap();
+    // Replay only the already accepted carrier: there is no retransmission or
+    // direct call to the kind473 parser or history import owner here.
+    devices.laptop.drain_pending_session_events().await.unwrap();
+    let imported = laptop_storage
+        .timeline_message(&chat_hex, &first)
+        .unwrap()
+        .expect("retained projection replay imports the history after storage recovers");
+    assert_eq!(imported.plaintext, "before the laptop");
+    assert_eq!(
+        laptop_storage
+            .app_event_import_source(&chat_hex, &first)
+            .unwrap(),
+        Some(slot_of(&devices.phone))
+    );
+    assert!(
+        matches!(failed, Err(AppError::Storage(cgka_traits::storage::StorageError::Backend(ref detail)))
+        if detail.contains("injected history import failure")),
+        "the failure must reach the authenticated history import write: {failed:?}"
+    );
+
+    devices.laptop.drain_pending_session_events().await.unwrap();
+    let page = devices
+        .laptop_app
+        .timeline_messages_with_query(
+            "alice",
+            TimelineMessageQuery {
+                group_id_hex: Some(chat_hex),
+                ..TimelineMessageQuery::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        page.messages
+            .iter()
+            .filter(|message| message.message_id_hex == first)
+            .count(),
+        1
+    );
+    assert_eq!(
+        laptop_storage
+            .device_group_messages()
+            .unwrap()
+            .iter()
+            .filter(|(.., kind)| *kind == KIND_HISTORY_DELIVERY)
+            .count(),
+        1
+    );
+}
+
+/// A delivery the laptop reads before it holds the chat waits for it, and the
+/// laptop's next maintenance pass after joining imports it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delivery_read_before_the_chat_waits_until_the_sibling_joins() {
+    let (mut devices, _group, chat, first) = history_devices().await;
+    let chat_hex = hex::encode(chat.as_slice());
+    // The delivery overtakes the Welcome.
+    devices
+        .phone
+        .dev_record_sibling_add(&chat, &slot_of(&devices.laptop))
+        .unwrap();
+    devices.phone.drive_history_deliveries().await;
+    deliver_all(&mut devices.laptop, &devices.relay).await;
+    let laptop_storage = storage(&devices.laptop_app);
+    assert_eq!(
+        laptop_storage.parked_history_delivery_chats().unwrap(),
+        std::slice::from_ref(&chat_hex)
+    );
+
+    add_laptop(&mut devices, &chat).await;
+    assert!(
+        laptop_storage
+            .timeline_message(&chat_hex, &first)
+            .unwrap()
+            .is_none()
+    );
+    devices.laptop.drive_history_deliveries().await;
+    assert!(
+        laptop_storage
+            .timeline_message(&chat_hex, &first)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        laptop_storage
+            .parked_history_delivery_chats()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// A held chat's delivery that expires unimported leaves the list, and hosts
+/// are told; nothing of it remains.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_expired_delivery_leaves_the_list_and_says_so() {
+    let (mut devices, _group, chat, _first) = history_devices().await;
+    devices
+        .phone
+        .dev_record_sibling_add(&chat, &slot_of(&devices.laptop))
+        .unwrap();
+    devices.phone.drive_history_deliveries().await;
+    deliver_all(&mut devices.laptop, &devices.relay).await;
+    add_laptop(&mut devices, &chat).await;
+    device_group_seam(&mut devices.laptop);
+    assert_eq!(
+        history_state(&devices.laptop, &chat),
+        [ChatHistoryImportState::Receiving { retrying: false }]
+    );
+
+    // The maintenance pass's expiry, a week on.
+    storage(&devices.laptop_app)
+        .expire_history_deliveries(crate::unix_now_seconds() + 8 * 24 * 60 * 60)
+        .unwrap();
+    assert!(device_group_seam(&mut devices.laptop));
+    assert!(history_state(&devices.laptop, &chat).is_empty());
+    assert!(!device_group_seam(&mut devices.laptop), "nothing new");
+}
+
+/// With device groups off, nothing is listed and nothing is announced, not
+/// even the announcement every other open makes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chat_history_imports_are_empty_and_silent_with_device_groups_off() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        "wss://relay.example",
+        MarmotAppConfig::white_noise(),
+    )
+    .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    assert!(!client.take_chat_history_imports_changed());
+    assert!(client.chat_history_imports().unwrap().is_empty());
+}
+
+/// A delivery sealed to a key other than the laptop's is refused: nothing is
+/// imported or parked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delivery_the_receiver_cannot_open_is_refused() {
+    let (mut devices, group, chat, first) = history_devices().await;
+    let chat_hex = hex::encode(chat.as_slice());
+    add_laptop(&mut devices, &chat).await;
+    let phone_key = devices.phone.runtime.history_public_key().unwrap();
+    edit_laptop_entry(&mut devices, &group, |entry| {
+        entry.history_key = Some(phone_key);
+    })
+    .await;
+    devices.phone.drive_history_deliveries().await;
+    assert!(
+        storage(&devices.phone_app)
+            .unsent_history_deliveries()
+            .unwrap()
+            .is_empty()
+    );
+    deliver_all(&mut devices.laptop, &devices.relay).await;
+    let laptop_storage = storage(&devices.laptop_app);
+    assert!(
+        laptop_storage
+            .timeline_message(&chat_hex, &first)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        laptop_storage
+            .parked_history_delivery_chats()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// A history whose delivery reached no relay stays owed and goes at the
+/// next pass. Withdrawing a sent delivery, or a later drain reporting that
+/// its publish failed for good, makes it owed again; the receiver imports
+/// the copies without adding a row twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_history_stays_owed_until_it_reaches_a_relay_and_again_once_withdrawn_or_failed() {
+    let (mut devices, group, chat, first) = history_devices().await;
+    let chat_hex = hex::encode(chat.as_slice());
+    add_laptop(&mut devices, &chat).await;
+    let phone_storage = storage(&devices.phone_app);
+
+    devices.relay.reject_next_publish();
+    devices.phone.drive_history_deliveries().await;
+    assert_eq!(phone_storage.unsent_history_deliveries().unwrap().len(), 1);
+    devices.phone.drive_history_deliveries().await;
+    assert!(
+        phone_storage
+            .unsent_history_deliveries()
+            .unwrap()
+            .is_empty()
+    );
+
+    let (_, _, message_id, _) = phone_storage
+        .device_group_messages()
+        .unwrap()
+        .into_iter()
+        .rfind(|(.., kind)| *kind == KIND_HISTORY_DELIVERY)
+        .expect("the delivery is recorded");
+    let message_id = MessageId::new(hex::decode(message_id.unwrap()).unwrap());
+    devices
+        .phone
+        .observe_device_group_event(&GroupEvent::AppMessageInvalidated {
+            group_id: group.clone(),
+            message_id,
+            epoch: cgka_traits::EpochId(0),
+            reason: cgka_traits::engine::AppMessageInvalidationReason::LosingBranch,
+            decrypted_payload_ref: None,
+        })
+        .unwrap();
+    assert_eq!(phone_storage.unsent_history_deliveries().unwrap().len(), 1);
+    devices.phone.drive_history_deliveries().await;
+    assert!(
+        phone_storage
+            .unsent_history_deliveries()
+            .unwrap()
+            .is_empty()
+    );
+
+    let (_, app_event_id, message_id, _) = phone_storage
+        .device_group_messages()
+        .unwrap()
+        .into_iter()
+        .rfind(|(.., kind)| *kind == KIND_HISTORY_DELIVERY)
+        .expect("the second delivery is recorded");
+    let failed = marmot_session::AccountDeviceEffects {
+        failed_app_messages: vec![marmot_session::FailedApplicationMessage {
+            group_id: group.clone(),
+            app_event_id,
+            message_id: MessageId::new(hex::decode(message_id.unwrap()).unwrap()),
+            reason: "every relay refused it".to_owned(),
+        }],
+        ..Default::default()
+    };
+    let _ = devices.phone.observe_drained_session_events(&failed).await;
+    assert_eq!(phone_storage.unsent_history_deliveries().unwrap().len(), 1);
+    devices.phone.drive_history_deliveries().await;
+    assert!(
+        phone_storage
+            .unsent_history_deliveries()
+            .unwrap()
+            .is_empty()
+    );
+
+    deliver_all(&mut devices.laptop, &devices.relay).await;
+    let laptop_storage = storage(&devices.laptop_app);
+    assert!(
+        laptop_storage
+            .timeline_message(&chat_hex, &first)
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        laptop_storage
+            .history_export_page(&chat_hex, None, crate::unix_now_seconds(), 64)
+            .unwrap()
+            .iter()
+            .filter(|row| row.message_id_hex == first)
+            .count(),
+        1,
+        "imported once"
+    );
+}
+
+/// A history that fills the inline bundles a link may send goes out, one
+/// delivery per bundle. One that needs more goes through the chat's Blossom
+/// server: the phone uploads its one bundle, then sends one delivery naming
+/// the server; the laptop parks it, fetches the blob and imports every
+/// message.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_history_too_long_to_send_inline_goes_through_blossom() {
+    // Keep this composed future's construction frame outside its polling frame.
+    fn scenario() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>> {
+        Box::pin(async {
+            let (mut devices, group, chat, _first) = history_devices().await;
+            let phone_storage = storage(&devices.phone_app);
+            let blossom = local_blossom();
+            // Two of these overflow one inline bundle, so each takes its own; the
+            // first shares its bundle with the short message before it. Each differs,
+            // so none shares another's id.
+            let long = "x".repeat(15_000);
+            for index in 0..MAX_INLINE_BUNDLES {
+                send_text(&mut devices.phone, &chat, &format!("{index}{long}")).await;
+            }
+            add_laptop(&mut devices, &chat).await;
+            let before = published_count(&devices.relay);
+            devices.phone.drive_history_deliveries().await;
+            assert_eq!(published_count(&devices.relay), before + MAX_INLINE_BUNDLES);
+            assert!(
+                phone_storage
+                    .unsent_history_deliveries()
+                    .unwrap()
+                    .is_empty()
+            );
+
+            let longer = devices
+                .phone
+                .create_group("longer", &[])
+                .await
+                .unwrap()
+                .operation
+                .expect("eligible fixture members");
+            let longer_hex = hex::encode(longer.as_slice());
+            devices
+                .phone
+                .replace_encrypted_media_blob_endpoints(
+                    &longer,
+                    vec![
+                        crate::AppBlobEndpoint {
+                            locator_kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
+                            base_url: "http://store.example/".to_owned(),
+                        },
+                        crate::AppBlobEndpoint {
+                            locator_kind: BLOSSOM_LOCATOR_KIND_V1.to_owned(),
+                            base_url: blossom.url.clone(),
+                        },
+                    ],
+                )
+                .await
+                .unwrap();
+            let mut sent = Vec::new();
+            for index in 0..=MAX_INLINE_BUNDLES {
+                sent.push(send_text(&mut devices.phone, &longer, &format!("{index}{long}")).await);
+            }
+            add_laptop(&mut devices, &longer).await;
+            let before = published_count(&devices.relay);
+            devices.phone.drive_history_deliveries().await;
+            assert_eq!(published_count(&devices.relay), before, "none goes inline");
+            assert!(blossom.blobs.lock().unwrap().is_empty());
+            let upload = devices.phone.prepare_history_upload().unwrap().unwrap();
+            let outcome = upload.run().await;
+            assert_eq!(
+                blossom.blobs.lock().unwrap().len(),
+                1,
+                "one uploaded bundle"
+            );
+            lose_phone_edit(&mut devices, &group, Some(false)).await;
+            assert!(
+                devices.phone.prepare_history_upload().unwrap().is_none(),
+                "a pending history toggle holds new uploads without forgetting debt"
+            );
+            let before_completion = published_count(&devices.relay);
+            assert!(
+                devices.phone.finish_history_upload(outcome).await,
+                "the upload completion settles independently of its held new carrier"
+            );
+            assert_eq!(published_count(&devices.relay), before_completion);
+            assert_eq!(phone_storage.unsent_history_deliveries().unwrap().len(), 1);
+            // Choosing the current true value cancels this lost disable before replay.
+            devices
+                .phone
+                .update_linked_device_settings(
+                    &hex::encode(slot_of(&devices.laptop)),
+                    None,
+                    Some(true),
+                    None,
+                )
+                .await
+                .unwrap();
+            let before_carrier = published_count(&devices.relay);
+            devices.phone.drive_history_blobs().await;
+            assert_eq!(
+                blossom.blobs.lock().unwrap().len(),
+                2,
+                "one bundle per attempt; the held upload had no carrier"
+            );
+            assert_eq!(published_count(&devices.relay), before_carrier + 1);
+            assert!(
+                phone_storage
+                    .unsent_history_deliveries()
+                    .unwrap()
+                    .is_empty()
+            );
+
+            deliver_all(&mut devices.laptop, &devices.relay).await;
+            let laptop_storage = storage(&devices.laptop_app);
+            assert_eq!(
+                laptop_storage.parked_history_delivery_chats().unwrap(),
+                std::slice::from_ref(&longer_hex),
+                "a Blossom delivery parks until its blob is fetched"
+            );
+            devices.laptop.drive_history_blobs().await;
+            for id in &sent {
+                assert!(
+                    laptop_storage
+                        .timeline_message(&longer_hex, id)
+                        .unwrap()
+                        .is_some()
+                );
+            }
+            assert!(
+                laptop_storage
+                    .parked_history_delivery_chats()
+                    .unwrap()
+                    .is_empty()
+            );
+        })
+    }
+
+    scenario().await;
+}
+
+/// Through the runtime, the account worker's maintenance pass fetches a
+/// parked Blossom delivery off the worker, and its messages reach
+/// subscribers as the fetch completes, not at the next pass 15 s later. The
+/// worker gave storage the roster's names when it opened, so each message
+/// names the phone, and the chat's new history state is announced with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_runtime_fetches_a_blossom_history_and_shows_it_at_once() {
+    let (mut devices, group, _chat, _first) = history_devices().await;
+    name_phone(&mut devices, &group, "Phone").await;
+    let phone = phone_named(&devices, "Phone");
+    let blossom = local_blossom();
+    let long = "x".repeat(15_000);
+    let longer = devices
+        .phone
+        .create_group("longer", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    let longer_hex = hex::encode(longer.as_slice());
+    use_blossom(
+        &mut devices.phone,
+        &longer,
+        BLOSSOM_LOCATOR_KIND_V1,
+        &blossom.url,
+    )
+    .await;
+    for index in 0..=MAX_INLINE_BUNDLES {
+        send_text(&mut devices.phone, &longer, &format!("{index}{long}")).await;
+    }
+    add_laptop(&mut devices, &longer).await;
+    devices.phone.drive_history_deliveries().await;
+    devices.phone.drive_history_blobs().await;
+    deliver_all(&mut devices.laptop, &devices.relay).await;
+    let laptop_storage = storage(&devices.laptop_app);
+    assert_eq!(
+        laptop_storage.parked_history_delivery_chats().unwrap(),
+        std::slice::from_ref(&longer_hex)
+    );
+
+    let Devices {
+        _dirs,
+        laptop_app,
+        laptop,
+        ..
+    } = devices;
+    drop(laptop);
+    let account_id_hex = laptop_app
+        .account_home()
+        .account("alice")
+        .unwrap()
+        .account_id_hex;
+    let runtime = MarmotAppRuntime::new(laptop_app.clone());
+    let mut events = runtime.subscribe();
+    runtime.reconcile_accounts().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !laptop_storage
+            .parked_history_delivery_chats()
+            .unwrap()
+            .is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the worker fetches and imports the blob");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match events.recv().await {
+                Ok(MarmotAppEvent::ProjectionUpdated(published))
+                    if published.account_id_hex == account_id_hex
+                        && published.update.group_id_hex == longer_hex
+                        && !published.update.timeline_messages.is_empty() =>
+                {
+                    assert!(
+                        published
+                            .update
+                            .timeline_messages
+                            .iter()
+                            .all(|message| message.imported_from.as_ref() == Some(&phone))
+                    );
+                    break;
+                }
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => panic!("events closed"),
+            }
+        }
+    })
+    .await
+    .expect("the imported history is published as the fetch completes");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match events.recv().await {
+                Ok(MarmotAppEvent::ChatHistoryImportsChanged {
+                    account_id_hex: changed,
+                    ..
+                }) if changed == account_id_hex => break,
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => panic!("events closed"),
+            }
+        }
+    })
+    .await
+    .expect("the chat's history state is announced with its messages");
+    let imports = runtime.chat_history_imports("alice").await.unwrap();
+    assert_eq!(imports.len(), 1);
+    assert_eq!(imports[0].group_id_hex, longer_hex);
+    assert!(matches!(
+        &imports[0].state,
+        ChatHistoryImportState::Imported { from, .. } if *from == phone
+    ));
+    runtime.shutdown().await;
+}
+
+/// An upload the server refuses leaves the history owed until its wait ends,
+/// then it goes. A blob the server no longer holds, or serves altered, keeps
+/// the delivery parked until its wait ends; the laptop imports it once the
+/// server serves the blob as uploaded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_blossom_upload_or_fetch_tries_again_later() {
+    let (mut devices, _group, chat, first) = history_devices().await;
+    let chat_hex = hex::encode(chat.as_slice());
+    let phone_storage = storage(&devices.phone_app);
+    let blossom = local_blossom();
+    use_blossom(
+        &mut devices.phone,
+        &chat,
+        BLOSSOM_LOCATOR_KIND_V1,
+        &blossom.url,
+    )
+    .await;
+    // An event too large for an inline bundle sends the history through
+    // Blossom.
+    send_text(
+        &mut devices.phone,
+        &chat,
+        &"y".repeat(INLINE_BUNDLE_MAX_PLAINTEXT),
+    )
+    .await;
+    add_laptop(&mut devices, &chat).await;
+    devices.phone.drive_history_deliveries().await;
+
+    blossom.refuse_uploads.store(true, Ordering::SeqCst);
+    let before = published_count(&devices.relay);
+    devices.phone.drive_history_blobs().await;
+    assert_eq!(published_count(&devices.relay), before);
+    let owed = phone_storage.unsent_history_deliveries().unwrap().remove(0);
+    assert_eq!(owed.blossom_attempts, 1);
+    assert!(owed.blossom_due_at.unwrap() > crate::unix_now_seconds());
+    blossom.refuse_uploads.store(false, Ordering::SeqCst);
+    devices.phone.drive_history_blobs().await;
+    assert_eq!(published_count(&devices.relay), before, "it waits");
+    phone_storage
+        .defer_blossom_history_delivery(&owed, 0)
+        .unwrap();
+    devices.phone.drive_history_blobs().await;
+    assert_eq!(published_count(&devices.relay), before + 1);
+
+    let (hash, blob) = blossom.blobs.lock().unwrap().drain().next().unwrap();
+    deliver_all(&mut devices.laptop, &devices.relay).await;
+    let laptop_storage = storage(&devices.laptop_app);
+    let fetch_attempts =
+        || match &laptop_storage.parked_history_deliveries(&chat_hex).unwrap()[0].bundle {
+            ParkedBundle::Blossom { fetch_attempts, .. } => *fetch_attempts,
+            ParkedBundle::Inline(_) => panic!("a Blossom delivery"),
+        };
+    devices.laptop.drive_history_blobs().await;
+    assert_eq!(fetch_attempts(), 1, "the blob is gone");
+    let parked = laptop_storage.parked_history_deliveries(&chat_hex).unwrap()[0].clone();
+    let mut altered = blob.clone();
+    altered[0] ^= 1;
+    blossom.blobs.lock().unwrap().insert(hash.clone(), altered);
+    laptop_storage
+        .defer_parked_history_fetch(&parked.app_event_id, 0)
+        .unwrap();
+    devices.laptop.drive_history_blobs().await;
+    assert_eq!(fetch_attempts(), 3, "other bytes than its hash names");
+    assert!(
+        laptop_storage
+            .timeline_message(&chat_hex, &first)
+            .unwrap()
+            .is_none()
+    );
+
+    blossom.blobs.lock().unwrap().insert(hash, blob);
+    laptop_storage
+        .defer_parked_history_fetch(&parked.app_event_id, 0)
+        .unwrap();
+    devices.laptop.drive_history_blobs().await;
+    assert!(
+        laptop_storage
+            .timeline_message(&chat_hex, &first)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        laptop_storage
+            .parked_history_delivery_chats()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// A Blossom delivery the laptop reads before it holds the chat waits for
+/// it: nothing is fetched until the laptop joins, then the blob is. Hosts
+/// see the chat receiving as soon as it is held, before the fetch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_blossom_delivery_read_before_the_chat_is_fetched_once_the_sibling_joins() {
+    let (mut devices, _group, chat, first) = history_devices().await;
+    let chat_hex = hex::encode(chat.as_slice());
+    let blossom = local_blossom();
+    use_blossom(
+        &mut devices.phone,
+        &chat,
+        BLOSSOM_LOCATOR_KIND_V1,
+        &blossom.url,
+    )
+    .await;
+    send_text(
+        &mut devices.phone,
+        &chat,
+        &"y".repeat(INLINE_BUNDLE_MAX_PLAINTEXT),
+    )
+    .await;
+    // The delivery overtakes the Welcome.
+    devices
+        .phone
+        .dev_record_sibling_add(&chat, &slot_of(&devices.laptop))
+        .unwrap();
+    devices.phone.drive_history_deliveries().await;
+    devices.phone.drive_history_blobs().await;
+    deliver_all(&mut devices.laptop, &devices.relay).await;
+    let laptop_storage = storage(&devices.laptop_app);
+    let fetch_attempts =
+        || match &laptop_storage.parked_history_deliveries(&chat_hex).unwrap()[0].bundle {
+            ParkedBundle::Blossom { fetch_attempts, .. } => *fetch_attempts,
+            ParkedBundle::Inline(_) => panic!("a Blossom delivery"),
+        };
+    devices.laptop.drive_history_blobs().await;
+    assert_eq!(fetch_attempts(), 0, "no fetch before the chat is held");
+    device_group_seam(&mut devices.laptop);
+    assert!(history_state(&devices.laptop, &chat).is_empty());
+
+    add_laptop(&mut devices, &chat).await;
+    // Joining lists the parked delivery, so hosts are told before the fetch.
+    assert!(device_group_seam(&mut devices.laptop));
+    assert_eq!(
+        history_state(&devices.laptop, &chat),
+        [ChatHistoryImportState::Receiving { retrying: false }]
+    );
+    assert!(!device_group_seam(&mut devices.laptop), "nothing new");
+    devices.laptop.drive_history_blobs().await;
+    assert!(device_group_seam(&mut devices.laptop));
+    assert!(matches!(
+        history_state(&devices.laptop, &chat)[..],
+        [ChatHistoryImportState::Imported { .. }]
+    ));
+    assert!(
+        laptop_storage
+            .timeline_message(&chat_hex, &first)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        laptop_storage
+            .parked_history_delivery_chats()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// Uploaded blobs whose deliveries reach no relay leave the history owed,
+/// backing off even when the refusal owes it again; the next attempt uploads
+/// afresh, under new keys, and sends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_blossom_history_whose_delivery_reaches_no_relay_is_sent_again() {
+    let (mut devices, _group, chat, _first) = history_devices().await;
+    let phone_storage = storage(&devices.phone_app);
+    let blossom = local_blossom();
+    use_blossom(
+        &mut devices.phone,
+        &chat,
+        BLOSSOM_LOCATOR_KIND_V1,
+        &blossom.url,
+    )
+    .await;
+    send_text(
+        &mut devices.phone,
+        &chat,
+        &"y".repeat(INLINE_BUNDLE_MAX_PLAINTEXT),
+    )
+    .await;
+    add_laptop(&mut devices, &chat).await;
+    devices.phone.drive_history_deliveries().await;
+
+    devices.relay.reject_next_publish();
+    let before = published_count(&devices.relay);
+    devices.phone.drive_history_blobs().await;
+    assert_eq!(blossom.blobs.lock().unwrap().len(), 1);
+    assert_eq!(published_count(&devices.relay), before);
+    let owed = phone_storage.unsent_history_deliveries().unwrap().remove(0);
+    assert_eq!(owed.blossom_attempts, 1);
+    assert!(owed.blossom_due_at.unwrap() > crate::unix_now_seconds());
+
+    phone_storage
+        .defer_blossom_history_delivery(&owed, 0)
+        .unwrap();
+    devices.phone.drive_history_blobs().await;
+    assert_eq!(blossom.blobs.lock().unwrap().len(), 2, "a fresh upload");
+    assert_eq!(published_count(&devices.relay), before + 1);
+    assert!(
+        phone_storage
+            .unsent_history_deliveries()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// A chat made where no media server is configured carries no media policy,
+/// so it has no Blossom endpoint: its long history is forgotten unsent, and
+/// never holds up another chat's history behind it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_long_history_of_a_text_only_chat_is_forgotten() {
+    let (devices, _group, chat, _first) = history_devices().await;
+    let Devices {
+        _dirs,
+        relay,
+        phone_app,
+        laptop_app,
+        phone,
+        laptop,
+        link,
+    } = devices;
+    drop(phone);
+    drop(phone_app);
+    let phone_app = MarmotApp::with_relay_and_config(
+        _dirs[0].path(),
+        "wss://relay.example",
+        MarmotAppConfig::default()
+            .with_dev_settlement_quiescence_ms(0)
+            .with_dev_scheduled_convergence_delay_ms(0)
+            .with_dev_device_groups(true)
+            .with_allow_loopback_blob_endpoints(true),
+    )
+    .with_test_relay_client(relay.clone());
+    let phone = phone_app.client("alice").await.unwrap();
+    let mut devices = Devices {
+        _dirs,
+        relay,
+        phone_app,
+        laptop_app,
+        phone,
+        laptop,
+        link,
+    };
+    let text_only = devices
+        .phone
+        .create_group("text only", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    let text_only_hex = hex::encode(text_only.as_slice());
+    let blossom = local_blossom();
+    use_blossom(
+        &mut devices.phone,
+        &chat,
+        BLOSSOM_LOCATOR_KIND_V1,
+        &blossom.url,
+    )
+    .await;
+    for group in [&text_only, &chat] {
+        send_text(
+            &mut devices.phone,
+            group,
+            &"y".repeat(INLINE_BUNDLE_MAX_PLAINTEXT),
+        )
+        .await;
+        add_laptop(&mut devices, group).await;
+    }
+    let before = published_count(&devices.relay);
+    devices.phone.drive_history_deliveries().await;
+    let phone_storage = storage(&devices.phone_app);
+    let owed = phone_storage.unsent_history_deliveries().unwrap();
+    assert_eq!(owed.len(), 2, "both owed through Blossom");
+    // The text-only history comes up first.
+    let first = owed
+        .iter()
+        .find(|owed| owed.group_id_hex == text_only_hex)
+        .unwrap();
+    phone_storage
+        .defer_blossom_history_delivery(first, 1)
+        .unwrap();
+    devices.phone.drive_history_blobs().await;
+    assert_eq!(blossom.blobs.lock().unwrap().len(), 1);
+    assert_eq!(published_count(&devices.relay), before + 1);
+    assert!(
+        phone_storage
+            .unsent_history_deliveries()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// A history too long for inline delivery, of a chat with no usable Blossom
+/// endpoint, is forgotten without sending any of it. Public HTTP remains a
+/// structurally valid endpoint, but the real transport never contacts it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_long_history_of_a_chat_with_no_blossom_endpoint_is_forgotten() {
+    let (mut devices, _group, chat, _first) = history_devices().await;
+    let undialable = devices
+        .phone
+        .create_group("undialable", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    for (chat, locator_kind, server) in [
+        (chat, "other-v1", "https://store.example/"),
+        (undialable, BLOSSOM_LOCATOR_KIND_V1, "http://store.example/"),
+    ] {
+        use_blossom(&mut devices.phone, &chat, locator_kind, server).await;
+        send_text(
+            &mut devices.phone,
+            &chat,
+            &"y".repeat(INLINE_BUNDLE_MAX_PLAINTEXT),
+        )
+        .await;
+        add_laptop(&mut devices, &chat).await;
+        let before = published_count(&devices.relay);
+        devices.phone.drive_history_deliveries().await;
+        devices.phone.drive_history_blobs().await;
+        assert_eq!(published_count(&devices.relay), before);
+        assert!(
+            storage(&devices.phone_app)
+                .unsent_history_deliveries()
+                .unwrap()
+                .is_empty(),
+            "a chat with no transport-eligible server must not keep unsendable history owed"
+        );
+    }
+}
+
+/// A Blossom delivery naming the device group itself is refused when read,
+/// never parked to fetch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_blossom_delivery_of_the_device_group_is_refused_unfetched() {
+    let (mut devices, group, _chat, _first) = history_devices().await;
+    let exchange = devices.phone.device_group_exchange().unwrap().unwrap();
+    let event = devices
+        .phone
+        .history_delivery_event(
+            &exchange,
+            &slot_of(&devices.laptop),
+            &group,
+            &[1; 32],
+            &[2; 32],
+            crate::history_delivery::DeliveredBundle::Blossom(vec![
+                "https://blossom.example/".to_owned(),
+            ]),
+        )
+        .unwrap();
+    assert!(
+        devices
+            .phone
+            .send_device_group_event(&group, event)
+            .await
+            .unwrap()
+    );
+    deliver_all(&mut devices.laptop, &devices.relay).await;
+    assert!(
+        storage(&devices.laptop_app)
+            .parked_history_delivery_chats()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// A history longer than the cap sends its newest bundles: the walk starts
+/// after the bundle before them, or at the start when the cap holds it all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_history_longer_than_the_cap_sends_its_newest_bundles() {
+    let (mut devices, _group, chat, _first) = history_devices().await;
+    let chat_hex = hex::encode(chat.as_slice());
+    let long = "x".repeat(15_000);
+    for index in 0..4 {
+        send_text(&mut devices.phone, &chat, &format!("{index}{long}")).await;
+    }
+    let mut ends = Vec::new();
+    while let Some(exported) = devices
+        .phone
+        .export_chat_history(&chat, ends.last(), INLINE_BUNDLE_MAX_PLAINTEXT)
+        .unwrap()
+    {
+        ends.push(exported.bundle.to);
+    }
+    assert_eq!(ends.len(), 4);
+    let account = devices.phone_app.account_storage("alice").unwrap();
+    let start = |cap| {
+        crate::client::newest_bundles_start(
+            &account,
+            &chat,
+            &chat_hex,
+            INLINE_BUNDLE_MAX_PLAINTEXT,
+            cap,
+            true,
+        )
+        .unwrap()
+    };
+    assert_eq!(start(2), Some(ends[1].clone()));
+    assert_eq!(start(3), Some(ends[0].clone()));
+    assert_eq!(start(4), None);
+    assert_eq!(start(16), None);
+}
+
+/// A storage failure while the history is exported is no refusal: the
+/// history stays owed and goes once storage works again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_storage_failure_while_sending_leaves_the_history_owed() {
+    let (mut devices, _group, chat, _first) = history_devices().await;
+    add_laptop(&mut devices, &chat).await;
+    let phone_storage = storage(&devices.phone_app);
+    phone_storage
+        .execute_batch_for_test("ALTER TABLE message_timeline RENAME TO message_timeline_hidden")
+        .unwrap();
+    let before = published_count(&devices.relay);
+    devices.phone.drive_history_deliveries().await;
+    assert_eq!(published_count(&devices.relay), before);
+    assert_eq!(phone_storage.unsent_history_deliveries().unwrap().len(), 1);
+    phone_storage
+        .execute_batch_for_test("ALTER TABLE message_timeline_hidden RENAME TO message_timeline")
+        .unwrap();
+    devices.phone.drive_history_deliveries().await;
+    assert_eq!(published_count(&devices.relay), before + 1);
+    assert!(
+        phone_storage
+            .unsent_history_deliveries()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// An add this device recorded a week ago, before it stopped for longer than
+/// that, is forgotten without owing or sending anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sibling_add_a_week_old_is_forgotten_unsent() {
+    let (mut devices, _group, chat, _first) = history_devices().await;
+    let account = devices.phone_app.account_storage("alice").unwrap();
+    let week_old = crate::unix_now_seconds() - storage_sqlite::HISTORY_DELIVERY_RETENTION_SECS - 1;
+    account
+        .record_sibling_adds(&chat, &[slot_of(&devices.laptop)], week_old)
+        .unwrap();
+    let before = published_count(&devices.relay);
+    devices.phone.drive_history_deliveries().await;
+    assert_eq!(published_count(&devices.relay), before);
+    assert!(account.sibling_adds().unwrap().is_empty());
+    assert!(
+        storage(&devices.phone_app)
+            .unsent_history_deliveries()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// An add recorded for the device group itself, which the engine skips, owes
+/// nothing: the device group is no chat whose history goes anywhere.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_add_to_the_device_group_owes_no_history() {
+    let (mut devices, group, _chat, _first) = history_devices().await;
+    devices
+        .phone
+        .dev_record_sibling_add(&group, &slot_of(&devices.laptop))
+        .unwrap();
+    let before = published_count(&devices.relay);
+    devices.phone.drive_history_deliveries().await;
+    assert_eq!(published_count(&devices.relay), before);
+    assert!(
+        storage(&devices.phone_app)
+            .unsent_history_deliveries()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// Exercise the existing native paired fixture's read failure and actual
+/// history import, then restore the same group without generating a roster event.
+async fn import_while_roster_read_fails(devices: &mut Devices, group: &GroupId, chat: &GroupId) {
+    let account = devices.laptop_app.account_storage("alice").unwrap();
+    let saved_group = cgka_traits::storage::GroupStorage::get_group(&account, group).unwrap();
+    // Only the device group's durable record is unreadable; the ordinary
+    // chat and its native history import remain available.
+    storage(&devices.laptop_app)
+        .execute_batch_for_test(&format!(
+            "UPDATE cgka_groups SET record = X'00' WHERE id = X'{}'",
+            hex::encode(group.as_slice())
+        ))
+        .unwrap();
+    assert!(matches!(
+        devices.laptop.trusted_device_roster(),
+        Err(AppError::DeviceGroupRefused("roster_unavailable"))
+    ));
+    assert!(
+        !device_group_seam(&mut devices.laptop),
+        "an unreadable roster cannot change the displayed import names"
+    );
+    assert!(!devices.laptop.take_linked_devices_changed());
+    assert!(matches!(
+        &history_state(&devices.laptop, chat)[..],
+        [ChatHistoryImportState::Imported { from, .. }] if *from == phone_named(devices, "Phone")
+    ));
+
+    let during_failure = send_text(&mut devices.phone, chat, "import during roster failure").await;
+    let bundle = devices
+        .phone
+        .export_chat_history(chat, None, INLINE_BUNDLE_MAX_PLAINTEXT)
+        .unwrap()
+        .unwrap();
+    let sealed = crate::history_bundle::seal_history_bundle(&bundle.bundle).unwrap();
+    let imported = devices
+        .laptop
+        .import_history_bundle(
+            chat,
+            &slot_of(&devices.phone),
+            &sealed.key,
+            &sealed.ciphertext_sha256,
+            &sealed.ciphertext,
+        )
+        .unwrap()
+        .expect("the real chat's new history imports despite the unreadable roster");
+    assert_eq!(
+        imported
+            .timeline_messages
+            .iter()
+            .find(|row| row.message_id_hex == during_failure)
+            .unwrap()
+            .imported_from,
+        Some(phone_named(devices, "Phone"))
+    );
+    // The same source imported in the same second may leave the latest
+    // answer unchanged. Drain it before testing the later label change.
+    let _ = device_group_seam(&mut devices.laptop);
+    assert!(!device_group_seam(&mut devices.laptop));
+
+    cgka_traits::storage::GroupStorage::put_group_keeping_roster(&account, &saved_group).unwrap();
+
+    // No worker seam or new roster event intervenes: the import itself must
+    // retry the failed roster read before returning its new timeline rows.
+    let after_recovery = send_text(&mut devices.phone, chat, "import after roster recovery").await;
+    let bundle = devices
+        .phone
+        .export_chat_history(chat, None, INLINE_BUNDLE_MAX_PLAINTEXT)
+        .unwrap()
+        .unwrap();
+    let sealed = crate::history_bundle::seal_history_bundle(&bundle.bundle).unwrap();
+    let imported = devices
+        .laptop
+        .import_history_bundle(
+            chat,
+            &slot_of(&devices.phone),
+            &sealed.key,
+            &sealed.ciphertext_sha256,
+            &sealed.ciphertext,
+        )
+        .unwrap()
+        .expect("new history imports after the roster recovers");
+    assert_eq!(
+        imported
+            .timeline_messages
+            .iter()
+            .find(|row| row.message_id_hex == after_recovery)
+            .unwrap()
+            .imported_from,
+        Some(phone_named(devices, "Old phone")),
+        "the import refreshes labels before any worker seam"
+    );
+}
+
+/// The original adder sends a genuinely sealed bundle through the native
+/// device-group receiver. The parked delivery makes the latest answer
+/// Receiving, independently of the names on already-imported timeline rows.
+async fn park_history_from_phone(devices: &mut Devices, group: &GroupId, chat: &GroupId) {
+    let bundle = devices
+        .phone
+        .export_chat_history(chat, None, INLINE_BUNDLE_MAX_PLAINTEXT)
+        .unwrap()
+        .unwrap();
+    let sealed = crate::history_bundle::seal_history_bundle(&bundle.bundle).unwrap();
+    let blossom = local_blossom();
+    blossom.blobs.lock().unwrap().insert(
+        hex::encode(sealed.ciphertext_sha256),
+        sealed.ciphertext.to_vec(),
+    );
+    let exchange = devices.phone.device_group_exchange().unwrap().unwrap();
+    let event = devices
+        .phone
+        .history_delivery_event(
+            &exchange,
+            &slot_of(&devices.laptop),
+            chat,
+            &sealed.key,
+            &sealed.ciphertext_sha256,
+            crate::history_delivery::DeliveredBundle::Blossom(vec![blossom.url.clone()]),
+        )
+        .unwrap();
+    assert!(
+        devices
+            .phone
+            .send_device_group_event(group, event)
+            .await
+            .unwrap()
+    );
+    deliver_all(&mut devices.laptop, &devices.relay).await;
+    assert_eq!(
+        history_state(&devices.laptop, chat),
+        [ChatHistoryImportState::Receiving { retrying: false }]
+    );
+    assert!(device_group_seam(&mut devices.laptop));
+}
+
+/// Each imported row names the device it came from, by the name the roster
+/// gives it now, and a live row names none; the import and the chat's
+/// history state reach hosts the same way. An import names its source even
+/// before any seam, as on a new connection. A chat whose history has not
+/// arrived lists nothing. A renamed device shows its new name, and one no longer on
+/// the roster shows none. A failed roster read or TEMP-label write keeps the
+/// previous names and retries at the next seam, without another roster change.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_imported_row_names_the_device_it_came_from() {
+    let (mut devices, group, chat, first) = Box::pin(history_devices()).await;
+    let chat_hex = hex::encode(chat.as_slice());
+    name_phone(&mut devices, &group, "Phone").await;
+    add_laptop(&mut devices, &chat).await;
+    // As on a new connection, storage holds no names.
+    storage(&devices.laptop_app).set_device_labels(&[]).unwrap();
+    drop(devices.laptop);
+    devices.laptop = devices.laptop_app.client("alice").await.unwrap();
+    devices.laptop.take_chat_history_imports_changed();
+    assert!(history_state(&devices.laptop, &chat).is_empty());
+
+    devices.phone.drive_history_deliveries().await;
+    devices.laptop.take_pending_projection_updates();
+    deliver_all(&mut devices.laptop, &devices.relay).await;
+    assert!(
+        device_group_seam(&mut devices.laptop),
+        "the import is announced"
+    );
+    let updates = devices.laptop.take_pending_projection_updates();
+    let published = updates
+        .iter()
+        .flat_map(|update| &update.timeline_messages)
+        .find(|message| message.message_id_hex == first)
+        .expect("the import is published");
+    assert_eq!(
+        published.imported_from,
+        Some(phone_named(&devices, "Phone"))
+    );
+    let [ChatHistoryImportState::Imported { from, at }] =
+        &history_state(&devices.laptop, &chat)[..]
+    else {
+        panic!("the chat's history was imported");
+    };
+    assert_eq!(*from, phone_named(&devices, "Phone"));
+    assert!(*at > 0);
+
+    let live = send_text(&mut devices.phone, &chat, "after the laptop").await;
+    deliver_all(&mut devices.laptop, &devices.relay).await;
+    let sources = |devices: &Devices| {
+        let page = devices
+            .laptop_app
+            .timeline_messages_with_query(
+                "alice",
+                TimelineMessageQuery {
+                    group_id_hex: Some(chat_hex.clone()),
+                    ..TimelineMessageQuery::default()
+                },
+            )
+            .unwrap();
+        [&first, &live].map(|id| {
+            page.messages
+                .iter()
+                .find(|message| message.message_id_hex == *id)
+                .expect("the row")
+                .imported_from
+                .clone()
+        })
+    };
+    assert_eq!(
+        sources(&devices),
+        [Some(phone_named(&devices, "Phone")), None]
+    );
+
+    name_phone(&mut devices, &group, "Old phone").await;
+    // Keep the added fault phase out of this already-composed test future.
+    Box::pin(import_while_roster_read_fails(&mut devices, &group, &chat)).await;
+    assert!(
+        device_group_seam(&mut devices.laptop),
+        "the recovered names are announced without another roster event"
+    );
+    assert_eq!(
+        sources(&devices),
+        [Some(phone_named(&devices, "Old phone")), None]
+    );
+    devices.laptop.refresh_device_labels(true);
+    assert!(
+        !devices.laptop.take_chat_history_imports_changed(),
+        "the same names again change nothing"
+    );
+    assert!(matches!(
+        &history_state(&devices.laptop, &chat)[..],
+        [ChatHistoryImportState::Imported { from, .. }] if *from == phone_named(&devices, "Old phone")
+    ));
+
+    Box::pin(park_history_from_phone(&mut devices, &group, &chat)).await;
+    name_phone(&mut devices, &group, "New phone").await;
+    let labels = storage(&devices.laptop_app);
+    let generation = labels.history_imports_generation().unwrap();
+    labels
+        .execute_batch_for_test(
+            "CREATE TEMP TRIGGER refuse_device_label_write BEFORE INSERT ON device_labels \
+             BEGIN SELECT RAISE(ABORT, 'device label write blocked'); END;",
+        )
+        .unwrap();
+    assert!(devices.laptop.trusted_device_roster().unwrap().is_some());
+    let failed = device_group_events(&mut devices.laptop);
+    assert!(
+        failed
+            .iter()
+            .any(|event| matches!(event, crate::MarmotAppEvent::LinkedDevicesChanged { .. }))
+    );
+    assert!(!failed.iter().any(|event| matches!(
+        event,
+        crate::MarmotAppEvent::ChatHistoryImportsChanged { .. }
+    )));
+    assert_eq!(labels.history_imports_generation().unwrap(), generation);
+    assert_eq!(
+        sources(&devices),
+        [Some(phone_named(&devices, "Old phone")), None]
+    );
+    assert!(
+        device_group_events(&mut devices.laptop).is_empty(),
+        "failed retries are quiet"
+    );
+    labels
+        .execute_batch_for_test("DROP TRIGGER temp.refuse_device_label_write")
+        .unwrap();
+    let recovered = device_group_events(&mut devices.laptop);
+    assert!(
+        recovered
+            .iter()
+            .any(|event| matches!(event, crate::MarmotAppEvent::LinkedDevicesChanged { .. })),
+        "successful deferred labels tell hosts to reread older timeline rows"
+    );
+    assert!(
+        !recovered.iter().any(|event| matches!(
+            event,
+            crate::MarmotAppEvent::ChatHistoryImportsChanged { .. }
+        )),
+        "the latest answer is still Receiving, despite the renamed older rows"
+    );
+    assert_eq!(
+        history_state(&devices.laptop, &chat),
+        [ChatHistoryImportState::Receiving { retrying: false }]
+    );
+    assert_eq!(
+        sources(&devices),
+        [Some(phone_named(&devices, "New phone")), None]
+    );
+    assert!(
+        device_group_events(&mut devices.laptop).is_empty(),
+        "fresh labels owe no catch-up event"
+    );
+    devices.laptop.drive_history_blobs().await;
+    assert!(device_group_seam(&mut devices.laptop));
+    assert!(matches!(
+        &history_state(&devices.laptop, &chat)[..],
+        [ChatHistoryImportState::Imported { from, .. }] if *from == phone_named(&devices, "New phone")
+    ));
+
+    devices
+        .laptop
+        .remove_linked_device(&hex::encode(slot_of(&devices.phone)))
+        .await
+        .unwrap();
+    assert!(
+        !roster(&devices.laptop, &group)
+            .devices
+            .contains_key(&slot_of(&devices.phone))
+    );
+    assert!(
+        device_group_seam(&mut devices.laptop),
+        "the removal is announced"
+    );
+    assert_eq!(sources(&devices), [Some(phone_named(&devices, "")), None]);
+}
+
+/// The phone sends the laptop the chat's history and the laptop lists it as
+/// imported, with every announcement so far drained.
+async fn imported_history() -> (Devices, GroupId) {
+    let (mut devices, _group, chat, _first) = history_devices().await;
+    add_laptop(&mut devices, &chat).await;
+    device_group_seam(&mut devices.laptop);
+    devices.phone.drive_history_deliveries().await;
+    deliver_all(&mut devices.laptop, &devices.relay).await;
+    assert!(device_group_seam(&mut devices.laptop));
+    assert!(matches!(
+        history_state(&devices.laptop, &chat)[..],
+        [ChatHistoryImportState::Imported { .. }]
+    ));
+    (devices, chat)
+}
+
+/// Retention pruning the imported rows takes the chat off the list, and
+/// hosts are told: nothing but storage's change count sees the cascade.
+#[test]
+fn pruning_imported_history_is_announced() {
+    crate::tests::run_composed_app_runtime_test("prune-imported-history", || async {
+        let (mut devices, chat) = imported_history().await;
+        let account_id_hex = devices
+            .laptop_app
+            .account_home()
+            .account("alice")
+            .unwrap()
+            .account_id_hex;
+        let pruned = storage(&devices.laptop_app)
+            .prune_app_events_before(
+                &hex::encode(chat.as_slice()),
+                crate::unix_now_seconds() + 24 * 60 * 60,
+                &account_id_hex,
+                &|_, _| false,
+            )
+            .unwrap();
+        assert!(pruned > 0);
+        assert!(device_group_seam(&mut devices.laptop));
+        assert!(history_state(&devices.laptop, &chat).is_empty());
+        assert!(!device_group_seam(&mut devices.laptop), "nothing new");
+    });
+}
+
+/// Deleting the chat's data locally removes its imported rows through the
+/// cascade from its app events; hosts are told, though the laptop still
+/// holds the chat.
+#[test]
+fn deleting_an_imported_chat_is_announced() {
+    crate::tests::run_composed_app_runtime_test("delete-imported-history", || async {
+        let (mut devices, chat) = imported_history().await;
+        devices
+            .laptop_app
+            .account_storage("alice")
+            .unwrap()
+            .delete_local_group_data(&hex::encode(chat.as_slice()))
+            .unwrap();
+        assert!(device_group_seam(&mut devices.laptop));
+        assert!(history_state(&devices.laptop, &chat).is_empty());
+        assert!(!device_group_seam(&mut devices.laptop), "nothing new");
+    });
+}
+
+/// A Blossom delivery read before the laptop holds its chat is neither
+/// listed nor announced, since a host cannot name the chat. Once the chat is
+/// held it reads `Receiving`, then `retrying` after a fetch fails, unchanged
+/// by a second failure, then `Imported` from the phone, each announced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_blossom_history_reads_receiving_then_retrying_then_imported() {
+    let (mut devices, group, chat, first) = history_devices().await;
+    let chat_hex = hex::encode(chat.as_slice());
+    name_phone(&mut devices, &group, "Phone").await;
+    let blossom = local_blossom();
+    use_blossom(
+        &mut devices.phone,
+        &chat,
+        BLOSSOM_LOCATOR_KIND_V1,
+        &blossom.url,
+    )
+    .await;
+    send_text(
+        &mut devices.phone,
+        &chat,
+        &"y".repeat(INLINE_BUNDLE_MAX_PLAINTEXT),
+    )
+    .await;
+    devices
+        .phone
+        .dev_record_sibling_add(&chat, &slot_of(&devices.laptop))
+        .unwrap();
+    devices.phone.drive_history_deliveries().await;
+    devices.phone.drive_history_blobs().await;
+    // The server loses the blob, so the first fetch fails.
+    let (hash, blob) = blossom.blobs.lock().unwrap().drain().next().unwrap();
+    device_group_seam(&mut devices.laptop);
+    deliver_all(&mut devices.laptop, &devices.relay).await;
+    assert!(
+        !device_group_seam(&mut devices.laptop),
+        "nothing to list yet"
+    );
+    assert!(history_state(&devices.laptop, &chat).is_empty());
+
+    add_laptop(&mut devices, &chat).await;
+    assert!(
+        device_group_seam(&mut devices.laptop),
+        "the held chat's delivery is announced"
+    );
+    assert_eq!(
+        history_state(&devices.laptop, &chat),
+        [ChatHistoryImportState::Receiving { retrying: false }]
+    );
+    devices.laptop.drive_history_blobs().await;
+    assert!(
+        device_group_seam(&mut devices.laptop),
+        "the failed fetch is announced"
+    );
+    assert_eq!(
+        history_state(&devices.laptop, &chat),
+        [ChatHistoryImportState::Receiving { retrying: true }]
+    );
+    let laptop_storage = storage(&devices.laptop_app);
+    let parked = laptop_storage.parked_history_deliveries(&chat_hex).unwrap()[0].clone();
+    laptop_storage
+        .defer_parked_history_fetch(&parked.app_event_id, 0)
+        .unwrap();
+    devices.laptop.drive_history_blobs().await;
+    assert!(
+        !device_group_seam(&mut devices.laptop),
+        "a second failure reads the same"
+    );
+
+    blossom.blobs.lock().unwrap().insert(hash, blob);
+    laptop_storage
+        .defer_parked_history_fetch(&parked.app_event_id, 0)
+        .unwrap();
+    devices.laptop.drive_history_blobs().await;
+    assert!(
+        device_group_seam(&mut devices.laptop),
+        "the import is announced"
+    );
+    assert!(
+        laptop_storage
+            .timeline_message(&chat_hex, &first)
+            .unwrap()
+            .is_some()
+    );
+    assert!(matches!(
+        &history_state(&devices.laptop, &chat)[..],
+        [ChatHistoryImportState::Imported { from, .. }] if *from == phone_named(&devices, "Phone")
+    ));
+}

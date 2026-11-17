@@ -11,9 +11,9 @@
 //! remains unremembered — re-aborts every subsequent catch-up the relay
 //! replays it into. One garbage event starves every message queued behind it.
 //!
-//! The shape mirrors `since_floor.rs`'s cold-boot harness (see that file's
-//! module docs for why one account per store and why a full shutdown, not
-//! `restart_account`): bob goes fully offline, a malformed kind-445 and a
+//! The shape is the cold-boot harness `cursor_persistence.rs` documents (one
+//! account per store, and a full shutdown rather than `restart_account`): bob
+//! goes fully offline, a malformed kind-445 and a
 //! real message land in his backlog, and a cold boot's first catch-up must
 //! deliver the real message and record zero sync failures.
 
@@ -26,7 +26,6 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use marmot_account::AccountHome;
 use marmot_app::{MarmotApp, MarmotAppConfig, MarmotAppEvent, MarmotAppRuntime};
-use nostr_relay_builder::MockRelay;
 use nostr_sdk::prelude::{
     Client as NostrSdkClient, EventBuilder, FinalizeEvent, Keys, Kind, Tag,
     Timestamp as NostrTimestamp,
@@ -34,11 +33,8 @@ use nostr_sdk::prelude::{
 use transport_nostr_adapter::{NostrRelayClient, NostrSdkRelayClient};
 use transport_nostr_peeler::{NOSTR_GROUP_CONTENT_MIN_LEN, NostrTransportEvent};
 
-async fn mock_relay() -> (MockRelay, String) {
-    let relay = MockRelay::run().await.unwrap();
-    let url = relay.url().await.to_string();
-    (relay, url)
-}
+#[path = "support/limited_relay.rs"]
+mod limited_relay;
 
 fn open_store(dir: &tempfile::TempDir, relay_url: &str) -> MarmotApp {
     MarmotApp::with_relay_and_config(
@@ -76,7 +72,7 @@ async fn wait_for_event<F>(
 /// Publish a kind-445 whose content is structurally too short to be a
 /// `base64(nonce || ciphertext)` envelope, with a fresh ephemeral (non-member)
 /// signing key — the peeler classifies it `Malformed` before any decryption
-/// attempt. Contrast `since_floor.rs`'s probe helper, which deliberately
+/// attempt. Contrast `next_event_backfill.rs`'s probe helper, which deliberately
 /// builds an envelope-*shaped* payload so it classifies `DecryptFailed`
 /// instead; this helper pins the other, structurally-invalid classification.
 async fn publish_malformed_group_message_at(
@@ -116,9 +112,12 @@ fn account_sync_failures(runtime: &MarmotAppRuntime) -> u64 {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn malformed_group_message_does_not_starve_messages_behind_it() {
-    let (_relay, url) = mock_relay().await;
+    // A truthful cap lets boot 2's recovery runner prove bob's offline gap and
+    // release the group's held live frames; a relay with no information
+    // document holds them behind the unknown-cap fence's slow sweep instead.
+    let (_relay, url) = limited_relay::mock_relay().await;
 
-    // One account per store, exactly as documented in `since_floor.rs`.
+    // One account per store, exactly as documented in `cursor_persistence.rs`.
     let dir_bob = tempfile::tempdir().unwrap();
     let home_bob = AccountHome::open(dir_bob.path());
     home_bob.create_account("bob").unwrap();
@@ -143,7 +142,9 @@ async fn malformed_group_message_does_not_starve_messages_behind_it() {
     let group_id = alice_client
         .create_group("malformed drain resilience", &[bob_id.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_event(&mut events_bob_boot1, |event| {
         matches!(
             event,

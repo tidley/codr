@@ -26,6 +26,14 @@ pub(crate) fn runtime_message_update_from_event(
         | MarmotAppEvent::EpochStallEscalated { .. }
         | MarmotAppEvent::GroupChangeSuperseded { .. }
         | MarmotAppEvent::HistoryNoticesChanged { .. }
+        | MarmotAppEvent::RecoveryStatusChanged { .. }
+        | MarmotAppEvent::LinkedDevicesChanged { .. }
+        | MarmotAppEvent::KeyPackageRefreshOverdueChanged { .. }
+        | MarmotAppEvent::UnrecognizedSignInsChanged { .. }
+        | MarmotAppEvent::CompromiseWarningChanged { .. }
+        | MarmotAppEvent::DeviceLinkChanged { .. }
+        | MarmotAppEvent::ChatHistoryImportsChanged { .. }
+        | MarmotAppEvent::DeviceUnlinked { .. }
         | MarmotAppEvent::AccountError(_) => None,
     }
 }
@@ -44,6 +52,14 @@ pub(crate) fn projection_update_from_event(
         | MarmotAppEvent::EpochStallEscalated { .. }
         | MarmotAppEvent::GroupChangeSuperseded { .. }
         | MarmotAppEvent::HistoryNoticesChanged { .. }
+        | MarmotAppEvent::RecoveryStatusChanged { .. }
+        | MarmotAppEvent::LinkedDevicesChanged { .. }
+        | MarmotAppEvent::KeyPackageRefreshOverdueChanged { .. }
+        | MarmotAppEvent::UnrecognizedSignInsChanged { .. }
+        | MarmotAppEvent::CompromiseWarningChanged { .. }
+        | MarmotAppEvent::DeviceLinkChanged { .. }
+        | MarmotAppEvent::ChatHistoryImportsChanged { .. }
+        | MarmotAppEvent::DeviceUnlinked { .. }
         | MarmotAppEvent::AccountError(_) => None,
     }
 }
@@ -60,12 +76,15 @@ pub(crate) fn projection_update_matches_query(
 }
 
 pub(crate) fn timeline_query_can_apply_projection_delta(query: &TimelineMessageQuery) -> bool {
-    // Projection application already derives canonical-vs-wall ordering from
-    // this field, so global windows can safely merge per-group deltas.
     query
         .search
         .as_ref()
         .is_none_or(|search| search.trim().is_empty())
+        && query.sender.is_none()
+        && query.since.is_none()
+        && query.until.is_none()
+        && query.attachment_type == crate::TimelineAttachmentType::Any
+        && !query.search_wall_clock
         && query.pagination.before.is_none()
         && query.pagination.before_message_id.is_none()
         && query.pagination.after.is_none()
@@ -95,6 +114,14 @@ pub(crate) fn runtime_group_event_route(event: &MarmotAppEvent) -> Option<(&str,
         | MarmotAppEvent::EpochStallEscalated { .. }
         | MarmotAppEvent::GroupChangeSuperseded { .. }
         | MarmotAppEvent::HistoryNoticesChanged { .. }
+        | MarmotAppEvent::RecoveryStatusChanged { .. }
+        | MarmotAppEvent::LinkedDevicesChanged { .. }
+        | MarmotAppEvent::KeyPackageRefreshOverdueChanged { .. }
+        | MarmotAppEvent::UnrecognizedSignInsChanged { .. }
+        | MarmotAppEvent::CompromiseWarningChanged { .. }
+        | MarmotAppEvent::DeviceLinkChanged { .. }
+        | MarmotAppEvent::ChatHistoryImportsChanged { .. }
+        | MarmotAppEvent::DeviceUnlinked { .. }
         | MarmotAppEvent::AccountError(_) => None,
     }
 }
@@ -122,6 +149,14 @@ pub(crate) fn chat_list_event_route(event: &MarmotAppEvent) -> Option<(&str, &Gr
         | MarmotAppEvent::EpochStallEscalated { .. }
         | MarmotAppEvent::GroupChangeSuperseded { .. }
         | MarmotAppEvent::HistoryNoticesChanged { .. }
+        | MarmotAppEvent::RecoveryStatusChanged { .. }
+        | MarmotAppEvent::LinkedDevicesChanged { .. }
+        | MarmotAppEvent::KeyPackageRefreshOverdueChanged { .. }
+        | MarmotAppEvent::UnrecognizedSignInsChanged { .. }
+        | MarmotAppEvent::CompromiseWarningChanged { .. }
+        | MarmotAppEvent::DeviceLinkChanged { .. }
+        | MarmotAppEvent::ChatHistoryImportsChanged { .. }
+        | MarmotAppEvent::DeviceUnlinked { .. }
         | MarmotAppEvent::AccountError(_) => None,
     }
 }
@@ -150,9 +185,8 @@ pub(crate) fn chat_list_trigger_from_event(event: &MarmotAppEvent) -> ChatListUp
             }
             GroupEvent::MessageReceived { .. }
             | GroupEvent::AppMessageInvalidated { .. }
-            | GroupEvent::TransportObjectResourceRefused { .. } => {
-                ChatListUpdateTrigger::SnapshotRefresh
-            }
+            | GroupEvent::TransportObjectResourceRefused { .. }
+            | GroupEvent::QueuedIntentRefused { .. } => ChatListUpdateTrigger::SnapshotRefresh,
         },
         MarmotAppEvent::ProjectionUpdated(update) => update.update.chat_list_trigger,
         MarmotAppEvent::MessageReceived(_)
@@ -163,6 +197,14 @@ pub(crate) fn chat_list_trigger_from_event(event: &MarmotAppEvent) -> ChatListUp
         | MarmotAppEvent::EpochStallEscalated { .. }
         | MarmotAppEvent::GroupChangeSuperseded { .. }
         | MarmotAppEvent::HistoryNoticesChanged { .. }
+        | MarmotAppEvent::RecoveryStatusChanged { .. }
+        | MarmotAppEvent::LinkedDevicesChanged { .. }
+        | MarmotAppEvent::KeyPackageRefreshOverdueChanged { .. }
+        | MarmotAppEvent::UnrecognizedSignInsChanged { .. }
+        | MarmotAppEvent::CompromiseWarningChanged { .. }
+        | MarmotAppEvent::DeviceLinkChanged { .. }
+        | MarmotAppEvent::ChatHistoryImportsChanged { .. }
+        | MarmotAppEvent::DeviceUnlinked { .. }
         | MarmotAppEvent::AccountError(_) => ChatListUpdateTrigger::SnapshotRefresh,
     }
 }
@@ -171,6 +213,7 @@ fn group_id_from_event(event: &GroupEvent) -> &GroupId {
     match event {
         GroupEvent::LocalGroupCopyTerminated { group_id, .. }
         | GroupEvent::LocalGroupCopyRestored { group_id }
+        | GroupEvent::QueuedIntentRefused { group_id, .. }
         | GroupEvent::GroupMemberLeavesRemoved { group_id, .. }
         | GroupEvent::GroupCreated { group_id }
         | GroupEvent::GroupJoined { group_id, .. }

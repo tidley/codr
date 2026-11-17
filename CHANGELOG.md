@@ -1,5 +1,43 @@
 # Changelog
 
+## [0.12.0] - Release candidate
+
+Not yet published. See the [release notes and contributor credits](docs/releases/0.12.0.md)
+and [packaging evidence and release handoff](docs/releases/0.12.0-readiness.md).
+
+### Fixed
+
+- Select the native `musl-gcc` linker for Linux x86_64 and ARM64 release and
+  preview packages. MDK Markdown's math dependency must not link glibc's static
+  `libm` into Rust's musl executable. Keep the static-loader and package checks.
+- Stop the combined service if its embedded messaging worker exits or panics,
+  including during startup, so the existing service supervisor can restart it.
+  Do not remain apparently healthy with phone messaging offline. Preserve durable
+  bridge state and normal graceful shutdown.
+
+### Changed
+
+- Submit OpenCode V2 phone prompts through its authenticated local API with a
+  persisted message ID and native acceptance receipt. Reconcile uncertain sends
+  by ID after restart without retrying or falling back to terminal typing.
+  Codex, Claude Code and legacy OpenCode retain their existing terminal delivery.
+
+- Update the embedded and standalone MDK connector source from 0.14.0 to 0.17.0,
+  pinned to release commit `4df811aea99269b437a6023be9446a5141e93cbe`.
+  Retain Codr's media-reference and graceful-shutdown extensions; use upstream
+  founding-admin controls. Declare the new `mdk-0.17` storage cohort so normal
+  updates cannot silently migrate existing accounts. Migration needs separate
+  approval and a stopped backup; downgrade after migration is unsupported.
+- Accept serial phone controls such as `/recent /unmute` in one message. Validate
+  the full sequence before dispatch, run controls left-to-right, and retain
+  completed-command receipts across retries and restarts. Launches, updates and
+  permission answers still require separate messages.
+- Display wide outgoing Markdown tables as labelled rows in phone chats. Keep
+  inline formatting and links instead of squeezing columns or using code blocks.
+  Small tables and existing code blocks stay unchanged. Apply the same display
+  rule to automatic replies, `/last` and `/recent` without changing native history
+  or delivery receipts.
+
 ## [0.11.2] - 2026-11-11
 
 See the [release notes](docs/releases/0.11.2.md) for upgrade limits, measured

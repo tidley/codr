@@ -14,11 +14,13 @@ fn authority() -> ConversationAuthority {
         admin_count: 1,
         pending_confirmation: false,
         leave_request_pending: false,
+        leave_blocked: false,
         lifecycle: AppGroupLifecycleState::Stable,
         unrecoverable: false,
         disbanding: false,
         disbanding_enabled: true,
         has_disbanding_blockers: false,
+        admin_leave_steps_down: false,
     }
 }
 fn state() -> ConversationHeaderState {
@@ -46,6 +48,8 @@ fn setup() -> (tempfile::TempDir, MarmotApp, ChatPresentationInput) {
         members: vec![account.account_id_hex, "bb".repeat(32)],
         avatar_url: None,
         avatar: None,
+        group_description: String::new(),
+        search_peer_names: Vec::new(),
     };
     (dir, app, input)
 }
@@ -78,6 +82,9 @@ fn message(group: &str, sender: &str) -> TimelineMessageRecord {
         deletion_source: Default::default(),
         deleted_by_message_id_hex: None,
         invalidation_status: None,
+        recipient_confirmed: false,
+        imported_from: None,
+        history_import_provenance: None,
     }
 }
 fn page(messages: Vec<TimelineMessageRecord>) -> TimelinePage {
@@ -135,8 +142,21 @@ fn conversation_capabilities_follow_membership_and_lifecycle_without_profiles() 
     assert!(!input.capabilities().can_leave);
     assert!(!input.member_actions(true, true).can_remove);
     assert!(!input.member_actions(false, true).can_demote);
+    assert!(input.capabilities().requires_self_demote_before_leave);
     input.admin_count = 2;
     assert!(input.member_actions(false, true).can_demote);
+    // Without device groups an admin demotes first, even with another admin
+    // (mdk#3014 interim); with them, Leave demotes it (D99).
+    assert!(!input.capabilities().can_leave);
+    assert!(input.capabilities().requires_self_demote_before_leave);
+    input.admin_leave_steps_down = true;
+    assert!(input.capabilities().can_leave);
+    assert!(!input.capabilities().requires_self_demote_before_leave);
+    input.admin_count = 1;
+    assert!(!input.capabilities().can_leave);
+    assert!(!input.capabilities().requires_self_demote_before_leave);
+    input.admin_count = 2;
+    input.admin_leave_steps_down = false;
     for (membership, leaving, pending, lifecycle, expected) in [
         (
             SelfMembership::Member,
@@ -174,6 +194,13 @@ fn conversation_capabilities_follow_membership_and_lifecycle_without_profiles() 
             ConversationParticipation::Removed,
         ),
         (
+            SelfMembership::DeviceRemoved,
+            false,
+            false,
+            AppGroupLifecycleState::Stable,
+            ConversationParticipation::DeviceRemoved,
+        ),
+        (
             SelfMembership::Member,
             false,
             false,
@@ -184,6 +211,7 @@ fn conversation_capabilities_follow_membership_and_lifecycle_without_profiles() 
         let a = ConversationAuthority {
             self_membership: membership,
             leave_request_pending: leaving,
+            leave_blocked: false,
             pending_confirmation: pending,
             lifecycle,
             ..input
@@ -194,6 +222,33 @@ fn conversation_capabilities_follow_membership_and_lifecycle_without_profiles() 
         assert!(!a.member_actions(false, false).can_promote);
         assert_eq!(c.is_self_admin, membership == SelfMembership::Member);
         assert!(!c.is_last_admin); // Two actual admins in this fixture.
+        // Declining is a Leave: an admin invitee demotes first.
+        assert_eq!(
+            c.requires_self_demote_before_leave,
+            expected == ConversationParticipation::PendingInvitation
+        );
+        let stepping_down = ConversationAuthority {
+            admin_leave_steps_down: true,
+            ..a
+        };
+        assert!(
+            !stepping_down
+                .capabilities()
+                .requires_self_demote_before_leave
+        );
+        // A blocked leave still reads as leaving and offers Cancel; the
+        // marker offers nothing outside a pending leave (mdk#3014).
+        assert!(!c.can_cancel_leave);
+        let blocked = ConversationAuthority {
+            leave_blocked: true,
+            ..a
+        }
+        .capabilities();
+        assert_eq!(blocked.participation, expected);
+        assert_eq!(
+            blocked.can_cancel_leave,
+            expected == ConversationParticipation::Leaving
+        );
     }
     input.unrecoverable = true;
     assert!(!input.capabilities().can_send);
@@ -214,6 +269,7 @@ fn conversation_dictionary_includes_former_members_replies_mentions_and_peer() {
         message_id_hex: "03".repeat(32),
         sender: reply.clone(),
         plaintext: "earlier".into(),
+        tags: Vec::new(),
         kind: 9,
         source_epoch: Some(0),
         media: None,
@@ -579,6 +635,7 @@ fn conversation_reply_mentions_have_independent_limits_and_complete_identities()
             .map(|id| format!("@{}", npub_for_account_id(id).unwrap()))
             .collect::<Vec<_>>()
             .join(" "),
+        tags: Vec::new(),
         kind: 9,
         source_epoch: Some(0),
         media: None,

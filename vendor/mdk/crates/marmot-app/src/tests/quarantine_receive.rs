@@ -30,15 +30,11 @@ async fn wait_for_message(
     .unwrap_or_else(|_| panic!("{account_label} never received {plaintext:?}"));
 }
 
-async fn start_runtime(
-    app: &MarmotApp,
-    relay: Arc<ScriptedPushRelayClient>,
-) -> (MarmotAppRuntime, ScriptedEosePump) {
-    let eose = scripted_eose_pump(app.relay_plane.clone(), relay, every_subscription);
+async fn start_runtime(app: &MarmotApp) -> MarmotAppRuntime {
     let runtime = MarmotAppRuntime::new(app.clone());
     runtime.reconcile_accounts().await.unwrap();
     runtime.catch_up_accounts().await.unwrap();
-    (runtime, eose)
+    runtime
 }
 
 async fn wait_for_joined(
@@ -76,19 +72,51 @@ async fn quarantined_group_does_not_block_account_receives_body(locally_deleted:
     remember_test_member_inbox(&app, &alice.account_id_hex, "wss://relay.example");
     remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
 
-    let (runtime, eose) = start_runtime(&app, relay.clone()).await;
+    let runtime = start_runtime(&app).await;
     let mut events = runtime.subscribe();
     let bob_members = std::slice::from_ref(&bob.account_id_hex);
     let broken = runtime
         .create_group("alice", "quarantined", bob_members, None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_joined(&mut events, &bob.account_id_hex, &broken).await;
     let healthy = runtime
         .create_group("alice", "healthy", bob_members, None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     wait_for_joined(&mut events, &bob.account_id_hex, &healthy).await;
+    runtime.shutdown().await;
+
+    // bob's copies have ended their post-join collection, as a relay that
+    // answers history reads lets them. This relay answers none, so bob's
+    // worker would re-activate his subscriptions for the collection while
+    // alice sends, and the swap discards a live copy of her message for the
+    // new REQs to read back from the relay, which serves no stored events
+    // either.
+    let bob_client = app.client("bob").await.unwrap();
+    for group in [&broken, &healthy] {
+        bob_client.runtime.mark_post_join_eose(group).unwrap();
+        let fetch = bob_client
+            .runtime
+            .start_post_join_history_fetch(group)
+            .unwrap()
+            .expect("bob's post-join fetch is owed");
+        bob_client
+            .runtime
+            .finish_post_join_history_fetch(group, &fetch)
+            .unwrap()
+            .expect("the fetch ends");
+    }
+    drop(bob_client);
+
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let runtime = start_runtime(&app).await;
+    let mut events = runtime.subscribe();
     runtime
         .send_message("alice", &healthy, b"warmup alice".to_vec())
         .await
@@ -103,7 +131,6 @@ async fn quarantined_group_does_not_block_account_receives_body(locally_deleted:
         assert!(runtime.delete_group_local("alice", &broken).await.unwrap());
     }
     runtime.shutdown().await;
-    drop(eose);
 
     // Two ambiguous apply snapshots make alice's next open quarantine the
     // group with the production reason, without touching its stored state.
@@ -119,7 +146,7 @@ async fn quarantined_group_does_not_block_account_receives_body(locally_deleted:
         // A restart is a fresh process: new app, relay plane and workers.
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(relay.clone());
-        let (runtime, _eose) = start_runtime(&app, relay.clone()).await;
+        let runtime = start_runtime(&app).await;
         let mut events = runtime.subscribe();
         let quarantined = runtime.quarantined_groups("alice").await.unwrap();
         assert_eq!(quarantined.len(), 1, "pass {pass}");
@@ -195,7 +222,7 @@ async fn quarantined_group_does_not_block_account_receives_body(locally_deleted:
     // while it was quarantined is applied, restoring a deleted chat.
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(relay.clone());
-    let (runtime, _eose) = start_runtime(&app, relay.clone()).await;
+    let runtime = start_runtime(&app).await;
     let mut events = runtime.subscribe();
     for snapshot in SNAPSHOTS {
         storage.release_group_snapshot(&broken, snapshot).unwrap();

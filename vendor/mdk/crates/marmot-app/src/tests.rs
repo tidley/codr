@@ -1,17 +1,48 @@
 #[cfg(feature = "test-policy-overrides")]
+mod account_devices_advertising;
+mod audit_ownership;
+#[cfg(feature = "test-policy-overrides")]
 mod canonical_membership;
+#[cfg(feature = "test-policy-overrides")]
+mod compromise_warning;
+#[cfg(feature = "test-policy-overrides")]
+mod device_group;
+#[cfg(feature = "test-policy-overrides")]
+mod device_pairing;
 mod draft_lifecycle;
 mod follow_list_edits;
 mod group_lookup;
 pub(crate) mod invite_recovery;
+mod key_package_client_tag;
 mod key_package_inventory;
+mod key_package_relay_lists;
 mod key_package_selection;
 mod message_journeys;
+#[cfg(feature = "test-policy-overrides")]
+mod multi_device_members;
+mod nip46_restore;
+#[cfg(feature = "product-analytics-export")]
+mod observed_operations;
+mod offline_queued_sends;
 mod publication_progress;
+#[cfg(feature = "test-policy-overrides")]
+mod push_announce;
+#[cfg(feature = "test-policy-overrides")]
+mod push_repair;
+#[cfg(feature = "test-policy-overrides")]
+mod push_snapshot;
+#[cfg(feature = "test-policy-overrides")]
+mod push_token_reshare;
 mod quarantine_receive;
+mod read_state;
+mod relay_event_limits;
 mod relay_plane_runtime;
 mod replaceable_delivery;
 mod report_backfill;
+#[cfg(feature = "test-policy-overrides")]
+mod sign_ins;
+#[cfg(feature = "test-policy-overrides")]
+mod small_state;
 mod suspension_close;
 mod unreachable_group_relays;
 mod user_blocks;
@@ -33,6 +64,7 @@ use cgka_traits::app_event::{
 use cgka_traits::storage::{DisbandCandidate, DisbandCandidateStorage};
 use cgka_traits::{GroupStorage as _, Timestamp};
 use marmot_account::AccountHomeError;
+use marmot_session::AccountDeviceSession;
 use nostr_directory::error::DirectoryError;
 use nostr_sdk::prelude::{
     EventBuilder, FinalizeEvent, Keys, Kind, Tag, Timestamp as NostrTimestamp,
@@ -46,7 +78,6 @@ use transport_nostr_peeler::{NOSTR_GROUP_CONTENT_MIN_LEN, NostrTransportEvent};
 use transport_quic_broker::BrokerServerTrust;
 
 use crate::audit_log::AUDIT_ID_BYTES;
-use crate::client::epoch_stall::{BackfillDecision, EPOCH_STALL_BACKFILL_THRESHOLD};
 use crate::conversions::{
     app_group_from_stored_group, stored_components_from_app_group, stored_group_from_app_group,
 };
@@ -80,8 +111,18 @@ async fn rejoin_eviction_invalidates_both_group_projections_without_mls_reads() 
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let old_group = client.create_group("old offer", &[]).await.unwrap();
-    let new_group = client.create_group("new offer", &[]).await.unwrap();
+    let old_group = client
+        .create_group("old offer", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    let new_group = client
+        .create_group("new offer", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let storage = app.account_storage("alice").unwrap();
     let old = PendingWelcome {
         message_id: cgka_traits::MessageId::new(vec![0xe1; 32]),
@@ -135,7 +176,12 @@ async fn rejoin_decline_does_not_require_live_mls_state() {
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let template_id = client.create_group("offer", &[]).await.unwrap();
+    let template_id = client
+        .create_group("offer", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let storage = app.account_storage("alice").unwrap();
     // Keep a real Marmot record but deliberately omit its corresponding MLS rows.
     let group_id = cgka_traits::GroupId::new(vec![0xf1; 16]);
@@ -165,12 +211,22 @@ async fn rejoin_decline_does_not_require_live_mls_state() {
             .unwrap()
             .is_empty()
     );
-    client.pending_recovery_status_updates.clear();
+    client
+        .history_recovery
+        .test_state()
+        .pending_recovery_status_updates
+        .clear();
     client.decline_group_rejoin(&welcome_id).unwrap();
     assert!(storage.list_welcomes().unwrap().is_empty());
     assert!(storage.has_ingress_dedup_marker(&welcome_id).unwrap());
     assert!(storage.has_ingress_dedup_marker(&content_id).unwrap());
-    assert!(client.pending_recovery_status_updates.contains(&group_id));
+    assert!(
+        client
+            .history_recovery
+            .test_state()
+            .pending_recovery_status_updates
+            .contains(&group_id)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -182,7 +238,12 @@ async fn send_finalizes_once() {
     let app = MarmotApp::with_relay(dir.path(), "wss://history.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let group = client.create_group("send projection", &[]).await.unwrap();
+    let group = client
+        .create_group("send projection", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     client.take_pending_projection_updates();
     let mut updates = Vec::new();
     let result = client
@@ -230,7 +291,12 @@ async fn send_history_timings() {
     let app = MarmotApp::with_relay(dir.path(), "wss://history.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let group = client.create_group("history probe", &[]).await.unwrap();
+    let group = client
+        .create_group("history probe", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let epoch = client.runtime.group_record(&group).unwrap().epoch.0;
     let group_hex = hex::encode(group.as_slice());
     let storage = app.account_storage("alice").unwrap();
@@ -293,12 +359,14 @@ async fn send_history_timings() {
 #[test]
 fn prepared_group_image_create_has_no_upload_phase_and_is_idempotent() {
     run_composed_app_runtime_test("prepared-group-image-create", || async {
-        let dir = tempfile::tempdir().unwrap();
-        AccountHome::open(dir.path())
-            .create_account("alice")
-            .unwrap();
-        let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
-            .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let (_dir, app, accounts, fetcher) = member_resolution_fixture(2, false).await;
+        app.account_home().create_account("alice").unwrap();
+        let missing = accounts[1].account_id_hex.clone();
+        fetcher
+            .events
+            .lock()
+            .unwrap()
+            .retain(|event| event.kind != KIND_MARMOT_INBOX_RELAY_LIST || event.pubkey != missing);
         let mut client = app.client("alice").await.unwrap();
         let staged = client
             .stage_prepared_initial_group_image(&one_pixel_png(), "image/png")
@@ -343,19 +411,36 @@ fn prepared_group_image_create_has_no_upload_phase_and_is_idempotent() {
             crate::client::PreparedGroupImageUploadStart::Complete(_)
         ));
 
-        let telemetry = AppPerformanceTelemetry::default();
-        let group_id = client
+        let telemetry = marmot_observability::PerformanceRecorder::default();
+        let created = client
             .create_group_with_prepared_initial_image_and_telemetry(
                 "prepared image",
-                &[],
+                &[accounts[0].account_id_hex.as_str(), missing.as_str()],
                 AppCreateGroupOptions::default(),
                 &staged.upload_id,
                 &telemetry,
             )
             .await
-            .unwrap()
-            .group_id;
-        let group_id_again = client
+            .unwrap();
+        let group_id = created.operation.unwrap().group_id;
+        let expected = vec![
+            MemberResolutionOutcome {
+                account_id_hex: accounts[0].account_id_hex.clone(),
+                status: MemberResolutionStatus::Selected,
+                selected_device_count: 1,
+            },
+            MemberResolutionOutcome {
+                account_id_hex: missing,
+                status: MemberResolutionStatus::MissingInboxRoute,
+                selected_device_count: 0,
+            },
+        ];
+        assert_eq!(created.member_outcomes, expected);
+        drop(client);
+        let mut client = app.client("alice").await.unwrap();
+        fetcher.events.lock().unwrap().clear();
+        fetcher.requests.lock().unwrap().clear();
+        let retried = client
             .create_group_with_prepared_initial_image_and_telemetry(
                 "ignored on idempotent retry",
                 &[],
@@ -364,8 +449,10 @@ fn prepared_group_image_create_has_no_upload_phase_and_is_idempotent() {
                 &telemetry,
             )
             .await
-            .unwrap()
-            .group_id;
+            .unwrap();
+        assert_eq!(retried.member_outcomes, expected);
+        assert!(fetcher.requests.lock().unwrap().is_empty());
+        let group_id_again = retried.operation.unwrap().group_id;
         assert_eq!(group_id_again, group_id);
         assert_eq!(client.state.groups.len(), 1);
         assert!(client.state.groups[0].image.present);
@@ -399,32 +486,49 @@ fn uploaded_prepared_group_image_retry_recovers_from_engine_without_projection()
         client
             .finish_initial_group_image_upload(&staged.upload_id, &Ok(()))
             .unwrap();
-        let component_data = app
+        let prepared = app
             .account_storage("alice")
             .unwrap()
             .app_storage()
             .prepared_group_image_upload(&staged.upload_id)
             .unwrap()
-            .unwrap()
-            .component_data;
-        let telemetry = AppPerformanceTelemetry::default();
+            .unwrap();
+        let telemetry = marmot_observability::PerformanceRecorder::default();
 
         // Simulate the narrow crash window: MLS creation is canonical, but
         // consumption fails and the best-effort app projection is absent.
+        let path = app.account_storage_path("alice");
+        let keys = app.account_home().load_signing_keys("alice").unwrap();
+        let key = app
+            .sqlcipher_key("alice", &keys, &path, SqlcipherDatabaseKind::Session)
+            .unwrap();
+        let connection = rusqlite::Connection::open(path).unwrap();
+        storage_sqlite::open_hardened_sqlcipher(
+            &connection,
+            &key,
+            storage_sqlite::SqlCipherHardening::cipher_only(),
+        )
+        .unwrap();
+        connection.execute_batch("CREATE TRIGGER fail_prepared_consume BEFORE UPDATE OF state ON app_prepared_group_image_upload WHEN NEW.state = 'consumed' BEGIN SELECT RAISE(FAIL, 'injected consume failure'); END;").unwrap();
         let group_id = client
             .create_group_with_initial_source_and_optional_telemetry(
                 "crash-window group",
                 &[],
                 AppCreateGroupOptions::default(),
                 Some(crate::client::InitialGroupImageSource::Prepared {
-                    upload_id: "injected-missing-consume-row".to_owned(),
-                    component_data,
+                    upload_id: staged.upload_id.clone(),
+                    component_data: prepared.component_data.clone(),
                 }),
                 Some(&telemetry),
             )
             .await
             .unwrap()
+            .operation
+            .expect("eligible fixture members")
             .group_id;
+        connection
+            .execute_batch("DROP TRIGGER fail_prepared_consume")
+            .unwrap();
         client.state.groups.clear();
         client
             .save_state_with_pending_local_group_deletion_frontier_clears()
@@ -448,6 +552,8 @@ fn uploaded_prepared_group_image_retry_recovers_from_engine_without_projection()
             )
             .await
             .unwrap()
+            .operation
+            .expect("eligible fixture members")
             .group_id;
 
         assert_eq!(recovered, group_id);
@@ -465,6 +571,32 @@ fn uploaded_prepared_group_image_retry_recovers_from_engine_without_projection()
                 .group_create_mls_prepare_persist
                 .attempts,
             1
+        );
+        // Restore the pre-consumption ledger as an upgraded legacy upload.
+        connection.execute(
+            "UPDATE app_prepared_group_image_upload SET state = 'uploaded', component_data = ?1, encrypted_blob = ?2, upload_secret = ?3, group_id_hex = NULL, member_outcomes_json = NULL WHERE upload_id = ?4",
+            rusqlite::params![&prepared.component_data, &prepared.encrypted_blob, &prepared.upload_secret, &staged.upload_id],
+        ).unwrap();
+        let error = client
+            .create_group_with_prepared_initial_image_and_telemetry(
+                "legacy retry cannot recreate",
+                &[],
+                AppCreateGroupOptions::default(),
+                &staged.upload_id,
+                &telemetry,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, AppError::CreatedGroupMemberReportUnavailable(group_id_hex) if group_id_hex == &hex::encode(recovered.as_slice()))
+        );
+        assert_eq!(client.runtime.live_group_ids().unwrap(), vec![recovered]);
+        assert_eq!(
+            client
+                .prepared_initial_group_image_status(&staged.upload_id)
+                .unwrap()
+                .state,
+            AppPreparedGroupImageUploadState::Consumed,
         );
     });
 }
@@ -502,6 +634,9 @@ fn legacy_inline_group_image_create_rejects_oversized_input_before_canonical_cre
     });
 }
 
+/// Which (REQ, relay) a [`ScriptedPushRelayClient`] leaves unanswered.
+pub(crate) type HeldReply = fn(&NostrSubscription, &TransportEndpoint) -> bool;
+
 #[derive(Default)]
 pub(crate) struct ScriptedPushRelayClient {
     pub(crate) acquisition_result:
@@ -519,6 +654,23 @@ pub(crate) struct ScriptedPushRelayClient {
     pub(crate) indexer_publish_release: tokio::sync::Notify,
     subscriptions: std::sync::Mutex<Vec<NostrSubscription>>,
     scoped_subscriptions: std::sync::Mutex<Vec<(String, NostrSubscription)>>,
+    /// What the scripted relays send the plane: each accepted REQ's reply.
+    messages: Arc<transport_nostr::test_support::ScriptedRelayMessages>,
+    /// Which (REQ, endpoint) the relay leaves unanswered; none by default.
+    hold_replies: std::sync::Mutex<Option<HeldReply>>,
+    /// Accepted REQs (wire id, subscription, endpoint) the relay has not
+    /// answered yet.
+    held_replies: std::sync::Mutex<Vec<(String, NostrSubscription, TransportEndpoint)>>,
+    /// When set, each REQ's reply carries one stored event created at this
+    /// second before its EOSE.
+    pub(crate) stored_before_eose: std::sync::Mutex<Option<u64>>,
+    /// Every relay reads as connected on this attempt, as its own state, so
+    /// moving it is a reconnect no notification reports.
+    pub(crate) connection_attempt: std::sync::atomic::AtomicUsize,
+    /// How many times the adapter has asked for a relay's connection.
+    pub(crate) connection_reads: std::sync::atomic::AtomicUsize,
+    /// The 1-based read that first sees the next connection; zero never.
+    pub(crate) reconnect_at_read: std::sync::atomic::AtomicUsize,
     subscription_attempts: std::sync::Mutex<Vec<NostrSubscription>>,
     block_next_subscribe: std::sync::atomic::AtomicBool,
     blocked_subscribe_count: std::sync::atomic::AtomicUsize,
@@ -535,10 +687,23 @@ pub(crate) struct ScriptedPushRelayClient {
     zero_ack_next_publish: std::sync::atomic::AtomicBool,
     reject_next_publish: std::sync::atomic::AtomicBool,
     fail_publish_unavailable: std::sync::atomic::AtomicBool,
+    /// Fail every publish as a send that may have reached the relay, as a
+    /// stale socket does once the device drops offline (mdk#2762).
+    fail_publish_possibly_exposed: std::sync::atomic::AtomicBool,
     unavailable_endpoints: std::sync::Mutex<Vec<String>>,
-    fail_publish_kind: std::sync::Mutex<Option<u64>>,
+    /// Endpoints whose relay refuses every publish of a kind for good, with
+    /// the answer's category (mdk#2333). The others answer as usual.
+    endpoint_refusals:
+        std::sync::Mutex<Vec<(u64, String, cgka_traits::TransportEndpointRejectionCategory)>>,
+    fail_publish_kind: std::sync::Mutex<Option<(u64, bool)>>,
     accept_first_endpoint_only: std::sync::atomic::AtomicBool,
     accepted_publish_routes: std::sync::Mutex<Vec<(u64, Vec<TransportEndpoint>)>>,
+    /// Every completion read stops before its end of stored events, as a
+    /// relay that timed out or closed the subscription.
+    pub(crate) unfinished_directory_reads: std::sync::atomic::AtomicBool,
+    /// Only each completion read's first relay finishes; the others are
+    /// down, so the read as a whole is not complete.
+    pub(crate) other_directory_relays_down: std::sync::atomic::AtomicBool,
     batch_calls: std::sync::atomic::AtomicUsize,
     publish_started: tokio::sync::Notify,
     publish_release: tokio::sync::Notify,
@@ -551,20 +716,21 @@ pub(crate) struct ScriptedPushRelayClient {
 #[derive(Default)]
 pub(crate) struct MemberResolutionDirectoryFetcher {
     pub(crate) requests: std::sync::Mutex<Vec<transport_nostr::DirectoryFetchRequest>>,
-    events: std::sync::Mutex<Vec<NostrTransportEvent>>,
+    pub(super) events: std::sync::Mutex<Vec<NostrTransportEvent>>,
     events_by_endpoint:
         std::sync::Mutex<std::collections::HashMap<String, Vec<NostrTransportEvent>>>,
     reject_multi_author: std::sync::atomic::AtomicBool,
     key_packages_only_in_single_author: std::sync::Mutex<std::collections::HashSet<String>>,
     key_packages_only_in_multi_author: std::sync::Mutex<std::collections::HashSet<String>>,
-    reject_multi_author_incomplete: std::sync::atomic::AtomicBool,
-    failing_single_author: std::sync::Mutex<Option<String>>,
+    pub(super) failing_single_author: std::sync::Mutex<Option<String>>,
     stalled_endpoint: std::sync::Mutex<Option<String>>,
     incomplete_endpoint: std::sync::Mutex<Option<String>>,
     incomplete_query_kind: std::sync::Mutex<Option<u64>>,
     failing_endpoint: std::sync::Mutex<Option<String>>,
     failing_endpoint_kind: std::sync::Mutex<Option<u64>>,
     fetch_gate_kind: std::sync::Mutex<Option<u64>>,
+    /// Answer every deletion proof with nothing, as a relay that lost them.
+    pub(crate) empty_deletion_proofs: std::sync::atomic::AtomicBool,
     fetch_gate: std::sync::Mutex<
         Option<(
             std::sync::Arc<tokio::sync::Notify>,
@@ -601,6 +767,37 @@ impl MemberResolutionDirectoryFetcher {
     }
 }
 
+/// The KeyPackage query of a KeyPackage read, checking that the read also
+/// asks for the authors' KeyPackage deletion requests.
+fn key_package_read(
+    request: &transport_nostr::DirectoryFetchRequest,
+) -> &transport_nostr::DirectoryEventQuery {
+    assert_eq!(request.queries.len(), 2, "{:?}", request.queries);
+    let packages = request
+        .queries
+        .iter()
+        .find(|query| query.kind == KIND_MARMOT_KEY_PACKAGE)
+        .unwrap();
+    assert!(request.queries.iter().any(|query| {
+        query.kind == 5
+            && query.authors == packages.authors
+            && query.reference == Some(('k', KIND_MARMOT_KEY_PACKAGE.to_string()))
+    }));
+    packages
+}
+
+/// Whether a fixture knob set for `kind` applies to `query`. A kind 5 knob
+/// targets deletion proofs, not the deletion read sent with every KeyPackage
+/// fetch.
+fn targets_kind(query: &transport_nostr::DirectoryEventQuery, kind: Option<u64>) -> bool {
+    Some(query.kind) == kind
+        && (query.kind != 5
+            || query
+                .reference
+                .as_ref()
+                .is_none_or(|(name, _)| *name != 'k'))
+}
+
 #[async_trait]
 impl transport_nostr::DirectoryRelayFetcher for MemberResolutionDirectoryFetcher {
     async fn fetch_directory_events(
@@ -610,10 +807,11 @@ impl transport_nostr::DirectoryRelayFetcher for MemberResolutionDirectoryFetcher
         self.requests.lock().unwrap().push(request.clone());
         let gate = {
             let mut fetch_gate = self.fetch_gate.lock().unwrap();
+            let gate_kind = *self.fetch_gate_kind.lock().unwrap();
             if request
                 .queries
                 .iter()
-                .any(|query| Some(query.kind) == *self.fetch_gate_kind.lock().unwrap())
+                .any(|query| targets_kind(query, gate_kind))
             {
                 fetch_gate.take()
             } else {
@@ -662,6 +860,16 @@ impl transport_nostr::DirectoryRelayFetcher for MemberResolutionDirectoryFetcher
                 .any(|endpoint| endpoint.0 == stalled)
         }) {
             tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        if self
+            .empty_deletion_proofs
+            .load(std::sync::atomic::Ordering::SeqCst)
+            && request
+                .queries
+                .iter()
+                .all(|query| targets_kind(query, Some(5)))
+        {
+            return Ok(Vec::new());
         }
         let single_author_only = self.key_packages_only_in_single_author.lock().unwrap();
         let multi_author_only = self.key_packages_only_in_multi_author.lock().unwrap();
@@ -718,14 +926,6 @@ impl transport_nostr::DirectoryRelayFetcher for MemberResolutionDirectoryFetcher
         &self,
         request: transport_nostr::DirectoryFetchRequest,
     ) -> Result<transport_nostr::DirectoryFetchOutcome, String> {
-        if self
-            .reject_multi_author_incomplete
-            .load(std::sync::atomic::Ordering::SeqCst)
-            && request.queries.iter().any(|query| query.authors.len() > 1)
-        {
-            self.requests.lock().unwrap().push(request);
-            return Ok(transport_nostr::DirectoryFetchOutcome::default());
-        }
         let incomplete_kind = *self.incomplete_query_kind.lock().unwrap();
         let complete = !self
             .incomplete_endpoint
@@ -737,7 +937,7 @@ impl transport_nostr::DirectoryRelayFetcher for MemberResolutionDirectoryFetcher
                     || request
                         .queries
                         .iter()
-                        .any(|query| Some(query.kind) == incomplete_kind))
+                        .any(|query| targets_kind(query, incomplete_kind)))
                     && request
                         .endpoints
                         .iter()
@@ -745,7 +945,15 @@ impl transport_nostr::DirectoryRelayFetcher for MemberResolutionDirectoryFetcher
             });
         let queries = request.queries.clone();
         let endpoints = request.endpoints.clone();
-        let mut records = self.fetch_directory_events(request).await?;
+        let mut records = match self.fetch_directory_events(request).await {
+            Ok(records) => records,
+            Err(error) if self.fail_all.load(std::sync::atomic::Ordering::SeqCst) => {
+                return Err(error);
+            }
+            // Relay rejection and failed routes are incomplete reads; only
+            // the explicit resource-failure knob fails the fetch operation.
+            Err(_) => return Ok(transport_nostr::DirectoryFetchOutcome::default()),
+        };
         records.sort_by(|a, b| {
             b.event
                 .created_at
@@ -784,6 +992,7 @@ impl transport_nostr::DirectoryRelayFetcher for MemberResolutionDirectoryFetcher
         Ok(transport_nostr::DirectoryFetchOutcome {
             records: retained,
             complete,
+            complete_endpoints: if complete { endpoints } else { Vec::new() },
         })
     }
 }
@@ -801,6 +1010,178 @@ fn registered_release(
 }
 
 impl ScriptedPushRelayClient {
+    /// Record an accepted REQ, or fail or park it as the test scripted.
+    async fn accept_subscription(
+        &self,
+        subscription: NostrSubscription,
+    ) -> Result<(), cgka_traits::TransportAdapterError> {
+        self.subscription_attempts
+            .lock()
+            .unwrap()
+            .push(subscription.clone());
+        if subscription.is_group_route() {
+            self.group_subscribe_attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        if self
+            .fail_next_subscribe
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(cgka_traits::TransportAdapterError::Subscription(
+                "injected subscribe failure".to_owned(),
+            ));
+        }
+        if subscription.is_group_route()
+            && self
+                .refuse_group_subscribes
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(cgka_traits::TransportAdapterError::Subscription(
+                "subscribe registered on 0 of 1 relays".to_owned(),
+            ));
+        }
+        let block_for_account = {
+            let mut blocked_account = self.block_account_subscribe.lock().unwrap();
+            if matches!(&subscription, NostrSubscription::AccountInbox { .. })
+                && blocked_account.as_deref() == Some(subscription.account_id().as_slice())
+            {
+                blocked_account.take();
+                true
+            } else {
+                false
+            }
+        };
+        let block_for_account_group = {
+            let mut blocked_account = self.block_account_group_subscribe.lock().unwrap();
+            if subscription.is_group_route()
+                && blocked_account.as_deref() == Some(subscription.account_id().as_slice())
+            {
+                blocked_account.take();
+                true
+            } else {
+                false
+            }
+        };
+        let blocked = block_for_account
+            || block_for_account_group
+            || self
+                .block_next_subscribe
+                .swap(false, std::sync::atomic::Ordering::SeqCst);
+        if blocked {
+            let released = registered_release(&self.subscribe_release);
+            self.blocked_subscribe_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.subscribe_started.notify_one();
+            released.await;
+            if self
+                .fail_blocked_subscribe
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(cgka_traits::TransportAdapterError::Subscription(
+                    "injected startup activation failure".to_owned(),
+                ));
+            }
+        }
+        self.subscriptions.lock().unwrap().push(subscription);
+        Ok(())
+    }
+
+    /// Answer an accepted REQ on each of its relays as a relay does, on the
+    /// connection it went out on: the stored event a test scripted, then EOSE.
+    /// A REQ the test holds stays unanswered until
+    /// [`Self::release_held_replies`]. A relay not yet connected connects
+    /// here, after the plane issued the REQ, so the plane restarts the REQ as
+    /// on a reconnect and counts it only from its EOSE; see
+    /// [`Self::connect_relays`].
+    fn reply(&self, subscription: &NostrSubscription, id: &str) {
+        let hold = *self.hold_replies.lock().unwrap();
+        for endpoint in subscription.endpoints() {
+            self.messages.connect(endpoint);
+            if hold.is_some_and(|hold| hold(subscription, endpoint)) {
+                self.held_replies.lock().unwrap().push((
+                    id.to_owned(),
+                    subscription.clone(),
+                    endpoint.clone(),
+                ));
+                continue;
+            }
+            self.answer(endpoint, id);
+        }
+    }
+
+    fn answer(&self, endpoint: &TransportEndpoint, id: &str) {
+        if let Some(created_at) = *self.stored_before_eose.lock().unwrap() {
+            self.messages
+                .event(endpoint, id, scripted_stored_event(created_at));
+        }
+        self.messages.eose(endpoint, id);
+    }
+
+    /// Leave each (REQ, relay) that `hold` selects unanswered from now on,
+    /// as a relay that has not finished, or never finishes, its stored
+    /// events. `None` answers every later REQ again.
+    pub(crate) fn hold_replies(&self, hold: Option<HeldReply>) {
+        *self.hold_replies.lock().unwrap() = hold;
+    }
+
+    /// Answer every held REQ that `release` selects now, late, and wait
+    /// until every plane on this relay has handled the answers.
+    pub(crate) async fn release_held_replies(
+        &self,
+        release: impl Fn(&NostrSubscription, &TransportEndpoint) -> bool,
+    ) {
+        let released = {
+            let mut held = self.held_replies.lock().unwrap();
+            let (released, kept) = std::mem::take(&mut *held)
+                .into_iter()
+                .partition::<Vec<_>, _>(|(_, subscription, endpoint)| {
+                    release(subscription, endpoint)
+                });
+            *held = kept;
+            released
+        };
+        for (id, _, endpoint) in released {
+            self.answer(&endpoint, &id);
+        }
+        self.replies_handled().await;
+    }
+
+    /// Answer every held REQ now, late, and wait until the planes handled it.
+    pub(crate) async fn answer_held_replies(&self) {
+        self.release_held_replies(|_, _| true).await;
+    }
+
+    /// These relays are connected, as a running app's relays are before its
+    /// account subscribes: wait until every plane on this relay has heard
+    /// each connection, so the REQs it issues there later count from their
+    /// own issue rather than from their EOSE. Call it once the plane exists
+    /// and before the account's first REQ.
+    pub(crate) async fn connect_relays(&self, endpoints: &[&str]) {
+        for endpoint in endpoints {
+            self.messages
+                .connect(&TransportEndpoint((*endpoint).to_owned()));
+        }
+        self.replies_handled().await;
+    }
+
+    /// Wait until every plane on this relay has handled every message the
+    /// relay sent so far.
+    pub(crate) async fn replies_handled(&self) {
+        self.messages.handled().await;
+    }
+
+    /// The relay at `endpoint` closes the REQ `id`, giving `reason`; waits
+    /// until every plane on this relay has handled the CLOSED.
+    pub(crate) async fn close_subscription(
+        &self,
+        endpoint: &TransportEndpoint,
+        id: &str,
+        reason: &str,
+    ) {
+        self.messages.closed(endpoint, id, reason);
+        self.replies_handled().await;
+    }
+
     fn script(&self, results: impl IntoIterator<Item = bool>) {
         *self.publish_results.lock().unwrap() = results.into_iter().collect();
     }
@@ -873,20 +1254,6 @@ impl ScriptedPushRelayClient {
         self.subscriptions.lock().unwrap().clone()
     }
 
-    pub(crate) fn unfloored_account_subscription_count(&self) -> usize {
-        self.subscriptions
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|subscription| {
-                matches!(
-                    subscription,
-                    NostrSubscription::AccountInbox { since: None, .. }
-                )
-            })
-            .count()
-    }
-
     pub(crate) async fn wait_for_blocked_subscribe(&self) {
         self.subscribe_started.notified().await;
     }
@@ -923,9 +1290,18 @@ impl ScriptedPushRelayClient {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    fn allow_publishes(&self) {
+    pub(crate) fn allow_publishes(&self) {
         self.fail_publish_unavailable
             .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.fail_publish_possibly_exposed
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Fail every publish as possibly exposed: the frame left the device but
+    /// no relay acknowledgement arrived (mdk#2762).
+    pub(crate) fn fail_publishes_as_possibly_exposed(&self) {
+        self.fail_publish_possibly_exposed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Fail single-endpoint publishes to these relays as unavailable.
@@ -936,8 +1312,30 @@ impl ScriptedPushRelayClient {
             .collect();
     }
 
+    /// The relay at `endpoint` refuses every publish of `kind` for good with
+    /// a final answer of `category`, as the SDK client classifies one; a
+    /// `TooLarge` answer carries the event's size class. The fanout publishes
+    /// one endpoint at a time, so the other relays still accept.
+    pub(crate) fn refuse_publishes_of_kind_at(
+        &self,
+        kind: u64,
+        endpoint: &str,
+        category: cgka_traits::TransportEndpointRejectionCategory,
+    ) {
+        self.endpoint_refusals
+            .lock()
+            .unwrap()
+            .push((kind, endpoint.to_owned(), category));
+    }
+
     pub(crate) fn fail_publishes_of_kind(&self, kind: u64) {
-        *self.fail_publish_kind.lock().unwrap() = Some(kind);
+        *self.fail_publish_kind.lock().unwrap() = Some((kind, false));
+    }
+
+    /// Supply the SDK's already-classified endpoint refusal to the real
+    /// adapter/session/App owners. Exact-wire parsing remains SDK-owned.
+    pub(crate) fn reject_publishes_of_kind_as_too_large(&self, kind: u64) {
+        *self.fail_publish_kind.lock().unwrap() = Some((kind, true));
     }
 
     pub(crate) fn allow_all_publish_kinds(&self) {
@@ -1062,10 +1460,72 @@ impl transport_nostr::DirectoryRelayFetcher for ScriptedPushRelayClient {
             })
             .collect())
     }
+
+    // The scripted relay holds every event published through it, so a read
+    // finishes unless a query's limit cut it short or a test cut it off.
+    async fn fetch_directory_events_with_completion(
+        &self,
+        request: transport_nostr::DirectoryFetchRequest,
+    ) -> Result<transport_nostr::DirectoryFetchOutcome, String> {
+        let queries = request.queries.clone();
+        let endpoints = request.endpoints.clone();
+        let records = self.fetch_directory_events(request).await?;
+        let finished = !self
+            .unfinished_directory_reads
+            .load(std::sync::atomic::Ordering::SeqCst)
+            && queries.iter().all(|query| {
+                records
+                    .iter()
+                    .filter(|record| query.matches(&record.event))
+                    .count()
+                    < query.limit
+            });
+        let others_down = self
+            .other_directory_relays_down
+            .load(std::sync::atomic::Ordering::SeqCst);
+        Ok(transport_nostr::DirectoryFetchOutcome {
+            records,
+            complete: finished && !others_down,
+            complete_endpoints: match (finished, others_down) {
+                (false, _) => Vec::new(),
+                (true, false) => endpoints,
+                (true, true) => endpoints.into_iter().take(1).collect(),
+            },
+        })
+    }
 }
 
 #[async_trait]
 impl NostrRelayClient for ScriptedPushRelayClient {
+    fn relay_notification_source(
+        &self,
+    ) -> Option<Arc<dyn transport_nostr_adapter::NostrRelayNotificationSource>> {
+        Some(self.messages.clone())
+    }
+
+    async fn reply_sent_nothing(
+        &self,
+        _account: Option<&MemberId>,
+        _endpoint: &TransportEndpoint,
+        subscription_id: &str,
+    ) -> bool {
+        self.messages.reply_sent_nothing(subscription_id)
+    }
+
+    fn relay_connection(
+        &self,
+        _: &MemberId,
+        _: &TransportEndpoint,
+    ) -> Option<transport_nostr_adapter::RelayConnection> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let read = self.connection_reads.fetch_add(1, SeqCst) + 1;
+        if read == self.reconnect_at_read.load(SeqCst) {
+            self.connection_attempt.fetch_add(1, SeqCst);
+        }
+        let attempt = self.connection_attempt.load(SeqCst);
+        Some(transport_nostr_adapter::RelayConnection::new(0, attempt))
+    }
+
     async fn acquire_history(
         &self,
         request: transport_nostr_adapter::NostrAcquisitionRequest,
@@ -1157,11 +1617,12 @@ impl NostrRelayClient for ScriptedPushRelayClient {
         subscription: NostrSubscription,
         id: String,
     ) -> Result<(), cgka_traits::TransportAdapterError> {
-        self.subscribe(subscription.clone()).await?;
+        self.accept_subscription(subscription.clone()).await?;
         self.scoped_subscriptions
             .lock()
             .unwrap()
-            .push((id, subscription));
+            .push((id.clone(), subscription.clone()));
+        self.reply(&subscription, &id);
         Ok(())
     }
     async fn unsubscribe_scoped(
@@ -1181,74 +1642,8 @@ impl NostrRelayClient for ScriptedPushRelayClient {
         &self,
         subscription: NostrSubscription,
     ) -> Result<(), cgka_traits::TransportAdapterError> {
-        self.subscription_attempts
-            .lock()
-            .unwrap()
-            .push(subscription.clone());
-        if subscription.is_group_route() {
-            self.group_subscribe_attempts
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
-        if self
-            .fail_next_subscribe
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
-        {
-            return Err(cgka_traits::TransportAdapterError::Subscription(
-                "injected subscribe failure".to_owned(),
-            ));
-        }
-        if subscription.is_group_route()
-            && self
-                .refuse_group_subscribes
-                .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            return Err(cgka_traits::TransportAdapterError::Subscription(
-                "subscribe registered on 0 of 1 relays".to_owned(),
-            ));
-        }
-        let block_for_account = {
-            let mut blocked_account = self.block_account_subscribe.lock().unwrap();
-            if matches!(&subscription, NostrSubscription::AccountInbox { .. })
-                && blocked_account.as_deref() == Some(subscription.account_id().as_slice())
-            {
-                blocked_account.take();
-                true
-            } else {
-                false
-            }
-        };
-        let block_for_account_group = {
-            let mut blocked_account = self.block_account_group_subscribe.lock().unwrap();
-            if subscription.is_group_route()
-                && blocked_account.as_deref() == Some(subscription.account_id().as_slice())
-            {
-                blocked_account.take();
-                true
-            } else {
-                false
-            }
-        };
-        let blocked = block_for_account
-            || block_for_account_group
-            || self
-                .block_next_subscribe
-                .swap(false, std::sync::atomic::Ordering::SeqCst);
-        if blocked {
-            let released = registered_release(&self.subscribe_release);
-            self.blocked_subscribe_count
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.subscribe_started.notify_one();
-            released.await;
-            if self
-                .fail_blocked_subscribe
-                .swap(false, std::sync::atomic::Ordering::SeqCst)
-            {
-                return Err(cgka_traits::TransportAdapterError::Subscription(
-                    "injected startup activation failure".to_owned(),
-                ));
-            }
-        }
-        self.subscriptions.lock().unwrap().push(subscription);
+        self.accept_subscription(subscription.clone()).await?;
+        self.reply(&subscription, &subscription.subscription_id());
         Ok(())
     }
 
@@ -1313,9 +1708,72 @@ impl NostrRelayClient for ScriptedPushRelayClient {
                         .iter()
                         .cloned()
                         .map(|endpoint| cgka_traits::TransportEndpointFailure {
+                            // The relay cannot be reached, so nothing was
+                            // sent, as the SDK client reports a failed
+                            // connect. Without the proof, the failure would
+                            // read as a relay's retryable answer (mdk#2332).
+                            pre_send: true,
+                            size_class: None,
                             endpoint,
                             reason: "relay unavailable".into(),
                             kind: cgka_traits::TransportEndpointFailureKind::RetryableUnavailable,
+                            rejection_category: None,
+                        })
+                        .collect(),
+                ),
+            ));
+        }
+        let refusals = self.endpoint_refusals.lock().unwrap().clone();
+        let refusal_of = |endpoint: &TransportEndpoint| {
+            refusals
+                .iter()
+                .find(|(kind, refusing, _)| *kind == event.kind && *refusing == endpoint.0)
+                .map(|(_, _, category)| *category)
+        };
+        if !endpoints.is_empty()
+            && endpoints
+                .iter()
+                .all(|endpoint| refusal_of(endpoint).is_some())
+        {
+            let class =
+                cgka_traits::EventSizeClass::of_bytes(serde_json::to_vec(event).unwrap().len());
+            return Ok(NostrPublishOutcome {
+                failed: endpoints
+                    .iter()
+                    .cloned()
+                    .map(|endpoint| {
+                        let category = refusal_of(&endpoint).unwrap();
+                        cgka_traits::TransportEndpointFailure {
+                            pre_send: false,
+                            size_class: (category
+                                == cgka_traits::TransportEndpointRejectionCategory::TooLarge)
+                                .then_some(class),
+                            reason: format!("relay rejected event ({})", category.as_str()),
+                            endpoint,
+                            kind: cgka_traits::TransportEndpointFailureKind::TerminalRejected,
+                            rejection_category: Some(category),
+                        }
+                    })
+                    .collect(),
+                ..Default::default()
+            });
+        }
+        if self
+            .fail_publish_possibly_exposed
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(cgka_traits::TransportAdapterError::PublishEndpoints(
+                cgka_traits::TransportPublishFailure::with_endpoint_failures(
+                    "send event timed out",
+                    endpoints
+                        .iter()
+                        .cloned()
+                        .map(|endpoint| cgka_traits::TransportEndpointFailure {
+                            pre_send: false,
+                            size_class: None,
+                            endpoint,
+                            reason: "send event timed out".into(),
+                            kind: cgka_traits::TransportEndpointFailureKind::PossiblyExposed,
                             rejection_category: None,
                         })
                         .collect(),
@@ -1350,6 +1808,8 @@ impl NostrRelayClient for ScriptedPushRelayClient {
                     .iter()
                     .cloned()
                     .map(|endpoint| cgka_traits::TransportEndpointFailure {
+                        pre_send: false,
+                        size_class: None,
                         endpoint,
                         reason: "injected terminal rejection".into(),
                         kind: cgka_traits::TransportEndpointFailureKind::TerminalRejected,
@@ -1367,8 +1827,43 @@ impl NostrRelayClient for ScriptedPushRelayClient {
         {
             return Ok(NostrPublishOutcome::default());
         }
-        let fail_matching_kind = *self.fail_publish_kind.lock().unwrap() == Some(event.kind);
-        if fail_matching_kind {
+        let failure = *self.fail_publish_kind.lock().unwrap();
+        if let Some((kind, true)) = failure.filter(|(kind, _)| *kind == event.kind) {
+            assert_eq!(kind, event.kind);
+            event
+                .to_verified_nostr_event()
+                .expect("typed boundary fixture receives a genuine signed event");
+            let class =
+                cgka_traits::EventSizeClass::of_bytes(serde_json::to_vec(event).unwrap().len());
+            let mut failure = cgka_traits::TransportPublishFailure::with_endpoint_failures(
+                "relay rejected event (too-large)",
+                endpoints
+                    .iter()
+                    .cloned()
+                    .map(|endpoint| cgka_traits::TransportEndpointFailure {
+                        pre_send: false,
+                        endpoint,
+                        reason: "relay rejected event (too-large)".into(),
+                        kind: cgka_traits::TransportEndpointFailureKind::TerminalRejected,
+                        rejection_category: Some(
+                            cgka_traits::TransportEndpointRejectionCategory::TooLarge,
+                        ),
+                        size_class: Some(class),
+                    })
+                    .collect(),
+            )
+            .with_message_id(cgka_traits::MessageId::new(hex::decode(&event.id).unwrap()));
+            // Every relay refused it with nothing accepted: the SDK client's
+            // aggregate size proof.
+            failure.event_size_class = cgka_traits::EventSizeClass::from_rejected_targets(
+                endpoints,
+                &failure.endpoint_failures,
+            );
+            return Err(cgka_traits::TransportAdapterError::PublishEndpoints(
+                failure,
+            ));
+        }
+        if failure.is_some_and(|(kind, _)| kind == event.kind) {
             return Err(cgka_traits::TransportAdapterError::Publish(
                 "injected publish failure".to_owned(),
             ));
@@ -1436,34 +1931,6 @@ impl NostrRelayClient for ScriptedPushRelayClient {
     }
 }
 
-/// Cut the recovery retry backoff to zero where `test-policy-overrides`
-/// honors it, so a paced retry costs milliseconds instead of the production
-/// 15 s cooldown.
-pub(crate) fn bounded_epoch_backfill_config() -> MarmotAppConfig {
-    MarmotAppConfig::white_noise().with_dev_epoch_backfill_retry_backoff_ms(0)
-}
-
-/// Queue/correlation tests also run without `test-policy-overrides`, where the
-/// configured zero backoff is correctly ignored. Advance the already-armed
-/// deadline instead of bypassing the automatic seam or waiting in wall-clock.
-fn expire_epoch_backfill_retry_cooldown(client: &mut crate::AppClient) {
-    let storage = client.app.account_storage(&client.state.label).unwrap();
-    assert!(
-        storage
-            .app_storage()
-            .recovery_retry_state()
-            .unwrap()
-            .attempt_serial
-            > 0
-    );
-    client.recovery_owner.test_advance_to_retry(&storage);
-    // The helper advances by whole milliseconds from a monotonic remainder.
-    // Cross the boundary even when that remainder was truncated below 1 ms.
-    client
-        .recovery_owner
-        .test_advance_clock(Duration::from_millis(1));
-}
-
 /// Open a client on the app's *own* relay plane.
 ///
 /// [`MarmotApp::client`] mints a fresh plane per client, so a test that drives
@@ -1476,72 +1943,40 @@ pub(crate) async fn client_on_app_relay_plane(app: &MarmotApp, label: &str) -> c
         .expect("client on the app relay plane")
 }
 
-/// Stand-in for the relay pool's end-of-stored-events frames, which an injected
-/// relay client never produces.
-///
-/// A live drain ends on EOSE instead of waiting out its quiet window, and a
-/// post-join maintenance boundary completes only on its own REQ's EOSE, so a
-/// test whose transport is a [`ScriptedPushRelayClient`] has to supply that
-/// signal itself. The pump reports EOSE for every subscription the relay has accepted
-/// and `accept` selects, on every endpoint it was issued to, and keeps doing so
-/// as later subscriptions are registered. Repeat reports are ignored by the
-/// adapter, so this is safe to run for the whole test.
-pub(crate) struct ScriptedEosePump(tokio::task::JoinHandle<()>);
-
-impl Drop for ScriptedEosePump {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
-pub(crate) fn scripted_eose_pump(
-    plane: MarmotRelayPlane,
-    relay: Arc<ScriptedPushRelayClient>,
-    accept: fn(&NostrSubscription) -> bool,
-) -> ScriptedEosePump {
-    ScriptedEosePump(tokio::spawn(async move {
-        loop {
-            report_scripted_eose(&plane, &relay, accept).await;
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    }))
-}
-
-/// One pass of [`scripted_eose_pump`], for a test that needs the EOSE to land
-/// at a moment of its own choosing.
-pub(crate) async fn report_scripted_eose(
-    plane: &MarmotRelayPlane,
-    relay: &ScriptedPushRelayClient,
-    accept: fn(&NostrSubscription) -> bool,
-) {
-    let scoped = relay.scoped_subscriptions.lock().unwrap().clone();
-    for (id, subscription) in scoped {
-        if accept(&subscription) {
-            for endpoint in subscription.endpoints() {
-                plane
-                    .handle_relay_eose_for_test(endpoint.clone(), id.clone())
-                    .await;
-            }
-        }
-    }
-    for subscription in relay.accepted_subscriptions() {
-        if !accept(&subscription) {
-            continue;
-        }
-        for endpoint in subscription.endpoints() {
-            plane
-                .handle_relay_eose_for_test(endpoint.clone(), subscription.subscription_id())
-                .await;
-        }
-    }
-}
-
-/// Every subscription reaches end-of-stored-events.
-pub(crate) fn every_subscription(_: &NostrSubscription) -> bool {
+/// The one stored event a scripted relay sends before its EOSE when a test
+/// asks for it ([`ScriptedPushRelayClient::stored_before_eose`]). Not a group
+/// message, so it counts in the REQ's reply without reaching admission, as a
+/// copy the pool had already seen.
+/// Selects every (REQ, relay) for [`ScriptedPushRelayClient::hold_replies`].
+pub(crate) fn every_reply(_: &NostrSubscription, _: &TransportEndpoint) -> bool {
     true
 }
 
-const EXPLICIT_CATCH_UP_BACKFILL_DEADLINE: Duration = Duration::from_secs(5);
+fn scripted_stored_event(created_at: u64) -> nostr_sdk::prelude::Event {
+    EventBuilder::new(Kind::GiftWrap, "")
+        .custom_created_at(NostrTimestamp::from_secs(created_at))
+        .finalize(&Keys::generate())
+        .expect("sign scripted stored event")
+}
+
+/// Wait until the scripted relay's EOSEs admit `client`'s live REQs' native
+/// replay. Until then its group messages wait behind the unanswered sources,
+/// so a sync that runs first can return before admitting them (mdk#2624).
+#[cfg(feature = "test-policy-overrides")]
+pub(crate) async fn settle_live_replay(client: &mut AppClient) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        client.synchronize_native_replay().await.unwrap();
+        if client.recovery_owner.test_replay_complete() {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the live REQs' replay settles"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
 
 #[cfg(feature = "test-policy-overrides")]
 #[test]
@@ -1570,10 +2005,10 @@ fn cancelled_sync_keeps_profile() {
         let group_id = alice
             .create_group("before", &[bob_account.account_id_hex.as_str()])
             .await
-            .unwrap();
-        let eose = scripted_eose_pump(app.relay_plane.clone(), relay, every_subscription);
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         bob.sync().await.unwrap();
-        drop(eose);
         let storage = app.account_storage("bob").unwrap();
         let epoch = storage.get_group(&group_id).unwrap().epoch;
         alice
@@ -1660,442 +2095,6 @@ async fn route_group_probe(client: &AppClient, event: NostrTransportEvent) {
     client.relay_plane.route_account_delivery_for_test(delivery);
 }
 
-/// Script the recovery job's comparisons: every pass over the group route
-/// `nostr_group_id_hex` fetches one fresh probe from its relay, and every
-/// other route answers with nothing missing.
-fn comparison_fetches_probe(
-    nostr_group_id_hex: &str,
-    created_at: u64,
-    marker: &str,
-) -> crate::client::ScriptedComparisons {
-    let route = storage_sqlite::TransportReconciliationRoute::Group(
-        hex::decode(nostr_group_id_hex)
-            .unwrap()
-            .try_into()
-            .expect("a 32-byte group route"),
-    );
-    let (nostr_group_id_hex, marker) = (nostr_group_id_hex.to_owned(), marker.to_owned());
-    crate::client::ScriptedComparisons::by_route(move |compared| {
-        let events = if *compared == route {
-            vec![NostrRelayEvent {
-                endpoint: TransportEndpoint("wss://relay.example".to_owned()),
-                subscription_id: None,
-                event: epoch_gap_probe(&nostr_group_id_hex, created_at, &marker),
-            }]
-        } else {
-            Vec::new()
-        };
-        Ok(Some((
-            transport_nostr_adapter::NostrReconciliationSummary {
-                relays_succeeded: 1,
-                ..Default::default()
-            },
-            events,
-        )))
-    })
-}
-
-#[test]
-fn catch_up_gap_is_compared_on_the_owner_tick_without_later_traffic() {
-    // Pauses the clock to step past the owner's backoff tick; Tokio allows
-    // that only on a current-thread runtime.
-    run_composed_app_runtime_test_on_one_thread("explicit-catch-up-backfill", || async {
-        let dir = tempfile::tempdir().unwrap();
-        let alice = AccountHome::open(dir.path())
-            .create_account("alice")
-            .unwrap();
-        let relay = Arc::new(ScriptedPushRelayClient::default());
-        let mut app = MarmotApp::with_relay_and_config(
-            dir.path(),
-            "wss://relay.example".to_owned(),
-            bounded_epoch_backfill_config().with_dev_epoch_backfill_retry_backoff_ms(300_000),
-        )
-        .with_test_relay_client(relay.clone());
-        app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
-            .unwrap();
-        app.relay_plane = MarmotRelayPlane::new_with_loopback(
-            Some(Duration::from_secs(120)),
-            relay.clone(),
-            true,
-        );
-
-        let cursor = crate::unix_now_seconds();
-        let group_id = {
-            let mut client = app.client("alice").await.unwrap();
-            let group_id = client
-                .create_group("explicit catch-up epoch-gap replay", &[])
-                .await
-                .unwrap();
-            client.state.last_transport_timestamp = Some(cursor);
-            app.save_state(&client.state).unwrap();
-            group_id
-        };
-        let group = app
-            .group("alice", &hex::encode(group_id.as_slice()))
-            .unwrap()
-            .expect("local group projection");
-
-        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
-        let runtime = MarmotAppRuntime::new(app.clone());
-        runtime.start().await.unwrap();
-        // This command is deferred behind startup catch-up, so its response is
-        // also the steady-state barrier this regression needs.
-        runtime.pause_maintenance("alice").await.unwrap();
-        report_scripted_eose(&app.relay_plane, &relay, every_subscription).await;
-        let sync = app.relay_plane.relay_telemetry().await.sync;
-        assert_eq!(sync.tracked_subscriptions, 2);
-        assert_eq!(sync.synced_subscriptions, sync.tracked_subscriptions);
-        let unfloored_before = relay.unfloored_account_subscription_count();
-
-        // Hold the CatchUp once it owns the account client. The worker is
-        // now committed to the command path and cannot consume these queued
-        // deliveries through its live receive arm instead.
-        let pin = Arc::new(tokio::sync::Barrier::new(2));
-        runtime
-            .shared_services()
-            .set_next_catch_up_barrier(&alice.account_id_hex, pin.clone());
-        let catch_up_runtime = runtime.clone();
-        let catch_up = tokio::spawn(async move { catch_up_runtime.catch_up_accounts().await });
-        tokio::time::timeout(EXPLICIT_CATCH_UP_BACKFILL_DEADLINE, pin.wait())
-            .await
-            .expect("catch-up must reach its hold");
-
-        let above_floor = cursor;
-        for arm in 0..EPOCH_STALL_BACKFILL_THRESHOLD {
-            inject_epoch_gap_probe(
-                &app,
-                epoch_gap_probe(
-                    &group.nostr_routing.nostr_group_id_hex,
-                    above_floor,
-                    &format!("arm-{arm}"),
-                ),
-            )
-            .await;
-        }
-
-        // The catch-up only drains these probes and arms the gap they reveal;
-        // it runs no job (mdk#2110). The debt stays pending for the owner.
-        tokio::time::timeout(EXPLICIT_CATCH_UP_BACKFILL_DEADLINE, pin.wait())
-            .await
-            .expect("the held catch-up should accept its release");
-        tokio::time::timeout(EXPLICIT_CATCH_UP_BACKFILL_DEADLINE, catch_up)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        let storage = app.account_storage("alice").unwrap().app_storage();
-        let retry = storage.recovery_retry_state().unwrap();
-        assert_eq!(
-            relay.unfloored_account_subscription_count(),
-            unfloored_before
-        );
-        assert!(
-            storage
-                .pending_recovery_demands()
-                .unwrap()
-                .iter()
-                .any(|d| d.cause == storage_sqlite::RecoveryCause::EpochGap)
-        );
-        // The owner waits out the account's current backoff.
-        runtime
-            .advance_recovery_clock_for_test("alice", Duration::from_millis(retry.delay_ms))
-            .await;
-        tokio::time::pause();
-        tokio::time::advance(Duration::from_secs(15)).await;
-        tokio::time::resume();
-        // The owner tick compares the gap's routes off the worker. It reuses
-        // the live tail: it issues no subscription at all.
-        tokio::time::timeout(EXPLICIT_CATCH_UP_BACKFILL_DEADLINE, async {
-            while storage.recovery_retry_state().unwrap().attempt_serial == retry.attempt_serial {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("the existing maintenance tick must service quiet pending debt");
-        assert_eq!(
-            storage.recovery_retry_state().unwrap().attempt_serial,
-            retry.attempt_serial + 1
-        );
-        runtime.drain_in_flight_work().await.unwrap();
-        assert_eq!(
-            relay.unfloored_account_subscription_count(),
-            unfloored_before,
-            "owner-issued automatic recovery never replays unfloored history"
-        );
-        let final_local_epoch = runtime
-            .group_mls_state("alice", &group_id)
-            .await
-            .expect("final local MLS epoch")
-            .epoch;
-
-        let audit_rows = app
-            .audit_log_files()
-            .unwrap()
-            .into_iter()
-            .flat_map(|file| {
-                std::fs::read_to_string(file.path)
-                    .unwrap()
-                    .lines()
-                    .map(|line| {
-                        marmot_forensics::v5::Record::from_json(line.as_bytes())
-                            .expect("real v5 recovery row");
-                        serde_json::from_str::<serde_json::Value>(line).unwrap()
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        let armed_rows: Vec<_> = audit_rows
-            .iter()
-            .filter(|row| row["event"]["type"] == "epoch_stall_backfill_armed")
-            .collect();
-        let started_rows: Vec<_> = audit_rows
-            .iter()
-            .filter(|row| row["event"]["type"] == "epoch_stall_backfill_started")
-            .collect();
-        let failed_rows: Vec<_> = audit_rows
-            .iter()
-            .filter(|row| row["event"]["type"] == "epoch_stall_backfill_failed")
-            .collect();
-        assert_eq!(armed_rows.len(), 1);
-        assert_eq!(
-            started_rows
-                .iter()
-                .map(|row| row["event"]["seam"].as_str().unwrap())
-                .collect::<Vec<_>>(),
-            ["maintenance"],
-            "only the owner's job runs; incremental grants emit no epoch rows"
-        );
-        for started in &started_rows {
-            let terminal = failed_rows
-                .iter()
-                .filter(|row| {
-                    row["event"]["record_context"]["operation_ref"]
-                        == started["event"]["record_context"]["operation_ref"]
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(terminal.len(), 1);
-            assert_eq!(
-                terminal[0]["event"]["error_kind"],
-                "history_coverage_unproven"
-            );
-            assert_eq!(terminal[0]["event"]["activation_outcome"], "succeeded");
-        }
-        let completed_rows: Vec<_> = failed_rows
-            .into_iter()
-            .filter(|row| {
-                row["event"]["record_context"]["operation_ref"]
-                    == started_rows[0]["event"]["record_context"]["operation_ref"]
-            })
-            .collect();
-        assert!(
-            storage
-                .pending_recovery_demands()
-                .unwrap()
-                .iter()
-                .any(|d| d.cause == storage_sqlite::RecoveryCause::EpochGap)
-        );
-        let audited_epoch_before = completed_rows[0]["event"]["local_epoch_before"]
-            .as_u64()
-            .expect("completed row local epoch before");
-        assert_eq!(
-            completed_rows[0]["event"]["local_epoch_after"].as_u64(),
-            Some(final_local_epoch),
-            "the terminal row must report the observed final local epoch"
-        );
-        assert_eq!(
-            completed_rows[0]["event"]["group_advanced"].as_bool(),
-            Some(final_local_epoch > audited_epoch_before),
-            "activation success and group epoch recovery must remain distinct"
-        );
-
-        runtime.shutdown().await;
-    });
-}
-
-#[test]
-fn failed_epoch_backfill_attempt_retains_one_correlated_retry() {
-    run_composed_app_runtime_test("failed-epoch-backfill-retry", || async {
-        let dir = tempfile::tempdir().unwrap();
-        AccountHome::open(dir.path())
-            .create_account("alice")
-            .unwrap();
-        let relay = Arc::new(ScriptedPushRelayClient::default());
-        let mut app = MarmotApp::with_relay_and_config(
-            dir.path(),
-            "wss://relay.example".to_owned(),
-            bounded_epoch_backfill_config(),
-        )
-        .with_test_relay_client(relay.clone());
-        app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
-            .unwrap();
-        app.relay_plane = MarmotRelayPlane::new_with_loopback(
-            Some(Duration::from_secs(120)),
-            relay.clone(),
-            true,
-        );
-        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
-
-        let mut client = client_on_app_relay_plane(&app, "alice").await;
-        let group_id = client
-            .create_group("failed epoch backfill retry", &[])
-            .await
-            .unwrap();
-        let stalled_epoch = client.group_mls_state(&group_id).unwrap().epoch;
-        client.apply_backfill_decision(
-            &group_id,
-            stalled_epoch,
-            BackfillDecision::Arm,
-            marmot_forensics::EpochStallBackfillTrigger::UndecryptableThreshold,
-        );
-
-        // The first job fails while it takes ownership of its network result.
-        let grant = client
-            .authorize_account_recovery(
-                None,
-                marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
-            )
-            .await
-            .unwrap()
-            .expect("the armed gap is granted");
-        client.released_backfill_reload_pending = true;
-        client.fail_next_released_backfill_reload = true;
-        client
-            .run_recovery_grant_for_test(grant)
-            .await
-            .expect_err("the injected storage failure must surface");
-        assert!(
-            client.has_pending_epoch_backfill(),
-            "a failed job must retain pending recovery"
-        );
-
-        expire_epoch_backfill_retry_cooldown(&mut client);
-        let retry = client
-            .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
-            .await
-            .expect("retained recovery must retry");
-        assert!(
-            matches!(retry, crate::EpochBackfillRunOutcome::Incomplete(_)),
-            "retry must run the pending comparison"
-        );
-        assert!(
-            client.has_pending_epoch_backfill(),
-            "an uncertified retry must retain unproven coverage"
-        );
-        drop(client);
-
-        let audit_rows = app
-            .audit_log_files()
-            .unwrap()
-            .into_iter()
-            .flat_map(|file| {
-                std::fs::read_to_string(file.path)
-                    .unwrap()
-                    .lines()
-                    .map(|line| {
-                        marmot_forensics::v5::Record::from_json(line.as_bytes())
-                            .expect("real v5 recovery row");
-                        serde_json::from_str::<serde_json::Value>(line).unwrap()
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        let rows_of_kind = |kind: &str| {
-            audit_rows
-                .iter()
-                .filter(|row| row["event"]["type"] == kind)
-                .collect::<Vec<_>>()
-        };
-        let armed = rows_of_kind("epoch_stall_backfill_armed");
-        let started = rows_of_kind("epoch_stall_backfill_started");
-        let failed = rows_of_kind("epoch_stall_backfill_failed")
-            .into_iter()
-            .filter(|row| row["event"]["error_kind"] == "storage_busy")
-            .collect::<Vec<_>>();
-        let completed = rows_of_kind("epoch_stall_backfill_failed")
-            .into_iter()
-            .filter(|row| row["event"]["error_kind"] == "history_coverage_unproven")
-            .collect::<Vec<_>>();
-        assert_eq!(armed.len(), 1, "one recovery intent must arm once");
-        assert_eq!(started.len(), 2, "failure plus retry must start twice");
-        assert_eq!(
-            failed.len(),
-            1,
-            "first attempt must have one failed terminal"
-        );
-        assert_eq!(
-            completed.len(),
-            1,
-            "retry must have one honest incomplete terminal"
-        );
-        assert_eq!(
-            started[0]["event"]["record_context"]["operation_ref"],
-            failed[0]["event"]["record_context"]["operation_ref"]
-        );
-        assert_eq!(
-            started[1]["event"]["record_context"]["operation_ref"],
-            completed[0]["event"]["record_context"]["operation_ref"]
-        );
-        assert_ne!(
-            started[0]["event"]["record_context"]["operation_ref"],
-            started[1]["event"]["record_context"]["operation_ref"],
-            "each actual owner attempt has its own durable serial"
-        );
-        assert_eq!(started[0]["event"]["retry_ordinal"], 0);
-        assert_eq!(failed[0]["event"]["retry_ordinal"], 0);
-        assert_eq!(started[1]["event"]["retry_ordinal"], 1);
-        assert_eq!(completed[0]["event"]["retry_ordinal"], 1);
-        assert_eq!(
-            failed[0]["event"]["activation_outcome"].as_str(),
-            Some("succeeded"),
-            "the job installs nothing for a gap, so it has no activation to fail"
-        );
-        assert_eq!(failed[0]["event"]["deliveries"], 0);
-        assert_eq!(failed[0]["event"]["group_advanced"], false);
-        // This run did read the group's post-replay epoch, so `group_advanced:
-        // false` here is a measurement and the row says so. Without the
-        // companion flag a reader cannot separate this row from one whose
-        // after-read failed and defaulted to the before-epoch.
-        assert_eq!(failed[0]["event"]["group_advanced_observed"], true);
-    });
-}
-
-/// A single-account app with one armed epoch-gap backfill intent on an injected
-/// relay client: the shape every recovery-settlement test below starts from.
-///
-/// Callers usually shorten the retry cooldown from its production value
-/// ([`crate::EPOCH_BACKFILL_RETRY_BACKOFF`]) so a paced retry is testable in
-/// wall-clock a test can afford.
-async fn armed_epoch_backfill(
-    dir: &tempfile::TempDir,
-    relay: &Arc<ScriptedPushRelayClient>,
-    config: MarmotAppConfig,
-) -> (MarmotApp, crate::AppClient, cgka_traits::GroupId) {
-    AccountHome::open(dir.path())
-        .create_account("alice")
-        .unwrap();
-    let mut app =
-        MarmotApp::with_relay_and_config(dir.path(), "wss://relay.example".to_owned(), config)
-            .with_test_relay_client(relay.clone());
-    app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
-        .unwrap();
-    app.relay_plane =
-        MarmotRelayPlane::new_with_loopback(Some(Duration::from_secs(120)), relay.clone(), true);
-
-    let mut client = client_on_app_relay_plane(&app, "alice").await;
-    let group_id = client
-        .create_group("epoch backfill drain completion", &[])
-        .await
-        .unwrap();
-    let stalled_epoch = client.group_mls_state(&group_id).unwrap().epoch;
-    client.apply_backfill_decision(
-        &group_id,
-        stalled_epoch,
-        BackfillDecision::Arm,
-        marmot_forensics::EpochStallBackfillTrigger::UndecryptableThreshold,
-    );
-    (app, client, group_id)
-}
-
 /// Every v5 audit row this app has recorded so far. Keep the old `kind` key in
 /// this test-only view so the recovery assertions below continue to examine
 /// their original numeric and categorical facts, after strict v5 admission.
@@ -2119,174 +2118,6 @@ fn recorded_audit_rows(app: &MarmotApp) -> Vec<serde_json::Value> {
         .collect()
 }
 
-fn recorded_rows_of_kind<'rows>(
-    rows: &'rows [serde_json::Value],
-    kind: &str,
-) -> Vec<&'rows serde_json::Value> {
-    rows.iter()
-        .filter(|row| row["kind"]["type"] == kind)
-        .collect()
-}
-
-/// Qualified history plus paced, distinct local engine evaluations earn the
-/// warning. Local commits preserve it; authenticated peer recovery clears it.
-#[test]
-fn recovery_warning_requires_qualified_local_observations_and_survives_local_commits_and_reopen() {
-    run_composed_app_runtime_test("recovery-warning-policy", || async {
-        let dir = tempfile::tempdir().unwrap();
-        let relay = Arc::new(ScriptedPushRelayClient::default());
-        let (app, mut client, group_id) =
-            armed_epoch_backfill(&dir, &relay, bounded_epoch_backfill_config()).await;
-        let epoch = client.runtime.group_record(&group_id).unwrap().epoch;
-        assert_eq!(
-            client.epoch_stall.observe_resource_refusal(
-                group_id.clone(),
-                epoch,
-                epoch_stall_test_now_ms(),
-            ),
-            BackfillDecision::Arm
-        );
-        assert!(
-            !client
-                .group_recovery_status(&group_id)
-                .unwrap()
-                .automatic_recovery_failed
-        );
-        client.persist_epoch_stall_evidence([&group_id]);
-        let storage = app.account_storage("alice").unwrap().app_storage();
-        let mut permit = crate::client::recovery::ExplicitRecoveryPermit::default();
-        let grant = client
-            .authorize_account_recovery(
-                Some(&mut permit),
-                marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp,
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        // The job fails while it takes ownership of its network result.
-        client.released_backfill_reload_pending = true;
-        client.fail_next_released_backfill_reload = true;
-        assert!(client.run_recovery_grant_for_test(grant).await.is_err());
-        client
-            .advance_convergence_after_runtime_sync(&group_id)
-            .await
-            .unwrap();
-        assert!(
-            !client
-                .group_recovery_status(&group_id)
-                .unwrap()
-                .automatic_recovery_failed,
-            "an engine evaluation after failed acquisition has no coverage certificate"
-        );
-
-        let mut permit = crate::client::recovery::ExplicitRecoveryPermit::default();
-        let grant = client
-            .authorize_account_recovery(
-                Some(&mut permit),
-                marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp,
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(qualify_group_recovery_for_test(&storage, &grant, &group_id));
-        drop(grant);
-        let attempts = storage.recovery_retry_state().unwrap().attempt_serial;
-        for completed in 1..=3 {
-            if completed > 1 {
-                client
-                    .recovery_owner
-                    .test_advance_clock(Duration::from_secs(3_600));
-            }
-            client
-                .advance_convergence_after_runtime_sync(&group_id)
-                .await
-                .unwrap();
-            assert_eq!(
-                client
-                    .group_recovery_status(&group_id)
-                    .unwrap()
-                    .automatic_recovery_failed,
-                completed == 3
-            );
-            assert_eq!(
-                storage.recovery_retry_state().unwrap().attempt_serial,
-                attempts,
-                "qualified local observations cannot authorize another replay"
-            );
-        }
-        assert!(
-            client
-                .pending_group_projection_updates
-                .contains(&hex::encode(group_id.as_slice()))
-        );
-        // Exercise an actual locally authored epoch advance, not just a fabricated event.
-        let self_update = client
-            .runtime
-            .send(cgka_traits::engine::SendIntent::SelfUpdate {
-                group_id: group_id.clone(),
-            })
-            .await
-            .unwrap();
-        client
-            .finish_maintenance_effects(&self_update)
-            .await
-            .unwrap();
-        assert!(client.runtime.group_record(&group_id).unwrap().epoch > epoch);
-        assert!(
-            client
-                .group_recovery_status(&group_id)
-                .unwrap()
-                .automatic_recovery_failed
-        );
-        drop(client);
-        let mut client = client_on_app_relay_plane(&app, "alice").await;
-        assert!(
-            client
-                .group_recovery_status(&group_id)
-                .unwrap()
-                .automatic_recovery_failed
-        );
-        let current = client.runtime.group_record(&group_id).unwrap().epoch;
-        let mut effects = marmot_account::AccountDeviceEffects::default();
-        effects
-            .events
-            .push(cgka_traits::engine::GroupEvent::MessageReceived {
-                authority: None,
-                group_id: group_id.clone(),
-                message_id: cgka_traits::MessageId::new(vec![0xa1; 32]),
-                sender: cgka_traits::MemberId::new(vec![0xb1; 32]),
-                epoch: current,
-                payload: Vec::new(),
-                retention: None,
-                encrypted_media_secret: None,
-            });
-        client.observe_recovery_health(&effects).unwrap();
-        assert!(
-            !client
-                .group_recovery_status(&group_id)
-                .unwrap()
-                .automatic_recovery_failed
-        );
-        assert!(
-            app.account_storage("alice")
-                .unwrap()
-                .app_storage()
-                .epoch_stall_evidence()
-                .unwrap()
-                .is_empty()
-        );
-        client.persist_epoch_stall_evidence([&group_id]);
-        drop(client);
-        let client = client_on_app_relay_plane(&app, "alice").await;
-        assert!(
-            !client
-                .group_recovery_status(&group_id)
-                .unwrap()
-                .automatic_recovery_failed
-        );
-    });
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recovery_warning_is_hidden_for_terminal_groups_but_not_repairable_groups() {
     use cgka_traits::storage::GroupStorage;
@@ -2297,7 +2128,12 @@ async fn recovery_warning_is_hidden_for_terminal_groups_but_not_repairable_group
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("recovery status", &[]).await.unwrap();
+    let group_id = client
+        .create_group("recovery status", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let storage = app.account_storage("alice").unwrap();
     let original = storage.get_group(&group_id).unwrap();
     storage
@@ -2348,1406 +2184,66 @@ async fn recovery_warning_is_hidden_for_terminal_groups_but_not_repairable_group
     }
 }
 
-/// A tracked group stalled below the arm threshold, so `mark_replayed` is the
-/// only thing that can stop it from arming when its next undecryptable lands.
-///
-/// Returned by the disarm tests below as the probe they read the detector
-/// through: the armed group's own `arm()` has already latched its epoch, so a
-/// bystander is the only place the disarm rule is observable.
-fn qualify_group_recovery_for_test(
-    storage: &storage_sqlite::SqliteAppStorage,
-    grant: &crate::client::recovery::AttemptGrant,
-    group: &cgka_traits::GroupId,
-) -> bool {
-    use storage_sqlite::{
-        RecoveryEligibility, RecoveryEndpointCheckpoint, RecoveryScopeCheckpoint,
-        RecoveryScopeOutcome,
-    };
-    // Inject the explicit contract at the owner boundary. EOSE and SDK success
-    // cannot generate this exhaustive, durably admitted proof in production.
-    let obligation = grant
-        .plan()
-        .unwrap()
-        .iter()
-        .find(|obligation| {
-            obligation.cause == storage_sqlite::RecoveryCause::EpochGap
-                && obligation.group_id.as_ref() == Some(group)
-        })
-        .unwrap();
-    let checkpoints = obligation
-        .scopes
-        .iter()
-        .map(|scope| RecoveryScopeCheckpoint {
-            token: scope.token.clone(),
-            retained_known_event: false,
-            replay_admitted: false,
-            endpoints: scope
-                .goal
-                .required_endpoints
-                .iter()
-                .map(|endpoint| RecoveryEndpointCheckpoint {
-                    endpoint: endpoint.clone(),
-                    outcome: RecoveryScopeOutcome::Covered,
-                    exhaustive: true,
-                    admission_complete: true,
-                    first_boundary: false,
-                })
-                .collect(),
-        })
-        .collect::<Vec<_>>();
-    storage
-        .checkpoint_recovery_obligation(
-            &grant.fence,
-            grant.reservation.attempt_serial,
-            obligation.id,
-            &checkpoints,
-            RecoveryEligibility::Retry,
-        )
-        .unwrap()
-}
-
-fn bystander_stalled_below_threshold(
-    client: &mut crate::AppClient,
-    stalled_epoch: u64,
-) -> cgka_traits::GroupId {
-    let bystander = cgka_traits::GroupId::new(vec![7_u8; 32]);
-    for probe in 0..EPOCH_STALL_BACKFILL_THRESHOLD - 1 {
-        assert_eq!(
-            client.epoch_stall.observe_undecryptable(
-                bystander.clone(),
-                format!("bystander-{probe}"),
-                cgka_traits::EpochId(stalled_epoch),
-                epoch_stall_test_now_ms(),
-            ),
-            BackfillDecision::Skip,
-        );
-    }
-    bystander
-}
-
-/// The threshold-crossing undecryptable for [`bystander_stalled_below_threshold`].
-fn bystander_crosses_threshold(
-    client: &mut crate::AppClient,
-    bystander: cgka_traits::GroupId,
-    stalled_epoch: u64,
-) -> BackfillDecision {
-    client.epoch_stall.observe_undecryptable(
-        bystander,
-        "bystander-threshold".to_owned(),
-        cgka_traits::EpochId(stalled_epoch),
-        epoch_stall_test_now_ms(),
-    )
-}
-
-/// A pass that completed but recovered nothing must not disarm the detector.
-///
-/// `mark_replayed` latches `fired_at_epoch` for *every* tracked group, which is
-/// the right trade when one account-wide pass really did serve every group's
-/// history. A pass that admitted nothing, with no tracked group's epoch moving,
-/// served nothing, so latching on it would end all automatic recovery for the
-/// process lifetime, silently. The run is still recorded honestly; only the
-/// disarm is withheld.
-#[test]
-fn unproven_pass_keeps_history_demand_and_does_not_disarm_other_groups() {
-    run_composed_app_runtime_test("backfill-unproven-keeps-debt", || async {
-        let dir = tempfile::tempdir().unwrap();
-        let relay = Arc::new(ScriptedPushRelayClient::default());
-        let (app, mut client, group) =
-            armed_epoch_backfill(&dir, &relay, bounded_epoch_backfill_config()).await;
-        let epoch = client.group_mls_state(&group).unwrap().epoch;
-        let bystander = bystander_stalled_below_threshold(&mut client, epoch);
-        assert!(matches!(
-            client
-                .run_pending_epoch_backfill(
-                    marmot_forensics::EpochBackfillExecutionSeam::Maintenance
-                )
-                .await
-                .unwrap(),
-            crate::EpochBackfillRunOutcome::Incomplete(_)
-        ));
-        assert_eq!(
-            bystander_crosses_threshold(&mut client, bystander, epoch),
-            BackfillDecision::Arm
-        );
-        assert!(client.has_pending_epoch_backfill());
-        let rows = recorded_audit_rows(&app);
-        assert!(recorded_rows_of_kind(&rows, "epoch_stall_backfill_completed").is_empty());
-        let failed = recorded_rows_of_kind(&rows, "epoch_stall_backfill_failed");
-        assert_eq!(failed.len(), 1);
-        assert_eq!(failed[0]["kind"]["deliveries"], 0);
-        assert_eq!(failed[0]["kind"]["error_kind"], "history_coverage_unproven");
-    });
-}
-
-#[test]
-fn a_backfill_whose_every_delivery_was_refused_does_not_disarm_the_detector() {
-    run_composed_app_runtime_test("backfill-all-refusals", || async {
-        let dir = tempfile::tempdir().unwrap();
-        let relay = Arc::new(ScriptedPushRelayClient::default());
-        let filled_through = crate::unix_now_seconds() - 1_000;
-        let (app, mut client, route) = group_at_the_undecryptable_retention_cap_with_config(
-            &dir,
-            &relay,
-            bounded_epoch_backfill_config(),
-            filled_through,
-        )
-        .await;
-        let stalled_epoch = client.group_mls_state(&route.group_id).unwrap().epoch;
-        let bystander = bystander_stalled_below_threshold(&mut client, stalled_epoch);
-
-        // Arm through the production seam rather than `apply_backfill_decision`:
-        // a refused delivery at the receive seam reaches `observe_resource_refusal`,
-        // so the armed group is tracked by the detector and its own re-arm is
-        // observable here alongside the bystander's.
-        client
-            .ingest_received_delivery(route.probe(filled_through + 400, "refusal-that-arms"))
-            .await
-            .expect("a refused ingest still completes its pass");
-        let storage = app.account_storage("alice").unwrap().app_storage();
-        assert_eq!(storage.pending_epoch_backfill_intents().unwrap().len(), 1);
-        client
-            .recovery_owner
-            .test_advance_clock(Duration::from_secs(15));
-
-        // The relays have the history and serve it; the engine's retention cap
-        // is full, so the comparison fetches it and cannot keep any of it.
-        client.test_comparison_results = Some(comparison_fetches_probe(
-            &route.nostr_group_id_hex,
-            filled_through + 500,
-            "refused-during-the-replay",
-        ));
-        let outcome = client
-            .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
-            .await
-            .expect("the armed replay must run");
-        assert!(
-            matches!(outcome, crate::EpochBackfillRunOutcome::Incomplete(_)),
-            "unretained input cannot discharge the recovery obligation",
-        );
-
-        assert_eq!(
-            bystander_crosses_threshold(&mut client, bystander, stalled_epoch),
-            BackfillDecision::Arm,
-            "a replay that kept none of what it fetched must not disarm a bystander group",
-        );
-        assert!(client.has_pending_epoch_backfill());
-        let demand = storage
-            .pending_recovery_demands()
-            .unwrap()
-            .into_iter()
-            .find(|demand| demand.cause == storage_sqlite::RecoveryCause::EpochGap)
-            .unwrap();
-        assert_eq!(
-            demand.eligibility,
-            storage_sqlite::RecoveryEligibility::WaitingCapacity
-        );
-
-        drop(client);
-        let rows = recorded_audit_rows(&app);
-        let completed = recorded_rows_of_kind(&rows, "epoch_stall_backfill_failed");
-        assert_eq!(completed.len(), 1, "the run records one terminal row");
-        assert_eq!(
-            completed[0]["kind"]["error_kind"].as_str(),
-            Some("history_coverage_unproven"),
-            "the row stays honest about how the pass ended",
-        );
-        let deliveries = completed[0]["kind"]["deliveries"].as_u64();
-        assert_eq!(
-            (deliveries, completed[0]["kind"]["refused"].as_u64()),
-            (Some(1), Some(1)),
-            "the row must self-report cap saturation: every delivery refused",
-        );
-    });
-}
-
-/// A full admission cap preserves demand and eventually permits one owner-paced probe.
-#[test]
-fn capacity_refusal_retains_debt_until_an_owner_paced_probe() {
-    run_composed_app_runtime_test("capacity-owner-probe", || async {
-        let dir = tempfile::tempdir().unwrap();
-        let relay = Arc::new(ScriptedPushRelayClient::default());
-        let filled_through = crate::unix_now_seconds() - 1_000;
-        let (app, mut client, route) = group_at_the_undecryptable_retention_cap_with_config(
-            &dir,
-            &relay,
-            bounded_epoch_backfill_config().with_dev_epoch_backfill_retry_backoff_ms(60_000),
-            filled_through,
-        )
-        .await;
-        client
-            .ingest_received_delivery(route.probe(filled_through + 400, "refusal-that-arms"))
-            .await
-            .unwrap();
-        let storage = app.account_storage("alice").unwrap();
-        let app = storage.app_storage();
-        let demand = app
-            .pending_recovery_demands()
-            .unwrap()
-            .into_iter()
-            .find(|d| d.group_id.as_deref() == Some(route.group_id.as_slice()))
-            .unwrap();
-        let ticket = demand.ticket;
-        assert_eq!(
-            demand.eligibility,
-            storage_sqlite::RecoveryEligibility::WaitingCapacity
-        );
-        // A genuine caller can spend one override while capacity is still full.
-        // Every pass fetches a fresh probe the full cap refuses.
-        client.test_comparison_results = Some(comparison_fetches_probe(
-            &route.nostr_group_id_hex,
-            filled_through + 500,
-            "refused-during-replay",
-        ));
-        assert!(matches!(
-            client
-                .run_pending_epoch_backfill(
-                    marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp
-                )
-                .await
-                .unwrap(),
-            crate::EpochBackfillRunOutcome::Incomplete(_)
-        ));
-        let retry = app.recovery_retry_state().unwrap();
-        let subscriptions = relay.unfloored_account_subscription_count();
-        assert!(matches!(
-            client
-                .run_pending_epoch_backfill(
-                    marmot_forensics::EpochBackfillExecutionSeam::Maintenance
-                )
-                .await
-                .unwrap(),
-            crate::EpochBackfillRunOutcome::Deferred
-        ));
-        assert_eq!(app.recovery_retry_state().unwrap(), retry);
-        assert_eq!(relay.unfloored_account_subscription_count(), subscriptions);
-        client.recovery_owner.test_advance_to_retry(&storage);
-        client
-            .recovery_owner
-            .test_advance_clock(Duration::from_secs(60));
-        assert!(matches!(
-            client
-                .run_pending_epoch_backfill(
-                    marmot_forensics::EpochBackfillExecutionSeam::Maintenance
-                )
-                .await
-                .unwrap(),
-            crate::EpochBackfillRunOutcome::Incomplete(_)
-        ));
-        assert_eq!(
-            app.recovery_retry_state().unwrap().attempt_serial,
-            retry.attempt_serial + 1
-        );
-        assert_eq!(
-            relay.unfloored_account_subscription_count(),
-            subscriptions,
-            "automatic recovery restores only the live tail"
-        );
-        let pending = app
-            .pending_recovery_demands()
-            .unwrap()
-            .into_iter()
-            .find(|d| d.ticket.id == ticket.id)
-            .unwrap();
-        assert_eq!(
-            pending.eligibility,
-            storage_sqlite::RecoveryEligibility::WaitingCapacity
-        );
-        assert!(
-            !app.recovery_obligation_is_satisfied(ticket.id, ticket.revision)
-                .unwrap()
-        );
-    });
-}
-
-/// Duplicate capacity pressure neither bypasses nor indefinitely extends account pacing.
-#[test]
-fn capacity_duplicates_preserve_deadline_and_one_explicit_override() {
-    run_composed_app_runtime_test("backfill-fruitless-pacing", || async {
-        let dir = tempfile::tempdir().unwrap();
-        let relay = Arc::new(ScriptedPushRelayClient::default());
-        let filled_through = crate::unix_now_seconds() - 1_000;
-        // A backoff long enough that the second attempt cannot slip past it
-        // inside this test.
-        let config =
-            MarmotAppConfig::white_noise().with_dev_epoch_backfill_retry_backoff_ms(60_000);
-        let (app, mut client, route) = group_at_the_undecryptable_retention_cap_with_config(
-            &dir,
-            &relay,
-            config,
-            filled_through,
-        )
-        .await;
-
-        client
-            .ingest_received_delivery(route.probe(filled_through + 400, "refusal-that-arms"))
-            .await
-            .expect("a refused ingest still completes its pass");
-        client.test_comparison_results = Some(comparison_fetches_probe(
-            &route.nostr_group_id_hex,
-            filled_through + 500,
-            "refused-during-the-replay",
-        ));
-        assert!(
-            matches!(
-                client
-                    .run_pending_epoch_backfill(
-                        marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp
-                    )
-                    .await
-                    .expect("the armed replay must run"),
-                crate::EpochBackfillRunOutcome::Incomplete(_)
-            ),
-            "refused admission cannot complete coverage",
-        );
-        let storage = app.account_storage("alice").unwrap();
-        let app = storage.app_storage();
-        let retry = app.recovery_retry_state().unwrap();
-        let subscriptions = relay.unfloored_account_subscription_count();
-        assert_eq!(retry.attempt_serial, 1);
-
-        // The re-armed group arms a second intent, which the cooldown must hold.
-        client
-            .ingest_received_delivery(route.probe(filled_through + 900, "refusal-after-replay"))
-            .await
-            .expect("a refused ingest still completes its pass");
-        assert!(
-            client.has_pending_epoch_backfill(),
-            "the re-armed group must arm a fresh intent",
-        );
-        assert!(
-            matches!(
-                client
-                    .run_pending_epoch_backfill(
-                        marmot_forensics::EpochBackfillExecutionSeam::Maintenance
-                    )
-                    .await
-                    .expect("the paced seam still returns Ok"),
-                crate::EpochBackfillRunOutcome::Deferred
-            ),
-            "the second fruitless cycle must wait out the cooldown instead of \
-             comparing the account again immediately",
-        );
-        assert_eq!(app.recovery_retry_state().unwrap(), retry);
-        assert_eq!(relay.unfloored_account_subscription_count(), subscriptions);
-        for index in 0..10 {
-            client
-                .ingest_received_delivery(route.probe(
-                    filled_through + 901 + index,
-                    &format!("duplicate-pressure-{index}"),
-                ))
-                .await
-                .unwrap();
-        }
-        assert_eq!(app.recovery_retry_state().unwrap(), retry);
-        client.recovery_owner.test_advance_to_retry(&storage);
-        client
-            .recovery_owner
-            .test_advance_clock(Duration::from_secs(60));
-        client
-            .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
-            .await
-            .unwrap();
-        assert_eq!(
-            app.recovery_retry_state().unwrap().attempt_serial,
-            retry.attempt_serial + 1
-        );
-        assert_eq!(
-            relay.unfloored_account_subscription_count(),
-            subscriptions,
-            "automatic recovery restores only the live tail"
-        );
-        // A separate caller operation may override the new cooldown once. Its
-        // job cannot spend another reservation on a follow-up pass.
-        client
-            .run_pending_epoch_backfill(
-                marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp,
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            app.recovery_retry_state().unwrap().attempt_serial,
-            retry.attempt_serial + 2
-        );
-        assert_eq!(
-            relay.unfloored_account_subscription_count(),
-            subscriptions,
-            "an explicit catch-up of automatic debt restores only the live tail"
-        );
-    });
-}
-
-/// A job that ends in `Err` must earn the same cooldown a fruitless or
-/// unconfirmed one does.
-///
-/// A failed job settles no outcome, so none of the outcome-derived pacing
-/// rules runs for it. Unpaced, the receive seam would start another job on the
-/// very next inbound batch. The intent is durable; the next seam past the
-/// cooldown runs it.
-#[test]
-fn a_failed_epoch_backfill_execution_paces_the_next_automatic_seam() {
-    run_composed_app_runtime_test("backfill-error-pacing", || async {
-        let dir = tempfile::tempdir().unwrap();
-        let relay = Arc::new(ScriptedPushRelayClient::default());
-        let filled_through = crate::unix_now_seconds() - 1_000;
-        // A backoff long enough that the second batch cannot slip past it
-        // inside this test.
-        let config =
-            MarmotAppConfig::white_noise().with_dev_epoch_backfill_retry_backoff_ms(60_000);
-        let (_app, mut client, route) = group_at_the_undecryptable_retention_cap_with_config(
-            &dir,
-            &relay,
-            config,
-            filled_through,
-        )
-        .await;
-
-        // First inbound batch: a refused delivery arms the intent.
-        client
-            .ingest_received_delivery(route.probe(filled_through + 400, "refusal-that-arms"))
-            .await
-            .expect("a refused ingest still completes its pass");
-        assert!(
-            client.has_pending_epoch_backfill(),
-            "the refused ingest must arm an epoch-gap replay",
-        );
-
-        // The job fails while it takes ownership of its network result.
-        let mut permit = crate::client::recovery::ExplicitRecoveryPermit::default();
-        let grant = client
-            .authorize_account_recovery(
-                Some(&mut permit),
-                marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp,
-            )
-            .await
-            .unwrap()
-            .expect("the armed gap is granted");
-        client.released_backfill_reload_pending = true;
-        client.fail_next_released_backfill_reload = true;
-        client
-            .run_recovery_grant_for_test(grant)
-            .await
-            .expect_err("the injected storage failure must surface");
-        assert!(
-            client.has_pending_epoch_backfill(),
-            "a failed execution must retain its intent",
-        );
-        assert!(
-            client
-                .app
-                .account_storage(&client.state.label)
-                .unwrap()
-                .app_storage()
-                .recovery_retry_state()
-                .unwrap()
-                .attempt_serial
-                > 0,
-            "an execution that ended in an error must earn a retry cooldown",
-        );
-
-        // Second inbound batch, immediately behind the first.
-        client
-            .ingest_received_delivery(route.probe(filled_through + 900, "refusal-after-failure"))
-            .await
-            .expect("a refused ingest still completes its pass");
-        assert!(
-            matches!(
-                client
-                    .run_pending_epoch_backfill(
-                        marmot_forensics::EpochBackfillExecutionSeam::Maintenance
-                    )
-                    .await
-                    .expect("the paced seam still returns Ok"),
-                crate::EpochBackfillRunOutcome::Deferred
-            ),
-            "the batch behind a failed execution must wait out the cooldown instead of \
-             re-entering the whole-account replay immediately",
-        );
-        // A person asking for a repair is not a loop.
-        assert!(
-            !client.epoch_backfill_retry_is_paced(
-                marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp
-            ),
-            "caller-directed catch-up stays exempt from the failure cooldown",
-        );
-    });
-}
-
-/// A job whose settlement fails hands the summary it holds back for the next
-/// successful seam.
-///
-/// Settlement drains the engine's no-inbound events. When that drain fails,
-/// the prefix an earlier failed pass deferred must survive it. The rows are
-/// durable either way, but `account_worker` publishes a summary only on `Ok`,
-/// so dropping it would cost the runtime event stream: projected state that
-/// persists in storage and never surfaces to a subscriber.
-#[test]
-#[cfg(feature = "test-policy-overrides")]
-fn a_failed_event_drain_retains_the_backfill_prefix_for_the_next_seam() {
-    run_composed_app_runtime_test("backfill-drain-error-summary", || async {
-        let dir = tempfile::tempdir().unwrap();
-        let relay = Arc::new(ScriptedPushRelayClient::default());
-        let (_app, mut client, _group_id) = armed_epoch_backfill(
-            &dir,
-            &relay,
-            bounded_epoch_backfill_config().with_dev_fail_pending_session_event_drain(),
-        )
-        .await;
-
-        // Progress this job inherits: a prefix an earlier failed pass deferred.
-        let deferred = crate::SyncSummary {
-            joined_groups: vec![cgka_traits::GroupId::new(vec![0x42])],
-            ..Default::default()
-        };
-        client.pending_failed_sync_summary.merge(deferred.clone());
-
-        client
-            .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
-            .await
-            .expect_err("the injected event-drain failure must surface");
-
-        assert_eq!(
-            client.pending_failed_sync_summary, deferred,
-            "a settlement failure must hand the deferred prefix back for the next \
-             successful seam instead of dropping it off the runtime event stream",
-        );
-    });
-}
-
-/// Refusal blocks only its group; independent missing-input debt stays retryable.
-#[test]
-fn capacity_pressure_is_scoped_to_the_refused_group() {
-    run_composed_app_runtime_test("backfill-fruitless-rearm-scope", || async {
-        let dir = tempfile::tempdir().unwrap();
-        let relay = Arc::new(ScriptedPushRelayClient::default());
-        let filled_through = crate::unix_now_seconds() - 1_000;
-        let (app, mut client, route) = group_at_the_undecryptable_retention_cap_with_config(
-            &dir,
-            &relay,
-            bounded_epoch_backfill_config(),
-            filled_through,
-        )
-        .await;
-        let stalled_epoch = client.group_mls_state(&route.group_id).unwrap().epoch;
-
-        let untouched = client.create_group("independent debt", &[]).await.unwrap();
-        let untouched_epoch = client.group_mls_state(&untouched).unwrap().epoch;
-        client.apply_backfill_decision(
-            &untouched,
-            untouched_epoch,
-            BackfillDecision::Arm,
-            marmot_forensics::EpochStallBackfillTrigger::UndecryptableThreshold,
-        );
-
-        client
-            .ingest_received_delivery(route.probe(filled_through + 400, "refusal-that-arms"))
-            .await
-            .expect("a refused ingest still completes its pass");
-        client.test_comparison_results = Some(comparison_fetches_probe(
-            &route.nostr_group_id_hex,
-            filled_through + 500,
-            "refused-during-the-replay",
-        ));
-        client
-            .run_pending_epoch_backfill(
-                marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp,
-            )
-            .await
-            .expect("the armed replay must run");
-
-        let storage = app.account_storage("alice").unwrap();
-        let demands = storage.app_storage().pending_recovery_demands().unwrap();
-        let refused = demands
-            .iter()
-            .find(|d| d.group_id.as_deref() == Some(route.group_id.as_slice()))
-            .unwrap();
-        let independent = demands
-            .iter()
-            .find(|d| d.group_id.as_deref() == Some(untouched.as_slice()))
-            .unwrap();
-        assert_eq!(refused.stalled_epoch, Some(stalled_epoch));
-        assert_eq!(
-            refused.eligibility,
-            storage_sqlite::RecoveryEligibility::WaitingCapacity
-        );
-        assert_eq!(
-            independent.eligibility,
-            storage_sqlite::RecoveryEligibility::Retry,
-            "another group's refusal must not block this group's future acquisition"
-        );
-    });
-}
-
-/// Qualified endpoint coverage permits distinct paced local evaluations to
-/// report a blocked/unknown engine without requiring another network replay.
-/// Reorgs preserve those samples; EOSE-only coverage cannot earn them.
-#[test]
-#[cfg(feature = "test-policy-overrides")]
-fn qualified_local_observations_escalate_without_replay_and_survive_reorg() {
-    run_composed_app_runtime_test("qualified-local-escalation", || async {
-        verify_qualified_local_escalation(false, false).await;
-        verify_qualified_local_escalation(false, true).await;
-    });
-}
-
-#[test]
-#[cfg(feature = "test-policy-overrides")]
-fn qualified_local_evidence_survives_reopen_without_replaying_or_reporting_twice() {
-    run_composed_app_runtime_test("qualified-local-reopen", || async {
-        verify_qualified_local_escalation(true, true).await;
-    });
-}
-
-#[cfg(feature = "test-policy-overrides")]
-async fn verify_qualified_local_escalation(reopen: bool, qualified: bool) {
+/// A current-epoch message from another device of this account proves the
+/// group is healthy, exactly like one from another account.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sibling_device_message_clears_the_recovery_warning() {
     let dir = tempfile::tempdir().unwrap();
-    let relay = Arc::new(ScriptedPushRelayClient::default());
-    let (app, mut client, route) =
-        undecryptable_probe_route(&dir, &relay, bounded_epoch_backfill_config()).await;
-    let epoch = client.group_mls_state(&route.group_id).unwrap().epoch;
-    for probe in 0..crate::client::epoch_stall::EPOCH_STALL_BACKFILL_THRESHOLD {
-        client
-            .ingest_received_delivery(route.probe(
-                crate::unix_now_seconds() - 100 + probe as u64,
-                &format!("local-observation-{probe}"),
-            ))
-            .await
-            .unwrap();
-    }
-    assert!(client.has_pending_epoch_backfill());
-    if qualified {
-        // Independent synthetic empty remote inventories, not an EOSE-to-proof
-        // conversion. The locally admitted undecryptable prefix is real.
-        client.test_recovery_evidence = Some(crate::client::recovery::empty_finite_history);
-    }
-    let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
-    client
-        .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
-        .await
+    AccountHome::open(dir.path())
+        .create_account("alice")
         .unwrap();
-    let storage = app.account_storage("alice").unwrap().app_storage();
-    let retry = storage.recovery_retry_state().unwrap();
-    let subscriptions = relay.subscription_count();
-    let interval = Duration::from_millis(
-        client
-            .epoch_stall
-            .qualified_observation_interval_ms()
-            .max(1),
-    );
-    let mut reports = 0;
-    for index in 0..4 {
-        if reopen && index == 2 {
-            drop(client);
-            client = client_on_app_relay_plane(&app, "alice").await;
-            // Resume the test's logical clock after the prior two samples.
-            client
-                .recovery_owner
-                .test_advance_clock(interval.saturating_mul(3));
-        }
-        client.recovery_owner.test_advance_clock(interval);
-        for _ in 0..10 {
-            client.observe_recovery_evidence(&a_convergence_reorg(&route.group_id, epoch));
-        }
-        let result = client
-            .advance_convergence_after_runtime_sync(&route.group_id)
-            .await
-            .unwrap();
-        reports += result.epoch_stall_escalations.len();
-        assert_eq!(reports, usize::from(qualified && index >= 2));
-        assert_eq!(
-            client.group_mls_state(&route.group_id).unwrap().epoch,
-            epoch
-        );
-        assert_eq!(
-            storage.recovery_retry_state().unwrap(),
-            retry,
-            "local observations cannot reserve or reset acquisition cost"
-        );
-        if !reopen {
-            assert_eq!(relay.subscription_count(), subscriptions);
-        }
-        assert_eq!(
-            storage.epoch_stall_evidence().unwrap()[0].fruitless_completions,
-            if qualified { index as u32 + 1 } else { 0 }
-        );
-    }
-    assert_eq!(
-        storage.automatic_recovery_failed(&route.group_id).unwrap(),
-        qualified
-    );
-    drop(client);
-    assert_eq!(
-        recorded_audit_rows(&app)
-            .iter()
-            .filter(|row| row["kind"]["type"] == "epoch_stall_backfill_escalated")
-            .count(),
-        usize::from(qualified)
-    );
-}
-
-/// Reopen preserves the same pending identities and deadline without earning a replay.
-#[test]
-fn recovery_reopen_preserves_pending_debt_and_the_retry_deadline() {
-    run_composed_app_runtime_test("frozen-epoch-restart-inside-interval", || async {
-        let dir = tempfile::tempdir().unwrap();
-        let relay = Arc::new(ScriptedPushRelayClient::default());
-        // A real interval, long enough that this test is always inside it.
-        let config = bounded_epoch_backfill_config()
-            .with_dev_epoch_backfill_retry_backoff_ms(60_000)
-            .with_dev_epoch_stall_wedge_rearm_interval_ms(10 * 60 * 1_000);
-        let (app, mut client, route) = undecryptable_probe_route(&dir, &relay, config).await;
-        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
-        let probe_base = crate::unix_now_seconds() - 1_000;
-
-        for probe in 0..crate::client::epoch_stall::EPOCH_STALL_BACKFILL_THRESHOLD {
-            client
-                .ingest_received_delivery(route.probe(
-                    probe_base + probe as u64,
-                    &format!("before-restart-{probe}"),
-                ))
-                .await
-                .expect("a retained undecryptable object completes its ingest pass");
-        }
-        assert!(
-            client.has_pending_epoch_backfill(),
-            "the first arm needs no interval to have elapsed",
-        );
-        client
-            .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
-            .await
-            .expect("the armed replay must run");
-        let storage = app.account_storage("alice").unwrap().app_storage();
-        let retry = storage.recovery_retry_state().unwrap();
-        let pending = storage.recovery_revision_fence().unwrap().obligations;
-        drop(client);
-
-        let mut reopened = client_on_app_relay_plane(&app, "alice").await;
-        let subscriptions = relay.unfloored_account_subscription_count();
-        for probe in 0..crate::client::epoch_stall::EPOCH_STALL_BACKFILL_THRESHOLD {
-            reopened
-                .ingest_received_delivery(route.probe(
-                    probe_base + 100 + probe as u64,
-                    &format!("after-restart-{probe}"),
-                ))
-                .await
-                .expect("a retained undecryptable object completes its ingest pass");
-        }
-        assert!(
-            reopened.has_pending_epoch_backfill(),
-            "an unproven pass did not retire the pending obligation",
-        );
-        assert!(matches!(
-            reopened
-                .run_pending_epoch_backfill(
-                    marmot_forensics::EpochBackfillExecutionSeam::Maintenance
-                )
-                .await
-                .unwrap(),
-            crate::EpochBackfillRunOutcome::Deferred
-        ));
-        assert_eq!(storage.recovery_retry_state().unwrap(), retry);
-        assert_eq!(
-            storage.recovery_revision_fence().unwrap().obligations,
-            pending
-        );
-        assert_eq!(relay.unfloored_account_subscription_count(), subscriptions);
-        assert!(
-            reopened.pending_epoch_stall_escalations.is_empty(),
-            "and nothing was reported off an interval nobody waited out",
-        );
-    });
-}
-
-/// A zero-delivery replay after which a tracked group's epoch moved is genuine
-/// success: the value of the replay was letting already-deferred rows converge,
-/// and that is exactly what the epoch delta reports.
-#[test]
-fn local_epoch_progress_does_not_clear_history_or_suppress_independent_gaps() {
-    run_composed_app_runtime_test("backfill-local-progress-keeps-debt", || async {
-        let dir = tempfile::tempdir().unwrap();
-        let relay = Arc::new(ScriptedPushRelayClient::default());
-        let (app, mut client, group) =
-            armed_epoch_backfill(&dir, &relay, bounded_epoch_backfill_config()).await;
-        let epoch = client.group_mls_state(&group).unwrap().epoch;
-        let bystander = bystander_stalled_below_threshold(&mut client, epoch);
-        let grant = client
-            .authorize_account_recovery(
-                None,
-                marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        // The app refuses group changes while this gap is armed (mdk#2258),
-        // so advance the epoch at the engine instead.
-        client
-            .runtime
-            .send(cgka_traits::engine::SendIntent::SelfUpdate {
-                group_id: group.clone(),
-            })
-            .await
-            .unwrap();
-        assert!(client.group_mls_state(&group).unwrap().epoch > epoch);
-        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
-        client.run_recovery_grant_for_test(grant).await.unwrap();
-        assert!(
-            client.has_pending_epoch_backfill(),
-            "local engine progress cannot prove historical coverage"
-        );
-        assert_eq!(
-            bystander_crosses_threshold(&mut client, bystander, epoch),
-            BackfillDecision::Arm
-        );
-    });
-}
-
-#[test]
-fn retained_delivery_does_not_certify_other_groups_history() {
-    run_composed_app_runtime_test("backfill-retained-input-keeps-other-gaps", || async {
-        let dir = tempfile::tempdir().unwrap();
-        let relay = Arc::new(ScriptedPushRelayClient::default());
-        let (app, mut client, group) =
-            armed_epoch_backfill(&dir, &relay, bounded_epoch_backfill_config()).await;
-        let epoch = client.group_mls_state(&group).unwrap().epoch;
-        let bystander = bystander_stalled_below_threshold(&mut client, epoch);
-        let route = app
-            .group("alice", &hex::encode(group.as_slice()))
-            .unwrap()
-            .unwrap()
-            .nostr_routing
-            .nostr_group_id_hex;
-        client.test_comparison_results = Some(comparison_fetches_probe(
-            &route,
-            crate::unix_now_seconds(),
-            "retained-during-owner-attempt",
-        ));
-        assert!(matches!(
-            client
-                .run_pending_epoch_backfill(
-                    marmot_forensics::EpochBackfillExecutionSeam::Maintenance
-                )
-                .await
-                .unwrap(),
-            crate::EpochBackfillRunOutcome::Incomplete(_)
-        ));
-        assert_eq!(
-            bystander_crosses_threshold(&mut client, bystander, epoch),
-            BackfillDecision::Arm
-        );
-        assert!(client.has_pending_epoch_backfill());
-        let rows = recorded_audit_rows(&app);
-        let failed = recorded_rows_of_kind(&rows, "epoch_stall_backfill_failed");
-        assert_eq!(failed.len(), 1);
-        assert_eq!(failed[0]["kind"]["deliveries"], 1);
-        assert_eq!(failed[0]["kind"]["refused"], 0);
-    });
-}
-
-#[test]
-fn unconfirmed_epoch_backfill_paces_its_automatic_retries() {
-    run_composed_app_runtime_test("backfill-retry-cooldown", || async {
-        let dir = tempfile::tempdir().unwrap();
-        let relay = Arc::new(ScriptedPushRelayClient::default());
-        // No comparison backend: every attempt ends unproven. The cooldown is
-        // what must stop the receive seam from starting a job on every inbound
-        // delivery.
-        let (app, mut client, _group_id) = armed_epoch_backfill(
-            &dir,
-            &relay,
-            bounded_epoch_backfill_config().with_dev_epoch_backfill_retry_backoff_ms(1_500),
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client
+        .create_group("sibling recovery", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    let epoch = client.runtime.group_record(&group_id).unwrap().epoch;
+    app.account_storage("alice")
+        .unwrap()
+        .app_storage()
+        .record_recovery_evidence(
+            &[storage_sqlite::StoredEpochStallEvidence {
+                group_id_hex: hex::encode(group_id.as_slice()),
+                stalled_epoch: epoch.0,
+                fruitless_completions: 3,
+                fruitless_reported: true,
+                last_arm_at_ms: 1,
+            }],
+            3,
         )
-        .await;
-
-        let first = client
-            .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Receive)
-            .await
-            .expect("an unconfirmed replay is not a transport error");
-        assert!(matches!(
-            first,
-            crate::EpochBackfillRunOutcome::Incomplete(_)
-        ));
-
-        let started = std::time::Instant::now();
-        for _ in 0..5 {
-            assert!(
-                matches!(
-                    client
-                        .run_pending_epoch_backfill(
-                            marmot_forensics::EpochBackfillExecutionSeam::Receive
-                        )
-                        .await
-                        .expect("a paced seam is not a failure"),
-                    crate::EpochBackfillRunOutcome::Deferred
-                ),
-                "the receive seam must skip an intent inside its cooldown"
-            );
-        }
-        assert!(
-            started.elapsed() < Duration::from_millis(500),
-            "skipped attempts must not run a job"
-        );
-        assert!(
-            client.has_pending_epoch_backfill(),
-            "a paced attempt must leave the intent pending"
-        );
-
-        // Caller-directed repair is not a loop, so it is never paced.
-        assert!(
-            matches!(
-                client
-                    .run_pending_epoch_backfill(
-                        marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp
-                    )
-                    .await
-                    .expect("explicit catch-up runs"),
-                crate::EpochBackfillRunOutcome::Incomplete(_)
-            ),
-            "caller-directed catch-up must bypass the cooldown"
-        );
-        drop(client);
-
-        let rows = recorded_audit_rows(&app);
-        assert_eq!(
-            recorded_rows_of_kind(&rows, "epoch_stall_backfill_started").len(),
-            2,
-            "only the unpaced attempts may start a job"
-        );
-    });
-}
-
-#[test]
-#[cfg(feature = "test-policy-overrides")]
-fn epoch_backfill_remains_pending_after_repeated_unavailable_relay_attempts() {
-    run_composed_app_runtime_test("backfill-eose-remains-pending", || async {
-        const UNCONFIRMED_ATTEMPTS: u64 = 3;
-        let dir = tempfile::tempdir().unwrap();
-        let relay = Arc::new(ScriptedPushRelayClient::default());
-        let (app, mut client, group_id) =
-            armed_epoch_backfill(&dir, &relay, bounded_epoch_backfill_config()).await;
-        let group = app
-            .group("alice", &hex::encode(group_id.as_slice()))
+        .unwrap();
+    assert!(
+        client
+            .group_recovery_status(&group_id)
             .unwrap()
-            .expect("local group projection");
+            .automatic_recovery_failed
+    );
 
-        // The group route's required relay never answers. Repeated bounded
-        // attempts must not convert that availability failure into proof that
-        // stored history was served.
-        client.test_comparison_results =
-            Some(crate::client::ScriptedComparisons::by_route(|route| {
-                let failed = matches!(
-                    route,
-                    storage_sqlite::TransportReconciliationRoute::Group(_)
-                );
-                Ok(Some((
-                    transport_nostr_adapter::NostrReconciliationSummary {
-                        relays_succeeded: usize::from(!failed),
-                        relays_failed: usize::from(failed),
-                        failed_endpoints: failed
-                            .then(|| TransportEndpoint("wss://relay.example".to_owned()))
-                            .into_iter()
-                            .collect(),
-                        ..Default::default()
-                    },
-                    Vec::new(),
-                )))
-            }));
-        for attempt in 0..UNCONFIRMED_ATTEMPTS {
-            let outcome = client
-                .run_pending_epoch_backfill(
-                    marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp,
-                )
-                .await
-                .expect("an unanswered comparison is not a job failure");
-            assert!(
-                matches!(outcome, crate::EpochBackfillRunOutcome::Incomplete(_)),
-                "attempt {attempt} must still hold the honest gate"
-            );
-        }
-
-        // Once the relay answers, the history it serves reaches the account,
-        // yet a gap with no lower bound still cannot be certified.
-        client.test_comparison_results = Some(comparison_fetches_probe(
-            &group.nostr_routing.nostr_group_id_hex,
-            crate::unix_now_seconds(),
-            "reachable-history",
-        ));
-        let answered = client
-            .run_pending_epoch_backfill(
-                marmot_forensics::EpochBackfillExecutionSeam::ExplicitCatchUp,
-            )
-            .await
-            .expect("the answered attempt runs");
-        assert!(matches!(
-            answered,
-            crate::EpochBackfillRunOutcome::Incomplete(_)
-        ));
-        assert!(
-            client.has_pending_epoch_backfill(),
-            "an unbounded gap must leave the durable intent pending"
-        );
-        drop(client);
-
-        let rows = recorded_audit_rows(&app);
-        let failed = recorded_rows_of_kind(&rows, "epoch_stall_backfill_failed");
-        assert_eq!(
-            failed.len(),
-            UNCONFIRMED_ATTEMPTS as usize + 1,
-            "every attempt must record its own honest terminal"
-        );
-        for (ordinal, row) in failed.iter().enumerate() {
-            assert_eq!(row["kind"]["error_kind"], "history_coverage_unproven");
-            assert_eq!(row["kind"]["completion_kind"].as_str(), None);
-            assert_eq!(row["kind"]["retry_ordinal"].as_u64(), Some(ordinal as u64));
-            assert_eq!(
-                row["kind"]["deliveries"],
-                u64::from(ordinal as u64 == UNCONFIRMED_ATTEMPTS),
-                "only the answered attempt recovers reachable history"
-            );
-        }
-    });
-}
-
-#[test]
-fn in_flight_epoch_backfill_arm_preserves_both_demands_on_failure() {
-    run_composed_app_runtime_test("owner-in-flight-demand", || async {
-        let dir = tempfile::tempdir().unwrap();
-        let relay = Arc::new(ScriptedPushRelayClient::default());
-        let (app, mut client, group_a) = armed_epoch_backfill(
-            &dir,
-            &relay,
-            bounded_epoch_backfill_config().with_dev_epoch_backfill_retry_backoff_ms(15_000),
-        )
-        .await;
-        let group_b = client.create_group("second demand", &[]).await.unwrap();
-        let storage = app.account_storage("alice").unwrap().app_storage();
-        let grant = client
-            .authorize_account_recovery(
-                None,
-                marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        let epoch = client.group_mls_state(&group_b).unwrap().epoch;
-        client.apply_backfill_decision(
-            &group_b,
+    let effects = marmot_session::AccountDeviceEffects {
+        events: vec![cgka_traits::engine::GroupEvent::MessageReceived {
+            authority: None,
+            group_id: group_id.clone(),
+            message_id: cgka_traits::MessageId::new(vec![0xa2; 32]),
+            sender: client.runtime.self_id(),
+            sender_leaf_index: None,
             epoch,
-            BackfillDecision::Arm,
-            marmot_forensics::EpochStallBackfillTrigger::UndecryptableThreshold,
-        );
-        assert!(
-            client
-                .authorize_account_recovery(
-                    None,
-                    marmot_forensics::EpochBackfillExecutionSeam::Receive
-                )
-                .await
-                .unwrap()
-                .is_none()
-        );
-        // The job fails while it takes ownership of its network result.
-        client.released_backfill_reload_pending = true;
-        client.fail_next_released_backfill_reload = true;
-        assert!(client.run_recovery_grant_for_test(grant).await.is_err());
-        let groups = storage
-            .pending_epoch_backfill_intents()
+            payload: Vec::new(),
+            retention: None,
+            encrypted_media_secret: None,
+        }],
+        ..Default::default()
+    };
+    client.observe_recovery_health(&effects).unwrap();
+    assert!(
+        !client
+            .group_recovery_status(&group_id)
             .unwrap()
-            .into_iter()
-            .map(|intent| intent.group_id_hex)
-            .collect::<HashSet<_>>();
-        assert_eq!(
-            groups,
-            HashSet::from([
-                hex::encode(group_a.as_slice()),
-                hex::encode(group_b.as_slice())
-            ])
-        );
-        assert_eq!(storage.recovery_retry_state().unwrap().attempt_serial, 1);
-        assert!(
-            client
-                .authorize_account_recovery(
-                    None,
-                    marmot_forensics::EpochBackfillExecutionSeam::Receive
-                )
-                .await
-                .unwrap()
-                .is_none()
-        );
-        expire_epoch_backfill_retry_cooldown(&mut client);
-        let retry = client
-            .authorize_account_recovery(
-                None,
-                marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(retry.reservation.attempt_serial, 2);
-        assert_eq!(
-            retry
-                .plan()
-                .unwrap()
-                .iter()
-                .filter(|obligation| obligation.cause == storage_sqlite::RecoveryCause::EpochGap)
-                .count(),
-            2
-        );
-    });
-}
-
-#[test]
-fn repeated_epoch_backfill_deferral_does_not_multiply_identical_evidence() {
-    run_composed_app_runtime_test("owner-duplicate-demand", || async {
-        let dir = tempfile::tempdir().unwrap();
-        let relay = Arc::new(ScriptedPushRelayClient::default());
-        let (app, mut client, group) = armed_epoch_backfill(
-            &dir,
-            &relay,
-            bounded_epoch_backfill_config().with_dev_epoch_backfill_retry_backoff_ms(15_000),
-        )
-        .await;
-        let storage = app.account_storage("alice").unwrap().app_storage();
-        let epoch = client.group_mls_state(&group).unwrap().epoch;
-        let grant = client
-            .authorize_account_recovery(
-                None,
-                marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        let retry = storage.recovery_retry_state().unwrap();
-        let fence = storage.recovery_revision_fence().unwrap();
-        for _ in 0..10 {
-            client.apply_backfill_decision(
-                &group,
-                epoch,
-                BackfillDecision::Arm,
-                marmot_forensics::EpochStallBackfillTrigger::UndecryptableThreshold,
-            );
-            assert!(
-                client
-                    .authorize_account_recovery(
-                        None,
-                        marmot_forensics::EpochBackfillExecutionSeam::Receive
-                    )
-                    .await
-                    .unwrap()
-                    .is_none()
-            );
-        }
-        assert_eq!(storage.recovery_retry_state().unwrap(), retry);
-        assert!(storage.recovery_revision_fence().unwrap() == fence);
-        drop(grant);
-        assert!(
-            client
-                .authorize_account_recovery(
-                    None,
-                    marmot_forensics::EpochBackfillExecutionSeam::Maintenance
-                )
-                .await
-                .unwrap()
-                .is_none()
-        );
-        let rows = recorded_audit_rows(&app);
-        assert_eq!(
-            recorded_rows_of_kind(&rows, "epoch_stall_backfill_armed").len(),
-            1
-        );
-        assert!(
-            recorded_rows_of_kind(&rows, "epoch_stall_backfill_started").is_empty(),
-            "reservation or deferral is not an actual activation"
-        );
-    });
-}
-
-/// Decision diagnostics preserve the full observed-epoch distinction, even
-/// when the number of pending groups has not changed.
-#[test]
-fn owner_deferral_deduplicates_identical_observations_but_keeps_epoch_changes() {
-    run_composed_app_runtime_test("owner-deferral-evidence", || async {
-        use cgka_traits::storage::GroupStorage;
-        let dir = tempfile::tempdir().unwrap();
-        let relay = Arc::new(ScriptedPushRelayClient::default());
-        let (app, client, group) = armed_epoch_backfill(
-            &dir,
-            &relay,
-            bounded_epoch_backfill_config().with_dev_epoch_backfill_retry_backoff_ms(300_000),
-        )
-        .await;
-        let storage = app.account_storage("alice").unwrap();
-        let phantom = cgka_traits::GroupId::new(hex::decode("deadbeef").unwrap());
-        let mut orphan = storage.get_group(&group).unwrap();
-        orphan.id = phantom;
-        storage.put_group(&orphan).unwrap();
-        storage
-            .app_storage()
-            .arm_epoch_backfill_intents(&[storage_sqlite::StoredEpochBackfillIntent {
-                group_id_hex: "deadbeef".into(),
-                stalled_epoch: 1,
-            }])
-            .unwrap();
-        // Reopen attempts actual hydration of the orphaned group, making its
-        // epoch unavailable without corrupting the valid group's session.
-        drop(client);
-        let mut client = client_on_app_relay_plane(&app, "alice").await;
-        assert!(
-            client
-                .group_mls_state(&cgka_traits::GroupId::new(hex::decode("deadbeef").unwrap()))
-                .is_err()
-        );
-        for _ in 0..4 {
-            drop(
-                client
-                    .authorize_account_recovery(
-                        None,
-                        marmot_forensics::EpochBackfillExecutionSeam::Receive,
-                    )
-                    .await
-                    .unwrap(),
-            );
-        }
-        let rows = recorded_audit_rows(&app);
-        assert_eq!(
-            recorded_rows_of_kind(&rows, "epoch_stall_backfill_deferred").len(),
-            1
-        );
-        let retry = storage.app_storage().recovery_retry_state().unwrap();
-        let mut record = storage.get_group(&group).unwrap();
-        record.epoch = cgka_traits::EpochId(record.epoch.0 + 1);
-        storage.put_group(&record).unwrap();
-        for _ in 0..4 {
-            assert!(
-                client
-                    .authorize_account_recovery(
-                        None,
-                        marmot_forensics::EpochBackfillExecutionSeam::Receive
-                    )
-                    .await
-                    .unwrap()
-                    .is_none()
-            );
-        }
-        assert_eq!(storage.app_storage().recovery_retry_state().unwrap(), retry);
-        let rows = recorded_audit_rows(&app);
-        let deferred = recorded_rows_of_kind(&rows, "epoch_stall_backfill_deferred");
-        assert_eq!(
-            deferred.len(),
-            2,
-            "same cardinality with a changed observed epoch is new evidence"
-        );
-        assert!(
-            deferred
-                .iter()
-                .all(|row| row["kind"]["reason"] == "group_epoch_unavailable")
-        );
-    });
-}
-
-#[test]
-fn unresolved_epoch_backfill_scope_does_not_starve_another_group() {
-    run_composed_app_runtime_test("owner-unresolved-scope", || async {
-        let dir = tempfile::tempdir().unwrap();
-        let relay = Arc::new(ScriptedPushRelayClient::default());
-        let (app, mut client, group) =
-            armed_epoch_backfill(&dir, &relay, bounded_epoch_backfill_config()).await;
-        let phantom = cgka_traits::GroupId::new(vec![0xde]);
-        let storage = app.account_storage("alice").unwrap();
-        let mut orphan = client.runtime.group_record(&group).unwrap();
-        orphan.id = phantom.clone();
-        cgka_traits::storage::GroupStorage::put_group(&storage, &orphan).unwrap();
-        storage
-            .app_storage()
-            .arm_epoch_backfill_intents(&[storage_sqlite::StoredEpochBackfillIntent {
-                group_id_hex: hex::encode(phantom.as_slice()),
-                stalled_epoch: 1,
-            }])
-            .unwrap();
-        let grant = client
-            .authorize_account_recovery(
-                None,
-                marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(grant.plan().unwrap().iter().any(|obligation| {
-            obligation.group_id.as_ref() == Some(&group)
-                && obligation
-                    .scopes
-                    .iter()
-                    .any(|scope| scope.goal.route_kind == 1)
-        }));
-        assert!(grant.plan().unwrap().iter().any(|obligation| {
-            obligation.group_id.as_ref() == Some(&phantom)
-                && obligation
-                    .scopes
-                    .iter()
-                    .all(|scope| scope.goal.route_kind == 2)
-        }));
-        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
-        client.test_recovery_evidence = Some(crate::client::recovery::empty_finite_history);
-        client.run_recovery_grant_for_test(grant).await.unwrap();
-        assert_eq!(
-            storage
-                .app_storage()
-                .pending_epoch_backfill_intents()
-                .unwrap()
-                .into_iter()
-                .map(|intent| intent.group_id_hex)
-                .collect::<Vec<_>>(),
-            vec![hex::encode(phantom.as_slice())],
-            "qualified real-group coverage cannot erase the unsupported group's debt"
-        );
-        let unresolved = storage
-            .app_storage()
-            .pending_recovery_demands()
-            .unwrap()
-            .into_iter()
-            .find(|d| d.group_id.as_deref() == Some(phantom.as_slice()))
-            .unwrap();
-        assert_eq!(
-            unresolved.eligibility,
-            storage_sqlite::RecoveryEligibility::WaitingCapability
-        );
-        client
-            .recovery_owner
-            .test_advance_clock(Duration::from_secs(300));
-        // A native replay goal may run after its source lease expires. That
-        // independent work must neither retry nor retire the unsupported scope.
-        client
-            .run_pending_epoch_backfill(marmot_forensics::EpochBackfillExecutionSeam::Maintenance)
-            .await
-            .unwrap();
-        let still_unresolved = storage
-            .app_storage()
-            .pending_recovery_demands()
-            .unwrap()
-            .into_iter()
-            .find(|d| d.group_id.as_deref() == Some(phantom.as_slice()))
-            .unwrap();
-        assert!(still_unresolved.ticket == unresolved.ticket);
-        assert_eq!(
-            still_unresolved.eligibility,
-            storage_sqlite::RecoveryEligibility::WaitingCapability,
-            "a timer cannot investigate a group with no acquisition route repeatedly"
-        );
-        assert_eq!(
-            storage
-                .app_storage()
-                .pending_epoch_backfill_intents()
-                .unwrap()
-                .into_iter()
-                .map(|intent| intent.group_id_hex)
-                .collect::<Vec<_>>(),
-            vec![hex::encode(phantom.as_slice())],
-        );
-        let rows = recorded_audit_rows(&app);
-        assert_eq!(
-            recorded_rows_of_kind(&rows, "epoch_stall_backfill_started").len(),
-            1,
-            "the unreadable group must not prevent the real group's acquisition"
-        );
-    });
+            .automatic_recovery_failed
+    );
 }
 
 /// Stack for every thread of a composed app-runtime test: debug OpenMLS group
@@ -3830,7 +2326,9 @@ fn create_group_options_apply_initial_retention_atomically() {
                 },
             )
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let disabled = client
             .create_group_with_options(
                 "disabled retention compatibility",
@@ -3838,7 +2336,9 @@ fn create_group_options_apply_initial_retention_atomically() {
                 AppCreateGroupOptions::default(),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
 
         assert_eq!(client.group_mls_state(&retained).unwrap().epoch, 0);
         assert_eq!(
@@ -3870,8 +2370,18 @@ fn live_group_archive_checkpoints_seen_and_target_group_deltas() {
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
-        let alpha = client.create_group("alpha", &[]).await.unwrap();
-        let beta = client.create_group("beta", &[]).await.unwrap();
+        let alpha = client
+            .create_group("alpha", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
+        let beta = client
+            .create_group("beta", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
 
         client.state.seen_events = (0..256).map(|index| format!("event-{index:05}")).collect();
         client.seen_events_index = client.state.seen_events.iter().cloned().collect();
@@ -4051,7 +2561,12 @@ async fn media_send_refuses_stale_epoch_body() {
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("media", &[]).await.unwrap();
+    let group_id = client
+        .create_group("media", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let current_epoch = client.group_mls_state(&group_id).unwrap().epoch;
 
     // The tag has no epoch field, so a recipient would derive the key for the
@@ -4068,30 +2583,43 @@ async fn media_send_refuses_stale_epoch_body() {
         media_type: "image/png".to_owned(),
         version: "encrypted-media-v2".to_owned(),
         source_epoch: current_epoch + 1,
+        source_epoch_identity: Some(hex::encode(
+            client.runtime.epoch_pin(&group_id).unwrap().identity,
+        )),
         dim: None,
         thumbhash: None,
     };
-    let error = client
-        .send_media_attachments(&group_id, vec![stale], None)
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(
-            error,
-            AppError::MediaReferenceStaleEpoch {
-                source_epoch,
-                current_epoch,
-            } if source_epoch == current_epoch + 1 && current_epoch == client
-                .group_mls_state(&group_id)
-                .unwrap()
-                .epoch
-        ),
-        "{error:?}"
-    );
-    assert!(
-        app.messages("alice").unwrap().is_empty(),
-        "a refused stale reference must publish nothing"
-    );
+    // Older/received references have no local upload provenance. Refusing
+    // those is independent of the numeric-epoch mismatch above.
+    let missing = MediaAttachmentReference {
+        source_epoch: current_epoch,
+        source_epoch_identity: None,
+        ..stale.clone()
+    };
+    for reference in [stale, missing] {
+        let expected_source = reference.source_epoch;
+        let error = client
+            .send_media_attachments(&group_id, vec![reference], None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                AppError::MediaReferenceStaleEpoch {
+                    source_epoch,
+                    current_epoch,
+                } if source_epoch == expected_source && current_epoch == client
+                    .group_mls_state(&group_id)
+                    .unwrap()
+                    .epoch
+            ),
+            "{error:?}"
+        );
+        assert!(
+            app.messages("alice").unwrap().is_empty(),
+            "a refused stale reference must publish nothing"
+        );
+    }
 }
 
 #[test]
@@ -4115,7 +2643,12 @@ async fn media_send_epoch_pin_body() {
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(relay.clone());
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("media", &[]).await.unwrap();
+    let group_id = client
+        .create_group("media", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let current_epoch = client.group_mls_state(&group_id).unwrap().epoch;
     let published_before = relay.published_event_ids().len();
 
@@ -4131,6 +2664,9 @@ async fn media_send_epoch_pin_body() {
         media_type: "image/png".to_owned(),
         version: "encrypted-media-v2".to_owned(),
         source_epoch: current_epoch + 1,
+        source_epoch_identity: Some(hex::encode(
+            client.runtime.epoch_pin(&group_id).unwrap().identity,
+        )),
         dim: None,
         thumbhash: None,
     };
@@ -4177,6 +2713,9 @@ async fn media_send_epoch_pin_body() {
     // proving the pin is the reference's epoch and not a blanket refusal.
     let current = MediaAttachmentReference {
         source_epoch: current_epoch,
+        source_epoch_identity: Some(hex::encode(
+            client.runtime.epoch_pin(&group_id).unwrap().identity,
+        )),
         ..MediaAttachmentReference {
             locators: vec![MediaLocator {
                 kind: "blossom-v1".to_owned(),
@@ -4189,6 +2728,7 @@ async fn media_send_epoch_pin_body() {
             media_type: "image/png".to_owned(),
             version: "encrypted-media-v2".to_owned(),
             source_epoch: 0,
+            source_epoch_identity: None,
             dim: None,
             thumbhash: None,
         }
@@ -4209,6 +2749,249 @@ async fn media_send_epoch_pin_body() {
 }
 
 #[test]
+#[cfg(feature = "test-policy-overrides")]
+fn media_send_pins_the_engine_to_the_reference_branch() {
+    run_composed_app_runtime_test("media-send-branch-pin", || {
+        media_send_branch_pin_body(false, false, false)
+    });
+}
+
+#[test]
+#[cfg(feature = "test-policy-overrides")]
+fn media_send_refuses_a_reference_after_a_same_epoch_branch_change() {
+    run_composed_app_runtime_test("media-upload-branch-pin", || {
+        media_send_branch_pin_body(true, false, false)
+    });
+}
+
+#[test]
+#[cfg(feature = "test-policy-overrides")]
+fn upload_and_send_refuses_a_same_epoch_branch_change_before_admission() {
+    run_composed_app_runtime_test("upload-and-send-branch-pin", || {
+        media_send_branch_pin_body(true, true, false)
+    });
+}
+
+#[test]
+#[cfg(feature = "test-policy-overrides")]
+fn reaction_send_pins_the_engine_to_the_upload_branch() {
+    run_composed_app_runtime_test("reaction-send-branch-pin", || {
+        media_send_branch_pin_body(false, false, true)
+    });
+}
+
+#[cfg(feature = "test-policy-overrides")]
+async fn media_send_branch_pin_body(before_send: bool, upload_and_send: bool, reaction: bool) {
+    // A reference names only its epoch number. A rival commit from the same
+    // source epoch can win branch selection inside the send itself and leave
+    // the group at that number on another branch, whose media secret the
+    // recipients would derive instead. The pin carries the branch, so the
+    // engine refuses the send and nothing is published.
+    use canonical_membership::deliver_new;
+    use cgka_traits::engine::SendIntent;
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    let alice_account = home.create_account("alice").unwrap();
+    let bob_account = home.create_account("bob").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        "wss://relay.example",
+        MarmotAppConfig::white_noise()
+            .with_dev_settlement_quiescence_ms(0)
+            .with_dev_scheduled_convergence_delay_ms(0)
+            .with_allow_loopback_blob_endpoints(true),
+    )
+    .with_test_relay_client(relay.clone());
+    remember_test_member_inbox(&app, &bob_account.account_id_hex, "wss://relay.example");
+    let mut bob = app.client("bob").await.unwrap();
+    bob.publish_key_package().await.unwrap();
+    let mut alice = app.client("alice").await.unwrap();
+    let group = alice
+        .create_group("branch pin", &[&bob_account.account_id_hex])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    let mut bob_cursor = 0;
+    deliver_new(&mut bob, &relay, &mut bob_cursor).await;
+    bob.sync().await.unwrap();
+    bob.accept_group_invite(&group).unwrap();
+    let target_message_id = alice
+        .send(&group, b"artwork target")
+        .await
+        .unwrap()
+        .message_ids[0]
+        .clone();
+    let source_epoch = bob.runtime.epoch_pin(&group).unwrap().epoch;
+    assert_eq!(alice.runtime.epoch_pin(&group).unwrap().epoch, source_epoch);
+
+    // Two self-updates from one epoch order by committer: the smaller account
+    // id wins, so the other account is the sender and loses.
+    let (mut winner, mut sender) = if alice_account.account_id_hex < bob_account.account_id_hex {
+        (alice, bob)
+    } else {
+        (bob, alice)
+    };
+    let settling = |ms| marmot_session::CanonicalizationPolicy {
+        settlement_quiescence_ms: ms,
+        ..marmot_session::CanonicalizationPolicy::default()
+    };
+    sender
+        .runtime
+        .session_mut()
+        .set_convergence_policy(settling(3_600_000))
+        .unwrap();
+    let self_update = || SendIntent::SelfUpdate {
+        group_id: group.clone(),
+    };
+    sender.runtime.send(self_update()).await.unwrap();
+    let mut sender_cursor = relay.published_events.lock().unwrap().len();
+    winner.runtime.send(self_update()).await.unwrap();
+
+    // The sender pins the epoch its own commit reached, then holds the rival
+    // as retained convergence input.
+    let pin = sender.runtime.epoch_pin(&group).unwrap();
+    assert_eq!(pin.epoch.0, source_epoch.0 + 1);
+    assert_ne!(pin, winner.runtime.epoch_pin(&group).unwrap());
+    let published_before = relay.published_event_ids().len();
+    let reference = MediaAttachmentReference {
+        locators: vec![MediaLocator {
+            kind: "blossom-v1".to_owned(),
+            value: format!("https://media.example/{}.bin", hex::encode([0x66_u8; 32])),
+        }],
+        ciphertext_sha256: hex::encode([0x66_u8; 32]),
+        plaintext_sha256: hex::encode([0x14_u8; 32]),
+        nonce_hex: hex::encode([0x25_u8; 12]),
+        file_name: "d.png".to_owned(),
+        media_type: "image/png".to_owned(),
+        version: "encrypted-media-v2".to_owned(),
+        source_epoch: pin.epoch.0,
+        source_epoch_identity: Some(hex::encode(pin.identity)),
+        dim: None,
+        thumbhash: None,
+    };
+    // Exercise genuine uploads held by the host and the combined upload/send
+    // path with the same real fork. The HTTP phase owns the original branch
+    // while the account worker remains free to adopt its rival.
+    let mut completion = None;
+    let mut server = None;
+    let reference = if before_send {
+        let (url, _, task) = crate::client::upload_cleanup_tests::upload_endpoint().await;
+        server = Some(task);
+        let (http, finish) = sender
+            .prepare_encrypted_media_upload(
+                &group,
+                MediaUploadRequest {
+                    attachments: vec![MediaUploadAttachmentRequest {
+                        file_name: "d.png".into(),
+                        media_type: "image/png".into(),
+                        plaintext: b"branch-bound artwork".to_vec(),
+                        dim: None,
+                        thumbhash: None,
+                    }],
+                    caption: None,
+                    send: upload_and_send,
+                    blossom_server: Some(url),
+                    message_tags: vec![],
+                },
+            )
+            .await
+            .unwrap();
+        let (result, uploads) = http.run().await.unwrap();
+        let reference = result.attachments[0].reference.clone();
+        assert_eq!(
+            reference.source_epoch_identity,
+            Some(hex::encode(pin.identity))
+        );
+        completion = Some((finish, result, uploads));
+        reference
+    } else {
+        reference
+    };
+    deliver_new(&mut sender, &relay, &mut sender_cursor).await;
+    assert_eq!(sender.runtime.epoch_pin(&group).unwrap(), pin);
+    sender
+        .runtime
+        .session_mut()
+        .set_convergence_policy(settling(0))
+        .unwrap();
+
+    // #2840: a host-held reference must retain the upload branch, even if
+    // convergence completed before the send's own preflight begins.
+    if before_send {
+        let effects = sender.runtime.advance_convergence(&group).await.unwrap();
+        sender
+            .observe_drained_session_events(&effects)
+            .await
+            .unwrap();
+        assert_eq!(
+            sender.runtime.epoch_pin(&group).unwrap(),
+            winner.runtime.epoch_pin(&group).unwrap(),
+        );
+    }
+    let error = if upload_and_send {
+        let (finish, result, uploads) = completion.take().unwrap();
+        sender
+            .finish_encrypted_media_upload(finish, result, uploads)
+            .await
+            .map(|_| ())
+    } else if before_send {
+        sender
+            .send_media_attachments(&group, vec![reference], None)
+            .await
+            .map(|_| ())
+    } else {
+        let intent = if reaction {
+            AppMessageIntent::Reaction {
+                target_message_id,
+                emoji: ":party:".into(),
+                tags: vec![vec![
+                    "emoji".into(),
+                    "party".into(),
+                    reference.locators[0].value.clone(),
+                ]],
+                attachments: vec![reference],
+            }
+        } else {
+            AppMessageIntent::Media {
+                message_tags: Vec::new(),
+                attachments: vec![reference],
+                caption: None,
+            }
+        };
+        sender.send_app_event(&group, intent).await.map(|_| ())
+    }
+    .unwrap_err();
+    if let Some((_, _, uploads)) = completion {
+        uploads.release().await;
+    }
+    if let Some(server) = server {
+        server.abort();
+    }
+    assert_eq!(
+        sender.runtime.epoch_pin(&group).unwrap(),
+        winner.runtime.epoch_pin(&group).unwrap(),
+        "the send must have selected the rival branch before encrypting"
+    );
+    assert!(
+        matches!(
+            error,
+            AppError::MediaReferenceStaleEpoch {
+                source_epoch,
+                current_epoch,
+            } if source_epoch == pin.epoch.0 && current_epoch == pin.epoch.0
+        ),
+        "a same-number branch change must refuse the media send, got {error:?}"
+    );
+    assert_eq!(
+        relay.published_event_ids().len(),
+        published_before,
+        "a refused pinned send must reach the relay with nothing"
+    );
+}
+
+#[test]
 fn edits_require_an_available_own_chat_target() {
     run_composed_app_runtime_test("edit-target-preflight", edit_target_preflight_body);
 }
@@ -4225,7 +3008,12 @@ async fn edit_target_preflight_body() {
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(relay.clone());
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("edits", &[]).await.unwrap();
+    let group_id = client
+        .create_group("edits", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_hex = hex::encode(group_id.as_slice());
     let edit = |target: &str, content: &str| AppMessageIntent::Edit {
         target_message_id: target.to_owned(),
@@ -4339,7 +3127,12 @@ async fn inbound_disband_candidate_blocks_local_delete_body() {
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("terminal", &[]).await.unwrap();
+    let group_id = client
+        .create_group("terminal", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
     app.account_storage("alice")
         .unwrap()
@@ -4381,7 +3174,12 @@ async fn pending_disband_keeps_a_worker_wakeup_after_acceptance_and_reopen() {
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(relay.clone());
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("pending closure", &[]).await.unwrap();
+    let group_id = client
+        .create_group("pending closure", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     client.take_pending_convergence_groups();
     client.disband_group(&group_id).await.unwrap();
     assert!(client.take_pending_convergence_groups().contains(&group_id));
@@ -4433,7 +3231,12 @@ async fn failed_or_unrecoverable_disband_does_not_create_an_idle_poll_loop() {
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
-        let group_id = client.create_group("paused closure", &[]).await.unwrap();
+        let group_id = client
+            .create_group("paused closure", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         client.disband_group(&group_id).await.unwrap();
         let storage = app.account_storage("alice").unwrap();
         if unrecoverable {
@@ -4471,7 +3274,12 @@ async fn pending_disband_composer_gate_body() {
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("terminal", &[]).await.unwrap();
+    let group_id = client
+        .create_group("terminal", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
 
     let request = client.disband_group(&group_id).await.unwrap();
@@ -4549,16 +3357,13 @@ async fn account_local_ready_before_subscribe_body() {
         .expect("account reconciliation task must finish")
         .unwrap();
     assert_eq!(runtime.accounts().managed_accounts().unwrap().len(), 1);
-    assert!(
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            runtime.quarantined_groups("alice"),
-        )
-        .await
-        .expect("worker-routed local reads must be served during registration")
-        .unwrap()
-        .is_empty()
-    );
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        crate::worker_fences::startup_sync_took_queued_commands(&runtime, "alice"),
+    )
+    .await
+    .expect("startup sync must serve local reads while registration is held")
+    .unwrap();
 
     let telemetry = runtime
         .shared_services()
@@ -4609,7 +3414,9 @@ async fn invite_members_detaches_post_mutation_catch_up_body() {
     let group_id = runtime
         .create_group("alice", "invite latency", &[], None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     // Group creation's own detached catch-up finishes first, so the hold below
     // catches the invite's.
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -4648,21 +3455,22 @@ async fn invite_members_detaches_post_mutation_catch_up_body() {
     tokio::time::timeout(std::time::Duration::from_secs(5), pin.wait())
         .await
         .expect("inviting-account catch-up should start after publication");
-    tokio::time::timeout(std::time::Duration::from_millis(250), invite)
-        .await
-        .expect("confirmed invite must return before read-side catch-up finishes")
-        .expect("invite task should not panic")
-        .expect("invite should succeed");
-
+    // The second rendezvous stays unpolled until every response is complete.
+    // The held catch-up, rather than an elapsed-time window, proves ordering;
+    // this outer timeout only bounds a hang.
     let (members, mls_state, roster) =
-        tokio::time::timeout(std::time::Duration::from_millis(250), async {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            invite
+                .await
+                .expect("invite task should not panic")
+                .expect("invite should succeed");
             let members = runtime.group_members("alice", &group_id).await?;
             let mls_state = runtime.group_mls_state("alice", &group_id).await?;
             let roster = runtime.group_roster("alice", &group_id).await?;
             Ok::<_, AppError>((members, mls_state, roster))
         })
         .await
-        .expect("same-account post-invite projection reads must not queue behind catch-up")
+        .expect("the invite response and projection reads must finish while catch-up is held")
         .expect("same-account post-invite projection reads should succeed");
     assert_eq!(members.len(), 2);
     assert_eq!(mls_state.member_count, 2);
@@ -4723,7 +3531,7 @@ fn founding_create_leaves_reconstructable_welcome_index_off_response_path() {
         app.chat_list_projection_stale
             .lock()
             .unwrap()
-            .insert("alice".to_owned());
+            .invalidate("alice");
 
         relay.block_next_publish();
         let created = runtime
@@ -4734,7 +3542,9 @@ fn founding_create_leaves_reconstructable_welcome_index_off_response_path() {
                 None,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         tokio::time::timeout(Duration::from_secs(5), relay.wait_for_blocked_publish())
             .await
             .expect("post-response Welcome publish should be blocked");
@@ -4761,7 +3571,7 @@ fn founding_create_leaves_reconstructable_welcome_index_off_response_path() {
             app.chat_list_projection_stale
                 .lock()
                 .unwrap()
-                .contains("alice"),
+                .is_stale("alice"),
             "create refreshes only its returned row and must preserve a pre-existing full-list rebuild obligation"
         );
         assert!(
@@ -4806,7 +3616,9 @@ fn joined_group_is_visible_before_subscription_rebuild_and_accept_is_prompt_duri
                 None,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
 
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -4868,38 +3680,36 @@ fn joined_group_is_visible_before_subscription_rebuild_and_accept_is_prompt_duri
             .await
             .expect("explicit catch-up should reach its hold");
 
-        let accept_error = tokio::time::timeout(
-            Duration::from_millis(250),
-            runtime.accept_group_invite("bob", &group_id),
-        )
+        // Keep the second rendezvous unpolled while all three real commands
+        // answer. Their typed results and unchanged durable invite state are
+        // the proof; the outer timeout only bounds a hang.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let accept_error = runtime
+                .accept_group_invite("bob", &group_id)
+                .await
+                .expect_err("accept cannot start while catch-up owns the account client");
+            assert!(matches!(accept_error, AppError::AccountWorkerBusy));
+            let unknown_offer = cgka_traits::MessageId::new(vec![0x75; 32]);
+            let confirm_error = runtime
+                .confirm_group_rejoin("bob", &unknown_offer, &[0; 32])
+                .await
+                .expect_err("confirm must not start during catch-up");
+            assert!(matches!(confirm_error, AppError::AccountWorkerBusy));
+            let decline_error = runtime
+                .decline_group_rejoin("bob", &unknown_offer)
+                .await
+                .expect_err("decline must not start during catch-up");
+            assert!(matches!(decline_error, AppError::AccountWorkerBusy));
+            assert!(
+                app.group("bob", &group_id_hex)
+                    .unwrap()
+                    .expect("invite remains visible")
+                    .pending_confirmation,
+                "busy means the accept mutation definitely did not run"
+            );
+        })
         .await
-        .expect("accept must answer promptly while catch-up is pinned")
-        .expect_err("accept cannot start while catch-up owns the account client");
-        assert!(matches!(accept_error, AppError::AccountWorkerBusy));
-        let unknown_offer = cgka_traits::MessageId::new(vec![0x75; 32]);
-        let confirm_error = tokio::time::timeout(
-            Duration::from_millis(250),
-            runtime.confirm_group_rejoin("bob", &unknown_offer, &[0; 32]),
-        )
-        .await
-        .expect("confirm must answer promptly during catch-up")
-        .expect_err("confirm must not start during catch-up");
-        assert!(matches!(confirm_error, AppError::AccountWorkerBusy));
-        let decline_error = tokio::time::timeout(
-            Duration::from_millis(250),
-            runtime.decline_group_rejoin("bob", &unknown_offer),
-        )
-        .await
-        .expect("decline must answer promptly during catch-up")
-        .expect_err("decline must not start during catch-up");
-        assert!(matches!(decline_error, AppError::AccountWorkerBusy));
-        assert!(
-            app.group("bob", &group_id_hex)
-                .unwrap()
-                .expect("invite remains visible")
-                .pending_confirmation,
-            "busy means the accept mutation definitely did not run"
-        );
+        .expect("invite decisions must answer while catch-up remains held");
 
         tokio::time::timeout(Duration::from_secs(5), pin.wait())
             .await
@@ -4932,18 +3742,37 @@ async fn concurrent_invites_keep_projections_readable_body() {
     let alice_group = runtime
         .create_group("alice", "alice invite", &[], None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let bob_group = runtime
         .create_group("bob", "bob invite", &[], None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    // A create catch-up must not consume either invite's one-shot hold.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while runtime
+            .shared_services()
+            .app_performance_telemetry()
+            .snapshot()
+            .group_create_post_mutation_catch_up
+            .attempts
+            != 2
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("both group creation catch-ups should finish before the invites");
     // Hold each invite at its first publication so both mutations overlap
     // before either detached catch-up can start.
     relay.block_next_publishes(2);
     let alice_runtime = runtime.clone();
     let alice_group_for_invite = alice_group.clone();
     let bob_account_id = bob.account_id_hex.clone();
-    let alice_invite = tokio::spawn(async move {
+    let alice_invite = async {
         alice_runtime
             .invite_members(
                 "alice",
@@ -4951,11 +3780,12 @@ async fn concurrent_invites_keep_projections_readable_body() {
                 std::slice::from_ref(&bob_account_id),
             )
             .await
-    });
+    };
+    tokio::pin!(alice_invite);
     let bob_runtime = runtime.clone();
     let bob_group_for_invite = bob_group.clone();
     let alice_account_id = alice.account_id_hex.clone();
-    let bob_invite = tokio::spawn(async move {
+    let bob_invite = async {
         bob_runtime
             .invite_members(
                 "bob",
@@ -4963,59 +3793,75 @@ async fn concurrent_invites_keep_projections_readable_body() {
                 std::slice::from_ref(&alice_account_id),
             )
             .await
-    });
-    tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        relay.wait_for_blocked_publishes(2),
-    )
+    };
+    tokio::pin!(bob_invite);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            _ = &mut alice_invite => panic!("alice invite must wait for its held publication"),
+            _ = &mut bob_invite => panic!("bob invite must wait for its held publication"),
+            _ = relay.wait_for_blocked_publishes(2) => {},
+        }
+    })
     .await
     .expect("both concurrent invites should reach publication");
+
+    let alice_pin = Arc::new(tokio::sync::Barrier::new(2));
+    runtime
+        .shared_services()
+        .set_next_catch_up_barrier(&alice.account_id_hex, alice_pin.clone());
     relay.release_publish();
-    let (alice_result, bob_result) =
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            tokio::join!(alice_invite, bob_invite)
+
+    // Both worker mutations have overlapped. Only poll Alice's public response
+    // until her detached catch-up consumes the single hold slot. Bob's worker
+    // can finish, but his unpolled response cannot dispatch its catch-up yet.
+    let (alice_result, _) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(&mut alice_invite, alice_pin.wait())
+    })
+    .await
+    .expect("alice invite must return while its detached catch-up is held");
+    alice_result.expect("alice invite should succeed");
+    let bob_pin = Arc::new(tokio::sync::Barrier::new(2));
+    runtime
+        .shared_services()
+        .set_next_catch_up_barrier(&bob.account_id_hex, bob_pin.clone());
+    let (bob_result, _) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(&mut bob_invite, bob_pin.wait())
+    })
+    .await
+    .expect("bob invite must return while its detached catch-up is held");
+    bob_result.expect("bob invite should succeed");
+
+    // Neither second rendezvous is polled until all reads have completed.
+    // The real held catch-ups prove ordering; this timeout only bounds a hang.
+    let (alice_members, alice_state, bob_members, bob_state) =
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let alice_members = runtime.group_members("alice", &alice_group).await?;
+            let alice_state = runtime.group_mls_state("alice", &alice_group).await?;
+            let bob_members = runtime.group_members("bob", &bob_group).await?;
+            let bob_state = runtime.group_mls_state("bob", &bob_group).await?;
+            Ok::<_, AppError>((alice_members, alice_state, bob_members, bob_state))
         })
         .await
-        .expect("both confirmed invites should return while detached catch-up is coordinated");
-    alice_result
-        .expect("alice invite task should not panic")
-        .expect("alice invite should succeed");
-    bob_result
-        .expect("bob invite task should not panic")
-        .expect("bob invite should succeed");
-
-    let alice_members = tokio::time::timeout(
-        std::time::Duration::from_millis(250),
-        runtime.group_members("alice", &alice_group),
-    )
-    .await
-    .expect("alice members must not queue behind concurrent invite catch-up")
-    .expect("alice members should succeed");
-    let alice_state = tokio::time::timeout(
-        std::time::Duration::from_millis(250),
-        runtime.group_mls_state("alice", &alice_group),
-    )
-    .await
-    .expect("alice MLS state must not queue behind concurrent invite catch-up")
-    .expect("alice MLS state should succeed");
-    let bob_members = tokio::time::timeout(
-        std::time::Duration::from_millis(250),
-        runtime.group_members("bob", &bob_group),
-    )
-    .await
-    .expect("bob members must not queue behind concurrent invite catch-up")
-    .expect("bob members should succeed");
-    let bob_state = tokio::time::timeout(
-        std::time::Duration::from_millis(250),
-        runtime.group_mls_state("bob", &bob_group),
-    )
-    .await
-    .expect("bob MLS state must not queue behind concurrent invite catch-up")
-    .expect("bob MLS state should succeed");
+        .expect("both accounts must answer projection reads while both catch-ups are held")
+        .expect("both accounts' projection reads should succeed");
     assert_eq!(alice_members.len(), 2);
     assert_eq!(alice_state.member_count, 2);
     assert_eq!(bob_members.len(), 2);
     assert_eq!(bob_state.member_count, 2);
+    let before_release = runtime
+        .shared_services()
+        .app_performance_telemetry()
+        .snapshot();
+    assert_eq!(before_release.group_invite_members.successes, 2);
+    assert_eq!(
+        before_release.group_invite_post_mutation_catch_up.successes,
+        0
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(alice_pin.wait(), bob_pin.wait())
+    })
+    .await
+    .expect("both held catch-ups should accept their release");
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             if runtime
@@ -5052,7 +3898,9 @@ async fn local_ready_send_pending_on_activation_failure_body() {
     let group_id = setup_client
         .create_group("local-ready send", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     drop(setup_client);
     let publishes_before_runtime = relay.published_event_ids().len();
 
@@ -5204,7 +4052,9 @@ async fn local_ready_queued_send_ordering_body() {
     let group_id = setup_client
         .create_group("local-ready ordering", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     drop(setup_client);
     let publishes_before_runtime = relay.published_event_ids().len();
 
@@ -5334,7 +4184,9 @@ async fn locally_queued_send_restart_body() {
     let group_id = setup_client
         .create_group("local-ready restart", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     drop(setup_client);
 
     relay.block_and_fail_next_subscribe();
@@ -5418,7 +4270,9 @@ async fn disable_native_push_removal_body() {
     runtime
         .create_group("alice", "alpha", &[], None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     runtime
         .set_native_push_enabled("alice", true)
         .await
@@ -5485,8 +4339,18 @@ async fn push_registration_update_retry_survives_failure_partial_success_and_res
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(relay.clone());
     let mut client = app.client("alice").await.unwrap();
-    client.create_group("alpha", &[]).await.unwrap();
-    client.create_group("beta", &[]).await.unwrap();
+    client
+        .create_group("alpha", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    client
+        .create_group("beta", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     app.set_native_push_enabled("alice", true).unwrap();
     let server_pubkey_hex = nostr::prelude::Keys::generate().public_key().to_hex();
     app.upsert_push_registration(
@@ -5552,8 +4416,18 @@ async fn foreground_push_registration_preserves_completed_gossip_after_reopen() 
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(relay.clone());
     let mut client = app.client("alice").await.unwrap();
-    client.create_group("alpha", &[]).await.unwrap();
-    client.create_group("beta", &[]).await.unwrap();
+    client
+        .create_group("alpha", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    client
+        .create_group("beta", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     app.set_native_push_enabled("alice", true).unwrap();
     let server = nostr::prelude::Keys::generate().public_key().to_hex();
     let first = client
@@ -5657,7 +4531,9 @@ async fn push_registration_idle_retry_body() {
     runtime
         .create_group("alice", "alpha", &[], None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     runtime
         .set_native_push_enabled("alice", true)
         .await
@@ -5719,7 +4595,9 @@ async fn push_registration_local_projection_body() {
     let group_id = runtime
         .create_group("alice", "alpha", &[], None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     runtime
         .set_native_push_enabled("alice", true)
         .await
@@ -5782,7 +4660,9 @@ async fn local_group_wipe_push_removal_body() {
     let group_id = runtime
         .create_group("alice", "alpha", &[], None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     runtime
         .set_native_push_enabled("alice", true)
         .await
@@ -5853,12 +4733,67 @@ async fn failed_leave_push_compensation_body() {
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(relay.clone());
-    let runtime = Arc::new(MarmotAppRuntime::new(app.clone()));
-    runtime.reconcile_accounts().await.unwrap();
-    let group_id = runtime
-        .create_group("alice", "alpha", &[], None)
+    let alice = app.account_home().account("alice").unwrap().account_id_hex;
+    let plane = MarmotRelayPlane::new(None, relay.clone());
+    let mut alice_client = app
+        .client_with_relay_plane("alice", &plane, None)
         .await
         .unwrap();
+    alice_client.publish_key_package().await.unwrap();
+    let bob_dir = tempfile::tempdir().unwrap();
+    AccountHome::open(bob_dir.path())
+        .create_account("bob")
+        .unwrap();
+    let bob_app = MarmotApp::with_relay(bob_dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    remember_test_member_inbox(&bob_app, &alice, "wss://relay.example");
+    let mut bob = bob_app
+        .client_with_relay_plane("bob", &plane, None)
+        .await
+        .unwrap();
+    let group_id = bob
+        .create_group("alpha", &[alice.as_str()])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    assert!(
+        alice_client
+            .sync()
+            .await
+            .unwrap()
+            .joined_groups
+            .contains(&group_id),
+        "Alice must really join as a nonadmin before the compensation phase"
+    );
+    alice_client.accept_group_invite(&group_id).unwrap();
+    // The external inviter has completed its only task. Release its client
+    // and close its separately owned account store before the worker phase.
+    drop(bob);
+    bob_app.close_storage().unwrap();
+    drop(bob_app);
+    assert!(
+        !alice_client
+            .runtime
+            .admin_pubkeys(&group_id)
+            .unwrap()
+            .iter()
+            .any(|key| hex::encode(key) == alice)
+    );
+    drop(alice_client);
+    drop(plane);
+    use cgka_traits::storage::GroupStorage as _;
+    let store = app.account_storage("alice").unwrap();
+    let admission = store.invitation_admission(&group_id).unwrap().unwrap();
+    assert!(
+        store
+            .app_storage()
+            .invitation_decision(&hex::encode(group_id.as_slice()), &admission.generation)
+            .unwrap()
+            .is_none()
+    );
+    let runtime = Arc::new(MarmotAppRuntime::new(app.clone()));
+    runtime.reconcile_accounts().await.unwrap();
     runtime
         .set_native_push_enabled("alice", true)
         .await
@@ -5874,20 +4809,50 @@ async fn failed_leave_push_compensation_body() {
         .await
         .unwrap();
 
-    relay.block_next_publish();
+    // Startup or maintenance may publish before the Leave command runs.
+    // Hold every publication until the departure's real removal row exists,
+    // releasing only earlier work rather than assuming the first send is it.
+    relay.block_next_publishes(usize::MAX);
     let runtime_for_leave = runtime.clone();
     let group_id_for_leave = group_id.clone();
-    let leave = tokio::spawn(async move {
+    let mut leave = tokio::spawn(async move {
         runtime_for_leave
             .leave_group("alice", &group_id_for_leave)
             .await
     });
-    tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        relay.wait_for_blocked_publish(),
-    )
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut blocked_count = 1;
+        loop {
+            tokio::select! {
+                result = &mut leave => {
+                    panic!("Leave ended before its held token removal: {result:?}");
+                }
+                _ = relay.wait_for_blocked_publishes(blocked_count) => {}
+            }
+            if !app
+                .pending_push_registration_removals("alice")
+                .unwrap()
+                .is_empty()
+            {
+                break;
+            }
+            blocked_count = relay
+                .blocked_publish_count
+                .load(std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            relay.release_publish();
+        }
+    })
     .await
-    .unwrap();
+    .expect("the departure must queue its removal while publication is held");
+    // Earlier setup traffic must not count as removal or compensation.
+    let before_group_publications = relay
+        .published_events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| event.kind == transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE)
+        .count();
     assert_eq!(
         app.pending_push_registration_removals("alice")
             .unwrap()
@@ -5903,15 +4868,50 @@ async fn failed_leave_push_compensation_body() {
         "the local projection must remain intact until removal publishes"
     );
 
+    // A real native persistence failure after successful token removal must
+    // retain the compensation contract independently of admin refusal policy.
+    let path = app.account_storage_path("alice");
+    let keys = app.account_home().load_signing_keys("alice").unwrap();
+    let key = app
+        .sqlcipher_key("alice", &keys, &path, SqlcipherDatabaseKind::Session)
+        .unwrap();
+    storage_sqlite::expect_uncounted_writes_for_test(&path);
+    let db = rusqlite::Connection::open(path).unwrap();
+    storage_sqlite::open_hardened_sqlcipher(
+        &db,
+        &key,
+        storage_sqlite::SqlCipherHardening::cipher_only(),
+    )
+    .unwrap();
+    db.execute_batch("CREATE TRIGGER reject_native_leave BEFORE INSERT ON openmls_values WHEN NEW.label = CAST('ProposalQueueRefs' AS BLOB) BEGIN SELECT RAISE(FAIL, 'native leave proposal checkpoint held'); END;").unwrap();
+    relay.block_next_publishes(0);
     relay.release_publish();
-    assert!(matches!(
-        leave.await.unwrap(),
-        Err(AppError::Account(marmot_account::AccountError::Session(
-            cgka_session::SessionError::Engine(
-                cgka_traits::EngineError::AdminCannotSelfRemove { .. }
-            )
-        )))
-    ));
+    let error = leave.await.unwrap().unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("native leave proposal checkpoint held"),
+        "{error}"
+    );
+    db.execute_batch("DROP TRIGGER reject_native_leave")
+        .unwrap();
+    assert_eq!(
+        db.query_row("SELECT COUNT(*) FROM cgka_leave_requests", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT COUNT(*) FROM openmls_values WHERE label = CAST('QueuedProposal' AS BLOB)",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0,
+        "the failed proposal queue transaction must not admit a departure"
+    );
+    drop(db);
     assert!(
         app.pending_push_registration_removals("alice")
             .unwrap()
@@ -5924,7 +4924,211 @@ async fn failed_leave_push_compensation_body() {
         1,
         "a failed leave must compensate by re-publishing the current registration"
     );
+    assert!(
+        relay
+            .published_events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.kind == transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE)
+            .count()
+            >= before_group_publications + 2,
+        "token removal and compensation must both actually publish"
+    );
+    assert!(
+        store
+            .app_storage()
+            .invitation_decision(&hex::encode(group_id.as_slice()), &admission.generation)
+            .unwrap()
+            .is_none(),
+        "without a trusted device group, UserLeave creates no replicated decline"
+    );
     runtime.shutdown().await;
+}
+
+/// Without device groups an admin's Leave is refused as before 0.15, even
+/// with another admin: before any push token removal, durable leave request,
+/// `Left` projection or publication. After the host demotes the account,
+/// Leave goes through (mdk#3014 interim).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_admin_leave_without_device_groups_waits_for_the_host_demotion() {
+    use cgka_traits::storage::LeaveRequestStorage as _;
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    assert!(!app.admin_leave_steps_down());
+    let bob_dir = tempfile::tempdir().unwrap();
+    let bob_id = AccountHome::open(bob_dir.path())
+        .create_account("bob")
+        .unwrap()
+        .account_id_hex;
+    let bob_app = MarmotApp::with_relay(bob_dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    bob_app
+        .client("bob")
+        .await
+        .unwrap()
+        .publish_key_package()
+        .await
+        .unwrap();
+    remember_test_member_inbox(&app, &bob_id, "wss://relay.example");
+    let mut alice = app.client("alice").await.unwrap();
+    let solo = alice
+        .create_group("solo", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    let group_id = alice
+        .create_group("coadmins", &[&bob_id])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    alice.promote_admin(&group_id, &bob_id).await.unwrap();
+    let group_hex = hex::encode(group_id.as_slice());
+    // A shared token would be withdrawn before a departure: a refusal after
+    // that withdrawal publishes it.
+    app.set_native_push_enabled("alice", true).unwrap();
+    let server = nostr::prelude::Keys::generate().public_key().to_hex();
+    alice
+        .upsert_and_share_push_registration(PushPlatform::Fcm, "opaque-token", &server, None)
+        .await
+        .unwrap();
+    assert_eq!(app.group_push_tokens("alice", &group_hex).unwrap().len(), 1);
+    let store = app.account_storage("alice").unwrap();
+    let published = relay.published_events.lock().unwrap().len();
+
+    // The last admin gets the same refusal as a coadmin.
+    for group in [&solo, &group_id] {
+        let refused = alice.leave_group(group).await.unwrap_err();
+        assert!(
+            matches!(
+                refused.as_engine_error(),
+                Some(cgka_traits::EngineError::AdminCannotSelfRemove { .. })
+            ),
+            "{refused}"
+        );
+        assert!(store.leave_request(group).unwrap().is_none());
+        assert_eq!(
+            app.group("alice", &hex::encode(group.as_slice()))
+                .unwrap()
+                .unwrap()
+                .self_membership,
+            SelfMembership::Member
+        );
+    }
+    assert!(
+        app.pending_push_registration_removals("alice")
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(app.group_push_tokens("alice", &group_hex).unwrap().len(), 1);
+    assert_eq!(
+        relay.published_events.lock().unwrap().len(),
+        published,
+        "no token removal, step-down or departure goes out"
+    );
+
+    alice.self_demote_admin(&group_id).await.unwrap();
+    alice.leave_group(&group_id).await.unwrap();
+    assert!(store.leave_request(&group_id).unwrap().is_some());
+    assert_eq!(
+        app.group("alice", &group_hex)
+            .unwrap()
+            .unwrap()
+            .self_membership,
+        SelfMembership::Left
+    );
+}
+
+/// Declining an invitation is a Leave: without device groups an invitee made
+/// an admin by the invite is refused the same way, with the invitation still
+/// pending, until it demotes itself (mdk#3014 interim).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_admin_invitee_without_device_groups_demotes_before_declining() {
+    use cgka_traits::storage::LeaveRequestStorage as _;
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let bob = home.create_account("bob").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    assert!(!app.admin_leave_steps_down());
+    remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
+    let plane = MarmotRelayPlane::new(None, relay.clone());
+    let mut alice = app
+        .client_with_relay_plane("alice", &plane, None)
+        .await
+        .unwrap();
+    let mut bob_client = app
+        .client_with_relay_plane("bob", &plane, None)
+        .await
+        .unwrap();
+    bob_client.sync().await.unwrap();
+    let group_id = alice
+        .create_group_with_options(
+            "Invite",
+            &[&bob.account_id_hex],
+            AppCreateGroupOptions {
+                initial_admins: vec![bob.account_id_hex.clone()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    assert!(
+        bob_client
+            .sync()
+            .await
+            .unwrap()
+            .joined_groups
+            .contains(&group_id)
+    );
+    let group_hex = hex::encode(group_id.as_slice());
+    assert!(
+        app.group("bob", &group_hex)
+            .unwrap()
+            .unwrap()
+            .pending_confirmation
+    );
+    let store = app.account_storage("bob").unwrap();
+    let published = relay.published_events.lock().unwrap().len();
+
+    let refused = bob_client
+        .decline_group_invite(&group_id)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            refused.as_engine_error(),
+            Some(cgka_traits::EngineError::AdminCannotSelfRemove { .. })
+        ),
+        "{refused}"
+    );
+    assert!(store.leave_request(&group_id).unwrap().is_none());
+    let pending = app.group("bob", &group_hex).unwrap().unwrap();
+    assert!(pending.pending_confirmation);
+    assert_eq!(pending.self_membership, SelfMembership::Member);
+    assert_eq!(relay.published_events.lock().unwrap().len(), published);
+
+    bob_client.self_demote_admin(&group_id).await.unwrap();
+    bob_client.decline_group_invite(&group_id).await.unwrap();
+    assert!(store.leave_request(&group_id).unwrap().is_some());
+    assert_eq!(
+        app.group("bob", &group_hex)
+            .unwrap()
+            .unwrap()
+            .self_membership,
+        SelfMembership::Left
+    );
 }
 
 #[test]
@@ -5937,15 +5141,20 @@ fn sole_admin_self_demote_surfaces_the_admin_policy_refusal() {
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
-        let group_id = client.create_group("sole admin", &[]).await.unwrap();
+        let group_id = client
+            .create_group("sole admin", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
 
         // Alice is the only admin, so demoting herself would leave the group
         // with none. The host must receive that as the admin-policy refusal it
         // is, not as a payload-encoding fault.
         let err = client.self_demote_admin(&group_id).await.err().unwrap();
         match err {
-            AppError::Account(marmot_account::AccountError::Session(
-                cgka_session::SessionError::Engine(cgka_traits::EngineError::AdminDepletion {
+            AppError::Account(marmot_session::AccountError::Session(
+                marmot_session::SessionError::Engine(cgka_traits::EngineError::AdminDepletion {
                     ..
                 }),
             )) => {}
@@ -5974,11 +5183,15 @@ async fn push_registration_removal_retry_body() {
     runtime
         .create_group("alice", "alpha", &[], None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     runtime
         .create_group("alice", "beta", &[], None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     runtime
         .set_native_push_enabled("alice", true)
         .await
@@ -7144,12 +6357,19 @@ async fn generated_identity_returns_before_bootstrap_publication_unblocks() {
     );
     assert!(result.profile.is_some());
     assert_eq!(result.readiness, AccountSetupReadiness::LocalReady);
-    assert_eq!(
-        runtime
+    // The background setup task records its publication phase on its own
+    // schedule; it can trail the worker's blocked KeyPackage publish.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while runtime
             .account_setup_readiness(&result.account.account_id_hex)
-            .unwrap(),
-        AccountSetupReadiness::Publishing
-    );
+            .unwrap()
+            != AccountSetupReadiness::Publishing
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("background setup must report publication while it is blocked");
     let lifecycle = app
         .account_storage(&result.account.label)
         .unwrap()
@@ -7215,7 +6435,7 @@ async fn local_ready_result_does_not_report_an_unrequested_key_package_publicati
     #[cfg(feature = "product-analytics-export")]
     let app = {
         let mut app = app;
-        app.product_analytics = crate::product_analytics::test_product_collector();
+        app.product_analytics = marmot_observability::test_product_collector();
         app.set_usage_diagnostics_consent(true).unwrap();
         app
     };
@@ -8115,6 +7335,47 @@ async fn key_package_cutover_retains_current_cache_without_scheduling_replacemen
     assert!(!app.key_package_cutover_replacement_pending(&account.label));
 }
 
+/// A published current-profile KeyPackage that predates a newly supported
+/// component is still joinable: the runtime replaces it in its slot and keeps
+/// its key for the grace, so the cutover cleanup must not delete it first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn key_package_cutover_leaves_a_cache_missing_a_new_component_to_slot_replacement() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(directory.path());
+    let account = home.create_account("before-account-devices").unwrap();
+    let app = MarmotApp::with_relay(directory.path(), "wss://relay.example");
+    let before_account_devices = app
+        .supported_app_component_ids()
+        .into_iter()
+        .filter(|id| *id != cgka_traits::app_components::ACCOUNT_DEVICES_COMPONENT_ID)
+        .collect();
+    let published =
+        fresh_key_package_with_components(&app, &account, false, before_account_devices).await;
+    let metadata = cgka_engine::key_package::key_package_metadata(&published).unwrap();
+    let record_path = app.key_package_record_path(&account.label);
+    write_json(
+        &record_path,
+        &KeyPackageRecord {
+            account_label: account.label.clone(),
+            account_id_hex: account.account_id_hex,
+            key_package_id: "published-slot".into(),
+            key_package_ref_hex: metadata.key_package_ref_hex,
+            key_package_event_id: "33".repeat(32),
+            published_at: 1,
+            key_package_hex: hex::encode(published.bytes()),
+        },
+    )
+    .unwrap();
+
+    assert!(
+        !app.retire_cached_non_current_key_package(&account.label)
+            .await,
+        "a joinable KeyPackage is replaced in its slot, never deleted first"
+    );
+    assert!(record_path.exists());
+    assert!(!app.key_package_cutover_replacement_pending(&account.label));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn key_package_cutover_imports_stable_slot_before_cache_retirement() {
     let directory = tempfile::tempdir().unwrap();
@@ -8896,7 +8157,7 @@ async fn cached_retired_inbox_with_failed_refresh_remains_retryable() {
         .await
         .expect_err("a failed refresh cannot use a retired-only cached inbox");
     assert!(
-        matches!(error, DirectoryError::DirectoryLookupIncomplete(ref id) if *id == account_id),
+        matches!(error, DirectoryError::RelayDirectory(_)),
         "{error:?}"
     );
 
@@ -9122,7 +8383,9 @@ async fn runtime_group_create_resolves_local_member_aliases_with_fresh_relay_pac
                 AppCreateGroupOptions::default(),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let roster = runtime.group_members("creator", &group).await.unwrap();
         assert_eq!(roster.len(), 2);
         assert!(
@@ -9135,10 +8398,119 @@ async fn runtime_group_create_resolves_local_member_aliases_with_fresh_relay_pac
     drop(directory);
 }
 
+/// Reject non-member admins before lookup and verify valid grants and audit context.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_group_create_sets_founding_admins_and_rejects_non_members() {
+    let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+    app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
+        .unwrap();
+    let member = &accounts[0];
+    let creator = app.account_home().create_account("creator").unwrap();
+    let outsider = app.account_home().create_account("outsider").unwrap();
+    let runtime = MarmotAppRuntime::new(app.clone());
+    let requests_before = fetcher.requests.lock().unwrap().len();
+    let result = runtime
+        .create_group_with_options(
+            "creator",
+            "Invalid admins",
+            std::slice::from_ref(&member.account_id_hex),
+            AppCreateGroupOptions {
+                initial_admins: vec![outsider.account_id_hex],
+                initial_image: Some(AppInitialGroupImage {
+                    plaintext: vec![1, 2, 3],
+                    media_type: "image/png".into(),
+                    source_url: None,
+                    dim: None,
+                    thumbhash: None,
+                }),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert_eq!(
+        result.unwrap_err().privacy_safe_kind(),
+        "group_create_admin_not_member"
+    );
+    assert_eq!(
+        fetcher.requests.lock().unwrap().len(),
+        requests_before,
+        "Invalid admins must fail before member lookup, image upload, or MLS creation"
+    );
+    assert!(app.groups("creator").unwrap().is_empty());
+    for reference in [
+        member.label.clone(),
+        member.account_id_hex.clone(),
+        npub_for_account_id_lossy(&member.account_id_hex),
+    ] {
+        let group_id = runtime
+            .create_group_with_options(
+                "creator",
+                "Founding admins",
+                std::slice::from_ref(&member.account_id_hex),
+                AppCreateGroupOptions {
+                    initial_admins: vec![reference],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
+        let group = app
+            .group("creator", &hex::encode(group_id.as_slice()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            group
+                .admin_policy
+                .admins
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>(),
+            std::collections::HashSet::from([
+                creator.account_id_hex.clone(),
+                member.account_id_hex.clone()
+            ])
+        );
+    }
+    let rows = app
+        .audit_log_files()
+        .unwrap()
+        .into_iter()
+        .flat_map(|file| {
+            std::fs::read_to_string(file.path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .collect::<Vec<_>>()
+        })
+        .filter(|row| row["event"]["type"] == "create_group_entry")
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 3);
+    for row in rows {
+        let context = &row["event"]["record_context"]["human_action"];
+        assert!(
+            context["fields"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("admins"))
+        );
+        assert!(
+            context["component_ids"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!(
+                    cgka_traits::app_components::GROUP_ADMIN_POLICY_COMPONENT_ID
+                ))
+        );
+    }
+    runtime.shutdown_and_close().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn runtime_group_create_rejects_creator_aliases_before_group_mutation() {
-    let (_directory, app, accounts, _fetcher) = member_resolution_fixture(1, false).await;
+    let (_directory, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
     let creator = &accounts[0];
+    fetcher.events.lock().unwrap().clear();
     let runtime = MarmotAppRuntime::new(app.clone());
     for reference in [
         creator.label.clone(),
@@ -9159,6 +8531,7 @@ async fn runtime_group_create_rejects_creator_aliases_before_group_mutation() {
         );
         assert!(app.groups(&creator.label).unwrap().is_empty());
     }
+    assert!(fetcher.requests.lock().unwrap().is_empty());
     // Empty rosters remain valid: the creator is included implicitly by MLS.
     let group = runtime
         .create_group_with_options(
@@ -9168,7 +8541,9 @@ async fn runtime_group_create_rejects_creator_aliases_before_group_mutation() {
             AppCreateGroupOptions::default(),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert_eq!(
         runtime
             .group_members(&creator.label, &group)
@@ -9306,14 +8681,20 @@ async fn create_group_with_key_package_but_no_inbox_route_fails_before_group_cre
         .unwrap();
     let mut client = app.client(&inviter.label).await.unwrap();
 
-    let error = client
+    let result = client
         .create_group("create route readiness", &[account_id.as_str()])
         .await
-        .expect_err("a KeyPackage alone must not create a founding Add commit");
-    assert!(matches!(
-        error,
-        AppError::MissingMemberInboxRoute(ref recipient) if recipient == &account_id
-    ));
+        .unwrap();
+    assert_eq!(result.operation, None);
+    assert_eq!(
+        result.member_outcomes,
+        vec![MemberResolutionOutcome {
+            account_id_hex: account_id.clone(),
+            status: MemberResolutionStatus::MissingInboxRoute,
+            selected_device_count: 0,
+        }]
+    );
+    assert!(client.runtime.live_group_ids().unwrap().is_empty());
     assert!(
         app.groups(&inviter.label).unwrap().is_empty(),
         "route readiness must fail before a group is persisted"
@@ -9334,7 +8715,9 @@ async fn create_group_with_key_package_but_no_inbox_route_fails_before_group_cre
     let group_id = client
         .create_group("create route readiness", &[account_id.as_str()])
         .await
-        .expect("the explicit retry should refetch the unconsumed KeyPackage");
+        .expect("the explicit retry should refetch the unconsumed KeyPackage")
+        .operation
+        .expect("the recipient now has a route");
     assert_eq!(client.group_mls_state(&group_id).unwrap().member_count, 2);
     assert!(fetcher.requests.lock().unwrap().iter().any(|request| {
         request
@@ -9345,70 +8728,342 @@ async fn create_group_with_key_package_but_no_inbox_route_fails_before_group_cre
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-/// A mixed roster fails atomically without consuming any valid KeyPackage.
-async fn mixed_invite_route_readiness_does_not_consume_key_packages_or_mutate_membership() {
+/// Only routeable accounts enter the roster; unavailable accounts stay retryable.
+async fn partial_invite_route_retry() {
     let (directory, app, accounts, fetcher) = member_resolution_fixture(2, false).await;
-    let missing_inbox_account = accounts[1].account_id_hex.clone();
-    fetcher.events.lock().unwrap().retain(|event| {
-        event.kind != KIND_MARMOT_INBOX_RELAY_LIST || event.pubkey != missing_inbox_account
-    });
-
+    let missing = accounts[1].account_id_hex.clone();
+    fetcher
+        .events
+        .lock()
+        .unwrap()
+        .retain(|event| event.kind != KIND_MARMOT_INBOX_RELAY_LIST || event.pubkey != missing);
     let inviter = AccountHome::open(directory.path())
         .create_account("route-readiness-inviter")
         .unwrap();
     let mut client = app.client(&inviter.label).await.unwrap();
-    let group_id = client
-        .create_group("atomic route readiness", &[])
+    let group = client
+        .create_group("partial route readiness", &[])
+        .await
+        .unwrap()
+        .operation
+        .unwrap();
+    let before_epoch = client.group_mls_state(&group).unwrap().epoch;
+    let refs = [
+        accounts[0].account_id_hex.as_str(),
+        missing.as_str(),
+        accounts[0].account_id_hex.as_str(),
+    ];
+    let result = client.invite_members(&group, &refs).await.unwrap();
+    assert_eq!(
+        result.operation.unwrap().accept_disposition,
+        cgka_traits::SendAcceptDisposition::Published
+    );
+    assert_eq!(
+        result.member_outcomes,
+        vec![
+            MemberResolutionOutcome {
+                account_id_hex: accounts[0].account_id_hex.clone(),
+                status: MemberResolutionStatus::Selected,
+                selected_device_count: 1
+            },
+            MemberResolutionOutcome {
+                account_id_hex: missing.clone(),
+                status: MemberResolutionStatus::MissingInboxRoute,
+                selected_device_count: 0
+            },
+        ]
+    );
+    let mut roster = client
+        .members(&group)
+        .unwrap()
+        .into_iter()
+        .map(|member| member.member_id_hex)
+        .collect::<Vec<_>>();
+    roster.sort();
+    let mut expected = vec![inviter.account_id_hex, accounts[0].account_id_hex.clone()];
+    expected.sort();
+    assert_eq!(roster, expected);
+    let after_epoch = client.group_mls_state(&group).unwrap().epoch;
+    assert_eq!(after_epoch, before_epoch + 1);
+    let before_refusal = client.group_mls_state(&group).unwrap();
+    client.invite_members(&group, &refs).await.unwrap_err();
+    assert_eq!(client.group_mls_state(&group).unwrap(), before_refusal);
+    let none = client
+        .invite_members(&group, &[missing.as_str()])
         .await
         .unwrap();
-    let member_refs = accounts
-        .iter()
-        .map(|account| account.account_id_hex.as_str())
-        .collect::<Vec<_>>();
-
-    let error = client
-        .invite_members(&group_id, &member_refs)
-        .await
-        .expect_err("one unrouteable member must reject the whole invite");
-    assert!(matches!(
-        error,
-        AppError::MissingMemberInboxRoute(ref recipient)
-            if recipient == &missing_inbox_account
-    ));
+    assert_eq!(none.operation, None);
     assert_eq!(
-        client.group_mls_state(&group_id).unwrap().member_count,
-        1,
-        "route readiness must fail before the MLS roster changes"
+        none.member_outcomes,
+        vec![MemberResolutionOutcome {
+            account_id_hex: missing.clone(),
+            status: MemberResolutionStatus::MissingInboxRoute,
+            selected_device_count: 0
+        }]
     );
-
+    assert_eq!(client.group_mls_state(&group).unwrap().epoch, after_epoch);
+    client.invite_members(&group, &[]).await.unwrap_err();
+    assert_eq!(client.group_mls_state(&group).unwrap().epoch, after_epoch);
     fetcher
         .events
         .lock()
         .unwrap()
         .push(NostrTransportEvent::new_unsigned(
-            missing_inbox_account,
+            missing.clone(),
             KIND_MARMOT_INBOX_RELAY_LIST,
             vec![vec!["relay".into(), "wss://shared.example".into()]],
             String::new(),
         ));
     fetcher.requests.lock().unwrap().clear();
-
-    client
-        .invite_members(&group_id, &member_refs)
+    let retry = client
+        .invite_members(&group, &[missing.as_str()])
         .await
-        .expect("the explicit retry should refetch both unconsumed KeyPackages");
-    assert_eq!(client.group_mls_state(&group_id).unwrap().member_count, 3);
-    assert!(
-        fetcher
-            .requests
-            .lock()
-            .unwrap()
+        .unwrap();
+    assert!(retry.operation.is_some());
+    assert_eq!(
+        retry.member_outcomes,
+        vec![MemberResolutionOutcome {
+            account_id_hex: missing,
+            status: MemberResolutionStatus::Selected,
+            selected_device_count: 1
+        }]
+    );
+    assert_eq!(client.group_mls_state(&group).unwrap().member_count, 3);
+    assert!(fetcher.requests.lock().unwrap().iter().any(|request| {
+        request
+            .queries
             .iter()
-            .any(|request| request
-                .queries
-                .iter()
-                .any(|query| query.kind == KIND_MARMOT_KEY_PACKAGE)),
-        "the retry must refetch packages even though failed preflight did not consume them"
+            .any(|query| query.kind == KIND_MARMOT_KEY_PACKAGE)
+    }));
+    let before_fault = client.group_mls_state(&group).unwrap();
+    fetcher.fail_all_fetches();
+    client
+        .invite_members(&group, &[accounts[0].account_id_hex.as_str()])
+        .await
+        .expect_err("a directory resource failure is not a recipient no-op");
+    assert_eq!(client.group_mls_state(&group).unwrap(), before_fault);
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oversized_member_is_partial() {
+    for kind in [KIND_NIP65_RELAY_LIST, KIND_MARMOT_INBOX_RELAY_LIST] {
+        let (_directory, app, accounts, fetcher) = member_resolution_fixture(2, false).await;
+        let tag = if kind == KIND_NIP65_RELAY_LIST {
+            "r"
+        } else {
+            "relay"
+        };
+        for event in fetcher.events.lock().unwrap().iter_mut() {
+            if event.kind == kind && event.pubkey == accounts[1].account_id_hex {
+                event.tags = (0..17)
+                    .map(|index| vec![tag.into(), format!("wss://outbox-{index}.example")])
+                    .collect();
+            }
+        }
+        app.directory()
+            .prewarm_group_member_key_packages(&[accounts[1].account_id_hex.as_str()])
+            .await
+            .expect_err("an inadmissible route is not ready for prewarm reuse");
+        let creator = app
+            .account_home()
+            .create_account("route-cap-creator")
+            .unwrap();
+        let mut client = app.client(&creator.label).await.unwrap();
+        let result = client
+            .create_group(
+                "partial route cap",
+                &[&accounts[0].account_id_hex, &accounts[1].account_id_hex],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.member_outcomes,
+            vec![
+                MemberResolutionOutcome {
+                    account_id_hex: accounts[0].account_id_hex.clone(),
+                    status: MemberResolutionStatus::Selected,
+                    selected_device_count: 1,
+                },
+                MemberResolutionOutcome {
+                    account_id_hex: accounts[1].account_id_hex.clone(),
+                    status: MemberResolutionStatus::Incomplete,
+                    selected_device_count: 0,
+                },
+            ]
+        );
+        let group = result.operation.unwrap();
+        let mut roster = client
+            .members(&group)
+            .unwrap()
+            .into_iter()
+            .map(|member| member.member_id_hex)
+            .collect::<Vec<_>>();
+        let mut expected = vec![creator.account_id_hex, accounts[0].account_id_hex.clone()];
+        roster.sort();
+        expected.sort();
+        assert_eq!(roster, expected);
+        for event in fetcher.events.lock().unwrap().iter_mut() {
+            if event.kind == kind && event.pubkey == accounts[1].account_id_hex {
+                event.tags = vec![vec![tag.into(), "wss://shared.example".into()]];
+                event.created_at += 1;
+            }
+        }
+        let retry = client
+            .invite_members(&group, &[accounts[1].account_id_hex.as_str()])
+            .await
+            .unwrap();
+        assert!(retry.operation.is_some());
+        assert_eq!(
+            retry.member_outcomes[0].status,
+            MemberResolutionStatus::Selected
+        );
+        expected.push(accounts[1].account_id_hex.clone());
+        expected.sort();
+        let mut roster = client
+            .members(&group)
+            .unwrap()
+            .into_iter()
+            .map(|member| member.member_id_hex)
+            .collect::<Vec<_>>();
+        roster.sort();
+        assert_eq!(roster, expected);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_requires_ready_peer() {
+    let (_dir, app, accounts, fetcher) = member_resolution_fixture(1, false).await;
+    let creator = app.account_home().create_account("direct-creator").unwrap();
+    fetcher
+        .events
+        .lock()
+        .unwrap()
+        .retain(|event| event.kind != KIND_MARMOT_KEY_PACKAGE);
+    let runtime = app.runtime();
+    let result = runtime
+        .start_direct_conversation(&creator.label, &accounts[0].account_id_hex)
+        .await;
+    runtime.shutdown().await;
+    let canonical_groups = {
+        let client = app.client(&creator.label).await.unwrap();
+        client.runtime.live_group_ids().unwrap()
+    };
+    app.close_storage().unwrap();
+    assert!(matches!(result, Err(AppError::MissingKeyPackage { .. })));
+    assert!(canonical_groups.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn partial_admins_follow_members() {
+    let (_directory, app, accounts, fetcher) = member_resolution_fixture(3, false).await;
+    let creator = app
+        .account_home()
+        .create_account("partial-admin-creator")
+        .unwrap();
+    let unavailable = accounts[1].account_id_hex.clone();
+    fetcher
+        .events
+        .lock()
+        .unwrap()
+        .retain(|event| event.kind != KIND_MARMOT_INBOX_RELAY_LIST || event.pubkey != unavailable);
+    let mut client = app.client(&creator.label).await.unwrap();
+    let telemetry = marmot_observability::PerformanceRecorder::default();
+    let result = client
+        .create_group_with_options(
+            "partial admins",
+            &[&accounts[0].account_id_hex, &unavailable],
+            AppCreateGroupOptions {
+                initial_admins: vec![
+                    accounts[0].account_id_hex.clone(),
+                    unavailable.clone(),
+                    creator.label.clone(),
+                ],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        result.member_outcomes,
+        vec![
+            MemberResolutionOutcome {
+                account_id_hex: accounts[0].account_id_hex.clone(),
+                status: MemberResolutionStatus::Selected,
+                selected_device_count: 1
+            },
+            MemberResolutionOutcome {
+                account_id_hex: unavailable.clone(),
+                status: MemberResolutionStatus::MissingInboxRoute,
+                selected_device_count: 0
+            },
+        ]
+    );
+    let group = result.operation.unwrap();
+    let admins = |client: &AppClient| {
+        client
+            .runtime
+            .admin_pubkeys(&group)
+            .unwrap()
+            .into_iter()
+            .map(hex::encode)
+            .collect::<HashSet<_>>()
+    };
+    assert_eq!(
+        admins(&client),
+        HashSet::from([
+            creator.account_id_hex.clone(),
+            accounts[0].account_id_hex.clone()
+        ])
+    );
+    let requests_before = fetcher.requests.lock().unwrap().len();
+    client
+        .invite_members_with_telemetry(
+            &group,
+            &[&unavailable],
+            &[&accounts[2].account_id_hex],
+            crate::MemberResolutionPolicy::Partial,
+            &telemetry,
+        )
+        .await
+        .expect_err("an initial admin outside the requested roster must be rejected");
+    let self_invite = client
+        .invite_members(&group, &[&creator.account_id_hex])
+        .await
+        .unwrap_err();
+    assert!(matches!(self_invite, AppError::GroupInviteIncludesInviter));
+    assert_eq!(fetcher.requests.lock().unwrap().len(), requests_before);
+    let invited = client
+        .invite_members_with_telemetry(
+            &group,
+            &[&unavailable, &accounts[2].account_id_hex],
+            &[&unavailable, &accounts[2].account_id_hex],
+            crate::MemberResolutionPolicy::Partial,
+            &telemetry,
+        )
+        .await
+        .unwrap();
+    assert!(invited.operation.is_some());
+    assert_eq!(
+        invited.member_outcomes,
+        vec![
+            MemberResolutionOutcome {
+                account_id_hex: unavailable,
+                status: MemberResolutionStatus::MissingInboxRoute,
+                selected_device_count: 0
+            },
+            MemberResolutionOutcome {
+                account_id_hex: accounts[2].account_id_hex.clone(),
+                status: MemberResolutionStatus::Selected,
+                selected_device_count: 1
+            },
+        ]
+    );
+    assert_eq!(
+        admins(&client),
+        HashSet::from([
+            creator.account_id_hex,
+            accounts[0].account_id_hex.clone(),
+            accounts[2].account_id_hex.clone()
+        ])
     );
 }
 
@@ -9432,7 +9087,9 @@ async fn thirty_incremental_invites_with_large_directory_cache_converge_without_
     let group_id = client
         .create_group("incremental route readiness", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
 
     for (batch_index, batch) in accounts.chunks(5).enumerate() {
         let member_refs = batch
@@ -9546,7 +9203,7 @@ async fn member_key_package_resolution_refreshes_shared_directory_and_prewarm() 
         1,
         "prewarmed routes should avoid repeating discovery"
     );
-    assert_eq!(requests[0].queries[0].kind, KIND_MARMOT_KEY_PACKAGE);
+    key_package_read(&requests[0]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9612,7 +9269,9 @@ async fn member_key_package_resolution_never_falls_back_to_cached_key_packages()
         let group = inviter
             .create_group("reinvite discovery", &[])
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let requirements = inviter
             .runtime
             .session()
@@ -9623,6 +9282,7 @@ async fn member_key_package_resolution_never_falls_back_to_cached_key_packages()
                 members.clone(),
                 &requirements,
                 nostr_directory::MemberResolutionPurpose::CommitFresh,
+                nostr_directory::MemberResolutionPolicy::Atomic,
             )
             .await
             .unwrap();
@@ -9651,6 +9311,7 @@ async fn member_key_package_resolution_never_falls_back_to_cached_key_packages()
                 members.clone(),
                 &requirements,
                 nostr_directory::MemberResolutionPurpose::CommitFresh,
+                nostr_directory::MemberResolutionPolicy::Atomic,
             )
             .await
             .err()
@@ -9709,7 +9370,7 @@ async fn member_key_package_set_batches_shared_relay_and_reuses_prewarm_routes()
     assert_eq!(
         requests.len(),
         3,
-        "prewarm needs discovery, outbox and package batches, without preference refetches"
+        "prewarm needs discovery, outbox and package batches, without single-author reads"
     );
     assert_eq!(requests[0].queries.len(), 2);
     assert!(
@@ -9729,10 +9390,12 @@ async fn member_key_package_set_batches_shared_relay_and_reuses_prewarm_routes()
             .iter()
             .all(|query| query.authors.len() == 8)
     );
-    assert_eq!(requests[2].queries.len(), 1);
-    assert_eq!(requests[2].queries[0].kind, KIND_MARMOT_KEY_PACKAGE);
-    assert_eq!(requests[2].queries[0].authors.len(), 8);
-    assert_eq!(requests[2].queries[0].limit, 8 * 12);
+    let packages = key_package_read(&requests[2]);
+    assert_eq!(packages.authors.len(), 8);
+    assert_eq!(
+        packages.limit,
+        transport_nostr_adapter::RELAY_REPLAY_PAGE_LIMIT
+    );
     drop(requests);
 
     for account in &accounts {
@@ -9755,7 +9418,7 @@ async fn member_key_package_set_batches_shared_relay_and_reuses_prewarm_routes()
     assert_eq!(
         fetcher.requests.lock().unwrap().len(),
         12,
-        "create reuses discovery routes but adds a package batch and eight preference refetches"
+        "create reuses discovery routes but adds a package batch and eight single-author reads"
     );
 }
 
@@ -9825,7 +9488,7 @@ async fn member_key_package_set_reuses_completed_discovery_when_it_is_the_outbox
         "discovery covers the outbox; prewarm adds only the package batch"
     );
     assert_eq!(requests[0].queries.len(), 2);
-    assert_eq!(requests[1].queries[0].kind, KIND_MARMOT_KEY_PACKAGE);
+    key_package_read(&requests[1]);
     assert_eq!(
         app.directory()
             .resolve_member_key_packages(&members)
@@ -9837,7 +9500,7 @@ async fn member_key_package_set_reuses_completed_discovery_when_it_is_the_outbox
     assert_eq!(
         fetcher.requests.lock().unwrap().len(),
         5,
-        "create adds the package batch and two preference refetches, without relay discovery"
+        "create adds the package batch and two single-author reads, without relay discovery"
     );
 }
 
@@ -9872,40 +9535,6 @@ async fn member_key_package_set_falls_back_when_multi_author_queries_are_rejecte
             .count(),
         6,
         "discovery, outbox, and KeyPackage batches must each fall back per member"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn member_key_package_set_falls_back_when_multi_author_queries_are_incomplete() {
-    let (_directory, app, accounts, fetcher) = member_resolution_fixture(2, false).await;
-    fetcher
-        .reject_multi_author_incomplete
-        .store(true, std::sync::atomic::Ordering::SeqCst);
-    let members = accounts
-        .iter()
-        .map(|account| account.account_id_hex.as_str())
-        .collect::<Vec<_>>();
-
-    let summary = app
-        .directory()
-        .prewarm_group_member_key_packages(&members)
-        .await
-        .expect("CLOSED-shaped incomplete batches must retry per author");
-
-    assert_eq!(summary.network_resolved_members, 2);
-    let requests = fetcher.requests.lock().unwrap();
-    assert!(
-        requests
-            .iter()
-            .any(|request| request.queries.iter().any(|query| query.authors.len() == 2))
-    );
-    assert_eq!(
-        requests
-            .iter()
-            .filter(|request| request.queries.iter().all(|query| query.authors.len() == 1))
-            .count(),
-        4,
-        "both relay-list hops retry each member; successful prewarm needs no preference refetch"
     );
 }
 
@@ -10314,6 +9943,19 @@ fn newer_all_read_nip65_list_clears_stale_write_targets() {
     );
 }
 
+fn sign_directory_fixture(keys: &Keys, event: NostrTransportEvent) -> NostrTransportEvent {
+    assert_eq!(event.pubkey, keys.public_key().to_hex());
+    let signed = EventBuilder::new(
+        Kind::from(u16::try_from(event.kind).unwrap()),
+        event.content,
+    )
+    .tags(event.tags.into_iter().map(|tag| Tag::parse(tag).unwrap()))
+    .custom_created_at(NostrTimestamp::from_secs(event.created_at))
+    .finalize(keys)
+    .unwrap();
+    NostrTransportEvent::from_nostr_event(&signed).unwrap()
+}
+
 #[test]
 fn ingesting_all_read_nip65_list_replaces_cached_write_targets() {
     let dir = tempfile::tempdir().unwrap();
@@ -10321,7 +9963,8 @@ fn ingesting_all_read_nip65_list_replaces_cached_write_targets() {
         .create_account("alice")
         .unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-    let account_id = "22".repeat(32);
+    let keys = Keys::generate();
+    let account_id = keys.public_key().to_hex();
     let record = |created_at, tags| {
         let mut event = NostrTransportEvent::new_unsigned(
             account_id.clone(),
@@ -10330,6 +9973,7 @@ fn ingesting_all_read_nip65_list_replaces_cached_write_targets() {
             String::new(),
         );
         event.created_at = created_at;
+        let event = sign_directory_fixture(&keys, event);
         transport_nostr::DirectoryRelayEventRecord {
             endpoints: vec![TransportEndpoint("wss://source.example".into())],
             event,
@@ -10373,7 +10017,8 @@ fn stale_live_relay_list_events_do_not_replace_newer_cached_lists() {
         .create_account("alice")
         .unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-    let account_id = "23".repeat(32);
+    let keys = Keys::generate();
+    let account_id = keys.public_key().to_hex();
 
     for (kind, tag_name) in [
         (KIND_NIP65_RELAY_LIST, "r"),
@@ -10387,6 +10032,7 @@ fn stale_live_relay_list_events_do_not_replace_newer_cached_lists() {
                 String::new(),
             );
             event.created_at = created_at;
+            let event = sign_directory_fixture(&keys, event);
             transport_nostr::DirectoryRelayEventRecord {
                 endpoints: vec![TransportEndpoint("wss://source.example".into())],
                 event,
@@ -10424,7 +10070,8 @@ fn zero_timestamp_relay_list_event_populates_legacy_empty_state() {
         .create_account("alice")
         .unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-    let account_id = "24".repeat(32);
+    let keys = Keys::generate();
+    let account_id = keys.public_key().to_hex();
     let mut event = NostrTransportEvent::new_unsigned(
         account_id.clone(),
         KIND_MARMOT_INBOX_RELAY_LIST,
@@ -10432,6 +10079,7 @@ fn zero_timestamp_relay_list_event_populates_legacy_empty_state() {
         String::new(),
     );
     event.created_at = 0;
+    let event = sign_directory_fixture(&keys, event);
 
     app.directory()
         .ingest_directory_relay_event(transport_nostr::DirectoryRelayEventRecord {
@@ -10960,14 +10608,14 @@ fn same_second_multiline_bio_does_not_replace_cached_single_line_bio() {
     // replaces it, for peers and for accounts held on this device alike.
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
-    let alice = home.create_account("alice").unwrap();
+    home.create_account("alice").unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-    let peer = format!("{:064x}", 1973);
+    let peer_keys = Keys::generate();
+    let alice_keys = home.load_signing_keys("alice").unwrap();
     let created_at = 1_700_001_973;
-    for (account_id, local) in [
-        (peer.as_str(), false),
-        (alice.account_id_hex.as_str(), true),
-    ] {
+    for (keys, local) in [(&peer_keys, false), (&alice_keys, true)] {
+        let account_id_hex = keys.public_key().to_hex();
+        let account_id = account_id_hex.as_str();
         app.directory()
             .remember_directory_profile(
                 account_id,
@@ -10987,6 +10635,7 @@ fn same_second_multiline_bio_does_not_replace_cached_single_line_bio() {
                 serde_json::json!({ "name": "bob", "about": "one\ntwo" }).to_string(),
             );
             event.created_at = created_at;
+            let event = sign_directory_fixture(keys, event);
             app.directory()
                 .ingest_directory_relay_event(transport_nostr::DirectoryRelayEventRecord {
                     endpoints: vec![TransportEndpoint("wss://profiles.example".to_owned())],
@@ -11077,7 +10726,8 @@ fn directory_entry_reconciles_nostr_components_independently() {
     let account = home.create_account("alice").unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
     let cache = app.directory_cache_for_account(&account).unwrap();
-    let contact = format!("{:064x}", 920);
+    let keys = Keys::generate();
+    let contact = keys.public_key().to_hex();
 
     let mut cached = test_directory_record(&contact, "new-profile", 100);
     cached.relay_lists.nip65.created_at = 10;
@@ -11150,6 +10800,7 @@ fn directory_entry_reconciles_nostr_components_independently() {
         String::new(),
     );
     stale_event.created_at = 15;
+    let stale_event = sign_directory_fixture(&keys, stale_event);
     app.directory()
         .ingest_directory_relay_event(transport_nostr::DirectoryRelayEventRecord {
             event: stale_event,
@@ -11307,6 +10958,7 @@ fn group_system_chat_preview_does_not_hydrate_its_optional_actor_as_a_nostr_send
         sender: String::new(),
         sender_display_name: None,
         plaintext: r#"{"v":1,"system_type":"admin_added","text":"Admin added"}"#.to_owned(),
+        tags: Vec::new(),
         kind: MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
         timeline_at: 1,
         retention_seconds: None,
@@ -11325,6 +10977,7 @@ fn group_system_chat_preview_does_not_hydrate_its_optional_actor_as_a_nostr_send
     );
 
     let ordinary = ChatListMessagePreview {
+        tags: Vec::new(),
         kind: MARMOT_APP_EVENT_KIND_CHAT,
         sender: "22".repeat(32),
         ..preview
@@ -11545,6 +11198,423 @@ async fn register_external_signer_requires_matching_external_account() {
     assert!(app.has_external_signer(&account.account_id_hex));
 }
 
+/// A checkpoint with nothing pending writes nothing and leaves the chat list
+/// warm; a moved transport cursor, a pending frontier clear or a cursor
+/// beyond the future skew still writes (mdk#2923).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_empty_checkpoint_skips_the_write_and_its_chat_list_rebuild() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let telemetry = marmot_observability::PerformanceRecorder::default();
+    client.runtime_telemetry = Some(telemetry.clone());
+    let skips = || {
+        let count = |op| {
+            telemetry
+                .snapshot()
+                .runtime_operations
+                .into_iter()
+                .find(|snapshot| snapshot.operation == op)
+                .map_or(0, |snapshot| snapshot.completed)
+        };
+        (
+            count(crate::RuntimePerformanceOperation::ProjectionCheckpointSkipped),
+            count(crate::RuntimePerformanceOperation::ProjectionCheckpointSkippedInvalidated),
+        )
+    };
+    // A second connection to the account database sees every commit the
+    // client makes, as another process would.
+    let probe = {
+        let path = app.account_storage_path("alice");
+        let keys = app.account_home().load_signing_keys("alice").unwrap();
+        let key = app
+            .sqlcipher_key("alice", &keys, &path, crate::SqlcipherDatabaseKind::Session)
+            .unwrap();
+        storage_sqlite::expect_uncounted_writes_for_test(&path);
+        let connection = rusqlite::Connection::open(path).unwrap();
+        storage_sqlite::open_hardened_sqlcipher(
+            &connection,
+            &key,
+            storage_sqlite::SqlCipherHardening::cipher_only(),
+        )
+        .unwrap();
+        connection
+    };
+    let data_version = |probe: &rusqlite::Connection| {
+        probe
+            .query_row("PRAGMA data_version", [], |row| row.get::<_, i64>(0))
+            .unwrap()
+    };
+    let store_future_cursor = |probe: &rusqlite::Connection| {
+        probe
+            .execute(
+                "UPDATE account_state SET last_transport_timestamp = ?1 WHERE label = 'alice'",
+                [i64::try_from(crate::unix_now_seconds() + 3_600).unwrap()],
+            )
+            .unwrap();
+    };
+    // Whether one save committed, and whether it left the chat list stale.
+    let save = |client: &mut crate::AppClient, probe: &rusqlite::Connection| {
+        {
+            let mut staleness = app.chat_list_projection_stale.lock().unwrap();
+            let generation = staleness.generation("alice");
+            staleness.record_rebuilt("alice", generation);
+        }
+        let before = data_version(probe);
+        client
+            .save_state_with_pending_local_group_deletion_frontier_clears()
+            .unwrap();
+        let stale = app
+            .chat_list_projection_stale
+            .lock()
+            .unwrap()
+            .is_stale("alice");
+        (data_version(probe) != before, stale)
+    };
+    // Settle whatever the open left pending.
+    save(&mut client, &probe);
+
+    assert_eq!(
+        save(&mut client, &probe),
+        (false, false),
+        "nothing pending: no write"
+    );
+
+    client.checkpointed_transport_timestamp =
+        Some(client.checkpointed_transport_timestamp.unwrap_or(0) + 1);
+    assert_eq!(
+        save(&mut client, &probe),
+        (true, true),
+        "a moved transport cursor is persisted"
+    );
+    assert_eq!(
+        save(&mut client, &probe),
+        (false, false),
+        "and saved only once"
+    );
+
+    client
+        .pending_local_group_deletion_frontier_clears
+        .insert("aa".repeat(32), 1);
+    assert!(
+        save(&mut client, &probe).1,
+        "a pending frontier clear is persisted"
+    );
+    assert_eq!(
+        save(&mut client, &probe),
+        (false, false),
+        "and cleared by that save"
+    );
+
+    // The clock moved back: a saved cursor beyond the allowed future skew
+    // still needs the save that clamps it, however often it repeats.
+    let future = Some(crate::unix_now_seconds() + 3_600);
+    client.checkpointed_transport_timestamp = future;
+    client.saved_transport_timestamp = future;
+    assert!(save(&mut client, &probe).1, "a future cursor is clamped");
+    assert!(
+        save(&mut client, &probe).1,
+        "on every save until it is in range"
+    );
+
+    // Another process stored a cursor the clock left in the future, while
+    // this client's own cursor is in range: the save still clamps it, and
+    // stops once the stored cursor is back in range.
+    let in_range = Some(crate::unix_now_seconds());
+    client.checkpointed_transport_timestamp = in_range;
+    client.saved_transport_timestamp = in_range;
+    store_future_cursor(&probe);
+    assert!(
+        save(&mut client, &probe).1,
+        "a stored future cursor is clamped"
+    );
+    assert_eq!(
+        save(&mut client, &probe),
+        (false, false),
+        "and once in range, an empty save skips"
+    );
+
+    // A client with no cursor of its own cannot clamp a stored one: its save
+    // carries none and leaves the stored value as is. So a stored future
+    // cursor must not force a save that would only repeat.
+    client.checkpointed_transport_timestamp = None;
+    client.saved_transport_timestamp = None;
+    store_future_cursor(&probe);
+    // The first skip sees that foreign commit and only invalidates.
+    assert!(!save(&mut client, &probe).0, "a cursor-less client skips");
+    assert_eq!(save(&mut client, &probe), (false, false), "every time");
+
+    // Another runtime archives a chat. The skipped checkpoint still
+    // invalidates this runtime's chat list, as the save it replaces did, so
+    // the warmed list picks the change up; then the next skip does not.
+    let group_id = client
+        .create_group("archived elsewhere", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    save(&mut client, &probe);
+    assert_eq!(save(&mut client, &probe), (false, false), "settled");
+    let (skipped, invalidated) = skips();
+    let other = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    other
+        .set_group_archived("alice", &hex::encode(group_id.as_slice()), true)
+        .unwrap();
+    assert_eq!(
+        save(&mut client, &probe),
+        (false, true),
+        "a foreign commit invalidates the chat list without a write"
+    );
+    assert_eq!(save(&mut client, &probe), (false, false), "only once");
+    assert_eq!(
+        skips(),
+        (skipped + 1, invalidated + 1),
+        "each skip counts as invalidating or not"
+    );
+
+    // A foreign commit can land before a reopened client's first
+    // checkpoint. That skip has no version to compare, so it invalidates
+    // too, and the warmed list shows the change.
+    drop(client);
+    let mut client = app.client("alice").await.unwrap();
+    let group_hex = hex::encode(group_id.as_slice());
+    let archived = |app: &MarmotApp| {
+        app.chat_list("alice", true)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.group_id_hex == group_hex)
+            .map(|row| row.archived)
+    };
+    assert_eq!(archived(&app), Some(true), "the list is warm");
+    other
+        .set_group_archived("alice", &group_hex, false)
+        .unwrap();
+    assert_eq!(
+        save(&mut client, &probe),
+        (false, true),
+        "the first skip after open invalidates without a write"
+    );
+    assert_eq!(
+        archived(&app),
+        Some(false),
+        "and the list picks the change up"
+    );
+
+    // A foreign commit right after a real save, before anything reads the
+    // version again, is still seen by the next skip: the save records the
+    // version from before it.
+    client
+        .pending_local_group_deletion_frontier_clears
+        .insert("bb".repeat(32), 1);
+    let archiver = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let racing_group = group_hex.clone();
+    client.test_after_checkpoint_save = Some(Box::new(move || {
+        archiver
+            .set_group_archived("alice", &racing_group, true)
+            .unwrap();
+    }));
+    assert!(save(&mut client, &probe).1, "a real save");
+    assert_eq!(
+        save(&mut client, &probe),
+        (false, true),
+        "a commit just after a save still invalidates the next skip"
+    );
+
+    // Creating a chat refreshes only its own row. A foreign commit before
+    // that save is not covered by it, so the creation's save compares
+    // versions and invalidates the list itself.
+    assert!(!save(&mut client, &probe).0, "settled");
+    MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .set_group_archived("alice", &group_hex, false)
+        .unwrap();
+    {
+        let mut staleness = app.chat_list_projection_stale.lock().unwrap();
+        let generation = staleness.generation("alice");
+        staleness.record_rebuilt("alice", generation);
+    }
+    client
+        .create_group("created after", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    assert!(
+        app.chat_list_projection_stale
+            .lock()
+            .unwrap()
+            .is_stale("alice"),
+        "a created-row save does not hide an earlier foreign commit"
+    );
+    assert_eq!(
+        archived(&app),
+        Some(false),
+        "and the list shows the other runtime's change"
+    );
+}
+
+/// An invalidation that lands while the chat list is being rebuilt is not
+/// cleared by that rebuild: the rebuild covers only the generation it
+/// snapshotted, so the next read rebuilds again. With checkpoints skipped
+/// on idle ticks, nothing else would re-mark it (mdk#2923).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_invalidation_during_a_chat_list_refresh_survives_it() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group = client
+        .create_group("refreshed", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    client
+        .save_state_with_pending_local_group_deletion_frontier_clears()
+        .unwrap();
+    app.chat_list("alice", true).unwrap();
+    let stale = |app: &MarmotApp| {
+        app.chat_list_projection_stale
+            .lock()
+            .unwrap()
+            .is_stale("alice")
+    };
+    assert!(!stale(&app), "warm and current");
+
+    app.invalidate_chat_list_projection("alice");
+    let during = app.clone();
+    crate::CHAT_LIST_REFRESH_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            during.invalidate_chat_list_projection("alice");
+        }));
+    });
+    app.chat_list("alice", true).unwrap();
+    assert!(
+        stale(&app),
+        "the invalidation made during the rebuild survives it"
+    );
+
+    MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .set_group_archived("alice", &hex::encode(group.as_slice()), true)
+        .unwrap();
+    let archived = app
+        .chat_list("alice", true)
+        .unwrap()
+        .into_iter()
+        .find(|row| row.group_id_hex == hex::encode(group.as_slice()))
+        .map(|row| row.archived);
+    assert_eq!(archived, Some(true), "so the next read rebuilds again");
+    assert!(!stale(&app), "and then the list is current");
+
+    // A refresh still running when the account's caches are evicted, and
+    // then invalidated up to the refresh's own snapshot, cannot mark the
+    // recreated account's list rebuilt: generations never go back.
+    app.invalidate_chat_list_projection("alice");
+    let snapshot = app
+        .chat_list_projection_stale
+        .lock()
+        .unwrap()
+        .generation("alice");
+    let during = app.clone();
+    crate::CHAT_LIST_REFRESH_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            during.drop_account_caches("alice");
+            loop {
+                during.invalidate_chat_list_projection("alice");
+                if during
+                    .chat_list_projection_stale
+                    .lock()
+                    .unwrap()
+                    .generation("alice")
+                    >= snapshot
+                {
+                    break;
+                }
+            }
+        }));
+    });
+    app.chat_list("alice", true).unwrap();
+    assert!(
+        stale(&app),
+        "an evicted incarnation's refresh does not cover a later invalidation"
+    );
+}
+
+/// Leaving a chat updates what the warmed chat list shows on the next read, without waiting for a later
+/// checkpoint save: an idle account may skip that save (mdk#2923).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_self_membership_write_reaches_the_warmed_chat_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let bob = home.create_account("bob").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
+    let plane = MarmotRelayPlane::new(None, relay.clone());
+    let mut alice = app
+        .client_with_relay_plane("alice", &plane, None)
+        .await
+        .unwrap();
+    let mut bob_client = app
+        .client_with_relay_plane("bob", &plane, None)
+        .await
+        .unwrap();
+    bob_client.sync().await.unwrap();
+    let group = alice
+        .create_group("left behind", &[bob.account_id_hex.as_str()])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    assert!(
+        bob_client
+            .sync()
+            .await
+            .unwrap()
+            .joined_groups
+            .contains(&group)
+    );
+    bob_client
+        .save_state_with_pending_local_group_deletion_frontier_clears()
+        .unwrap();
+    let group_hex = hex::encode(group.as_slice());
+    let membership = |app: &MarmotApp| {
+        app.chat_list_row("bob", &group_hex)
+            .unwrap()
+            .map(|row| row.self_membership)
+    };
+    assert_eq!(membership(&app), Some(SelfMembership::Member), "warm");
+
+    // The leave saves its checkpoint before it records `Left`. A chat-list
+    // read between the two rebuilds the list from the old membership, and
+    // no later save is due to mark it stale again.
+    let reader = app.clone();
+    let reader_group = group_hex.clone();
+    bob_client.test_after_checkpoint_save = Some(Box::new(move || {
+        assert_eq!(
+            reader
+                .chat_list_row("bob", &reader_group)
+                .unwrap()
+                .map(|row| row.self_membership),
+            Some(SelfMembership::Member)
+        );
+    }));
+    bob_client.leave_group(&group).await.unwrap();
+    assert_eq!(
+        membership(&app),
+        Some(SelfMembership::Left),
+        "the leave shows without another save"
+    );
+}
+
 #[test]
 fn drop_account_caches_evicts_storage_and_directory_handles_and_warm_flags() {
     // Regression for mdk#220: removing an account (or rolling back a
@@ -11596,11 +11666,13 @@ fn drop_account_caches_evicts_storage_and_directory_handles_and_warm_flags() {
             .unwrap()
             .contains(&alice.label)
     );
+    // Eviction advances the chat-list generation rather than dropping it,
+    // so the next incarnation's first read rebuilds (mdk#2923).
     assert!(
-        !app.chat_list_projection_stale
+        app.chat_list_projection_stale
             .lock()
             .unwrap()
-            .contains(&alice.label)
+            .is_stale(&alice.label)
     );
 }
 
@@ -11902,7 +11974,8 @@ fn ingesting_remote_contact_list_does_not_promote_follows_and_caps_stored_follow
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
 
     // A remote, non-local user whose contact list arrives over a relay.
-    let author = format!("{:064x}", 42);
+    let keys = Keys::generate();
+    let author = keys.public_key().to_hex();
     app.directory()
         .remember_directory_user_with_reason_for_test(&author, "message")
         .unwrap();
@@ -11914,7 +11987,7 @@ fn ingesting_remote_contact_list_does_not_promote_follows_and_caps_stored_follow
         .collect::<Vec<_>>();
     let record = transport_nostr::DirectoryRelayEventRecord {
         endpoints: vec![TransportEndpoint("wss://relay.example".to_owned())],
-        event: contact_list_event(&author, &follows),
+        event: sign_directory_fixture(&keys, contact_list_event(&author, &follows)),
     };
 
     app.directory()
@@ -11977,7 +12050,8 @@ fn ingesting_kind0_profile_persists_only_bounded_unknown_fields() {
     let home = AccountHome::open(dir.path());
     home.create_account("alice").unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-    let author = format!("{:064x}", 867);
+    let keys = Keys::generate();
+    let author = keys.public_key().to_hex();
     let mut event = NostrTransportEvent::new_unsigned(
         author.clone(),
         KIND_NOSTR_METADATA,
@@ -11995,6 +12069,7 @@ fn ingesting_kind0_profile_persists_only_bounded_unknown_fields() {
         .to_string(),
     );
     event.created_at = 1_700_000_867;
+    let event = sign_directory_fixture(&keys, event);
     app.directory()
         .ingest_directory_relay_event(transport_nostr::DirectoryRelayEventRecord {
             endpoints: vec![TransportEndpoint("wss://profiles.example".to_owned())],
@@ -12079,7 +12154,8 @@ fn ingesting_kind0_profile_preserves_multiline_about_and_single_line_fields() {
     let home = AccountHome::open(dir.path());
     home.create_account("alice").unwrap();
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-    let author = format!("{:064x}", 868);
+    let keys = Keys::generate();
+    let author = keys.public_key().to_hex();
     let payload = "  first\r\nsecond\u{1b}[2J\n\nthird  ";
     let mut event = NostrTransportEvent::new_unsigned(
         author.clone(),
@@ -12100,6 +12176,7 @@ fn ingesting_kind0_profile_preserves_multiline_about_and_single_line_fields() {
         .to_string(),
     );
     event.created_at = 1_700_000_868;
+    let event = sign_directory_fixture(&keys, event);
     app.directory()
         .ingest_directory_relay_event(transport_nostr::DirectoryRelayEventRecord {
             endpoints: vec![TransportEndpoint("wss://profiles.example".to_owned())],
@@ -12641,309 +12718,6 @@ fn legacy_account_projection_clamps_poisoned_transport_cursor_on_import() {
     );
 }
 
-/// Reproduce repeated overflow verdicts at the account queue boundary. These are
-/// distinct transport IDs already retained by the application, not SDK-level
-/// cross-relay duplicates, which are filtered before this boundary.
-#[test]
-#[cfg(feature = "test-policy-overrides")]
-fn epoch_backfill_overflow_retries_back_off_even_after_the_queue_is_empty() {
-    run_composed_app_runtime_test("epoch-overflow-empty-retry", || async {
-        let dir = tempfile::tempdir().unwrap();
-        let relay = Arc::new(ScriptedPushRelayClient::default());
-        let (app, mut client, group_id) = armed_epoch_backfill(
-            &dir,
-            &relay,
-            bounded_epoch_backfill_config().with_dev_epoch_backfill_retry_backoff_ms(15_000),
-        )
-        .await;
-        let group = app
-            .group("alice", &hex::encode(group_id.as_slice()))
-            .unwrap()
-            .unwrap();
-        let cursor = crate::unix_now_seconds();
-        client.state.last_transport_timestamp = Some(cursor);
-        app.save_state(&client.state).unwrap();
-        assert!(
-            app.relay_plane
-                .disable_account_delivery_spill_for_test(client.adapter.account_id())
-        );
-        const HISTORY: usize = transport_nostr::ACCOUNT_DELIVERY_BUFFER + 16;
-        for index in 0..HISTORY {
-            let event = epoch_gap_probe(
-                &group.nostr_routing.nostr_group_id_hex,
-                cursor.saturating_sub(600 + index as u64),
-                &format!("retained-history-{index}"),
-            );
-            client.remember_seen_event(event.id.clone());
-            route_group_probe(&client, event).await;
-        }
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let health = app.relay_plane.relay_health().await;
-                if health.account_delivery_dropped
-                    >= (HISTORY - transport_nostr::ACCOUNT_DELIVERY_BUFFER) as u64
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the undrained history must overflow the account queue");
-        // The drop metric advances before the account-local marker writer has
-        // persisted its count. Wait for that evidence so the first recovery
-        // reservation cannot race its asynchronous loss import.
-        let storage = app.account_storage("alice").unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let watermarks = storage
-                    .app_storage()
-                    .recovery_loss_watermarks("alice", storage_sqlite::RecoveryLossCause::Queue)
-                    .unwrap();
-                if watermarks.len() == 1
-                    && watermarks[0].observed_count
-                        == (HISTORY - transport_nostr::ACCOUNT_DELIVERY_BUFFER) as u64
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the complete queue loss count must be durable before recovery");
-
-        for ordinal in 0..2 {
-            if ordinal > 0 {
-                expire_epoch_backfill_retry_cooldown(&mut client);
-            }
-            let outcome = client
-                .run_pending_epoch_backfill(
-                    marmot_forensics::EpochBackfillExecutionSeam::Maintenance,
-                )
-                .await
-                .unwrap();
-            if !matches!(outcome, crate::EpochBackfillRunOutcome::Incomplete(_)) {
-                let storage = client
-                    .app
-                    .account_storage(&client.state.label)
-                    .unwrap()
-                    .app_storage();
-                let routing = client.routing.snapshot();
-                let group_endpoints = routing
-                    .group_routes
-                    .iter()
-                    .map(|route| route.endpoints.len())
-                    .sum::<usize>();
-                let admitted_inbox = client
-                    .adapter
-                    .recovery_admitted_endpoints(&routing.local_inbox_endpoints)
-                    .len();
-                let admitted_groups = routing
-                    .group_routes
-                    .iter()
-                    .map(|route| {
-                        client
-                            .adapter
-                            .recovery_admitted_endpoints(&route.endpoints)
-                            .len()
-                    })
-                    .sum::<usize>();
-                panic!(
-                    "overflow attempt {ordinal} returned {outcome:?}; retry state: {:?}; pending demands: {}; eligible obligations: {}; inbox endpoints: {}; group endpoints: {group_endpoints}; admitted inbox: {admitted_inbox}; admitted groups: {admitted_groups}; cursor frozen: {}",
-                    storage.recovery_retry_state().unwrap(),
-                    storage.pending_recovery_demands().unwrap().len(),
-                    storage
-                        .recovery_eligible_revision_fence(false)
-                        .unwrap()
-                        .obligations
-                        .len(),
-                    routing.local_inbox_endpoints.len(),
-                    client.app.cursor_persistence() == crate::CursorPersistence::Frozen,
-                );
-            }
-            let storage = client.app.account_storage(&client.state.label).unwrap();
-            let retry = storage.app_storage().recovery_retry_state().unwrap();
-            let expected = Duration::from_secs(15 * (1 << ordinal));
-            assert_eq!(
-                retry.delay_ms,
-                expected.as_millis() as u64,
-                "overflow attempt {ordinal} must reserve the full backoff"
-            );
-            assert_eq!(
-                retry.not_before_ms.saturating_sub(retry.recorded_at_ms),
-                expected.as_millis() as u64,
-                "overflow attempt {ordinal} deadline must match the earned delay"
-            );
-            let remaining = client.recovery_owner.test_retry_remaining(&storage);
-            assert!(
-                remaining > Duration::ZERO && remaining <= expected,
-                "overflow attempt {ordinal} must stay in backoff after reserving {expected:?}, got {remaining:?}"
-            );
-            let subscriptions = relay.accepted_subscriptions().len();
-            assert!(matches!(
-                client
-                    .run_pending_epoch_backfill(
-                        marmot_forensics::EpochBackfillExecutionSeam::Receive
-                    )
-                    .await
-                    .unwrap(),
-                crate::EpochBackfillRunOutcome::Deferred
-            ));
-            assert_eq!(relay.accepted_subscriptions().len(), subscriptions);
-        }
-        let rows = recorded_audit_rows(&app);
-        let failed = recorded_rows_of_kind(&rows, "epoch_stall_backfill_failed");
-        assert_eq!(failed.len(), 2);
-        for row in failed {
-            // The job never drains the live queue: history the account already
-            // retains is neither refetched nor counted as recovery.
-            assert_eq!(row["kind"]["skipped"], 0);
-            assert_eq!(row["kind"]["error_kind"], "history_coverage_unproven");
-        }
-        assert_eq!(
-            app.load_state("alice").unwrap().last_transport_timestamp,
-            Some(cursor)
-        );
-        assert!(client.has_pending_epoch_backfill());
-        assert!(
-            app.account_storage("alice")
-                .unwrap()
-                .app_storage()
-                .account_delivery_recovery("alice")
-                .unwrap()
-                .is_some()
-        );
-    });
-}
-
-#[test]
-fn reopened_unbounded_overflow_waits_for_explicit_full_history_repair() {
-    run_composed_app_runtime_test("delivery-overflow-reopen", || async {
-        let dir = tempfile::tempdir().unwrap();
-        AccountHome::open(dir.path())
-            .create_account("alice")
-            .unwrap();
-        let cursor = crate::unix_now_seconds() - 3_600;
-
-        {
-            let app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
-            app.ensure_account_state("alice").unwrap();
-            let mut state = app.load_state("alice").unwrap();
-            state.last_transport_timestamp = Some(cursor);
-            app.save_state(&state).unwrap();
-            app.account_storage("alice")
-                .unwrap()
-                .app_storage()
-                .mark_account_delivery_recovery("alice", 17, 1)
-                .unwrap();
-        }
-
-        let relay = Arc::new(ScriptedPushRelayClient::default());
-        let mut reopened = MarmotApp::with_relay(dir.path(), "wss://relay.example")
-            .with_test_relay_client(relay.clone());
-        reopened.relay_plane = MarmotRelayPlane::new_with_loopback(
-            Some(Duration::from_secs(120)),
-            relay.clone(),
-            true,
-        );
-        let mut client = client_on_app_relay_plane(&reopened, "alice").await;
-
-        assert!(client.delivery_overflow_recovery_pending);
-        assert_eq!(
-            client.state.last_transport_timestamp,
-            Some(cursor),
-            "the newer durable cursor remains diagnostic state"
-        );
-        assert!(
-            client.subscription_rebuild_since().unwrap().is_some(),
-            "live registration remains floored while the recovery owner retains the pending gap"
-        );
-        let subscriptions = relay.accepted_subscriptions();
-        assert!(!subscriptions.is_empty());
-        assert!(
-            subscriptions.iter().all(|subscription| match subscription {
-                NostrSubscription::AccountInbox { since, .. }
-                | NostrSubscription::Group { since, .. }
-                | NostrSubscription::GroupBatch { since, .. } => since.is_some(),
-                NostrSubscription::GroupMaintenance { .. } => true,
-            }),
-            "opening live interest cannot independently authorize an unfloored replay"
-        );
-
-        let group_id = client
-            .create_group("overflow recovery target", &[])
-            .await
-            .unwrap();
-        let group = reopened
-            .group("alice", &hex::encode(group_id.as_slice()))
-            .unwrap()
-            .expect("recovery target group projection");
-        let omitted = epoch_gap_probe(
-            &group.nostr_routing.nostr_group_id_hex,
-            cursor.saturating_sub(600),
-            "overflow-redelivery",
-        );
-        let omitted_id = omitted.id.clone();
-        inject_epoch_gap_probe(&reopened, omitted).await;
-
-        let _eose = scripted_eose_pump(
-            reopened.relay_plane.clone(),
-            relay.clone(),
-            every_subscription,
-        );
-        client
-            .sync()
-            .await
-            .expect("ordinary catch-up runs its floored pass without certifying coverage");
-        assert!(
-            reopened
-                .load_state("alice")
-                .unwrap()
-                .seen_events
-                .contains(&omitted_id),
-            "live delivery ingests the older event without any replay"
-        );
-        assert!(
-            client.delivery_overflow_recovery_pending,
-            "a loss with no known bound cannot be certified by comparison"
-        );
-        assert_eq!(relay.unfloored_account_subscription_count(), 0);
-        let storage = reopened.account_storage("alice").unwrap().app_storage();
-        assert!(
-            storage
-                .account_delivery_recovery("alice")
-                .unwrap()
-                .is_some()
-        );
-        assert_eq!(storage.recovery_retry_state().unwrap().attempt_serial, 1);
-        // The independent synthetic backend certifies the finite endpoint set
-        // only on this second, genuinely caller-requested operation. All actual
-        // delivery/admission, token fencing and live acknowledgment stay real.
-        client.test_recovery_evidence = Some(crate::client::recovery::empty_finite_history);
-        client.repair_full_history().await.unwrap();
-        assert_eq!(
-            relay.unfloored_account_subscription_count(),
-            0,
-            "repair compares history; it never replays a subscription"
-        );
-        assert!(!client.delivery_overflow_recovery_pending);
-        assert!(
-            reopened
-                .account_storage("alice")
-                .unwrap()
-                .app_storage()
-                .account_delivery_recovery("alice")
-                .unwrap()
-                .is_none(),
-            "only qualified coverage plus exact live acknowledgment retires the marker"
-        );
-        let health = reopened.relay_plane.relay_health().await;
-        assert_eq!(health.account_delivery_recovery_attempts, 2);
-        assert_eq!(health.account_delivery_recovery_successes, 1);
-        assert_eq!(health.account_delivery_recovery_failures, 1);
-    });
-}
-
 #[test]
 fn full_account_queue_spills_durably_and_admits_every_delivery_without_loss() {
     run_composed_app_runtime_test("delivery-overflow-spill", || async {
@@ -12960,7 +12734,12 @@ fn full_account_queue_spills_durably_and_admits_every_delivery_without_loss() {
             true,
         );
         let mut client = client_on_app_relay_plane(&app, "alice").await;
-        let group_id = client.create_group("overflow spill", &[]).await.unwrap();
+        let group_id = client
+            .create_group("overflow spill", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let nostr_group_id_hex = app
             .group("alice", &hex::encode(group_id.as_slice()))
             .unwrap()
@@ -13013,9 +12792,10 @@ fn full_account_queue_spills_durably_and_admits_every_delivery_without_loss() {
         let storage = app.account_storage("alice").unwrap().app_storage();
         assert!(
             storage
-                .account_delivery_recovery("alice")
+                .recovery_loss_watermarks("alice", storage_sqlite::RecoveryLossCause::Queue)
                 .unwrap()
-                .is_none()
+                .is_empty(),
+            "a spill records no loss"
         );
         assert_eq!(
             storage
@@ -13042,7 +12822,7 @@ fn full_account_queue_spills_durably_and_admits_every_delivery_without_loss() {
             .len();
         drop(client);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
-        report_scripted_eose(&app.relay_plane, &relay, every_subscription).await;
+        relay.replies_handled().await;
         for _ in 0..=spilled_before_reopen {
             if !client.admit_native_turn().await.unwrap() {
                 break;
@@ -13072,6 +12852,9 @@ fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
             .create_account("alice")
             .unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
+        // The relay is still replaying stored history, newest first, when
+        // the burst overflows the queue, so live ingest promotes no cursor.
+        relay.hold_replies(Some(every_reply));
         let mut app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(relay.clone());
         app.relay_plane =
@@ -13086,7 +12869,9 @@ fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
         let group_id = client
             .create_group("overflow cursor fence", &[])
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let nostr_group_id_hex = app
             .group("alice", &hex::encode(group_id.as_slice()))
             .unwrap()
@@ -13100,15 +12885,16 @@ fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
         let attempts = marker_attempts.clone();
         let storage = app.account_storage("alice").unwrap();
         let marker: transport_nostr::AccountDeliveryRecoveryMarker =
-            Arc::new(move |marker_token, dropped, _| {
+            Arc::new(move |marker_token, dropped, _, _| {
                 attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 if !release.load(std::sync::atomic::Ordering::SeqCst) {
                     return Err(transport_nostr::AccountDeliveryRecoveryMarkerError::Retryable);
                 }
                 storage
                     .app_storage()
-                    .record_account_delivery_loss(
+                    .record_account_recovery_loss(
                         "alice",
+                        storage_sqlite::RecoveryLossCause::Queue,
                         marker_token,
                         dropped,
                         unix_now_seconds(),
@@ -13208,9 +12994,9 @@ fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
             app.account_storage("alice")
                 .unwrap()
                 .app_storage()
-                .account_delivery_recovery("alice")
+                .recovery_loss_watermarks("alice", storage_sqlite::RecoveryLossCause::Queue)
                 .unwrap()
-                .is_none(),
+                .is_empty(),
             "the regression must inspect the pre-marker crash window"
         );
         assert!(
@@ -13239,25 +13025,43 @@ fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
         .await
         .expect("the single marker worker must persist after the retry clears");
         let storage = app.account_storage("alice").unwrap().app_storage();
-        assert!(
+        let queue_loss_demand = || {
             storage
-                .account_delivery_recovery("alice")
+                .pending_recovery_demands()
                 .unwrap()
-                .is_none(),
+                .iter()
+                .any(|demand| demand.cause == storage_sqlite::RecoveryCause::QueueLoss)
+        };
+        assert!(
+            !queue_loss_demand(),
             "the loss writer persists evidence only; it cannot create owner demand"
         );
-        // The serialized owner boundary imports the evidence. No acquisition is
-        // needed to prove cursor safety across this handoff and reopen.
-        let grant = client
-            .authorize_account_recovery(None, marmot_forensics::EpochBackfillExecutionSeam::Receive)
-            .await
-            .unwrap();
-        drop(grant);
+        // The serialized recovery seam imports the evidence. No acquisition
+        // is needed to prove cursor safety across this handoff and reopen.
+        client.refresh_account_recovery().await.unwrap();
         assert!(
+            !queue_loss_demand(),
+            "the runner keeps no legacy recovery-demand pointer"
+        );
+        let owes_omission = || {
+            let route = storage_sqlite::TransportReconciliationRoute::Group(
+                hex::decode(&nostr_group_id_hex)
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+            );
             storage
-                .account_delivery_recovery("alice")
+                .recovery_coverage_debt(&route, &["wss://relay.example".into()], unix_now_seconds())
                 .unwrap()
-                .is_some()
+                .iter()
+                .any(|range| {
+                    range.since_seconds <= omitted_timestamp
+                        && omitted_timestamp <= range.until_seconds
+                })
+        };
+        assert!(
+            owes_omission(),
+            "the runner must persist debt for the omitted timestamp without a legacy demand"
         );
         assert_eq!(
             app.load_state("alice").unwrap().last_transport_timestamp,
@@ -13265,8 +13069,15 @@ fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
         );
         drop(client);
         let reopened = client_on_app_relay_plane(&app, "alice").await;
-        assert!(reopened.delivery_overflow_recovery_pending);
+        assert!(
+            reopened.delivery_overflow_recovery_pending,
+            "queued loss still holds the local guard until its serialized handoff settles"
+        );
         assert_eq!(reopened.state.last_transport_timestamp, Some(cursor_before));
+        assert!(
+            owes_omission(),
+            "unfetched loss remains durable ledger debt across reopen"
+        );
     });
 }
 
@@ -13274,8 +13085,8 @@ fn process_local_overflow_fence_freezes_cursor_while_marker_write_retries() {
 fn replay_fences_cursor_on_save() {
     run_composed_app_runtime_test("unfinished-replay-checkpoint", || async {
         let mut fixture = LiveCursorFixture::open().await;
-        fixture._eose.0.abort();
-        let _ = (&mut fixture._eose.0).await;
+        // The fresh activation's REQs stay unfinished, so replay is too.
+        fixture.relay.hold_replies(Some(every_reply));
         fixture
             .client
             .runtime
@@ -13347,7 +13158,6 @@ pub(crate) struct LiveCursorFixture {
     account_id: MemberId,
     nostr_group_id_hex: String,
     pub(crate) cursor_before: u64,
-    _eose: ScriptedEosePump,
     _dir: tempfile::TempDir,
 }
 
@@ -13371,6 +13181,51 @@ impl LiveCursorFixture {
         let fixture = Self::open_with_cursor(false, false).await;
         assert_eq!(fixture.persisted(), None);
         fixture
+    }
+
+    /// Replace the fixture's empty account queue with a store that waits before
+    /// writing the real spill rows. Dropping the sender opens the gate, including
+    /// on panic, so a blocked writer cannot strand the runtime's blocking pool.
+    pub(crate) fn hold_spill_writes(
+        &mut self,
+    ) -> (std::sync::mpsc::Sender<()>, Arc<tokio::sync::Notify>) {
+        let (release, held) = std::sync::mpsc::channel();
+        let held = std::sync::Mutex::new(held);
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let writing = entered.clone();
+        let storage = self.app.account_storage("alice").unwrap();
+        let store: transport_nostr::AccountDeliverySpillStore = Arc::new(move |deliveries| {
+            writing.notify_one();
+            let _ = held.lock().unwrap().recv();
+            storage
+                .app_storage()
+                .spill_account_deliveries(
+                    deliveries,
+                    crate::client::delivery_spill::ACCOUNT_DELIVERY_SPILL_LIMITS,
+                    crate::unix_now_seconds(),
+                )
+                .map(|dispositions| {
+                    dispositions
+                        .into_iter()
+                        .map(crate::client::delivery_spill::plane_spill_disposition)
+                        .collect()
+                })
+                .map_err(|error| {
+                    if error.is_closed() {
+                        transport_nostr::AccountDeliveryRecoveryMarkerError::Closed
+                    } else {
+                        transport_nostr::AccountDeliveryRecoveryMarkerError::Retryable
+                    }
+                })
+        });
+        self.client.adapter = self.app.relay_plane.account_adapter_with_recovery_marker(
+            self.account_id.clone(),
+            self.relay.clone(),
+            None,
+            Some(store),
+        );
+        self.client.adapter.open_transport_cursor(self.persisted());
+        (release, entered)
     }
 
     async fn open_with_cursor(seed_cursor: bool, audited: bool) -> Self {
@@ -13397,9 +13252,13 @@ impl LiveCursorFixture {
             seeded.last_transport_timestamp = Some(cursor_before);
             app.save_state(&seeded).unwrap();
         }
-        let eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let mut client = client_on_app_relay_plane(&app, "alice").await;
-        let group_id = client.create_group("live cursor", &[]).await.unwrap();
+        let group_id = client
+            .create_group("live cursor", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let nostr_group_id_hex = app
             .group("alice", &hex::encode(group_id.as_slice()))
             .unwrap()
@@ -13421,7 +13280,6 @@ impl LiveCursorFixture {
             account_id: MemberId::new(hex::decode(&account.account_id_hex).unwrap()),
             nostr_group_id_hex,
             cursor_before,
-            _eose: eose,
             _dir: dir,
         }
     }
@@ -13484,7 +13342,6 @@ impl LiveCursorFixture {
             account_id,
             nostr_group_id_hex,
             cursor_before,
-            _eose,
             _dir,
         } = self;
         drop(client);
@@ -13496,7 +13353,6 @@ impl LiveCursorFixture {
             account_id,
             nostr_group_id_hex,
             cursor_before,
-            _eose,
             _dir,
         }
     }
@@ -13620,6 +13476,9 @@ fn live_ingest_keeps_the_cursor_until_every_subscription_replayed_stored_history
             .create_account("alice")
             .unwrap();
         let relay = Arc::new(ScriptedPushRelayClient::default());
+        // No relay reports end-of-stored-events: the relays may still be
+        // replaying stored history newest-first.
+        relay.hold_replies(Some(every_reply));
         let mut app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(relay.clone());
         app.relay_plane =
@@ -13629,10 +13488,13 @@ fn live_ingest_keeps_the_cursor_until_every_subscription_replayed_stored_history
         let mut seeded = app.load_state("alice").unwrap();
         seeded.last_transport_timestamp = Some(cursor_before);
         app.save_state(&seeded).unwrap();
-        // No relay reports end-of-stored-events: the relays may still be
-        // replaying stored history newest-first.
         let mut client = client_on_app_relay_plane(&app, "alice").await;
-        let group_id = client.create_group("live cursor", &[]).await.unwrap();
+        let group_id = client
+            .create_group("live cursor", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let nostr_group_id_hex = app
             .group("alice", &hex::encode(group_id.as_slice()))
             .unwrap()
@@ -13884,7 +13746,7 @@ fn live_ingest_keeps_the_cursor_behind_a_queue_omission_after_replay() {
         );
         let marker_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let attempts = marker_attempts.clone();
-        let marker: transport_nostr::AccountDeliveryRecoveryMarker = Arc::new(move |_, _, _| {
+        let marker: transport_nostr::AccountDeliveryRecoveryMarker = Arc::new(move |_, _, _, _| {
             attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Err(transport_nostr::AccountDeliveryRecoveryMarkerError::Retryable)
         });
@@ -14237,11 +14099,6 @@ fn connectivity_recovery_interrupts_max_account_worker_reconnect_backoff() {
         // All preceding live reopens ran with EOSE withheld. Only the
         // coalesced catch-up below receives a boundary; it still cannot
         // certify or clear independent loss debt.
-        let _eose_pump = scripted_eose_pump(
-            runtime.shared_services().relay_plane().clone(),
-            relay.clone(),
-            every_subscription,
-        );
         relay.release_subscribe();
 
         recovery_a.await.unwrap().unwrap();
@@ -14302,7 +14159,9 @@ async fn reconnect_drains_deferred_hydration_before_steady_state_serves_groups_b
                 client
                     .create_group(&format!("reconnect group {group}"), &[donor_id.as_str()])
                     .await
-                    .unwrap(),
+                    .unwrap()
+                    .operation
+                    .expect("eligible fixture members"),
             );
         }
     }
@@ -14385,7 +14244,7 @@ fn app_transport_routing_recovers_from_poisoned_lock() {
         required_acks: 1,
     });
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _guard = routing.inner.write().unwrap();
+        let _guard = routing.inner.state.write().unwrap();
         panic!("poison app routing lock");
     }));
 
@@ -14398,6 +14257,43 @@ fn app_transport_routing_recovers_from_poisoned_lock() {
     });
 
     assert_eq!(routing.snapshot().required_acks, 2);
+}
+
+#[test]
+fn recovery_selected_inbox_only() {
+    let recipient = MemberId::new(vec![0xa1; 32]);
+    let other = MemberId::new(vec![0xa2; 32]);
+    let endpoint = TransportEndpoint("wss://member-inbox.example".into());
+    let routing = AppTransportRouting::new(AppRoutingState {
+        local_inbox_endpoints: vec![TransportEndpoint("wss://own-inbox.example".into())],
+        key_package_endpoints: Vec::new(),
+        inbox_routes: HashMap::new(),
+        group_routes: Vec::new(),
+        required_acks: 1,
+    });
+    let message = TransportMessage {
+        id: MessageId::new(vec![0xa3; 32]),
+        payload: vec![1],
+        timestamp: Timestamp(1),
+        causal_deps: Vec::new(),
+        source: cgka_traits::transport::TransportSource("nostr".into()),
+        envelope: TransportEnvelope::Welcome {
+            recipient: recipient.clone(),
+        },
+    };
+    routing.replace_inbox_route(other, Some(vec![endpoint.clone()]));
+    assert!(matches!(
+        routing.publish_target(&message),
+        Err(TransportRoutingError::MissingInboxRoute)
+    ));
+    routing.replace_inbox_route(recipient.clone(), Some(vec![endpoint.clone()]));
+    assert_eq!(
+        routing.publish_target(&message).unwrap(),
+        TransportPublishTarget::Inbox {
+            recipient,
+            endpoints: vec![endpoint],
+        }
+    );
 }
 
 #[test]
@@ -14554,6 +14450,31 @@ fn chat_intent_builds_kind_nine_with_no_tags() {
 }
 
 #[test]
+fn sticker_intent_builds_sonar_kind_nine_tag() {
+    let coordinate = format!("30031:{}:cats", "ab".repeat(32));
+    let hash = "11".repeat(32);
+    let event = build(AppMessageIntent::Sticker {
+        sticker_ref: AppStickerRef {
+            pack_coordinate: coordinate.clone(),
+            shortcode: "wave".to_owned(),
+            plaintext_sha256: hash.clone(),
+        },
+        message_tags: Vec::new(),
+    });
+    assert_eq!(event.kind, MARMOT_APP_EVENT_KIND_CHAT);
+    assert!(event.content.is_empty());
+    assert_eq!(
+        event.tags,
+        vec![vec![
+            "sticker".to_owned(),
+            coordinate,
+            "wave".to_owned(),
+            hash,
+        ]]
+    );
+}
+
+#[test]
 fn reaction_intent_builds_kind_seven_with_e_tag() {
     let event = build(AppMessageIntent::Reaction {
         target_message_id: "abc123".to_owned(),
@@ -14564,6 +14485,88 @@ fn reaction_intent_builds_kind_seven_with_e_tag() {
     assert_eq!(event.kind, MARMOT_APP_EVENT_KIND_REACTION);
     assert_eq!(event.content, "🔥");
     assert_eq!(tag_value(&event.tags, EVENT_REF_TAG), Some("abc123"));
+}
+
+#[test]
+fn poll_context_preserves_fields() {
+    let create = |message_tags| AppMessageIntent::Poll {
+        question: "Drink?".into(),
+        options: vec!["Tea".into(), "Coffee".into()],
+        poll_type: cgka_traits::PollType::MultipleChoice,
+        ends_at: Some(1_700_000_100),
+        message_tags,
+    };
+    for key in ["option", "polltype", "endsAt", "response", "imeta"] {
+        let result = build_inner_event(
+            &create(vec![vec![key.into(), "override".into()]]),
+            SENDER_HEX,
+            1_700_000_000,
+        );
+        let expected = if key == "imeta" {
+            "invalid additional message tag"
+        } else {
+            "poll context cannot override poll fields"
+        };
+        assert!(
+            matches!(result, Err(AppError::InvalidAppMessagePayload(detail)) if detail == expected)
+        );
+    }
+    let context = vec![vec!["p".into(), SENDER_HEX.into()]; cgka_traits::polls::POLL_MAX_TAGS - 4];
+    let event = build(create(context.clone()));
+    let poll = cgka_traits::parse_poll(&event).unwrap();
+    assert_eq!(event.tags.len(), 32);
+    assert_eq!(poll.question, "Drink?");
+    assert_eq!(poll.poll_type, cgka_traits::PollType::MultipleChoice);
+    assert_eq!(poll.ends_at, Some(1_700_000_100));
+    assert_eq!(
+        poll.options
+            .iter()
+            .map(|option| (option.id.as_str(), option.label.as_str()))
+            .collect::<Vec<_>>(),
+        [("0", "Tea"), ("1", "Coffee")]
+    );
+    let mut oversized = context;
+    oversized.push(vec!["p".into(), SENDER_HEX.into()]);
+    let result = build_inner_event(&create(oversized), SENDER_HEX, 1_700_000_000);
+    assert!(
+        matches!(result, Err(AppError::InvalidAppMessagePayload(detail)) if detail == "poll tags exceed limits")
+    );
+}
+
+#[test]
+fn sticker_context_rejects_tags() {
+    let sticker_ref = AppStickerRef {
+        pack_coordinate: format!("30031:{}:cats", "ab".repeat(32)),
+        shortcode: "wave".into(),
+        plaintext_sha256: "11".repeat(32),
+    };
+    for (tags, expected) in [
+        (
+            vec![vec!["sticker".into(), "other".into()]],
+            "sticker context cannot carry another sticker",
+        ),
+        (
+            vec![vec!["imeta".into(), "url https://example.com".into()]],
+            "invalid additional message tag",
+        ),
+        (vec![Vec::new()], "invalid additional message tag"),
+        (
+            vec![vec!["e".into(), " ".into()]],
+            "target message id cannot be empty",
+        ),
+    ] {
+        let result = build_inner_event(
+            &AppMessageIntent::Sticker {
+                sticker_ref: sticker_ref.clone(),
+                message_tags: tags,
+            },
+            SENDER_HEX,
+            1_700_000_000,
+        );
+        assert!(
+            matches!(result, Err(AppError::InvalidAppMessagePayload(detail)) if detail == expected)
+        );
+    }
 }
 
 #[test]
@@ -14713,6 +14716,7 @@ fn media_intent_builds_kind_nine_with_ordered_imeta_tags() {
                 media_type: "image/png".to_owned(),
                 version: ENCRYPTED_MEDIA_VERSION.to_owned(),
                 source_epoch: 7,
+                source_epoch_identity: None,
                 dim: Some("10x20".to_owned()),
                 thumbhash: Some("thumb".to_owned()),
             },
@@ -14728,6 +14732,7 @@ fn media_intent_builds_kind_nine_with_ordered_imeta_tags() {
                 media_type: "video/mp4".to_owned(),
                 version: ENCRYPTED_MEDIA_VERSION.to_owned(),
                 source_epoch: 7,
+                source_epoch_identity: None,
                 dim: None,
                 thumbhash: None,
             },
@@ -14983,6 +14988,17 @@ fn custom_intent_rejects_every_reserved_kind() {
         MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE,
         MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST,
         MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL,
+        // Device-group kinds: heartbeat, gap claim, private KeyPackage request and
+        // hand-off, sibling Welcome, history delivery, small-state update and
+        // broadcast request.
+        457,
+        458,
+        459,
+        460,
+        461,
+        473,
+        475,
+        476,
     ] {
         assert!(crate::is_reserved_app_event_kind(kind));
         let result = build_inner_event(
@@ -15070,6 +15086,7 @@ fn received_media_message_with_out_of_policy_locator_is_still_delivered() {
             media_type: "image/png".to_owned(),
             version: ENCRYPTED_MEDIA_VERSION.to_owned(),
             source_epoch: 7,
+            source_epoch_identity: None,
             dim: None,
             thumbhash: None,
         }],
@@ -15106,6 +15123,7 @@ fn malformed_media_message(version: &str) -> Vec<u8> {
             media_type: "image/png".to_owned(),
             version: version.to_owned(),
             source_epoch: 7,
+            source_epoch_identity: None,
             dim: None,
             thumbhash: None,
         }],
@@ -15268,6 +15286,50 @@ fn app_error_display_does_not_expose_group_or_account_ids() {
         assert!(!error.contains(&group_id), "{error}");
         assert!(!error.contains(&account_id), "{error}");
     }
+}
+
+/// The app constructors relax storage for this unit-test process, so a
+/// database opened afterwards skips SQLCipher's memory security even when its
+/// options ask for it.
+#[test]
+fn app_unit_tests_open_databases_without_sqlcipher_memory_security() {
+    static CIPHER_PRAGMAS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    fn record_cipher_pragma(event: rusqlite::trace::TraceEvent<'_>) {
+        if let rusqlite::trace::TraceEvent::Stmt(_, sql) = event {
+            let sql = sql.to_ascii_lowercase();
+            if sql.starts_with("pragma cipher") {
+                CIPHER_PRAGMAS.lock().unwrap().push(sql);
+            }
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let _app = MarmotApp::with_relay(dir.path(), "wss://relay.example");
+    let connection = rusqlite::Connection::open(dir.path().join("probe.sqlite")).unwrap();
+    connection.trace_v2(
+        rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+        Some(record_cipher_pragma),
+    );
+
+    storage_sqlite::open_hardened_sqlcipher(
+        &connection,
+        &storage_sqlite::SqlCipherKey::raw([0x42; 32]),
+        storage_sqlite::SqlCipherHardening::cipher_only(),
+    )
+    .unwrap();
+
+    let pragmas = CIPHER_PRAGMAS.lock().unwrap().clone();
+    assert!(
+        pragmas
+            .iter()
+            .any(|sql| sql.contains("cipher_compatibility")),
+        "{pragmas:?}"
+    );
+    assert!(
+        !pragmas
+            .iter()
+            .any(|sql| sql.contains("cipher_memory_security")),
+        "{pragmas:?}"
+    );
 }
 
 #[test]
@@ -15854,7 +15916,12 @@ async fn a_drained_disband_sweeps_the_held_send_its_first_pass_never_reached() {
     let app = MarmotApp::with_relay(dir.path(), "wss://drained-disband.example")
         .with_test_relay_client(relay.clone());
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("drained disband", &[]).await.unwrap();
+    let group_id = client
+        .create_group("drained disband", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
 
     // A send the engine accepted and retained: no published source id, so it
@@ -15880,7 +15947,7 @@ async fn a_drained_disband_sweeps_the_held_send_its_first_pass_never_reached() {
     )
     .unwrap();
 
-    let effects = marmot_account::AccountDeviceEffects {
+    let effects = marmot_session::AccountDeviceEffects {
         events: vec![cgka_traits::engine::GroupEvent::GroupStateChanged {
             group_id: group_id.clone(),
             epoch: cgka_traits::EpochId(1),
@@ -15935,7 +16002,12 @@ async fn reopening_an_account_replays_a_disband_once_and_then_stays_silent() {
     let app = MarmotApp::with_relay(dir.path(), "wss://announce-once.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("announce once", &[]).await.unwrap();
+    let group_id = client
+        .create_group("announce once", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
 
     // The durable terminal guard a settled disband commits. Written directly so
     // the test pins the hydration seam instead of re-driving convergence.
@@ -16031,7 +16103,12 @@ async fn an_open_heals_a_held_send_from_an_already_announced_guard() {
     let app = MarmotApp::with_relay(dir.path(), "wss://announced-guard-heals.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("terminal", &[]).await.unwrap();
+    let group_id = client
+        .create_group("terminal", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
 
     // A send the engine accepted and retained: no published source id, so it
@@ -16152,7 +16229,12 @@ async fn a_drained_member_departure_removes_that_members_group_push_tokens() {
     let app = MarmotApp::with_relay(dir.path(), "wss://drained-departure.example")
         .with_test_relay_client(relay);
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("drained departure", &[]).await.unwrap();
+    let group_id = client
+        .create_group("drained departure", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
 
     let departing = nostr::prelude::Keys::generate().public_key().to_hex();
@@ -16168,7 +16250,7 @@ async fn a_drained_member_departure_removes_that_members_group_push_tokens() {
     )
     .unwrap();
 
-    let effects = marmot_account::AccountDeviceEffects {
+    let effects = marmot_session::AccountDeviceEffects {
         events: vec![cgka_traits::engine::GroupEvent::GroupMemberLeavesRemoved {
             group_id: group_id.clone(),
             epoch: cgka_traits::EpochId(1),
@@ -16196,6 +16278,92 @@ async fn a_drained_member_departure_removes_that_members_group_push_tokens() {
     );
 }
 
+/// A device departure reaches hosts without leaf indexes. MDK still drops the
+/// removed device's push record; hosts learn only which accounts left, and an
+/// account whose other device stays has not left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_departure_event_carries_no_leaf_index() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://device-departure.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client
+        .create_group("device departure", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let peer = nostr::prelude::Keys::generate().public_key().to_hex();
+    for leaf in [1, 2] {
+        app.upsert_group_push_token(
+            "alice",
+            &drained_seam_push_token(&group_id_hex, &peer, leaf),
+        )
+        .unwrap();
+    }
+
+    let effects = marmot_session::AccountDeviceEffects {
+        events: vec![cgka_traits::engine::GroupEvent::GroupMemberLeavesRemoved {
+            group_id: group_id.clone(),
+            epoch: cgka_traits::EpochId(1),
+            leaves: vec![cgka_traits::engine::GroupMemberLeaf {
+                member: MemberId::new(hex::decode(&peer).unwrap()),
+                leaf_index: 1,
+            }],
+            departed_members: vec![],
+        }],
+        ..Default::default()
+    };
+    let summary = client
+        .observe_drained_session_events(&effects)
+        .await
+        .unwrap();
+
+    let remaining = app.group_push_tokens("alice", &group_id_hex).unwrap();
+    assert_eq!(
+        remaining
+            .iter()
+            .map(|token| token.leaf_index)
+            .collect::<Vec<_>>(),
+        vec![2],
+        "only the removed device's push record is dropped"
+    );
+    assert_eq!(
+        summary.events,
+        vec![cgka_traits::engine::GroupEvent::GroupMemberLeavesRemoved {
+            group_id,
+            epoch: cgka_traits::EpochId(1),
+            leaves: vec![],
+            departed_members: vec![],
+        }]
+    );
+}
+
+/// A received message's sender leaf is a device destination MDK keeps to
+/// itself: hosts receive the event without it.
+#[test]
+fn hosts_receive_no_sender_leaf() {
+    let event = |sender_leaf_index| cgka_traits::engine::GroupEvent::MessageReceived {
+        group_id: GroupId::new(vec![0x5A; 16]),
+        message_id: cgka_traits::MessageId::new(vec![0x11; 32]),
+        sender: MemberId::new(vec![0x22; 32]),
+        sender_leaf_index,
+        epoch: cgka_traits::EpochId(4),
+        payload: b"{}".to_vec(),
+        retention: None,
+        authority: None,
+        encrypted_media_secret: None,
+    };
+    assert_eq!(
+        crate::groups::host_group_event(&event(Some(3))),
+        event(None)
+    );
+}
+
 /// `account_groups.self_membership` is the source of truth for the account
 /// unread aggregate. A self-departure observed only on the drained seam must
 /// move it, and a drained re-join must move it back — otherwise a crash during
@@ -16214,7 +16382,9 @@ async fn a_drained_self_departure_and_rejoin_move_stored_self_membership() {
     let group_id = client
         .create_group("drained membership", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
     assert_eq!(
         app.stored_group_self_membership("alice", &group_id_hex)
@@ -16222,7 +16392,7 @@ async fn a_drained_self_departure_and_rejoin_move_stored_self_membership() {
         Some(SelfMembership::Member),
     );
 
-    let departure = marmot_account::AccountDeviceEffects {
+    let departure = marmot_session::AccountDeviceEffects {
         events: vec![
             cgka_traits::engine::GroupEvent::GroupStateChanged {
                 group_id: group_id.clone(),
@@ -16251,7 +16421,7 @@ async fn a_drained_self_departure_and_rejoin_move_stored_self_membership() {
         "a drained self-eviction must record how the account left"
     );
 
-    let rejoin = marmot_account::AccountDeviceEffects {
+    let rejoin = marmot_session::AccountDeviceEffects {
         events: vec![cgka_traits::engine::GroupEvent::GroupJoined {
             group_id: group_id.clone(),
             via_welcome: MessageId::new(vec![0x7a; 32]),
@@ -16285,9 +16455,14 @@ async fn a_peer_member_added_leaves_stored_self_membership_alone() {
     let app =
         MarmotApp::with_relay(dir.path(), "wss://peer-added.example").with_test_relay_client(relay);
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("peer added", &[]).await.unwrap();
+    let group_id = client
+        .create_group("peer added", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
-    let state_change = |change| marmot_account::AccountDeviceEffects {
+    let state_change = |change| marmot_session::AccountDeviceEffects {
         events: vec![cgka_traits::engine::GroupEvent::GroupStateChanged {
             group_id: group_id.clone(),
             epoch: cgka_traits::EpochId(1),
@@ -16347,7 +16522,12 @@ async fn a_self_departure_marks_transport_routes_dirty() {
     let app = MarmotApp::with_relay(dir.path(), "wss://routes-dirty.example")
         .with_test_relay_client(relay);
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("routes dirty", &[]).await.unwrap();
+    let group_id = client
+        .create_group("routes dirty", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let departure = |change| cgka_traits::engine::GroupEvent::GroupStateChanged {
         group_id: group_id.clone(),
         epoch: cgka_traits::EpochId(1),
@@ -16407,7 +16587,12 @@ async fn a_drained_disband_performs_the_terminal_push_sweep() {
     let app = MarmotApp::with_relay(dir.path(), "wss://drained-sweep.example")
         .with_test_relay_client(relay);
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("drained sweep", &[]).await.unwrap();
+    let group_id = client
+        .create_group("drained sweep", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
 
     app.upsert_push_registration(
@@ -16439,7 +16624,7 @@ async fn a_drained_disband_performs_the_terminal_push_sweep() {
             .is_err()
     );
     let departed = MemberId::new(hex::decode(&peer).unwrap());
-    let effects = marmot_account::AccountDeviceEffects {
+    let effects = marmot_session::AccountDeviceEffects {
         events: vec![
             cgka_traits::engine::GroupEvent::GroupMemberLeavesRemoved {
                 group_id: group_id.clone(),
@@ -16506,7 +16691,9 @@ async fn a_drained_invalidation_event_withdraws_the_timeline_record() {
     let group_id = client
         .create_group("drained invalidation", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
     let source_message_id = MessageId::new(vec![0x5c; 32]);
     let source_message_id_hex = hex::encode(source_message_id.as_slice());
@@ -16532,7 +16719,7 @@ async fn a_drained_invalidation_event_withdraws_the_timeline_record() {
     )
     .unwrap();
 
-    let effects = marmot_account::AccountDeviceEffects {
+    let effects = marmot_session::AccountDeviceEffects {
         events: vec![cgka_traits::engine::GroupEvent::AppMessageInvalidated {
             group_id: group_id.clone(),
             message_id: source_message_id,
@@ -16586,11 +16773,19 @@ async fn replaying_a_drained_batch_the_seam_already_applied_is_a_no_op() {
     let app = MarmotApp::with_relay(dir.path(), "wss://drained-replay.example")
         .with_test_relay_client(relay);
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("drained replay", &[]).await.unwrap();
-    // The replay fixture represents an already terminal canonical copy.
+    let group_id = client
+        .create_group("drained replay", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    // The replay fixture represents an already terminal canonical copy the
+    // account was removed from, so the account is off its roster.
     let storage = app.account_storage("alice").unwrap();
     let mut terminal = storage.get_group(&group_id).unwrap();
     terminal.removed = true;
+    let self_id = client.runtime.self_id();
+    terminal.members.retain(|member| member.id != self_id);
     storage.put_group(&terminal).unwrap();
     let group_id_hex = hex::encode(group_id.as_slice());
 
@@ -16606,7 +16801,7 @@ async fn replaying_a_drained_batch_the_seam_already_applied_is_a_no_op() {
     app.upsert_group_push_token("alice", &drained_seam_push_token(&group_id_hex, &peer, 1))
         .unwrap();
 
-    let effects = marmot_account::AccountDeviceEffects {
+    let effects = marmot_session::AccountDeviceEffects {
         events: vec![
             cgka_traits::engine::GroupEvent::LocalGroupCopyTerminated {
                 group_id: group_id.clone(),
@@ -16681,14 +16876,16 @@ async fn a_drained_state_change_synthesizes_the_system_row_the_live_seam_does() 
     let group_id = client
         .create_group("drained system rows", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
     let actor = MemberId::new(hex::decode(&account.account_id_hex).unwrap());
 
     // One authenticated rename, twice: the row id is derived from the change
     // and its epoch, so the two seams take one epoch each rather than
     // converging on the same deterministic row.
-    let rename = |epoch: u64, name: &str| marmot_account::AccountDeviceEffects {
+    let rename = |epoch: u64, name: &str| marmot_session::AccountDeviceEffects {
         events: vec![cgka_traits::engine::GroupEvent::GroupStateChanged {
             group_id: group_id.clone(),
             epoch: cgka_traits::EpochId(epoch),
@@ -16779,7 +16976,9 @@ async fn a_retained_event_resend_revives_the_row_its_failed_send_retracted() {
     let group_id = client
         .create_group("same second resend", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
     let sender = account.account_id_hex.clone();
 
@@ -16934,8 +17133,8 @@ mod superseded_system_row_shapes {
 
     pub(super) fn batch(
         events: Vec<cgka_traits::engine::GroupEvent>,
-    ) -> marmot_account::AccountDeviceEffects {
-        marmot_account::AccountDeviceEffects {
+    ) -> marmot_session::AccountDeviceEffects {
+        marmot_session::AccountDeviceEffects {
             events,
             ..Default::default()
         }
@@ -16985,7 +17184,9 @@ async fn a_drained_batch_leaves_no_live_system_row_for_a_commit_it_supersedes() 
     let group_id = client
         .create_group("drained superseded rows", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
     let actor = MemberId::new(hex::decode(&account.account_id_hex).unwrap());
 
@@ -17101,7 +17302,12 @@ async fn account_open_repairs_a_branch_selection_announcement_a_crash_lost() {
     let app = MarmotApp::with_relay(dir.path(), "wss://crash-repair.example")
         .with_test_relay_client(relay);
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("crash repair", &[]).await.unwrap();
+    let group_id = client
+        .create_group("crash repair", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
     let actor = MemberId::new(hex::decode(&account.account_id_hex).unwrap());
 
@@ -17246,7 +17452,9 @@ async fn a_batch_that_flips_its_verdict_projects_the_last_one() {
     let group_id = client
         .create_group("flipped verdict rows", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
     let actor = MemberId::new(hex::decode(&account.account_id_hex).unwrap());
 
@@ -17346,7 +17554,9 @@ async fn a_live_batch_leaves_no_live_system_row_for_a_commit_it_supersedes() {
     let group_id = client
         .create_group("live superseded rows", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
     let actor = MemberId::new(hex::decode(&account.account_id_hex).unwrap());
 
@@ -17634,11 +17844,15 @@ async fn a_deferred_open_never_subscribes_a_departed_groups_route() {
     let removed_group = alice
         .create_group("deferred removal", &[bob.account_id_hex.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let kept_group = alice
         .create_group("deferred keeper", &[bob.account_id_hex.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let joined = bob_client.sync().await.unwrap().joined_groups;
     assert!(
         joined.contains(&removed_group) && joined.contains(&kept_group),
@@ -17649,7 +17863,7 @@ async fn a_deferred_open_never_subscribes_a_departed_groups_route() {
         .remove_members(&removed_group, &[bob.account_id_hex.as_str()])
         .await
         .unwrap();
-    report_scripted_eose(&plane, &relay, every_subscription).await;
+    relay.replies_handled().await;
     while bob_client.admit_native_turn().await.unwrap() {}
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     while !bob_client
@@ -17712,7 +17926,6 @@ async fn a_committed_leave_stops_routing_the_group_across_a_reopen() {
         .with_test_relay_client(relay.clone());
     remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
     let plane = MarmotRelayPlane::new(None, relay.clone());
-    let _eose = scripted_eose_pump(plane.clone(), relay.clone(), every_subscription);
 
     let mut alice = app
         .client_with_relay_plane("alice", &plane, None)
@@ -17726,7 +17939,9 @@ async fn a_committed_leave_stops_routing_the_group_across_a_reopen() {
     let group_id = alice
         .create_group("leaving for good", &[bob.account_id_hex.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert!(
         bob_client
             .sync()
@@ -17810,7 +18025,9 @@ async fn a_pending_leave_request_keeps_its_group_route_across_a_reopen() {
     let group_id = alice
         .create_group("leaving", &[bob.account_id_hex.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert!(
         bob_client
             .sync()
@@ -17881,11 +18098,15 @@ async fn an_admin_removal_clears_the_removed_devices_group_routes() {
     let removed_group = alice
         .create_group("removal target", &[bob.account_id_hex.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let kept_group = alice
         .create_group("still a member", &[bob.account_id_hex.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let joined = bob_client.sync().await.unwrap().joined_groups;
     assert!(
         joined.contains(&removed_group) && joined.contains(&kept_group),
@@ -17905,7 +18126,7 @@ async fn an_admin_removal_clears_the_removed_devices_group_routes() {
     // The native group lane waits for the current REQ's stored-history
     // boundary before admitting the real locally published removal commit.
     // It lands in bob's current epoch and buffers for convergence.
-    report_scripted_eose(&plane, &relay, every_subscription).await;
+    relay.replies_handled().await;
     while bob_client.admit_native_turn().await.unwrap() {}
     // The scheduled-convergence path the account worker drives. This is the
     // field case: the removal was adopted through convergence, not inline.
@@ -17994,11 +18215,15 @@ async fn a_routing_rebuild_after_a_removal_does_not_resubscribe_the_removed_grou
     let removed_group = alice
         .create_group("removal target", &[bob.account_id_hex.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let kept_group = alice
         .create_group("still a member", &[bob.account_id_hex.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let joined = bob_client.sync().await.unwrap().joined_groups;
     assert!(
         joined.contains(&removed_group) && joined.contains(&kept_group),
@@ -18009,7 +18234,7 @@ async fn a_routing_rebuild_after_a_removal_does_not_resubscribe_the_removed_grou
         .remove_members(&removed_group, &[bob.account_id_hex.as_str()])
         .await
         .unwrap();
-    report_scripted_eose(&plane, &relay, every_subscription).await;
+    relay.replies_handled().await;
     while bob_client.admit_native_turn().await.unwrap() {}
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     while !bob_client
@@ -18089,7 +18314,9 @@ async fn a_removed_device_fails_a_composer_send_before_projecting_a_row() {
     let group_id = alice
         .create_group("removal target", &[bob.account_id_hex.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
     assert!(
         bob_client
@@ -18105,7 +18332,7 @@ async fn a_removed_device_fails_a_composer_send_before_projecting_a_row() {
         .remove_members(&group_id, &[bob.account_id_hex.as_str()])
         .await
         .unwrap();
-    report_scripted_eose(&plane, &relay, every_subscription).await;
+    relay.replies_handled().await;
     while bob_client.admit_native_turn().await.unwrap() {}
     // The removal lands in the epoch bob still holds, so convergence adopts it
     // rather than the inline commit-apply path.
@@ -18165,7 +18392,12 @@ async fn local_delete_compensation_preserves_primary_error_and_attempts_route_re
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(relay.clone());
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("compensation", &[]).await.unwrap();
+    let group_id = client
+        .create_group("compensation", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
     let routes_before = client.routing.snapshot().group_routes;
 
@@ -18232,7 +18464,9 @@ async fn local_delete_restart_preserves_rotated_route_relay_pairs_for_resurrecti
     let group_id = client
         .create_group("rotated local delete", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
     let old_route = app
         .group("alice", &group_id_hex)
@@ -18341,12 +18575,13 @@ async fn local_delete_restart_preserves_rotated_route_relay_pairs_for_resurrecti
         .await
         .unwrap();
     assert!(fresh.failures.is_empty());
-    let effects = marmot_account::AccountDeviceEffects {
+    let effects = marmot_session::AccountDeviceEffects {
         events: vec![cgka_traits::engine::GroupEvent::MessageReceived {
             authority: None,
             group_id: group_id.clone(),
             message_id: fresh.reports[0].message_id.clone(),
             sender: MemberId::new(hex::decode(&sender).unwrap()),
+            sender_leaf_index: None,
             epoch: reopened.runtime.group_record(&group_id).unwrap().epoch,
             payload: fresh_payload,
             retention: None,
@@ -18401,7 +18636,12 @@ async fn local_delete_batch_suppresses_historical_chat_in_both_event_orders() {
         let app =
             MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
         let mut client = app.client("alice").await.unwrap();
-        let group_id = client.create_group("batch frontier", &[]).await.unwrap();
+        let group_id = client
+            .create_group("batch frontier", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let group_id_hex = hex::encode(group_id.as_slice());
         let sender_hex = app.account_home().account("alice").unwrap().account_id_hex;
         let sender = MemberId::new(hex::decode(&sender_hex).unwrap());
@@ -18456,6 +18696,7 @@ async fn local_delete_batch_suppresses_historical_chat_in_both_event_orders() {
             group_id: group_id.clone(),
             message_id: historical.reports[0].message_id.clone(),
             sender: sender.clone(),
+            sender_leaf_index: None,
             epoch,
             payload: historical_payload,
             retention: None,
@@ -18466,12 +18707,13 @@ async fn local_delete_batch_suppresses_historical_chat_in_both_event_orders() {
             group_id: group_id.clone(),
             message_id: fresh.reports[0].message_id.clone(),
             sender,
+            sender_leaf_index: None,
             epoch,
             payload: fresh_payload,
             retention: None,
             encrypted_media_secret: None,
         };
-        let effects = marmot_account::AccountDeviceEffects {
+        let effects = marmot_session::AccountDeviceEffects {
             events: if fresh_first {
                 vec![fresh_event, historical_event]
             } else {
@@ -18511,7 +18753,12 @@ async fn account_open_recovers_first_fresh_chat_after_protocol_projection_crash(
     let app =
         MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("crash recovery", &[]).await.unwrap();
+    let group_id = client
+        .create_group("crash recovery", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
     let sender_hex = app.account_home().account("alice").unwrap().account_id_hex;
     let sender = MemberId::new(hex::decode(&sender_hex).unwrap());
@@ -18544,6 +18791,7 @@ async fn account_open_recovers_first_fresh_chat_after_protocol_projection_crash(
         group_id: group_id.clone(),
         message_id: message_id.clone(),
         sender,
+        sender_leaf_index: None,
         epoch: client.runtime.group_record(&group_id).unwrap().epoch,
         payload: fresh_payload,
         retention: None,
@@ -18596,7 +18844,12 @@ async fn account_open_keeps_first_fresh_chat_pending_when_group_projection_is_un
     let app =
         MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("crash recovery", &[]).await.unwrap();
+    let group_id = client
+        .create_group("crash recovery", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
     let sender_hex = app.account_home().account("alice").unwrap().account_id_hex;
     let sender = MemberId::new(hex::decode(&sender_hex).unwrap());
@@ -18629,6 +18882,7 @@ async fn account_open_keeps_first_fresh_chat_pending_when_group_projection_is_un
         group_id: group_id.clone(),
         message_id,
         sender,
+        sender_leaf_index: None,
         epoch: client.runtime.group_record(&group_id).unwrap().epoch,
         payload: fresh_payload,
         retention: None,
@@ -18728,7 +18982,9 @@ async fn an_escalation_recorded_before_a_failing_sync_is_reported_by_the_next_sy
     let group_id = client
         .create_group("escalation redelivery", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
 
     let escalated = client
         .sync()
@@ -18740,13 +18996,16 @@ async fn an_escalation_recorded_before_a_failing_sync_is_reported_by_the_next_sy
     client.apply_backfill_decision(
         &group_id,
         7,
-        crate::client::epoch_stall::BackfillDecision::ArmAndEscalate { arms: 3 },
+        crate::client::history_recovery::epoch_stall::BackfillDecision::ArmAndEscalate { arms: 3 },
         marmot_forensics::EpochStallBackfillTrigger::UndecryptableThreshold,
     );
     // ...and a later fallible step in that same pass errors, so the summary the
     // pass was building never reaches a caller: here, the receipt reload
     // before its recovery selection.
-    client.released_backfill_reload_pending = true;
+    client
+        .history_recovery
+        .test_state()
+        .released_backfill_reload_pending = true;
     client.fail_next_released_backfill_reload = true;
     let failed = client.sync().await;
     assert!(
@@ -18845,12 +19104,17 @@ async fn a_resource_refusal_for_a_terminal_group_arms_no_recovery() {
     app.set_audit_log_settings(AuditLogSettings { enabled: true })
         .unwrap();
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("terminal refusal", &[]).await.unwrap();
+    let group_id = client
+        .create_group("terminal refusal", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     // Disbanded rather than removed: the sweep gate already stops the removed
     // copy, so this is the shape that actually reaches the arm site.
     make_group_terminal(&client, &group_id, true);
 
-    let mut effects = marmot_account::AccountDeviceEffects::default();
+    let mut effects = marmot_session::AccountDeviceEffects::default();
     effects.events.push(
         cgka_traits::engine::GroupEvent::TransportObjectResourceRefused {
             group_id: group_id.clone(),
@@ -18927,12 +19191,14 @@ async fn a_publish_failure_in_the_session_event_drain_still_arms_recovery() {
     let group_id = client
         .create_group("drain arm ordering", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert_eq!(audit_rows_of_kind(&app, "epoch_stall_backfill_armed"), 0);
 
     // One drained batch that carries both a resource refusal for the live group
     // and a hard publish failure (its pending commit rolled back).
-    let mut effects = marmot_account::AccountDeviceEffects::default();
+    let mut effects = marmot_session::AccountDeviceEffects::default();
     effects.events.push(
         cgka_traits::engine::GroupEvent::TransportObjectResourceRefused {
             group_id: group_id.clone(),
@@ -18940,13 +19206,14 @@ async fn a_publish_failure_in_the_session_event_drain_still_arms_recovery() {
             resource: cgka_traits::ingest::InboundResourceLimit::TransportDeferredCapacity,
         },
     );
-    effects.failures.push(marmot_account::PublishFailure {
+    effects.failures.push(marmot_session::PublishFailure {
+        oversized: None,
         message_id: cgka_traits::MessageId::new(vec![0xab; 32]),
         reason: "injected publish failure".to_owned(),
     });
     effects
         .pending
-        .push(marmot_account::PendingResolution::RolledBack {
+        .push(marmot_session::PendingResolution::RolledBack {
             pending: cgka_traits::engine_state::PendingStateRef::new(7),
         });
 
@@ -18972,9 +19239,9 @@ async fn a_publish_failure_in_the_session_event_drain_still_arms_recovery() {
 /// refusal the pass does not arm on becomes unrecoverable.
 fn a_refusal_riding_a_rolled_back_publish(
     group_id: &cgka_traits::GroupId,
-) -> marmot_account::AccountDeviceEffects {
+) -> marmot_session::AccountDeviceEffects {
     let message_id = cgka_traits::MessageId::new(vec![0xab; 32]);
-    let mut effects = marmot_account::AccountDeviceEffects::default();
+    let mut effects = marmot_session::AccountDeviceEffects::default();
     effects.events.push(
         cgka_traits::engine::GroupEvent::TransportObjectResourceRefused {
             group_id: group_id.clone(),
@@ -18982,13 +19249,14 @@ fn a_refusal_riding_a_rolled_back_publish(
             resource: cgka_traits::ingest::InboundResourceLimit::TransportDeferredCapacity,
         },
     );
-    effects.failures.push(marmot_account::PublishFailure {
+    effects.failures.push(marmot_session::PublishFailure {
+        oversized: None,
         message_id,
         reason: "injected publish failure".to_owned(),
     });
     effects
         .pending
-        .push(marmot_account::PendingResolution::RolledBack {
+        .push(marmot_session::PendingResolution::RolledBack {
             pending: cgka_traits::engine_state::PendingStateRef::new(7),
         });
     effects
@@ -19016,7 +19284,9 @@ async fn a_publish_failure_after_scheduled_convergence_still_arms_recovery() {
     let group_id = client
         .create_group("advance arm ordering", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert_eq!(audit_rows_of_kind(&app, "epoch_stall_backfill_armed"), 0);
 
     let effects = a_refusal_riding_a_rolled_back_publish(&group_id);
@@ -19052,7 +19322,12 @@ async fn invite_recovery_failure_preserves_committed_effects_and_results() {
         let app = MarmotApp::with_relay(dir.path(), "wss://recovery-failure.example")
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let mut client = app.client("alice").await.unwrap();
-        let group_id = client.create_group("committed effects", &[]).await.unwrap();
+        let group_id = client
+            .create_group("committed effects", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let storage = app.account_storage("alice").unwrap().app_storage();
         let epoch = client.runtime.group_record(&group_id).unwrap().epoch;
         storage
@@ -19087,6 +19362,7 @@ async fn invite_recovery_failure_preserves_committed_effects_and_results() {
         let key = app
             .sqlcipher_key("alice", &keys, &path, SqlcipherDatabaseKind::Session)
             .unwrap();
+        storage_sqlite::expect_uncounted_writes_for_test(&path);
         let connection = rusqlite::Connection::open(path).unwrap();
         storage_sqlite::open_hardened_sqlcipher(
             &connection,
@@ -19176,7 +19452,7 @@ async fn assert_mixed_publish_batch_finalizes_successful_message(
     #[cfg(feature = "product-analytics-export")]
     let app = {
         let mut app = app;
-        app.product_analytics = crate::product_analytics::test_product_collector();
+        app.product_analytics = marmot_observability::test_product_collector();
         app
     };
     #[cfg(feature = "product-analytics-export")]
@@ -19186,7 +19462,12 @@ async fn assert_mixed_publish_batch_finalizes_successful_message(
         runtime
     };
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("mixed publish", &[]).await.unwrap();
+    let group_id = client
+        .create_group("mixed publish", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
     let app_event_id = "successful-app-message";
     let failed_app_event_id = "failed-app-message";
@@ -19236,8 +19517,9 @@ async fn assert_mixed_publish_batch_finalizes_successful_message(
     let published_message_id = cgka_traits::MessageId::new(vec![0xcd; 32]);
     let failed_message_id = cgka_traits::MessageId::new(vec![0xee; 32]);
     let retention = AppMessageRetentionDecision::new(10, 0);
-    let effects = marmot_account::AccountDeviceEffects {
-        published_app_messages: vec![marmot_account::PublishedApplicationMessage {
+    let effects = marmot_session::AccountDeviceEffects {
+        published_app_messages: vec![marmot_session::PublishedApplicationMessage {
+            publication_observation: None,
             authority: None,
             group_id: group_id.clone(),
             app_event_id: app_event_id.to_owned(),
@@ -19245,11 +19527,12 @@ async fn assert_mixed_publish_batch_finalizes_successful_message(
             source_epoch: cgka_traits::EpochId(1),
             retention,
         }],
-        failures: vec![marmot_account::PublishFailure {
+        failures: vec![marmot_session::PublishFailure {
+            oversized: None,
             message_id: failed_message_id.clone(),
             reason: "unrelated sibling publish failed".to_owned(),
         }],
-        failed_app_messages: vec![marmot_account::FailedApplicationMessage {
+        failed_app_messages: vec![marmot_session::FailedApplicationMessage {
             group_id: group_id.clone(),
             app_event_id: failed_app_event_id.to_owned(),
             message_id: failed_message_id,
@@ -19435,7 +19718,9 @@ async fn published_message_acknowledgement_failure_retries_cleanup_without_repub
     let group_id = client
         .create_group("acknowledgement failure", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
     let publish_attempts_before = relay.attempted_event_ids().len();
 
@@ -19522,12 +19807,15 @@ async fn accepted_projection_retries() {
         let group_id = client
             .create_group("projection failure", &[])
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let path = app.account_storage_path("alice");
         let keys = app.account_home().load_signing_keys("alice").unwrap();
         let key = app
             .sqlcipher_key("alice", &keys, &path, SqlcipherDatabaseKind::Session)
             .unwrap();
+        storage_sqlite::expect_uncounted_writes_for_test(&path);
         let connection = rusqlite::Connection::open(path).unwrap();
         storage_sqlite::open_hardened_sqlcipher(
             &connection,
@@ -19624,7 +19912,9 @@ async fn a_publish_failure_during_a_convergence_retry_still_arms_recovery() {
     let group_id = client
         .create_group("retry arm ordering", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert_eq!(audit_rows_of_kind(&app, "epoch_stall_backfill_armed"), 0);
 
     let effects = a_refusal_riding_a_rolled_back_publish(&group_id);
@@ -19652,9 +19942,9 @@ async fn a_publish_failure_during_a_convergence_retry_still_arms_recovery() {
 /// warning (mdk#428).
 fn a_refusal_riding_a_confirmed_but_partial_publish(
     group_id: &cgka_traits::GroupId,
-) -> marmot_account::AccountDeviceEffects {
+) -> marmot_session::AccountDeviceEffects {
     let message_id = cgka_traits::MessageId::new(vec![0xcd; 32]);
-    let mut effects = marmot_account::AccountDeviceEffects::default();
+    let mut effects = marmot_session::AccountDeviceEffects::default();
     effects.events.push(
         cgka_traits::engine::GroupEvent::TransportObjectResourceRefused {
             group_id: group_id.clone(),
@@ -19662,13 +19952,14 @@ fn a_refusal_riding_a_confirmed_but_partial_publish(
             resource: cgka_traits::ingest::InboundResourceLimit::TransportDeferredCapacity,
         },
     );
-    effects.failures.push(marmot_account::PublishFailure {
+    effects.failures.push(marmot_session::PublishFailure {
+        oversized: None,
         message_id,
         reason: "insufficient publish acknowledgements".to_owned(),
     });
     effects
         .pending
-        .push(marmot_account::PendingResolution::Confirmed {
+        .push(marmot_session::PendingResolution::Confirmed {
             pending: cgka_traits::engine_state::PendingStateRef::new(7),
         });
     effects
@@ -19695,7 +19986,12 @@ async fn a_publish_failure_on_the_send_path_still_arms_recovery() {
     app.set_audit_log_settings(AuditLogSettings { enabled: true })
         .unwrap();
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("send arm ordering", &[]).await.unwrap();
+    let group_id = client
+        .create_group("send arm ordering", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert_eq!(audit_rows_of_kind(&app, "epoch_stall_backfill_armed"), 0);
 
     let effects = a_refusal_riding_a_rolled_back_publish(&group_id);
@@ -19736,7 +20032,9 @@ async fn a_confirmed_but_partial_send_publish_still_passes_the_arming_gate() {
     let group_id = client
         .create_group("send soft arm ordering", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
 
     let effects = a_refusal_riding_a_confirmed_but_partial_publish(&group_id);
     let result = client
@@ -19771,8 +20069,13 @@ async fn a_queued_send_is_not_failed_by_an_unrelated_failure_in_its_batch() {
     let app = MarmotApp::with_relay(dir.path(), "wss://queued-send-gate.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("queued send gate", &[]).await.unwrap();
-    let queued_for = |group_id: &cgka_traits::GroupId| cgka_session::QueuedIntentRef {
+    let group_id = client
+        .create_group("queued send gate", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    let queued_for = |group_id: &cgka_traits::GroupId| marmot_session::QueuedIntentRef {
         group_id: group_id.clone(),
         intent_id: cgka_traits::MessageId::new(vec![0x22; 32]),
     };
@@ -19791,7 +20094,7 @@ async fn a_queued_send_is_not_failed_by_an_unrelated_failure_in_its_batch() {
     failed.queued.push(queued_for(&group_id));
     failed
         .failed_app_messages
-        .push(marmot_account::FailedApplicationMessage {
+        .push(marmot_session::FailedApplicationMessage {
             group_id: group_id.clone(),
             app_event_id: "current-send".to_owned(),
             message_id: cgka_traits::MessageId::new(vec![0xab; 32]),
@@ -19814,6 +20117,125 @@ async fn a_queued_send_is_not_failed_by_an_unrelated_failure_in_its_batch() {
             .await
             .is_err(),
         "an intent queued in another group is not evidence about this send"
+    );
+}
+
+/// Discard drops a failed own send and reports its removal. While the group
+/// still holds a send the engine may publish, discard refuses: that send could
+/// be this one, and the engine cannot cancel it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn discarding_a_failed_send_waits_for_the_groups_sends_then_drops_it() {
+    use cgka_traits::storage::{OutboundIntentStorage, QueuedOutboundIntent};
+
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://discard-failed-send.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client
+        .create_group("discard", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    let group_id_hex = hex::encode(group_id.as_slice());
+    let failed = "44".repeat(32);
+    app.record_account_app_event(
+        "alice",
+        &AppMessageProjection {
+            authority: None,
+            message_id_hex: failed.clone(),
+            source_message_id_hex: None,
+            direction: "sent".to_owned(),
+            group_id_hex: group_id_hex.clone(),
+            sender: account.account_id_hex.clone(),
+            plaintext: "never left".to_owned(),
+            kind: cgka_traits::MARMOT_APP_EVENT_KIND_CHAT,
+            tags: Vec::new(),
+            source_epoch: None,
+            retention: None,
+            recorded_at: Some(unix_now_seconds()),
+            origin_commit_id: None,
+            moderation_grant: false,
+        },
+    )
+    .unwrap();
+    app.invalidate_timeline_app_event(
+        "alice",
+        &group_id_hex,
+        &failed,
+        crate::LOCAL_PUBLISH_FAILED_REASON,
+    )
+    .unwrap();
+
+    let store = app.account_storage("alice").unwrap();
+    let held = cgka_traits::MessageId::new(vec![5; 32]);
+    store
+        .put_queued_outbound_intent(&QueuedOutboundIntent {
+            id: held.clone(),
+            group_id: group_id.clone(),
+            intent: cgka_traits::SendIntent::AppMessage {
+                group_id: group_id.clone(),
+                payload: b"held".to_vec(),
+                expected_epoch: None,
+            },
+            created_at_ms: 1,
+            reissue_attempts: 0,
+        })
+        .unwrap();
+    let mut updates = Vec::new();
+    let refused = client
+        .discard_failed_send_with_local_projection(&group_id, &failed, |update| {
+            updates.push(update)
+        })
+        .unwrap();
+    assert_eq!(
+        refused.outcome,
+        crate::DiscardFailedSendOutcome::StillSending
+    );
+    assert!(updates.is_empty());
+    assert!(
+        app.timeline_message("alice", &group_id_hex, &failed)
+            .unwrap()
+            .is_some()
+    );
+
+    store.delete_queued_outbound_intent(&held).unwrap();
+    let discarded = client
+        .discard_failed_send_with_local_projection(&group_id, &failed, |update| {
+            updates.push(update)
+        })
+        .unwrap();
+    assert_eq!(
+        discarded.outcome,
+        crate::DiscardFailedSendOutcome::Discarded
+    );
+    assert!(
+        updates
+            .iter()
+            .flat_map(|update| &update.timeline_changes)
+            .any(|change| matches!(
+                change,
+                TimelineMessageChange::Remove {
+                    message_id_hex,
+                    reason: storage_sqlite::TimelineRemoveReason::Cleared,
+                } if message_id_hex == &failed
+            )),
+        "subscribers hear the row leave"
+    );
+    assert!(
+        app.timeline_message("alice", &group_id_hex, &failed)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        client
+            .discard_failed_send_with_local_projection(&group_id, &failed, |_| {})
+            .unwrap()
+            .outcome,
+        crate::DiscardFailedSendOutcome::NotFailedSend
     );
 }
 
@@ -19855,8 +20277,9 @@ async fn a_relay_accepted_send_revives_its_local_publish_failure() {
         moderation_grant: false,
     };
     let published = |app_event_id: &str, group_id: &cgka_traits::GroupId| {
-        marmot_account::AccountDeviceEffects {
-            published_app_messages: vec![marmot_account::PublishedApplicationMessage {
+        marmot_session::AccountDeviceEffects {
+            published_app_messages: vec![marmot_session::PublishedApplicationMessage {
+                publication_observation: None,
                 authority: None,
                 group_id: group_id.clone(),
                 app_event_id: app_event_id.to_owned(),
@@ -19886,7 +20309,12 @@ async fn a_relay_accepted_send_revives_its_local_publish_failure() {
         assert!(row.poll.is_none(), "a retracted poll has no projection");
     };
 
-    let live = client.create_group("revive live", &[]).await.unwrap();
+    let live = client
+        .create_group("revive live", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let live_event = "11".repeat(32);
     retracted(&live_event, &live);
     client
@@ -19907,7 +20335,12 @@ async fn a_relay_accepted_send_revives_its_local_publish_failure() {
     );
     assert!(row.poll.is_some(), "the revived poll projects again");
 
-    let terminal = client.create_group("revive terminal", &[]).await.unwrap();
+    let terminal = client
+        .create_group("revive terminal", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let terminal_event = "22".repeat(32);
     retracted(&terminal_event, &terminal);
     make_group_terminal(&client, &terminal, false);
@@ -19980,13 +20413,19 @@ async fn the_arming_publish_gate_classifies_exactly_as_the_bare_publish_check() 
     let app = MarmotApp::with_relay(dir.path(), "wss://gate-parity.example")
         .with_test_relay_client(relay.clone());
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("gate parity", &[]).await.unwrap();
+    let group_id = client
+        .create_group("gate parity", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
 
-    let clean = marmot_account::AccountDeviceEffects::default();
-    let mut failure_without_pending = marmot_account::AccountDeviceEffects::default();
+    let clean = marmot_session::AccountDeviceEffects::default();
+    let mut failure_without_pending = marmot_session::AccountDeviceEffects::default();
     failure_without_pending
         .failures
-        .push(marmot_account::PublishFailure {
+        .push(marmot_session::PublishFailure {
+            oversized: None,
             message_id: cgka_traits::MessageId::new(vec![0xef; 32]),
             reason: "relay rejected".to_owned(),
         });
@@ -20020,8 +20459,8 @@ fn an_epoch_passage(
     group_id: &cgka_traits::GroupId,
     from: u64,
     to: u64,
-) -> marmot_account::AccountDeviceEffects {
-    let mut effects = marmot_account::AccountDeviceEffects::default();
+) -> marmot_session::AccountDeviceEffects {
+    let mut effects = marmot_session::AccountDeviceEffects::default();
     effects
         .events
         .push(cgka_traits::engine::GroupEvent::EpochChanged {
@@ -20043,9 +20482,9 @@ fn an_epoch_passage(
 fn a_convergence_reorg(
     group_id: &cgka_traits::GroupId,
     fork_source_epoch: u64,
-) -> marmot_account::AccountDeviceEffects {
+) -> marmot_session::AccountDeviceEffects {
     let invalidated_commit_id = cgka_traits::MessageId::new(vec![7u8; 32]);
-    let mut effects = marmot_account::AccountDeviceEffects::default();
+    let mut effects = marmot_session::AccountDeviceEffects::default();
     effects
         .events
         .push(cgka_traits::engine::GroupEvent::CommitRolledBack {
@@ -20083,24 +20522,37 @@ async fn a_convergence_reorg_ends_the_unrecovered_arm_run() {
     let app = MarmotApp::with_relay(dir.path(), "wss://convergence-reorg.example")
         .with_test_relay_client(relay.clone());
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("convergence reorg", &[]).await.unwrap();
+    let group_id = client
+        .create_group("convergence reorg", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
 
     // Two arms of one run, at two epochs the device armed at.
     assert_eq!(
-        client.epoch_stall.observe_resource_refusal(
-            group_id.clone(),
-            cgka_traits::EpochId(10),
-            epoch_stall_test_now_ms()
-        ),
-        crate::client::epoch_stall::BackfillDecision::Arm
+        client
+            .history_recovery
+            .test_state()
+            .epoch_stall
+            .observe_resource_refusal(
+                group_id.clone(),
+                cgka_traits::EpochId(10),
+                epoch_stall_test_now_ms()
+            ),
+        crate::client::history_recovery::epoch_stall::BackfillDecision::Arm
     );
     assert_eq!(
-        client.epoch_stall.observe_resource_refusal(
-            group_id.clone(),
-            cgka_traits::EpochId(11),
-            epoch_stall_test_now_ms()
-        ),
-        crate::client::epoch_stall::BackfillDecision::Arm
+        client
+            .history_recovery
+            .test_state()
+            .epoch_stall
+            .observe_resource_refusal(
+                group_id.clone(),
+                cgka_traits::EpochId(11),
+                epoch_stall_test_now_ms()
+            ),
+        crate::client::history_recovery::epoch_stall::BackfillDecision::Arm
     );
 
     // Convergence then resolves a fork this device was on the wrong side of.
@@ -20114,12 +20566,16 @@ async fn a_convergence_reorg_ends_the_unrecovered_arm_run() {
     // pins that shape). With it, the arms before the reorg are not one
     // unrecovered run.
     assert_eq!(
-        client.epoch_stall.observe_resource_refusal(
-            group_id,
-            cgka_traits::EpochId(12),
-            epoch_stall_test_now_ms()
-        ),
-        crate::client::epoch_stall::BackfillDecision::Arm,
+        client
+            .history_recovery
+            .test_state()
+            .epoch_stall
+            .observe_resource_refusal(
+                group_id,
+                cgka_traits::EpochId(12),
+                epoch_stall_test_now_ms()
+            ),
+        crate::client::history_recovery::epoch_stall::BackfillDecision::Arm,
         "a group whose fork convergence just adjudicated is alive; the arms it took to get there are not evidence that a replay is failing to recover it"
     );
 }
@@ -20145,16 +20601,22 @@ async fn a_maintenance_tick_reports_its_own_epoch_passage_to_the_stall_detector(
     let group_id = client
         .create_group("maintenance passage", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
 
     // The group is stuck and arms once, at epoch 10.
     assert_eq!(
-        client.epoch_stall.observe_resource_refusal(
-            group_id.clone(),
-            cgka_traits::EpochId(10),
-            epoch_stall_test_now_ms()
-        ),
-        crate::client::epoch_stall::BackfillDecision::Arm
+        client
+            .history_recovery
+            .test_state()
+            .epoch_stall
+            .observe_resource_refusal(
+                group_id.clone(),
+                cgka_traits::EpochId(10),
+                epoch_stall_test_now_ms()
+            ),
+        crate::client::history_recovery::epoch_stall::BackfillDecision::Arm
     );
 
     // Maintenance then confirms a recovered evolution, 10 -> 11.
@@ -20165,29 +20627,41 @@ async fn a_maintenance_tick_reports_its_own_epoch_passage_to_the_stall_detector(
 
     // A peer fold carries the device on to 12. Only a detector that heard the
     // maintenance passage is sitting at 11 to have this one leave it.
-    client.epoch_stall.observe_epoch_passage(
-        &group_id,
-        cgka_traits::EpochId(11),
-        cgka_traits::EpochId(12),
-    );
+    client
+        .history_recovery
+        .test_state()
+        .epoch_stall
+        .observe_epoch_passage(
+            &group_id,
+            cgka_traits::EpochId(11),
+            cgka_traits::EpochId(12),
+        );
 
     // So the stalls that follow are a new run: without the maintenance report
     // the second of these is the run's escalating third arm.
     assert_eq!(
-        client.epoch_stall.observe_resource_refusal(
-            group_id.clone(),
-            cgka_traits::EpochId(12),
-            epoch_stall_test_now_ms()
-        ),
-        crate::client::epoch_stall::BackfillDecision::Arm
+        client
+            .history_recovery
+            .test_state()
+            .epoch_stall
+            .observe_resource_refusal(
+                group_id.clone(),
+                cgka_traits::EpochId(12),
+                epoch_stall_test_now_ms()
+            ),
+        crate::client::history_recovery::epoch_stall::BackfillDecision::Arm
     );
     assert_eq!(
-        client.epoch_stall.observe_resource_refusal(
-            group_id,
-            cgka_traits::EpochId(13),
-            epoch_stall_test_now_ms()
-        ),
-        crate::client::epoch_stall::BackfillDecision::Arm,
+        client
+            .history_recovery
+            .test_state()
+            .epoch_stall
+            .observe_resource_refusal(
+                group_id,
+                cgka_traits::EpochId(13),
+                epoch_stall_test_now_ms()
+            ),
+        crate::client::history_recovery::epoch_stall::BackfillDecision::Arm,
         "the maintenance passage must have ended the run, so this is only its second arm"
     );
 }
@@ -20216,16 +20690,22 @@ async fn a_confirmed_local_publish_reports_its_epoch_passage_through_the_publish
     let group_id = client
         .create_group("own publish passage", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
 
     // The group is stuck and arms once, at epoch 10.
     assert_eq!(
-        client.epoch_stall.observe_resource_refusal(
-            group_id.clone(),
-            cgka_traits::EpochId(10),
-            epoch_stall_test_now_ms()
-        ),
-        crate::client::epoch_stall::BackfillDecision::Arm
+        client
+            .history_recovery
+            .test_state()
+            .epoch_stall
+            .observe_resource_refusal(
+                group_id.clone(),
+                cgka_traits::EpochId(10),
+                epoch_stall_test_now_ms()
+            ),
+        crate::client::history_recovery::epoch_stall::BackfillDecision::Arm
     );
 
     // The device then commits and the publish confirms, 10 -> 11.
@@ -20236,27 +20716,39 @@ async fn a_confirmed_local_publish_reports_its_epoch_passage_through_the_publish
 
     // One epoch per arm is a limp, so that confirm alone does not end the run —
     // the movement after it does.
-    client.epoch_stall.observe_epoch_passage(
-        &group_id,
-        cgka_traits::EpochId(11),
-        cgka_traits::EpochId(12),
-    );
+    client
+        .history_recovery
+        .test_state()
+        .epoch_stall
+        .observe_epoch_passage(
+            &group_id,
+            cgka_traits::EpochId(11),
+            cgka_traits::EpochId(12),
+        );
 
     assert_eq!(
-        client.epoch_stall.observe_resource_refusal(
-            group_id.clone(),
-            cgka_traits::EpochId(12),
-            epoch_stall_test_now_ms()
-        ),
-        crate::client::epoch_stall::BackfillDecision::Arm
+        client
+            .history_recovery
+            .test_state()
+            .epoch_stall
+            .observe_resource_refusal(
+                group_id.clone(),
+                cgka_traits::EpochId(12),
+                epoch_stall_test_now_ms()
+            ),
+        crate::client::history_recovery::epoch_stall::BackfillDecision::Arm
     );
     assert_eq!(
-        client.epoch_stall.observe_resource_refusal(
-            group_id,
-            cgka_traits::EpochId(13),
-            epoch_stall_test_now_ms()
-        ),
-        crate::client::epoch_stall::BackfillDecision::Arm,
+        client
+            .history_recovery
+            .test_state()
+            .epoch_stall
+            .observe_resource_refusal(
+                group_id,
+                cgka_traits::EpochId(13),
+                epoch_stall_test_now_ms()
+            ),
+        crate::client::history_recovery::epoch_stall::BackfillDecision::Arm,
         "the confirm must have been observed, so this is only the new run's second arm"
     );
 }
@@ -20279,12 +20771,17 @@ async fn an_escalation_recorded_during_a_received_delivery_rides_that_seam() {
     let app = MarmotApp::with_relay(dir.path(), "wss://ingest-seam.example")
         .with_test_relay_client(relay.clone());
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("ingest seam", &[]).await.unwrap();
+    let group_id = client
+        .create_group("ingest seam", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
 
     client.apply_backfill_decision(
         &group_id,
         9,
-        crate::client::epoch_stall::BackfillDecision::ArmAndEscalate { arms: 4 },
+        crate::client::history_recovery::epoch_stall::BackfillDecision::ArmAndEscalate { arms: 4 },
         marmot_forensics::EpochStallBackfillTrigger::UndecryptableThreshold,
     );
 
@@ -20369,7 +20866,9 @@ async fn assert_failed_cursor_pin(recovery: FailedDeliveryRecovery) {
     let group_id = alice
         .create_group("retryable failed ingest", &[bob.account_id_hex.as_str()])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert!(
         bob_client
             .sync()
@@ -20379,7 +20878,7 @@ async fn assert_failed_cursor_pin(recovery: FailedDeliveryRecovery) {
             .contains(&group_id),
         "bob must join before the failing application message",
     );
-    report_scripted_eose(&plane, &relay, every_subscription).await;
+    relay.replies_handled().await;
     while bob_client.admit_native_turn().await.unwrap() {}
     bob_client.take_pending_projection_updates();
     bob_client.take_pending_applied_sync_summary();
@@ -20402,15 +20901,7 @@ async fn assert_failed_cursor_pin(recovery: FailedDeliveryRecovery) {
     let event_id = hex::encode(message.id.as_slice());
     assert_eq!(event_id, relay_event.id);
     let later_cursor = message.timestamp.0 + 10_000;
-    let probe_cursor = |client: &AppClient| {
-        let sealed = client
-            .adapter
-            .seal_transport_cursor(Some(later_cursor), |_| true);
-        client
-            .adapter
-            .unseal_transport_cursor(client.state.last_transport_timestamp);
-        sealed
-    };
+    let probe_cursor = |client: &AppClient| probe_transport_cursor_seal(client, later_cursor);
     if matches!(recovery, FailedDeliveryRecovery::BeforeEngine) {
         bob_client.fail_ingest_of = Some(message.id);
     } else {
@@ -20444,11 +20935,11 @@ async fn assert_failed_cursor_pin(recovery: FailedDeliveryRecovery) {
             .await
             .expect("quiet retry must complete the retained projection");
         assert!(!bob_client.has_pending_effect_projections());
-        report_scripted_eose(&plane, &relay, every_subscription).await;
+        relay.replies_handled().await;
         assert!(bob_client.admit_native_turn().await.unwrap());
         assert_eq!(
-            probe_cursor(&bob_client),
-            Some(later_cursor),
+            decided_transport_cursor_seal(&bob_client, later_cursor).await,
+            later_cursor,
             "projection retry must release the pin without another delivery",
         );
         bob_client.take_pending_applied_sync_summary()
@@ -20469,7 +20960,7 @@ async fn assert_failed_cursor_pin(recovery: FailedDeliveryRecovery) {
                 "projection retry must not release an unaccepted delivery",
             );
         }
-        report_scripted_eose(&plane, &relay, every_subscription).await;
+        relay.replies_handled().await;
         assert!(
             bob_client
                 .admit_native_turn()
@@ -20481,8 +20972,8 @@ async fn assert_failed_cursor_pin(recovery: FailedDeliveryRecovery) {
             "a successful ingest must mark the delivery seen",
         );
         assert_eq!(
-            probe_cursor(&bob_client),
-            Some(later_cursor),
+            decided_transport_cursor_seal(&bob_client, later_cursor).await,
+            later_cursor,
             "successful redelivery must release the original cursor pin",
         );
         bob_client.take_pending_applied_sync_summary()
@@ -20519,6 +21010,37 @@ async fn assert_failed_cursor_pin(recovery: FailedDeliveryRecovery) {
         "the failed delivery's message must be durably projected exactly once",
     );
 }
+
+/// How far a commit could promote `client`'s cursor toward `candidate` right
+/// now, leaving the restart floor where it was.
+#[cfg(feature = "test-policy-overrides")]
+fn probe_transport_cursor_seal(client: &AppClient, candidate: u64) -> Option<u64> {
+    let sealed = client
+        .adapter
+        .seal_transport_cursor(Some(candidate), |_| true);
+    client
+        .adapter
+        .unseal_transport_cursor(client.state.last_transport_timestamp);
+    sealed
+}
+
+/// The cursor a seal decides once it can decide at all. A seal defers with
+/// `None` while replay admission settles or while another plane task holds
+/// the adapter state it will not wait for; neither says whether a pin caps it.
+#[cfg(feature = "test-policy-overrides")]
+async fn decided_transport_cursor_seal(client: &AppClient, candidate: u64) -> u64 {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(sealed) = probe_transport_cursor_seal(client, candidate) {
+                return sealed;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the cursor seal must decide once replay admission settles")
+}
+
 /// The clock a test uses when it drives the epoch-stall detector directly.
 ///
 /// The very same reading production takes, deliberately. These tests arm
@@ -20572,7 +21094,7 @@ impl UndecryptableProbeRoute {
 /// Every filling probe is dated `filled_through` so a later probe's effect on
 /// the transport cursor is unambiguous, and each is ingested through the receive
 /// seam because that is the cheapest way to reach the engine 256 times.
-async fn group_at_the_undecryptable_retention_cap(
+pub(crate) async fn group_at_the_undecryptable_retention_cap(
     dir: &tempfile::TempDir,
     filled_through: u64,
 ) -> (MarmotApp, crate::AppClient, UndecryptableProbeRoute) {
@@ -20631,7 +21153,9 @@ pub(crate) async fn undecryptable_probe_route(
     let group_id = client
         .create_group("undecryptable retention cap", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let nostr_group_id_hex = app
         .group("alice", &hex::encode(group_id.as_slice()))
         .unwrap()
@@ -20903,7 +21427,12 @@ fn a_transport_deferred_delivery_is_still_marked_seen() {
             true,
         );
         let mut client = client_on_app_relay_plane(&app, "alice").await;
-        let group_id = client.create_group("deferred fence", &[]).await.unwrap();
+        let group_id = client
+            .create_group("deferred fence", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let route = UndecryptableProbeRoute {
             account_id_hex,
             nostr_group_id_hex: app
@@ -20959,8 +21488,6 @@ fn a_refused_delivery_stays_fetchable_through_the_catch_up_drain() {
         )
         .await;
         {
-            let _eose =
-                scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
             client
                 .sync()
                 .await
@@ -21001,8 +21528,6 @@ fn a_refused_delivery_stays_fetchable_through_the_catch_up_drain() {
                     .unwrap(),
                 1,
             );
-            let _eose =
-                scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
             client
                 .sync()
                 .await
@@ -21639,8 +22164,8 @@ async fn shutdown_and_close_allows_another_process_to_open_root() {
 /// the inference the criterion forbids.
 #[test]
 fn a_retained_send_reports_accepted_pending_rather_than_an_empty_publish() {
-    let mut effects = marmot_account::AccountDeviceEffects::default();
-    effects.queued.push(cgka_session::QueuedIntentRef {
+    let mut effects = marmot_session::AccountDeviceEffects::default();
+    effects.queued.push(marmot_session::QueuedIntentRef {
         group_id: cgka_traits::GroupId::new(vec![0x11; 16]),
         intent_id: cgka_traits::MessageId::new(vec![0x22; 32]),
     });
@@ -21670,7 +22195,9 @@ async fn a_send_that_reaches_the_transport_reports_published() {
     let group_id = setup_client
         .create_group("accept disposition", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     drop(setup_client);
 
     let runtime = MarmotAppRuntime::new(app.clone());
@@ -21702,7 +22229,9 @@ async fn unavailable_send_retries_the_exact_event_after_transport_recovers() {
     let group_id = setup_client
         .create_group("send recovery", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     drop(setup_client);
 
     let runtime = MarmotAppRuntime::new(app.clone());
@@ -21812,7 +22341,9 @@ async fn connectivity_restored_wakes_a_retained_send_before_the_retry_timer() {
     let group_id = setup_client
         .create_group("send recovery wake", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     drop(setup_client);
 
     let runtime = MarmotAppRuntime::new(app.clone());
@@ -21900,7 +22431,9 @@ async fn retained_send_recovers_after_reconnect(host_wake: bool) {
     let group_id = setup_client
         .create_group("reconnect send recovery", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     drop(setup_client);
 
     let runtime = MarmotAppRuntime::new(app.clone());
@@ -21918,22 +22451,38 @@ async fn retained_send_recovers_after_reconnect(host_wake: bool) {
     let failed_event_id = relay.attempted_event_ids()[attempts_before].clone();
 
     relay.allow_publishes();
+    let mut events = runtime.subscribe();
     runtime
         .shared_services()
         .relay_plane()
         .simulate_notification_consumer_exit_for_test();
-    let backoff_deadline = std::time::Instant::now() + Duration::from_secs(15);
-    loop {
-        match runtime.unhydrated_group_count_for_test("sender").await {
-            Err(AppError::TransportClosed) => break,
-            Ok(_) => tokio::task::yield_now().await,
-            Err(error) => panic!("unexpected reconnect probe error: {error:?}"),
+    // Wait for the failed receive before probing: the worker takes a ready
+    // command before its receive, so probes sent back to back would keep
+    // the receive that observes the exit from running.
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            match events.recv().await {
+                Ok(MarmotAppEvent::AccountError(error))
+                    if error.message.starts_with("runtime receive failed") =>
+                {
+                    break;
+                }
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    panic!("runtime events closed before the failed receive")
+                }
+            }
         }
-        assert!(
-            std::time::Instant::now() < backoff_deadline,
-            "account worker did not enter reconnect backoff"
-        );
-    }
+    })
+    .await
+    .expect("the consumer exit must fail the worker's receive");
+    assert!(
+        matches!(
+            runtime.unhydrated_group_count_for_test("sender").await,
+            Err(AppError::TransportClosed)
+        ),
+        "account worker did not enter reconnect backoff"
+    );
 
     if host_wake {
         runtime
@@ -21994,7 +22543,12 @@ async fn eventless_drain_projects_every_retained_send_it_publishes() {
     let app = MarmotApp::with_relay(dir.path(), "wss://eventless-drain.example")
         .with_test_relay_client(relay.clone());
     let mut client = app.client("sender").await.unwrap();
-    let group_id = client.create_group("eventless drain", &[]).await.unwrap();
+    let group_id = client
+        .create_group("eventless drain", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     relay.fail_publishes_as_unavailable();
 
     for plaintext in ["first eventless retained", "second eventless retained"] {
@@ -22084,7 +22638,9 @@ async fn two_unavailable_sends_retry_once_in_order_after_transport_recovers() {
     let group_id = setup_client
         .create_group("ordered recovery", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     drop(setup_client);
 
     let runtime = MarmotAppRuntime::new(app.clone());
@@ -22165,14 +22721,18 @@ async fn unavailable_group_invite_retries_the_exact_commit_after_transport_recov
     let group_id = runtime
         .create_group("sender", "invite recovery", &[], None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
 
     let attempts_before = relay.attempted_event_ids().len();
     relay.fail_publishes_as_unavailable();
     let summary = runtime
         .invite_members("sender", &group_id, &[invited.account_id_hex])
         .await
-        .expect("a temporary invite publish failure must retain the exact commit");
+        .expect("a temporary invite publish failure must retain the exact commit")
+        .operation
+        .expect("the invite must retain its actual summary");
     assert_eq!(
         summary.accept_disposition,
         cgka_traits::SendAcceptDisposition::CompletionUnknown
@@ -22229,6 +22789,220 @@ async fn unavailable_group_invite_retries_the_exact_commit_after_transport_recov
     runtime.shutdown().await;
 }
 
+/// Alice's client with a group ready to invite Bob into, and a relay that
+/// fails every group-message publish with an untyped error, so the invite's
+/// commit is retained with its acknowledgement unknown (mdk#2726).
+struct UnresolvedInvite {
+    _dir: tempfile::TempDir,
+    _plane: MarmotRelayPlane,
+    _bob_client: AppClient,
+    relay: Arc<ScriptedPushRelayClient>,
+    alice: AppClient,
+    group: GroupId,
+    bob_id_hex: String,
+    attempted_before: usize,
+}
+
+async fn unresolved_invite() -> UnresolvedInvite {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let bob = home.create_account("bob").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
+    let plane = MarmotRelayPlane::new(None, relay.clone());
+    let mut alice = app
+        .client_with_relay_plane("alice", &plane, None)
+        .await
+        .unwrap();
+    let mut bob_client = app
+        .client_with_relay_plane("bob", &plane, None)
+        .await
+        .unwrap();
+    bob_client.sync().await.unwrap();
+    let group = alice
+        .create_group("unresolved invite", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    let attempted_before = relay.attempted_events().len();
+    relay.fail_publishes_of_kind(transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE);
+    UnresolvedInvite {
+        _dir: dir,
+        _plane: plane,
+        _bob_client: bob_client,
+        relay,
+        alice,
+        group,
+        bob_id_hex: bob.account_id_hex,
+        attempted_before,
+    }
+}
+
+/// Kinds of the events attempted since `before`.
+fn attempted_kinds_since(relay: &ScriptedPushRelayClient, before: usize) -> Vec<u64> {
+    relay.attempted_events()[before..]
+        .iter()
+        .map(|event| event.kind)
+        .collect()
+}
+
+/// mdk#2726: the public invite call publishes no Welcome while its Add
+/// commit's acknowledgement is unknown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invite_with_unresolved_commit_holds_its_welcome() {
+    let mut invite = unresolved_invite().await;
+    let summary = invite
+        .alice
+        .invite_members(&invite.group, &[invite.bob_id_hex.as_str()])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    assert_eq!(
+        summary.accept_disposition,
+        cgka_traits::SendAcceptDisposition::CompletionUnknown
+    );
+
+    let attempted = attempted_kinds_since(&invite.relay, invite.attempted_before);
+    assert!(
+        attempted.contains(&transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE),
+        "the invite attempted its commit"
+    );
+    assert!(
+        !attempted.contains(&transport_nostr_peeler::KIND_NIP59_GIFT_WRAP),
+        "no Welcome may be published before its Add commit confirms"
+    );
+}
+
+/// mdk#2726: an invite whose commit is retained leaves no Welcome slot for a
+/// later caller to drive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invite_with_unresolved_commit_leaves_no_welcome_slot() {
+    let mut invite = unresolved_invite().await;
+    let telemetry = marmot_observability::PerformanceRecorder::default();
+    let summary = invite
+        .alice
+        .invite_members_with_telemetry(
+            &invite.group,
+            &[invite.bob_id_hex.as_str()],
+            &[],
+            crate::MemberResolutionPolicy::Partial,
+            &telemetry,
+        )
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    assert_eq!(
+        summary.accept_disposition,
+        cgka_traits::SendAcceptDisposition::CompletionUnknown
+    );
+    assert!(invite.alice.unpublished_welcome_delivery.is_none());
+}
+
+/// mdk#2726: the account worker drives an invite's Welcomes only when its
+/// commit is published, but a retained invite used to leave its slot behind.
+/// A later create that only returns an existing group, as a retried
+/// prepared-image create does, then drove that slot and published the
+/// invite's Welcome before its commit confirmed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retained_invite_leaves_no_welcome_for_a_later_create_to_send() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("sender").unwrap();
+    let invited = home.create_account("invited").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://retained-invite.example")
+        .with_test_relay_client(relay.clone());
+    remember_test_member_inbox(
+        &app,
+        &invited.account_id_hex,
+        "wss://retained-invite.example",
+    );
+    // A group already created from a prepared image, so creating from that
+    // image again returns it without creating anything.
+    let (upload_id, image_group) = {
+        let mut client = app.client("sender").await.unwrap();
+        let staged = client
+            .stage_prepared_initial_group_image(&one_pixel_png(), "image/png")
+            .unwrap();
+        client
+            .finish_initial_group_image_upload(&staged.upload_id, &Ok(()))
+            .unwrap();
+        let created = client
+            .create_group_with_prepared_initial_image_and_telemetry(
+                "image group",
+                &[],
+                AppCreateGroupOptions::default(),
+                &staged.upload_id,
+                &marmot_observability::PerformanceRecorder::default(),
+            )
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
+        (staged.upload_id, created.group_id)
+    };
+    let runtime = MarmotAppRuntime::new(app);
+    runtime.reconcile_accounts().await.unwrap();
+    runtime.catch_up_accounts().await.unwrap();
+    let group_id = runtime
+        .create_group("sender", "retained invite", &[], None)
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+
+    let attempted_before = relay.attempted_events().len();
+    relay.fail_publishes_of_kind(transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE);
+    let summary = runtime
+        .invite_members("sender", &group_id, &[invited.account_id_hex])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    assert_eq!(
+        summary.accept_disposition,
+        cgka_traits::SendAcceptDisposition::CompletionUnknown
+    );
+    let again = runtime
+        .create_group_with_prepared_initial_image(
+            "sender",
+            "retried image group",
+            &[],
+            None,
+            upload_id,
+        )
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    assert_eq!(again, image_group);
+    // Worker mutations run in order, so this one starts only after the
+    // create's post-reply Welcome delivery has finished.
+    runtime
+        .create_group("sender", "after the retry", &[], None)
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+
+    let attempted = attempted_kinds_since(&relay, attempted_before);
+    assert!(
+        attempted.contains(&transport_nostr_peeler::KIND_MARMOT_GROUP_MESSAGE),
+        "the invite attempted its commit"
+    );
+    assert!(
+        !attempted.contains(&transport_nostr_peeler::KIND_NIP59_GIFT_WRAP),
+        "no Welcome may be published before its Add commit confirms"
+    );
+    runtime.shutdown().await;
+}
+
 // ---- mdk#1380: steady-state reconciliation passes must not rescan full state ----
 
 #[test]
@@ -22243,7 +23017,12 @@ fn encrypted_media_warm_skips_authoritative_rechecks_at_an_unchanged_epoch() {
             .with_test_relay_client(relay.clone());
 
         let mut client = app.client("alice").await.unwrap();
-        let group_id = client.create_group("warm pass", &[]).await.unwrap();
+        let group_id = client
+            .create_group("warm pass", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let group_id_hex = hex::encode(group_id.as_slice());
         assert_eq!(client.state.groups.len(), 1);
         assert!(client.state.groups[0].encrypted_media.required);
@@ -22355,7 +23134,12 @@ async fn check_received_media_source_epoch_secret(carried_secret: bool) {
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("left epoch media", &[]).await.unwrap();
+    let group_id = client
+        .create_group("left epoch media", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
     let sender_hex = app.account_home().account("alice").unwrap().account_id_hex;
     let storage = app.account_storage("alice").unwrap().app_storage();
@@ -22388,6 +23172,7 @@ async fn check_received_media_source_epoch_secret(carried_secret: bool) {
         media_type: "application/pdf".to_owned(),
         version: "encrypted-media-v2".to_owned(),
         source_epoch: source_epoch.0,
+        source_epoch_identity: None,
         dim: None,
         thumbhash: None,
     };
@@ -22449,12 +23234,24 @@ async fn check_received_media_source_epoch_secret(carried_secret: bool) {
         "precondition: the source epoch was never cached while current"
     );
 
-    let effects = marmot_account::AccountDeviceEffects {
+    // #2840: a same-number losing branch's key can already be cached. A
+    // canonical source replaces it from the carried key or, for a late legacy
+    // event without one, the authoritative retained source-epoch exporter.
+    storage
+        .remember_encrypted_media_epoch_secret(
+            &group_id_hex,
+            GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID,
+            source_epoch.0,
+            &[0xcc; 32],
+        )
+        .unwrap();
+    let effects = marmot_session::AccountDeviceEffects {
         events: vec![cgka_traits::engine::GroupEvent::MessageReceived {
             authority: None,
             group_id: group_id.clone(),
             message_id: sent.reports[0].message_id.clone(),
             sender: MemberId::new(hex::decode(&sender_hex).unwrap()),
+            sender_leaf_index: None,
             epoch: source_epoch,
             payload,
             retention: None,
@@ -22469,7 +23266,7 @@ async fn check_received_media_source_epoch_secret(carried_secret: bool) {
         .unwrap();
     assert_eq!(summary.messages.len(), 1);
 
-    assert_eq!(
+    assert!(
         storage
             .encrypted_media_epoch_secret(
                 &group_id_hex,
@@ -22477,8 +23274,8 @@ async fn check_received_media_source_epoch_secret(carried_secret: bool) {
                 source_epoch.0,
             )
             .unwrap()
-            .as_deref(),
-        Some(source_secret.as_ref()),
+            .as_deref()
+            == Some(source_secret.as_ref()),
         "the cached key must be the source epoch's exporter secret"
     );
     assert!(
@@ -22502,7 +23299,12 @@ fn idle_sync_skips_the_checkpoint_route_recomputation() {
             .with_test_relay_client(relay.clone());
 
         let mut client = app.client("alice").await.unwrap();
-        client.create_group("idle sync", &[]).await.unwrap();
+        client
+            .create_group("idle sync", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
 
         // Settle startup/replay traffic, then reset the counter: syncs below
         // drain an empty channel, so nothing can have changed routing.
@@ -22531,7 +23333,12 @@ fn member_ids_page_reads_admins_from_the_durable_group_projection() {
             .with_test_relay_client(relay.clone());
 
         let mut client = app.client("alice").await.unwrap();
-        let group_id = client.create_group("durable admins", &[]).await.unwrap();
+        let group_id = client
+            .create_group("durable admins", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         assert_eq!(
             client.admin_policy_for_group(&group_id).admins,
             vec![alice.account_id_hex.clone()],
@@ -22755,6 +23562,422 @@ fn reconcile_repairs_stale_three_member_count_on_two_member_direct() {
     );
 }
 
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_miss_skips_unhydrated() {
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let peer = home.create_account("bob").unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let unrelated = {
+        let mut client = app.client("alice").await.unwrap();
+        client
+            .create_group("unrelated", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members")
+    };
+    let missing = {
+        let failing = MarmotApp::with_relay_and_config(
+            dir.path(),
+            "wss://relay.example",
+            MarmotAppConfig::white_noise().with_dev_fail_create_local_projection(true),
+        )
+        .with_test_relay_client(relay.clone());
+        let mut client = failing.client("alice").await.unwrap();
+        [
+            client
+                .create_group("unprojected", &[])
+                .await
+                .unwrap()
+                .operation
+                .expect("eligible fixture members"),
+            client
+                .create_group("", &[])
+                .await
+                .unwrap()
+                .operation
+                .expect("eligible fixture members"),
+        ]
+    };
+    assert_eq!(app.groups("alice").unwrap().len(), 1);
+    let plane = MarmotRelayPlane::new(None, relay);
+    let mut client = app
+        .local_client_with_relay_plane_and_hydration("alice", &plane, None, true, None)
+        .await
+        .unwrap();
+    assert!(matches!(
+        client
+            .runtime
+            .group_record(&unrelated)
+            .unwrap_err()
+            .as_engine_error(),
+        Some(cgka_traits::error::EngineError::GroupNotHydrated(_))
+    ));
+    for group_id in &missing {
+        assert!(matches!(
+            client
+                .runtime
+                .group_record(group_id)
+                .unwrap_err()
+                .as_engine_error(),
+            Some(cgka_traits::error::EngineError::GroupNotHydrated(_))
+        ));
+    }
+    assert!(
+        client
+            .reusable_direct_group(&peer.account_id_hex)
+            .unwrap()
+            .is_none()
+    );
+    assert!(matches!(
+        client
+            .runtime
+            .group_record(&unrelated)
+            .unwrap_err()
+            .as_engine_error(),
+        Some(cgka_traits::error::EngineError::GroupNotHydrated(_))
+    ));
+    for group_id in &missing {
+        assert!(matches!(
+            client
+                .runtime
+                .group_record(group_id)
+                .unwrap_err()
+                .as_engine_error(),
+            Some(cgka_traits::error::EngineError::GroupNotHydrated(_))
+        ));
+    }
+    assert_eq!(app.groups("alice").unwrap().len(), 1);
+}
+
+/// Every direct-conversation candidate the peer index yields is in A or
+/// listed quarantined there, so the lookup's wait for its candidates ends at
+/// once for every class of stored row: a live direct conversation, a pending
+/// invitation, one left, one removed from, one whose device was removed, and
+/// one quarantined at hydration (mdk#3273 PR 4). The left and removed rows
+/// are not reusable and need no members; the quarantined one fails the
+/// lookup as unknown, as the worker's read failed it.
+#[test]
+fn every_direct_candidate_class_answers_without_waiting() {
+    run_composed_app_runtime_test(
+        "direct-candidate-classes",
+        every_direct_candidate_class_answers_without_waiting_body,
+    );
+}
+
+async fn every_direct_candidate_class_answers_without_waiting_body() {
+    use cgka_traits::storage::GroupStorage;
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    // Bob has his own home, so the runtime runs only Alice's worker.
+    let bob_dir = tempfile::tempdir().unwrap();
+    let bob_id = AccountHome::open(bob_dir.path())
+        .create_account("bob")
+        .unwrap()
+        .account_id_hex;
+    let bob_app = MarmotApp::with_relay(bob_dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    remember_test_member_inbox(&app, &bob_id, "wss://relay.example");
+    let [live, pending, left, removed, device_removed, quarantined] = {
+        let mut bob = bob_app.client("bob").await.unwrap();
+        let mut alice = app.client("alice").await.unwrap();
+        let mut created = Vec::new();
+        for _ in 0..6 {
+            bob.publish_key_package().await.unwrap();
+            created.push(
+                alice
+                    .create_group("", &[bob_id.as_str()])
+                    .await
+                    .unwrap()
+                    .operation
+                    .expect("eligible fixture members"),
+            );
+        }
+        created.try_into().unwrap()
+    };
+    let hex_of = |group: &GroupId| hex::encode(group.as_slice());
+    let mut state = app.load_state("alice").unwrap();
+    state
+        .groups
+        .iter_mut()
+        .find(|group| group.group_id_hex == hex_of(&pending))
+        .expect("the pending invitation")
+        .pending_confirmation = true;
+    app.save_state(&state).unwrap();
+    for (group, membership) in [
+        (&left, SelfMembership::Left),
+        (&removed, SelfMembership::Removed),
+        (&device_removed, SelfMembership::DeviceRemoved),
+    ] {
+        app.set_group_self_membership("alice", &hex_of(group), membership)
+            .unwrap();
+    }
+    let candidates = |app: &MarmotApp| {
+        app.direct_conversation_candidates("alice", &bob_id)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.group_id_hex)
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let rows = |app: &MarmotApp| {
+        app.direct_conversation_candidates("alice", &bob_id)
+            .unwrap()
+            .into_iter()
+            .map(|row| {
+                (
+                    row.group_id_hex,
+                    row.self_membership,
+                    row.pending_confirmation,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let every_class = [
+        &live,
+        &pending,
+        &left,
+        &removed,
+        &device_removed,
+        &quarantined,
+    ]
+    .map(hex_of)
+    .into_iter()
+    .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(candidates(&app), every_class);
+
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.start().await.unwrap();
+    let found = tokio::time::timeout(
+        Duration::from_secs(10),
+        runtime.existing_direct_conversation("alice", &bob_id),
+    )
+    .await
+    .expect("the lookup waits for no candidate")
+    .unwrap()
+    .expect("a reusable direct conversation");
+    // The one quarantined below is still a live member row here.
+    assert!(
+        [&live, &pending, &quarantined]
+            .map(hex_of)
+            .contains(&found.group_id_hex),
+        "only a member row is reused: found {}, rows {:?}",
+        found.group_id_hex,
+        rows(&app)
+    );
+    runtime.shutdown().await;
+
+    let storage = app.account_storage("alice").unwrap();
+    let mut damaged = storage.get_group(&quarantined).unwrap();
+    damaged.protocol_profile = cgka_traits::group::ProtocolProfile::Legacy;
+    storage.put_group(&damaged).unwrap();
+    drop(storage);
+    app.close_storage().unwrap();
+    let app =
+        MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
+    assert_eq!(candidates(&app), every_class);
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.start().await.unwrap();
+    let error = tokio::time::timeout(
+        Duration::from_secs(10),
+        runtime.existing_direct_conversation("alice", &bob_id),
+    )
+    .await
+    .expect("the lookup waits for no quarantined candidate")
+    .expect_err("an unreadable direct conversation is never skipped into a miss");
+    assert!(
+        matches!(&error, AppError::UnknownGroup(id) if id == &hex_of(&quarantined))
+            || matches!(error.as_engine_error(), Some(cgka_traits::error::EngineError::UnknownGroup(id)) if id == &quarantined),
+        "{error:?}"
+    );
+    assert_eq!(
+        runtime
+            .quarantined_groups("alice")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|group| group.group_id_hex)
+            .collect::<Vec<_>>(),
+        vec![hex_of(&quarantined)]
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_retry_blocks_quarantine() {
+    use cgka_traits::storage::GroupStorage;
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let bob = home.create_account("bob").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        "wss://relay.example",
+        MarmotAppConfig::white_noise().with_dev_fail_create_local_projection(true),
+    )
+    .with_test_relay_client(relay.clone());
+    remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
+    let group_id = {
+        let mut peer = app.client("bob").await.unwrap();
+        peer.publish_key_package().await.unwrap();
+        let mut alice = app.client("alice").await.unwrap();
+        alice
+            .create_group_with_options(
+                "",
+                &[&bob.account_id_hex],
+                AppCreateGroupOptions {
+                    initial_admins: vec![bob.account_id_hex.clone()],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members")
+    };
+    assert!(app.groups("alice").unwrap().is_empty());
+    let group_hex = hex::encode(group_id.as_slice());
+    let storage = app.account_storage("alice").unwrap();
+    let mut damaged = storage.get_group(&group_id).unwrap();
+    assert_ne!(
+        damaged.protocol_profile,
+        cgka_traits::group::ProtocolProfile::Legacy
+    );
+    damaged.protocol_profile = cgka_traits::group::ProtocolProfile::Legacy;
+    storage.put_group(&damaged).unwrap();
+    let plane = MarmotRelayPlane::new(None, relay);
+    let mut alice = app
+        .local_client_with_relay_plane_and_hydration("alice", &plane, None, true, None)
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        let error = match alice.reusable_direct_group(&bob.account_id_hex) {
+            Err(error) => error,
+            Ok(_) => panic!("an unreadable canonical direct must not allow a new create"),
+        };
+        assert!(
+            matches!(&error, AppError::UnknownGroup(id) if id == &group_hex)
+                || matches!(error.as_engine_error(), Some(cgka_traits::error::EngineError::UnknownGroup(id)) if id == &group_id),
+            "{error:?}"
+        );
+        assert_eq!(alice.runtime.quarantined_groups().len(), 1);
+        assert_eq!(alice.runtime.quarantined_groups()[0].0, group_id);
+    }
+    drop(alice);
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.start().await.unwrap();
+    for _ in 0..2 {
+        let error = runtime
+            .start_direct_conversation("alice", &bob.account_id_hex)
+            .await
+            .expect_err("an unreadable canonical direct must not allow a new create");
+        assert!(
+            matches!(&error, AppError::UnknownGroup(id) if id == &group_hex)
+                || matches!(error.as_engine_error(), Some(cgka_traits::error::EngineError::UnknownGroup(id)) if id == &group_id),
+            "{error:?}"
+        );
+    }
+    assert_eq!(
+        storage
+            .list_group_records()
+            .unwrap()
+            .iter()
+            .map(|group| &group.id)
+            .collect::<Vec<_>>(),
+        vec![&group_id]
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn direct_retry_skips_removed() {
+    use cgka_traits::storage::GroupStorage;
+    let dir = tempfile::tempdir().unwrap();
+    let home = AccountHome::open(dir.path());
+    home.create_account("alice").unwrap();
+    let bob = home.create_account("bob").unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        "wss://relay.example",
+        MarmotAppConfig::white_noise().with_dev_fail_create_local_projection(true),
+    )
+    .with_test_relay_client(relay.clone());
+    remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
+    let group_id = {
+        let mut peer = app.client("bob").await.unwrap();
+        peer.publish_key_package().await.unwrap();
+        let mut alice = app.client("alice").await.unwrap();
+        alice
+            .create_group("", &[&bob.account_id_hex])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members")
+    };
+    let storage = app.account_storage("alice").unwrap();
+    let mut removed = storage.get_group(&group_id).unwrap();
+    assert_ne!(
+        removed.protocol_profile,
+        cgka_traits::group::ProtocolProfile::Legacy
+    );
+    removed.protocol_profile = cgka_traits::group::ProtocolProfile::Legacy;
+    removed.removed = true;
+    storage.put_group(&removed).unwrap();
+    let plane = MarmotRelayPlane::new(None, relay);
+    let mut alice = app
+        .local_client_with_relay_plane_and_hydration("alice", &plane, None, true, None)
+        .await
+        .unwrap();
+    assert!(app.groups("alice").unwrap().is_empty());
+    assert!(!alice.runtime.ensure_group_hydrated(&group_id).unwrap());
+    assert_eq!(alice.runtime.quarantined_groups().len(), 1);
+    assert_eq!(alice.runtime.quarantined_groups()[0].0, group_id);
+    assert!(
+        alice
+            .reusable_direct_group(&bob.account_id_hex)
+            .unwrap()
+            .is_none()
+    );
+    drop(alice);
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.start().await.unwrap();
+    let created = runtime
+        .start_direct_conversation("alice", &bob.account_id_hex)
+        .await
+        .unwrap();
+    assert_ne!(created, group_id);
+    assert_eq!(
+        runtime
+            .start_direct_conversation("alice", &bob.account_id_hex)
+            .await
+            .unwrap(),
+        created
+    );
+    assert_eq!(
+        storage
+            .list_group_records()
+            .unwrap()
+            .into_iter()
+            .map(|group| group.id)
+            .collect::<std::collections::HashSet<_>>(),
+        std::collections::HashSet::from([group_id, created])
+    );
+    runtime.shutdown_and_close().await.unwrap();
+}
+
 async fn reconcile_repairs_stale_three_member_count_on_two_member_direct_body() {
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let dir = tempfile::tempdir().unwrap();
@@ -22770,7 +23993,12 @@ async fn reconcile_repairs_stale_three_member_count_on_two_member_direct_body() 
         let mut bob = app.client("bob").await.unwrap();
         bob.publish_key_package().await.unwrap();
         let mut alice = app.client("alice").await.unwrap();
-        let group_id = alice.create_group("", &[bob_id.as_str()]).await.unwrap();
+        let group_id = alice
+            .create_group("", &[bob_id.as_str()])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         group_id_hex = hex::encode(group_id.as_slice());
     }
 
@@ -22838,7 +24066,9 @@ async fn reconcile_repairs_stale_two_member_count_on_three_member_group_body() {
         let group_id = alice
             .create_group("", &[bob_id.as_str(), carol_id.as_str()])
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         group_id_hex = hex::encode(group_id.as_slice());
     }
 
@@ -22937,12 +24167,7 @@ fn released_transport_is_replayed_after_lost_effect_and_reopen() {
                         .unwrap();
                 } else {
                     inject_epoch_gap_probe(&app, probe.clone()).await;
-                    report_scripted_eose(&app.relay_plane, &relay, every_subscription).await;
-                    let _eose = scripted_eose_pump(
-                        app.relay_plane.clone(),
-                        relay.clone(),
-                        every_subscription,
-                    );
+                    relay.replies_handled().await;
                     if handling == "sdk drain" {
                         client.sync().await.unwrap();
                     } else {
@@ -22962,7 +24187,7 @@ fn released_transport_is_replayed_after_lost_effect_and_reopen() {
                 drop(client);
                 client = client_on_app_relay_plane(&app, "alice").await;
             } else if handling == "failed effects" {
-                let mut effects = marmot_account::AccountDeviceEffects::default();
+                let mut effects = marmot_session::AccountDeviceEffects::default();
                 effects.events.push(
                     cgka_traits::engine::GroupEvent::TransportObjectResourceRefused {
                         group_id: route.group_id.clone(),
@@ -22971,13 +24196,14 @@ fn released_transport_is_replayed_after_lost_effect_and_reopen() {
                             cgka_traits::ingest::InboundResourceLimit::TransportDeferredRetryBudget,
                     },
                 );
-                effects.failures.push(marmot_account::PublishFailure {
+                effects.failures.push(marmot_session::PublishFailure {
+                    oversized: None,
                     message_id: delivery.message.id.clone(),
                     reason: "injected".into(),
                 });
                 effects
                     .pending
-                    .push(marmot_account::PendingResolution::RolledBack {
+                    .push(marmot_session::PendingResolution::RolledBack {
                         pending: cgka_traits::engine_state::PendingStateRef::new(7),
                     });
                 assert!(
@@ -23013,8 +24239,6 @@ fn released_transport_is_replayed_after_lost_effect_and_reopen() {
                     .any(|item| hex::encode(item.event_id) == probe.id)
             );
             inject_epoch_gap_probe(&app, probe.clone()).await;
-            let _eose =
-                scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
             client.sync().await.unwrap();
             assert_eq!(
                 recorded_ingest_outcomes(&app, &probe.id).len(),
@@ -23069,6 +24293,111 @@ async fn dev_maintenance_timing_reaches_the_account_runtime_only_in_test_policy_
         expected,
         "the override must reach the runtime that schedules rotations only in test-policy builds"
     );
+}
+
+/// Two runtimes built from one app share its collector side: consent, and the product events
+/// either records. Each keeps its own performance recorder and snapshot (#2627).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtimes_from_one_app_share_consent_and_product_events_but_not_performance() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = MarmotApp::with_relays(dir.path(), vec![]);
+    let first = app.runtime();
+    let second = app.runtime();
+    first
+        .set_product_analytics_runtime_config(ProductAnalyticsRuntimeConfig {
+            events_endpoint: Some("https://analytics.example/api/v0/events".into()),
+            app_key: Some("A-SH-test".into()),
+            operator: "test".into(),
+            allow_loopback: false,
+            registry: vec![],
+            metadata: ProductAnalyticsMetadata {
+                app_version: "1.0".into(),
+                os_family: "linux".into(),
+                os_major_version: "6".into(),
+                device_class: "desktop".into(),
+                host_surface: "native".into(),
+                environment: "staging".into(),
+                is_debug: true,
+            },
+        })
+        .unwrap();
+
+    first.set_usage_diagnostics_consent(true).unwrap();
+    assert_eq!(
+        second.usage_diagnostics_status().consent,
+        UsageDiagnosticsDecision::Granted
+    );
+
+    let frame_draw = |runtime: &MarmotAppRuntime| {
+        runtime
+            .app_performance_snapshot()
+            .runtime_operations
+            .into_iter()
+            .find(|snapshot| snapshot.operation == RuntimePerformanceOperation::HostFrameDraw)
+            .unwrap()
+            .started
+    };
+    first.record_host_performance(
+        HostPerformanceOperation::FrameDraw,
+        Duration::from_millis(3),
+        HostPerformanceOutcome::Success,
+    );
+    assert_eq!((frame_draw(&first), frame_draw(&second)), (1, 0));
+
+    #[cfg(feature = "product-analytics-export")]
+    {
+        let first_sync =
+            first.begin_product_operation(ProductFamily::Sync, "full_history", ProductUnit::Action);
+        first_sync.unwrap().finish("success");
+        let second_schedule = second.begin_product_operation(
+            ProductFamily::Notification,
+            "schedule",
+            ProductUnit::Attempt,
+        );
+        second_schedule.unwrap().finish("failure");
+        // A runtime's performance recorder forwards readiness to the shared collector. The
+        // collector drops a sample longer than consent has been granted, so this one is empty.
+        second.record_host_performance(
+            HostPerformanceOperation::ForegroundLocalReady,
+            Duration::ZERO,
+            HostPerformanceOutcome::Success,
+        );
+        // Sealing also adds the window's coverage row, which carries no outcome.
+        let mut recorded: Vec<_> = app
+            .product_analytics
+            .test_payloads()
+            .iter()
+            .filter_map(|row| {
+                let props = &row["props"];
+                Some((
+                    row["eventName"].as_str()?.to_owned(),
+                    props["operation"].as_str()?.to_owned(),
+                    props["outcome"].as_str()?.to_owned(),
+                ))
+            })
+            .collect();
+        recorded.sort();
+        let expected = [
+            ("mdk_notification_summary", "schedule", "failure"),
+            ("mdk_runtime_summary", "readiness", "success"),
+            ("mdk_sync_summary", "full_history", "success"),
+        ]
+        .map(|(event, operation, outcome)| (event.into(), operation.into(), outcome.into()));
+        assert_eq!(recorded, expected);
+    }
+
+    second.set_usage_diagnostics_consent(false).unwrap();
+    assert_eq!(
+        first.usage_diagnostics_status().consent,
+        UsageDiagnosticsDecision::Declined
+    );
+    assert!(
+        first
+            .begin_product_operation(ProductFamily::Sync, "full_history", ProductUnit::Action)
+            .is_none()
+    );
+    first.shutdown().await;
+    second.shutdown().await;
 }
 
 #[cfg(feature = "product-analytics-export")]
@@ -23158,6 +24487,7 @@ async fn assert_peer_leave_behind_fanout(remove_observer: bool) {
     remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
     remember_test_member_inbox(&app, &alice_account.account_id_hex, "wss://relay.example");
     let plane = MarmotRelayPlane::new(None, relay.clone());
+    // The scripted relay has no socket forwarder to finish native stored input.
     let mut alice = app
         .client_with_relay_plane("alice", &plane, None)
         .await
@@ -23178,7 +24508,9 @@ async fn assert_peer_leave_behind_fanout(remove_observer: bool) {
             &[&alice_account.account_id_hex, &bob.account_id_hex],
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert!(
         bob_client
             .sync()
@@ -23336,6 +24668,146 @@ async fn assert_peer_leave_behind_fanout(remove_observer: bool) {
     );
 }
 
+/// Plant a frozen batch whose failure budget ran out (mdk#2684), however it
+/// got there.
+fn plant_parked_convergence_pass(app: &MarmotApp, group_id: &cgka_traits::GroupId, epoch: u64) {
+    use cgka_traits::convergence_pass::{
+        ConvergencePassPhase, ConvergencePassRetry, ConvergencePassStep, DurableConvergencePass,
+    };
+    use cgka_traits::storage::ConvergencePassStorage;
+    app.account_storage("alice")
+        .unwrap()
+        .put_convergence_pass(&DurableConvergencePass {
+            group_id: group_id.clone(),
+            generation: 1,
+            phase: ConvergencePassPhase::Frozen,
+            base_epoch: cgka_traits::EpochId(epoch),
+            clock_instance_id: 0,
+            opened_monotonic_ms: 0,
+            quiescence_deadline_monotonic_ms: 0,
+            absolute_deadline_monotonic_ms: 0,
+            opened_wall_ms: 0,
+            quiescence_deadline_wall_ms: 0,
+            absolute_deadline_wall_ms: 0,
+            members: Vec::new(),
+            frozen_at_wall_ms: Some(0),
+            cutoff_cause: None,
+            fairness_slot_available: false,
+            retry: Some(ConvergencePassRetry {
+                failed_attempts: 12,
+                failed_step: ConvergencePassStep::Apply,
+                next_attempt_monotonic_ms: 0,
+                next_attempt_wall_ms: 0,
+                parked_at_wall_ms: Some(0),
+            }),
+        })
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_parked_convergence_pass_owes_hosts_one_notice_per_change() {
+    use cgka_traits::storage::ConvergencePassStorage;
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client
+        .create_group("parked", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    let epoch = client.group_mls_state(&group_id).unwrap().epoch;
+    assert!(client.take_convergence_park_notices().is_empty());
+    plant_parked_convergence_pass(&app, &group_id, epoch);
+
+    let mut notices = Vec::new();
+    for _ in 0..2 {
+        assert!(matches!(
+            client.convergence_schedule_state(&group_id).unwrap(),
+            crate::ConvergenceScheduleState::Idle
+        ));
+        notices.push(client.take_convergence_park_notices());
+    }
+    assert_eq!(
+        notices,
+        [vec![group_id.clone()], Vec::new()],
+        "the park is announced once, whichever schedule read sees it"
+    );
+    assert!(
+        client
+            .group_mls_state(&group_id)
+            .unwrap()
+            .convergence_parked
+    );
+
+    app.account_storage("alice")
+        .unwrap()
+        .delete_convergence_pass(&group_id)
+        .unwrap();
+    let mut notices = Vec::new();
+    for _ in 0..2 {
+        client.convergence_schedule_state(&group_id).unwrap();
+        notices.push(client.take_convergence_park_notices());
+    }
+    assert_eq!(
+        notices,
+        [vec![group_id.clone()], Vec::new()],
+        "leaving the park is announced once too"
+    );
+    assert!(
+        !client
+            .group_mls_state(&group_id)
+            .unwrap()
+            .convergence_parked
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_explicit_convergence_retry_whose_advance_fails_still_wakes_the_group() {
+    use cgka_traits::storage::ConvergencePassStorage;
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client
+        .create_group("parked", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    let epoch = client.group_mls_state(&group_id).unwrap().epoch;
+    plant_parked_convergence_pass(&app, &group_id, epoch);
+    client.take_pending_convergence_groups();
+
+    // The retry un-parks the batch, then its advance fails before any attempt
+    // could park it again (mdk#2684).
+    client.fail_next_convergence_retry_advance = true;
+    assert!(client.retry_group_convergence(&group_id).await.is_err());
+    let pass = app
+        .account_storage("alice")
+        .unwrap()
+        .convergence_pass(&group_id)
+        .unwrap()
+        .expect("the batch survives the failed advance");
+    assert!(!pass.is_parked());
+    assert_eq!(
+        client.take_pending_convergence_groups(),
+        vec![group_id.clone()],
+        "the worker's next schedule read must still see the group"
+    );
+    assert!(matches!(
+        client.convergence_schedule_state(&group_id).unwrap(),
+        crate::ConvergenceScheduleState::Ready
+    ));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn voluntary_left_classification_survives_reopen_but_resets_on_rejoin() {
     let dir = tempfile::tempdir().unwrap();
@@ -23348,7 +24820,9 @@ async fn voluntary_left_classification_survives_reopen_but_resets_on_rejoin() {
     let group_id = client
         .create_group("departure attribution", &[])
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_hex = hex::encode(group_id.as_slice());
     app.set_group_self_membership("alice", &group_hex, SelfMembership::Left)
         .unwrap();
@@ -23397,7 +24871,7 @@ async fn due_peer_leave_does_not_shorten_a_collecting_convergence_pass() {
     for member in [&bob, &carol] {
         remember_test_member_inbox(&app, &member.account_id_hex, "wss://relay.example");
     }
-    let plane = MarmotRelayPlane::new(None, relay);
+    let plane = MarmotRelayPlane::new(None, relay.clone());
     let mut alice = app
         .client_with_relay_plane("alice", &plane, None)
         .await
@@ -23418,7 +24892,9 @@ async fn due_peer_leave_does_not_shorten_a_collecting_convergence_pass() {
             &[&bob.account_id_hex, &carol.account_id_hex],
         )
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert!(
         bob_client
             .sync()
@@ -23435,6 +24911,9 @@ async fn due_peer_leave_does_not_shorten_a_collecting_convergence_pass() {
             .joined_groups
             .contains(&group_id)
     );
+    // Bob's leave reaches Alice behind her live REQs' replay; settle it so
+    // her next sync ingests the proposal.
+    settle_live_replay(&mut alice).await;
     bob_client.leave_group(&group_id).await.unwrap();
     alice.sync().await.unwrap();
     let delay = alice
@@ -23480,7 +24959,12 @@ async fn diagnostics_maintenance_reuses_failed_obligation_levels_across_ticks() 
     let app = MarmotApp::with_relay(root.path(), "wss://relay.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("maintenance", &[]).await.unwrap();
+    let group_id = client
+        .create_group("maintenance", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     client
         .runtime
         .schedule_manual_self_update(&group_id)
@@ -23523,14 +25007,15 @@ fn presentation_worker_refreshes_without_screen_subscribers_and_recovers_notific
         let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
             .with_test_relay_client(relay.clone());
         remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
-        let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
         let runtime = MarmotAppRuntime::new(app.clone());
         runtime.reconcile_accounts().await.unwrap();
         runtime.catch_up_accounts().await.unwrap();
         let created = runtime
             .create_group_detailed("alice", "", std::slice::from_ref(&bob.account_id_hex), None)
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let group = created.chat_list_row.group_id_hex;
         let storage = app.account_storage("alice").unwrap();
         // No UI or presentation subscriber is attached for initial hydration or this update.
@@ -23655,7 +25140,9 @@ fn presentation_quarantine_preserves_existing_chat_kind_and_direct_reuse() {
             group_id = alice
                 .create_group("", &[&bob_account.account_id_hex])
                 .await
-                .unwrap();
+                .unwrap()
+                .operation
+                .expect("eligible fixture members");
         }
         let id = hex::encode(group_id.as_slice());
         let storage = app.account_storage("alice").unwrap();
@@ -23747,7 +25234,12 @@ async fn group_changes_refuse_while_epoch_gap_recovery_holds_the_group() {
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(relay.clone());
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("behind", &[]).await.unwrap();
+    let group_id = client
+        .create_group("behind", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_hex = hex::encode(group_id.as_slice());
     let epoch = client.runtime.group_record(&group_id).unwrap().epoch;
     let storage = app.account_storage("alice").unwrap().app_storage();
@@ -23792,6 +25284,11 @@ async fn group_changes_refuse_while_epoch_gap_recovery_holds_the_group() {
         client.enable_group_disbanding(&group_id).await,
         &group_hex,
         "enable_group_disbanding",
+    );
+    assert_group_catching_up(
+        client.enable_account_devices(&group_id).await,
+        &group_hex,
+        "enable_account_devices",
     );
     assert_group_catching_up(
         client.disband_group(&group_id).await,
@@ -23936,7 +25433,12 @@ async fn group_changes_refuse_while_the_last_commit_is_owed_to_a_relay() {
     let mut client = app.client("alice").await.unwrap();
     // Refuse as soon as a relay is owed instead of after the grace.
     client.commit_delivery_gate_grace_secs = 0;
-    let group_id = client.create_group("owed", &[]).await.unwrap();
+    let group_id = client
+        .create_group("owed", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_hex = hex::encode(group_id.as_slice());
     assert_eq!(client.group_commit_delivery(&group_id).unwrap(), None);
     assert!(
@@ -24017,7 +25519,12 @@ async fn a_quick_follow_up_change_is_not_refused_within_the_delivery_grace() {
     )
     .with_test_relay_client(relay.clone());
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("grace", &[]).await.unwrap();
+    let group_id = client
+        .create_group("grace", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     relay.make_endpoints_unavailable(&["wss://relay-b.example"]);
     client
         .update_group_profile(&group_id, Some("first"), None)
@@ -24051,7 +25558,12 @@ async fn both_advisory_gates_can_be_acknowledged_in_turn() {
     let mut client = app.client("alice").await.unwrap();
     // Refuse as soon as a relay is owed instead of after the grace.
     client.commit_delivery_gate_grace_secs = 0;
-    let group_id = client.create_group("both gates", &[]).await.unwrap();
+    let group_id = client
+        .create_group("both gates", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     relay.make_endpoints_unavailable(&["wss://relay-b.example"]);
     client
         .update_group_profile(&group_id, Some("owed"), None)
@@ -24092,6 +25604,189 @@ async fn both_advisory_gates_can_be_acknowledged_in_turn() {
     assert!(client.runtime.group_record(&group_id).unwrap().epoch.0 > epoch.0);
 }
 
+/// mdk#2333: a relay that refuses a confirmed commit for good will never carry
+/// it. The refusal is reported with its cause and refuses the next group change
+/// at once, with no grace. The acknowledgement dismisses it for good and admits
+/// one attempt; the gate stays lifted after that attempt fails, until a new
+/// commit is refused again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_relay_refusal_refuses_group_changes_at_once_until_acknowledged() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relays(
+        dir.path(),
+        vec![
+            "wss://relay-a.example".to_owned(),
+            "wss://relay-b.example".to_owned(),
+        ],
+    )
+    .with_test_relay_client(relay.clone());
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client
+        .create_group("refused", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    let group_hex = hex::encode(group_id.as_slice());
+    relay.refuse_publishes_of_kind_at(
+        445,
+        "wss://relay-b.example",
+        cgka_traits::TransportEndpointRejectionCategory::TooLarge,
+    );
+    client
+        .update_group_profile(&group_id, Some("first"), None)
+        .await
+        .unwrap();
+
+    let delivery = client
+        .group_commit_delivery(&group_id)
+        .unwrap()
+        .expect("relay B refused the commit");
+    assert!(delivery.owed_relay_urls.is_empty());
+    assert!(
+        matches!(
+            delivery.refused_relays.as_slice(),
+            [crate::GroupCommitRefusedRelay {
+                relay_url,
+                cause: crate::GroupCommitRefusalCause::TooLarge { size_class: Some(_) },
+            }] if relay_url == "wss://relay-b.example"
+        ),
+        "{:?}",
+        delivery.refused_relays
+    );
+    let refused = |result: Result<SendSummary, AppError>, operation: &str| match result {
+        Err(AppError::GroupCommitUndelivered(held)) => assert_eq!(held, group_hex, "{operation}"),
+        other => panic!("{operation} must refuse while a relay refusal stands, got {other:?}"),
+    };
+    let epoch = client.runtime.group_record(&group_id).unwrap().epoch;
+    refused(
+        client
+            .update_group_profile(&group_id, Some("second"), None)
+            .await,
+        "update_group_profile inside the delivery grace",
+    );
+    assert_eq!(client.runtime.group_record(&group_id).unwrap().epoch, epoch);
+
+    assert!(
+        client
+            .acknowledge_group_commit_undelivered(&group_id)
+            .unwrap()
+    );
+    assert_eq!(client.group_commit_delivery(&group_id).unwrap(), None);
+    assert!(matches!(
+        client
+            .update_group_avatar_url(
+                &group_id,
+                Some("http://insecure.example/a.png".into()),
+                None,
+                None
+            )
+            .await,
+        Err(AppError::InvalidGroupAvatarUrl(_))
+    ));
+    client
+        .update_group_profile(&group_id, Some("second"), None)
+        .await
+        .unwrap();
+    assert!(client.runtime.group_record(&group_id).unwrap().epoch.0 > epoch.0);
+
+    // The new commit is refused too, and gates again.
+    refused(
+        client
+            .update_group_profile(&group_id, Some("third"), None)
+            .await,
+        "update_group_profile after a new refusal",
+    );
+}
+
+/// mdk#2333: a refused commit gates at once, and one acknowledgement covers it
+/// and an older commit still owed inside its grace, which gates once the grace
+/// ends: the next attempt is admitted. A commit that starts gating after the
+/// acknowledgement is refused again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_acknowledgement_covers_an_owed_and_a_refused_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relays(
+        dir.path(),
+        vec![
+            "wss://relay-a.example".to_owned(),
+            "wss://relay-b.example".to_owned(),
+            "wss://relay-c.example".to_owned(),
+        ],
+    )
+    .with_test_relay_client(relay.clone());
+    let mut client = app.client("alice").await.unwrap();
+    let group_id = client
+        .create_group("mixed", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    // The first commit stays owed to B; the second is owed to B and refused
+    // by C. Inside the grace, the owed commit does not hold the second.
+    relay.make_endpoints_unavailable(&["wss://relay-b.example"]);
+    client
+        .update_group_profile(&group_id, Some("owed"), None)
+        .await
+        .unwrap();
+    relay.refuse_publishes_of_kind_at(
+        445,
+        "wss://relay-c.example",
+        cgka_traits::TransportEndpointRejectionCategory::Blocked,
+    );
+    client
+        .update_group_profile(&group_id, Some("refused"), None)
+        .await
+        .unwrap();
+    let delivery = client.group_commit_delivery(&group_id).unwrap().unwrap();
+    assert_eq!(
+        delivery.refused_relays,
+        vec![crate::GroupCommitRefusedRelay {
+            relay_url: "wss://relay-c.example".into(),
+            cause: crate::GroupCommitRefusalCause::Rejected,
+        }],
+        "the refused commit is named ahead of the older owed one"
+    );
+
+    // The refusal gates at once; the owed commit is still inside its grace.
+    assert!(matches!(
+        client
+            .update_group_profile(&group_id, Some("next"), None)
+            .await,
+        Err(AppError::GroupCommitUndelivered(_))
+    ));
+    assert!(
+        client
+            .acknowledge_group_commit_undelivered(&group_id)
+            .unwrap()
+    );
+    // Past the grace the owed commit gates too, and the acknowledgement,
+    // given while it was inside the grace, covers it.
+    client.commit_delivery_gate_grace_secs = 0;
+    let epoch = client.runtime.group_record(&group_id).unwrap().epoch;
+    client
+        .update_group_profile(&group_id, Some("next"), None)
+        .await
+        .unwrap();
+    assert!(client.runtime.group_record(&group_id).unwrap().epoch.0 > epoch.0);
+
+    // That commit is owed to B and refused by C: not covered.
+    assert!(matches!(
+        client
+            .update_group_profile(&group_id, Some("after"), None)
+            .await,
+        Err(AppError::GroupCommitUndelivered(_))
+    ));
+}
+
 /// mdk#2258: gap evidence armed at an epoch the device has since left does not
 /// hold the group; only an unresolved gap at or above the local epoch does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -24103,7 +25798,12 @@ async fn epoch_gap_below_the_local_epoch_does_not_hold_group_changes() {
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("moved on", &[]).await.unwrap();
+    let group_id = client
+        .create_group("moved on", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let stalled = client.runtime.group_record(&group_id).unwrap().epoch;
     client
         .update_group_profile(&group_id, Some("first"), None)
@@ -24134,8 +25834,18 @@ async fn forget_group_local_stops_work_and_survives_reopen() {
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(relay.clone());
     let mut client = app.client("alice").await.unwrap();
-    let forgotten = client.create_group("forgotten", &[]).await.unwrap();
-    let kept = client.create_group("kept", &[]).await.unwrap();
+    let forgotten = client
+        .create_group("forgotten", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    let kept = client
+        .create_group("kept", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_hex = hex::encode(forgotten.as_slice());
     let publishes = relay.published_event_ids().len();
     client.pending_convergence_groups.insert(forgotten.clone());
@@ -24204,6 +25914,7 @@ async fn forget_group_local_rejects_old_welcome_then_rejoins_from_fresh_invitati
             .with_test_relay_client(relay.clone());
         remember_test_member_inbox(&app, &bob.account_id_hex, "wss://relay.example");
         let plane = MarmotRelayPlane::new(None, relay.clone());
+        // The scripted relay has no socket forwarder to finish native stored input.
         let mut alice = app
             .client_with_relay_plane("alice", &plane, None)
             .await
@@ -24216,7 +25927,9 @@ async fn forget_group_local_rejects_old_welcome_then_rejoins_from_fresh_invitati
         let group = alice
             .create_group("abandoned", &[bob.account_id_hex.as_str()])
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let welcome = relay
             .published_events
             .lock()
@@ -24324,7 +26037,9 @@ async fn forget_group_local_rejects_old_welcome_then_rejoins_from_fresh_invitati
         alice
             .invite_members(&group, &[bob.account_id_hex.as_str()])
             .await
-            .unwrap();
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
         let fresh = relay
             .published_events
             .lock()
@@ -24518,7 +26233,9 @@ async fn runtime_forget_group_local_body() {
     let group = runtime
         .create_group("alice", "abandoned", &[], None)
         .await
-        .unwrap();
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     assert!(runtime.forget_group_local("alice", &group).await.unwrap());
     assert!(
         app.group("alice", &hex::encode(group.as_slice()))
@@ -24562,7 +26279,12 @@ async fn authenticated_system_previews_keep_actor_subject_and_multi_commit_row_i
     let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
         .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();
-    let group_id = client.create_group("system previews", &[]).await.unwrap();
+    let group_id = client
+        .create_group("system previews", &[])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
     let group_hex = hex::encode(group_id.as_slice());
     let actor = MemberId::new(vec![0xbb; 32]);
     let peer = MemberId::new(vec![0xcc; 32]);
@@ -24672,6 +26394,11 @@ async fn authenticated_system_previews_keep_actor_subject_and_multi_commit_row_i
 #[path = "tests/conversation_cold_open.rs"]
 mod conversation_cold_open;
 
+/// The integration tests' relay with a truthful information page, shared with
+/// unit tests that need its published caps.
+#[path = "../tests/support/limited_relay.rs"]
+pub(crate) mod limited_relay;
+
 /// Undecryptable traffic older than this copy's Welcome is not stall evidence.
 ///
 /// The detector's undecryptable signal means "this device is behind the group".
@@ -24692,8 +26419,7 @@ async fn undecryptable_traffic_older_than_this_copys_welcome_does_not_arm_a_back
     let dir = tempfile::tempdir().unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let (app, mut client, route) =
-        undecryptable_probe_route(&dir, &relay, bounded_epoch_backfill_config()).await;
-    let _eose = scripted_eose_pump(app.relay_plane.clone(), relay.clone(), every_subscription);
+        undecryptable_probe_route(&dir, &relay, MarmotAppConfig::white_noise()).await;
 
     // Model a welcome-installed copy: the route's group is created locally, and
     // a copy this device created has no Welcome time to compare against.
@@ -24704,7 +26430,7 @@ async fn undecryptable_traffic_older_than_this_copys_welcome_does_not_arm_a_back
     storage.put_group(&record).unwrap();
 
     let before_the_welcome = welcome_at - 4 * 60 * 60;
-    for probe in 0..crate::client::epoch_stall::EPOCH_STALL_BACKFILL_THRESHOLD {
+    for probe in 0..crate::client::history_recovery::epoch_stall::EPOCH_STALL_BACKFILL_THRESHOLD {
         client
             .ingest_received_delivery(
                 route.probe(before_the_welcome + probe as u64, &format!("gap-{probe}")),
@@ -24719,7 +26445,7 @@ async fn undecryptable_traffic_older_than_this_copys_welcome_does_not_arm_a_back
 
     // The same device, the same group, the same undecryptable outcome — only
     // the envelope time differs — still arms.
-    for probe in 0..crate::client::epoch_stall::EPOCH_STALL_BACKFILL_THRESHOLD {
+    for probe in 0..crate::client::history_recovery::epoch_stall::EPOCH_STALL_BACKFILL_THRESHOLD {
         client
             .ingest_received_delivery(
                 route.probe(welcome_at + probe as u64, &format!("live-{probe}")),
@@ -24855,4 +26581,16 @@ pub(crate) mod alloc_audit {
     pub(crate) fn peak() -> isize {
         PEAK.load(Ordering::Relaxed)
     }
+}
+
+/// A retained route's recovery goal ends one clock-skew allowance after its
+/// switch, which its subscription floor sits one allowance before.
+#[test]
+fn a_retained_routes_recovery_goal_ends_an_allowance_after_its_switch() {
+    let switch = 1_800_000_000;
+    let allowance = HISTORY_FLOOR_CLOCK_SKEW_ALLOWANCE.as_secs();
+    assert_eq!(
+        crate::retained_route_goal_until(crate::history_floor(switch)),
+        switch + allowance
+    );
 }

@@ -4,7 +4,7 @@
 //! early app surfaces: encrypted session storage, Nostr MLS peeling, Nostr
 //! transport publishing, and relay-backed app projections.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,14 +12,14 @@ use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use cgka_engine::{
-    FeatureRegistry, canonicalization::CanonicalizationPolicy, key_package::key_package_metadata,
-};
-use cgka_session::{AccountDeviceSession, SessionConfig};
 use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_QUIC_FANOUT_CAPABILITY, AGENT_TEXT_STREAM_QUIC_FANOUT_FEATURE,
     AGENT_TEXT_STREAM_QUIC_RECEIVE_CAPABILITY, AGENT_TEXT_STREAM_QUIC_RECEIVE_FEATURE,
     AGENT_TEXT_STREAM_QUIC_SEND_CAPABILITY, AGENT_TEXT_STREAM_QUIC_SEND_FEATURE,
+};
+use cgka_traits::app_components::{
+    ACCOUNT_DEVICES_COMPONENT_ID, AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, DEVICE_ROSTER_COMPONENT_ID,
+    NostrRoutingV1, default_group_components,
 };
 #[allow(deprecated)]
 pub use cgka_traits::app_components::{
@@ -34,9 +34,6 @@ pub use cgka_traits::app_components::{
     GROUP_PROFILE_COMPONENT, GROUP_PROFILE_COMPONENT_ID, NOSTR_ROUTING_COMPONENT,
     NOSTR_ROUTING_COMPONENT_ID,
 };
-use cgka_traits::app_components::{
-    AGENT_TEXT_STREAM_QUIC_COMPONENT_ID, NostrRoutingV1, default_group_components,
-};
 pub use cgka_traits::app_event::AppMessageRetentionDecision;
 use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM};
 use cgka_traits::capabilities::{Capability, CapabilityRequirement, Feature, RequirementLevel};
@@ -50,10 +47,12 @@ use cgka_traits::{
     GroupId, MemberId, MessageId, TransportEndpoint, TransportGroupSubscription,
     TransportPublishTarget,
 };
-use marmot_account::{
-    AccountDeviceRuntime, AccountHome, AccountHomeError, AccountSetupKind, AccountSummary,
+use marmot_account::{AccountHome, AccountHomeError, AccountSetupKind, AccountSummary};
+use marmot_session::{
+    AccountDeviceRuntime, CanonicalizationPolicy, FeatureRegistry, KeyPackageEventDeletion,
     KeyPackagePublication, KeyPackagePublishError, KeyPackagePublishReceipt, KeyPackagePublisher,
-    TransportRoutingError, TransportRoutingPolicy,
+    KeyPackageSlotWithdrawal, SessionConfig, TransportRoutingError, TransportRoutingPolicy,
+    key_package_metadata,
 };
 use nostr_sdk::prelude::{
     EventBuilder, FinalizeUnsignedEvent, Kind, PublicKey, Tag, Timestamp as NostrTimestamp,
@@ -64,7 +63,7 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use storage_sqlite::{
     SecurePruneAppEventsResult, SqliteAccountStorage, SqliteSharedStorage, StoredAppMessageQuery,
-    TimelineProjectionUpdate,
+    TimelineProjectionUpdate, TransportReconciliationRoute,
 };
 use transport_nostr_adapter::{
     KIND_MARMOT_INBOX_RELAY_LIST, KIND_MARMOT_KEY_PACKAGE, KIND_NIP65_RELAY_LIST,
@@ -75,24 +74,22 @@ use transport_nostr_adapter::{
 use transport_nostr_peeler::{NostrMlsPeeler, NostrTransportEvent};
 
 mod close_registry;
+mod unlinked_publish_gate;
 mod user_blocks;
 pub use runtime::RuntimeBlockListSubscription;
 pub use user_blocks::{BlockListSnapshot, BlockedUser};
 mod agent_streams;
-mod app_telemetry;
-mod collector_host_safety;
+mod app_outcome;
 mod network_proxy;
-pub mod product_analytics;
-pub use product_analytics::*;
+mod usage_diagnostics;
+pub use usage_diagnostics::configure_product_analytics_from_environment;
 mod audit_log;
-pub mod audit_otlp_sender;
 mod chat_presentation;
 mod client;
 mod config;
 mod deployment;
 pub use deployment::{
-    KeyPackageClientPreference, MarmotDeployment, NEUTRAL_KEYCHAIN_SERVICE_NAME,
-    OpenRankingProvider,
+    MarmotDeployment, NEUTRAL_KEYCHAIN_SERVICE_NAME, OpenRankingProvider, RelayEventLimit,
 };
 pub mod conversation_presentation;
 mod conversions;
@@ -100,14 +97,21 @@ mod directory_resources;
 #[cfg(test)]
 mod directory_tests;
 mod drafts;
+mod emoji_sets;
 mod local_submissions;
 pub use local_submissions::{LocalSendAcceptance, LocalSendStatus};
+mod backup_archive;
 mod error;
+#[cfg(any(test, feature = "test-support"))]
+pub mod error_kind_table;
 mod external_signer;
 mod groups;
+mod history_bundle;
+mod history_delivery;
 mod history_notices;
-pub use history_notices::{HistoryNotice, HistoryNoticeCause};
+pub use history_notices::{AccountRecoveryStatus, HistoryNotice, HistoryNoticeCause};
 mod ids;
+mod image_inspect;
 mod key_package_records;
 #[cfg(test)]
 mod local_open_test_gate;
@@ -125,61 +129,89 @@ pub use moderation_reports::{
     ModerationReportOrigin, ModerationReportOutcome, ModerationReportRetrySummary,
     ModerationReportStatus,
 };
+mod nip46;
 mod nostr_secret;
 mod nostr_verification;
+pub use nip46::{Nip46Error, Nip46Permissions, Nip46Session, Nip46State, Nip46Status};
 mod notifications;
+#[cfg(test)]
+mod observability_tests;
 mod profile_publication;
 mod projection;
 mod publisher_sequences;
-mod relay_telemetry_export;
+mod relay_caps;
+mod relay_event_limits;
 mod root_closers;
 mod root_runtime_lease;
 mod runtime;
+mod small_state;
 mod sqlcipher;
 mod startup_diagnostics;
 pub use startup_diagnostics::{
     NativeStartupObservation, NativeStartupOutcome, NativeStartupSnapshot, NativeStartupStage,
 };
+mod stickers;
 #[cfg(feature = "test-policy-overrides")]
 mod test_support;
+/// Named account-worker fences for tests: the host crates' tests and this
+/// crate's own (mdk#3273).
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod worker_fences;
 
+pub use cgka_traits::EventSizeClass;
 pub use cgka_traits::engine::{
     SupersededIntentKind, SupersededIntentOutcome, SupersededIntentReport,
+};
+pub use emoji_sets::{
+    AppEmojiSet, AppEmojiSetAsset, AppEmojiSetCover, AppEmojiSetEmoji, AppEmojiSetInstallResult,
+    AppEmojiSetSyncResult, AppEmojiSkip, AppEmojiSkipReason, AppInstalledCustomEmoji,
+    AppInstalledCustomEmojiAsset, AppInstalledEmojiSetState, AppUserEmojiList, EMOJI_SET_KIND,
+    EmojiSetInstallControl, EmojiSetInstallProgress, MAX_CUSTOM_EMOJI_SHORTCODE_BYTES,
+    MAX_DISCOVERY_EMOJI_SETS, MAX_EMOJI_IMAGE_BYTES, MAX_EMOJI_PER_SET, MAX_INSTALLED_EMOJI_BYTES,
+    MAX_INSTALLED_EMOJI_SET_BYTES, MAX_INSTALLED_EMOJI_SETS, USER_EMOJI_LIST_KIND,
+    parse_emoji_set_input,
 };
 use external_signer::{AccountSigner, RegisteredExternalSigner};
 pub use external_signer::{EXTERNAL_SIGNER_REJECTED, ExternalAccountSigner};
 pub(crate) use groups::AppGroupImageInput;
-pub use marmot_account::MaintenanceTiming;
+pub use marmot_session::{
+    AccountError, AccountIdentityProofRequest, AccountIdentityProofSigner, MaintenanceTiming,
+    OversizedArtifact, OversizedEvent, SessionError,
+};
 pub use root_runtime_lease::{MARMOT_ROOT_RUNTIME_LOCK_FILE, MarmotRootRuntimeLease};
-use runtime::account_worker::{AccountStartupProgress, AccountStartupStage};
+use runtime::account_worker::{AccountOpenProgress, AccountStartupProgress, AccountStartupStage};
 pub(crate) use runtime::blocking_app_task;
 pub use runtime::{
     AccountAttentionEntry, AccountAttentionSnapshot, AccountAttentionState, AccountAttentionTotal,
-    AccountAttentionUnavailable, AccountManager, AccountSetupReadiness, AccountSetupRequest,
-    AccountSetupResult, AgentPublisher, AgentPublisherOptions, AgentPublisherRecord,
-    AgentPublisherRouting, AgentStreamWatchOptions, AgentTextStreamCryptoContext,
-    AuditOtlpAttemptOutcome, CatchUpAccountsSummary, ChatListUpdateTrigger, GroupLeaveFailure,
-    LocalCleanupReport, ManagedAccount, MarmotAppEvent, MarmotAppRuntime, OnboardingAction,
-    OnboardingCheckOutcome, OnboardingCheckPurpose, OnboardingDeviceDiscovery,
-    OnboardingDevicePackage, OnboardingFinding, OnboardingFindingContext, OnboardingIssue,
-    OnboardingOptions, OnboardingRelayCapability, OnboardingRelayRepair, OnboardingRelayRepairMode,
-    OnboardingRelayTag, OnboardingRelayTagChange, OnboardingRelayTagDisposition,
-    OnboardingRelayTagRole, OnboardingRepairProposal, OnboardingSingleDeviceNotice,
-    OnboardingSnapshot, OnboardingStatus, OnboardingStep, OnboardingStepState,
-    OnboardingSubscription, RelayFailure, RuntimeAccountAttentionSubscription, RuntimeAccountError,
-    RuntimeAgentStreamMessage, RuntimeAgentStreamUpdate, RuntimeAgentStreamWatch,
-    RuntimeChatListSubscription, RuntimeChatListUpdate, RuntimeChatsSubscription,
-    RuntimeEventsSubscription, RuntimeGroupEvent, RuntimeGroupStateSubscription,
-    RuntimeMessageReceived, RuntimeMessageUpdate, RuntimeMessagesSubscription,
-    RuntimeNotificationsSubscription, RuntimeProjectionUpdate, RuntimeSharedServices,
-    RuntimeTimelineMessageUpdate, RuntimeTimelineMessagesSubscription, SignOutOptions,
-    SignOutOutcome, StreamStartView, TimelineWindowHandle, WipeOutcome,
+    AccountAttentionUnavailable, AccountManager, AccountSetup, AccountSetupReadiness,
+    AccountSetupRequest, AccountSetupResult, AgentPublisher, AgentPublisherOptions,
+    AgentPublisherRecord, AgentPublisherRouting, AgentStreamWatchOptions,
+    AgentTextStreamCryptoContext, AuditOtlpAttemptOutcome, BackgroundBackupOutcome,
+    CatchUpAccountsSummary, ChatListUpdateTrigger, GroupLeaveFailure, LocalCleanupReport,
+    ManagedAccount, MarmotAppEvent, MarmotAppRuntime, OnboardingAction, OnboardingCheckOutcome,
+    OnboardingCheckPurpose, OnboardingDeviceDiscovery, OnboardingDevicePackage, OnboardingFinding,
+    OnboardingFindingContext, OnboardingIssue, OnboardingOptions, OnboardingRelayCapability,
+    OnboardingRelayRepair, OnboardingRelayRepairMode, OnboardingRelayTag, OnboardingRelayTagChange,
+    OnboardingRelayTagDisposition, OnboardingRelayTagRole, OnboardingRepairProposal,
+    OnboardingSingleDeviceNotice, OnboardingSnapshot, OnboardingStatus, OnboardingStep,
+    OnboardingStepState, OnboardingSubscription, RelayFailure, RuntimeAccountAttentionSubscription,
+    RuntimeAccountError, RuntimeAgentStreamMessage, RuntimeAgentStreamUpdate,
+    RuntimeAgentStreamWatch, RuntimeChatListSubscription, RuntimeChatListUpdate,
+    RuntimeChatsSubscription, RuntimeEventsSubscription, RuntimeGroupEvent,
+    RuntimeGroupStateSubscription, RuntimeMessageReceived, RuntimeMessageUpdate,
+    RuntimeMessagesSubscription, RuntimeNotificationsSubscription, RuntimeProjectionUpdate,
+    RuntimeRelayLivenessSubscription, RuntimeSharedServices, RuntimeTimelineMessageUpdate,
+    RuntimeTimelineMessagesSubscription, SignOutOptions, SignOutOutcome, StreamStartView,
+    TimelineWindowHandle, WipeOutcome,
 };
 pub use runtime::{
     CHAT_LIST_WINDOW_INITIAL_ROWS, CHAT_LIST_WINDOW_MAX_ROWS, ChatListAnchorOutcome,
-    ChatListPageDirection, ChatListView, ChatListWindowError, ChatListWindowHandle,
-    ChatListWindowSnapshot, PresentedChatListUpdate, RuntimeChatListWindowSubscription,
-    RuntimePresentedChatListSubscription,
+    ChatListCondition, ChatListFilter, ChatListFilterNode, ChatListPageDirection,
+    ChatListQueryError, ChatListView, ChatListViewQuery, ChatListWindowError, ChatListWindowHandle,
+    ChatListWindowSnapshot, MAX_CHAT_LIST_FILTER_DEPTH, MAX_CHAT_LIST_FILTER_GROUP_IDS,
+    MAX_CHAT_LIST_FILTER_NODES, MAX_CHAT_LIST_FILTER_TEXT_BYTES, PresentedChatListUpdate,
+    RuntimeChatListWindowSubscription, RuntimePresentedChatListSubscription,
 };
 pub use runtime::{
     CONVERSATION_WINDOW_MAX_ROWS, ConversationAnchor, ConversationOpenAnchorOutcome,
@@ -188,6 +220,11 @@ pub use runtime::{
     ConversationWindowRevision, ConversationWindowSnapshot, RuntimeConversationWindowSubscription,
 };
 pub(crate) use sqlcipher::{SqlcipherDatabaseKind, remove_sqlite_file_set};
+pub use stickers::{
+    AppSticker, AppStickerAsset, AppStickerImportResult, AppStickerPack, AppStickerRef,
+    AppStickerSyncResult, parse_sticker_pack_input, sticker_ref_from_message,
+    sticker_ref_from_tags,
+};
 pub use storage_sqlite::{
     CHAT_LIST_DRAFT_PREVIEW_CHARS, ChatListDraftPreview, ChatListRowActions, ChatPinState,
     ChatPresentationVersion, ConversationOpenError, ConversationPresentation,
@@ -200,27 +237,57 @@ pub use agent_streams::{
     AgentStreamDelta, AgentStreamUpdate, AgentStreamWatchCompletion, AgentStreamWatchManager,
     AgentStreamWatchReport, AgentStreamWatchStart,
 };
-pub use app_telemetry::{
-    AppPerformanceOperationSnapshot, AppPerformanceSnapshot, AppPerformanceTelemetry,
-    HostPerformanceOperation, HostPerformanceOutcome, RuntimePerformanceOperation,
-    RuntimePerformanceSnapshot, SyncErrorClass, SyncFailureClassification, SyncFailureCount,
-    SyncFailureStage,
-};
 pub use audit_log::{
-    AuditLogDeleteOutcome, AuditLogFile, AuditLogSettings, AuditLogTrackerUpdateResult,
-    AuditLogUploadResult, AuditOtlpTrackerResult,
+    AUDIT_LOG_DEFAULT_MAX_BYTES_PER_ACCOUNT, AUDIT_LOG_MAX_AGE_DAYS,
+    AUDIT_LOG_MIN_MAX_BYTES_PER_ACCOUNT, AuditDeliveryBacklog, AuditDeliveryFailure,
+    AuditDeliveryFailureKind, AuditDeliveryStatus, AuditLogDeleteOutcome, AuditLogFile,
+    AuditLogRetention, AuditLogSettings, AuditLogSource, AuditLogTrackerUpdateResult,
+    AuditOtlpTrackerResult,
 };
 pub use cgka_traits::{
     MARMOT_APP_EVENT_KIND_POLL, MARMOT_APP_EVENT_KIND_POLL_RESPONSE, PollOptionResult,
     PollProjection, PollType, PollVote, PollVotePage,
 };
+// The directly owned per-account client, for tests that drive it directly.
+// Hosts reach accounts through `MarmotAppRuntime`; `wn sync` runs its one pass
+// through `MarmotApp::sync_account`.
+#[cfg(feature = "test-support")]
 pub use client::AppClient;
+#[cfg(not(feature = "test-support"))]
+pub(crate) use client::AppClient;
+
+/// How many account read-state publishes the test oracle checked in this
+/// process (mdk#3273). The oracle runs only in marmot-app's own tests, so a
+/// downstream crate's tests read zero here even after a worker published.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn read_state_oracle_checks() -> u64 {
+    client::read_state::oracle::checks()
+}
+#[cfg(feature = "test-policy-overrides")]
+#[doc(hidden)]
+pub use client::DevSealedHistoryBundle;
+pub use client::backup_restore::{
+    BackupHistoryAvailability, BackupRestoreId, BackupRestorePhase, BackupRestoreStatus,
+    BackupRestoreWatch, BackupRestoreWords,
+};
+pub use client::backups::{BackupSettings, RecoveryWords};
+pub use client::compromise_warning::{CompromiseWarningItem, CompromiseWarningReason};
+#[cfg(feature = "test-policy-overrides")]
+#[doc(hidden)]
+pub use client::device_group::ConfirmedDeviceLink;
+pub use client::device_group::{LinkedDevice, LinkedDeviceStatus};
+pub use client::device_pairing::{
+    DeviceGroupMoveSibling, DeviceGroupMoveState, DeviceGroupMoveView, DeviceLinkChoices,
+    DeviceLinkEmoji, DeviceLinkEndReason, DeviceLinkOp, DeviceLinkPrompt, DeviceLinkPromptState,
+    DeviceLinkSnapshot, NewDeviceLinkState,
+};
+pub use client::history_imports::{ChatHistoryImport, ChatHistoryImportState};
+pub use client::sign_ins::{SignInResponse, UnrecognizedSignIn, UnrecognizedSignInState};
 pub(crate) use client::{ConvergenceScheduleState, EpochBackfillRunOutcome};
 pub use config::{
-    AttachmentAcquisitionMode, AttachmentAcquisitionPolicy, AuditLogTrackerConfig,
-    AuditLogUploadSource, CursorPersistence, MarmotAppConfig, MarmotServiceEndpoints,
-    RelayTelemetryExportConfig, RelayTelemetryResource, RelayTelemetryRuntimeConfig,
-    RelayTelemetrySettings,
+    AttachmentAcquisitionMode, AttachmentAcquisitionPolicy, CursorPersistence, MarmotAppConfig,
+    MarmotServiceEndpoints, RelayTelemetrySettings,
 };
 pub use drafts::{
     ChatListDraftVersion, MessageDraft, MessageDraftAttachment, MessageDraftAttachmentSummary,
@@ -231,20 +298,37 @@ pub use error::{
     AccountCatchUpFailure, AppError, FullHistoryRepairIncompleteReason, MissingKeyPackageReason,
 };
 pub use groups::{
-    AppAgentTextStreamComponent, AppBlobEndpoint, AppCreateGroupOptions, AppDisbandFailureReason,
-    AppDisbandRequest, AppGroupAdminPolicyComponent, AppGroupAvatarUrlComponent,
-    AppGroupConversationSnapshot, AppGroupEncryptedMediaComponent,
-    AppGroupHydrationQuarantineReason, AppGroupImageComponent, AppGroupLifecycleState,
-    AppGroupMemberIds, AppGroupMemberRecord, AppGroupMessageRetentionComponent, AppGroupMlsState,
-    AppGroupNostrRoutingComponent, AppGroupOpaqueComponent, AppGroupProfileComponent,
-    AppGroupRecord, AppGroupRoster, AppGroupRosterMember, AppGroupSystemEvent,
-    AppInitialGroupImage, AppPreparedGroupImageUpload, AppPreparedGroupImageUploadState,
-    AppPriorNostrRoute, AppProtocolProfile, AppQuarantinedGroup, GroupRecoveryStatus,
-    GroupRejoinInvitation, GroupSystemEventProvenance, MAX_GROUP_MEMBER_IDS_PAGE_SIZE,
-    PendingGroupInvite, group_system_event_from_message,
+    AppAccountDevicesActivation, AppAgentTextStreamComponent, AppBlobEndpoint,
+    AppCreateGroupOptions, AppDisbandFailureReason, AppDisbandRequest,
+    AppGroupAdminPolicyComponent, AppGroupAvatarUrlComponent, AppGroupConversationSnapshot,
+    AppGroupEncryptedMediaComponent, AppGroupHydrationQuarantineReason, AppGroupImageComponent,
+    AppGroupLifecycleState, AppGroupMemberIds, AppGroupMemberRecord,
+    AppGroupMessageRetentionComponent, AppGroupMlsState, AppGroupNostrRoutingComponent,
+    AppGroupOpaqueComponent, AppGroupProfileComponent, AppGroupRecord, AppGroupRoster,
+    AppGroupRosterMember, AppGroupSystemEvent, AppInitialGroupImage, AppPreparedGroupImageUpload,
+    AppPreparedGroupImageUploadState, AppPriorNostrRoute, AppProtocolProfile, AppQuarantinedGroup,
+    GroupRecoveryStatus, GroupRejoinInvitation, GroupSystemEventProvenance,
+    MAX_GROUP_MEMBER_IDS_PAGE_SIZE, PendingGroupInvite, group_system_event_from_message,
 };
 pub use ids::{
     account_id_hex_from_ref, nprofile_for_account_id, npub_for_account_id, validate_relay_urls,
+};
+pub use marmot_observability::{
+    AppPerformanceOperationSnapshot, AppPerformanceSnapshot, AppPerformanceTelemetry,
+    DiagnosticsExporterStatus, DiagnosticsPermit, ExportHistogram, ExportMetricPoint,
+    ExportMetricValue, HostPerformanceOperation, HostPerformanceOutcome,
+    PRODUCT_DURATION_BOUNDS_MS, PRODUCT_OUTCOMES, PRODUCT_REGISTRY_VERSION, ProductAnalytics,
+    ProductAnalyticsActivity, ProductAnalyticsError, ProductAnalyticsMetadata,
+    ProductAnalyticsRuntimeConfig, ProductEvent, ProductEventMode, ProductEventSchema,
+    ProductFamily, ProductObservation, ProductPropertyRule, ProductPropertySchema,
+    ProductRecordResult, ProductUnit, RelayExportError, RelayTelemetryExportBatch,
+    RelayTelemetryExportConfig, RelayTelemetryExporter, RelayTelemetryResource,
+    RelayTelemetryRuntimeConfig, RuntimePerformanceOperation, RuntimePerformanceSnapshot,
+    SyncErrorClass, SyncFailureClassification, SyncFailureCount, SyncFailureStage,
+    USAGE_DIAGNOSTICS_DISCLOSURE, USAGE_DIAGNOSTICS_POLICY, UsageDiagnosticsDecision,
+    UsageDiagnosticsSettings, UsageDiagnosticsStatus, approved_host_product_schemas,
+    audit_otlp_sender, build_export_batch, build_export_batch_with_app_performance, metric_names,
+    product_analytics, product_count_bucket, product_duration_bucket,
 };
 pub use media::file_transfer::{
     MAX_FILE_MEDIA_CIPHERTEXT_BYTES, MediaFileTransferControl, MediaFileUploadAttachmentRequest,
@@ -272,7 +356,8 @@ pub use nostr_directory::{
 };
 pub use nostr_directory::{
     CachedIdentityProjection, DirectoryKeyPackage, MAX_CACHED_IDENTITY_PAGE_SIZE, MatchQuality,
-    MatchedField, MemberKeyPackagePrewarmSummary, OFF_GRAPH_SEARCH_RADIUS, SearchUpdateTrigger,
+    MatchedField, MemberKeyPackagePrewarmSummary, MemberResolutionOutcome, MemberResolutionPolicy,
+    MemberResolutionStatus, OFF_GRAPH_SEARCH_RADIUS, SearchUpdateTrigger,
     UserDirectoryLocalAccount, UserDirectoryRecord, UserDirectoryRefresh, UserDirectorySearch,
     UserDirectorySearchResult, UserProfileMetadata, UserSearchParams, UserSearchSubscription,
     UserSearchUpdate, sort_user_search_results,
@@ -299,25 +384,22 @@ pub use notifications::{
     parse_provider_token, push_token_fingerprint,
 };
 pub use profile_pseudonyms::{default_profile_pseudonym, random_profile_pseudonym};
-pub use relay_telemetry_export::{
-    ExportHistogram, ExportMetricPoint, ExportMetricValue, RelayExportError,
-    RelayTelemetryExportBatch, RelayTelemetryExporter, build_export_batch,
-    build_export_batch_with_app_performance, metric_names,
-};
 pub use storage_sqlite::{
-    ChatConversationKind, ChatListAttachmentKind, ChatListAvatar, ChatListMessageDeliveryState,
-    ChatListMessagePreview, ChatListQuery, ChatListRow, DeletionSource, ExistingDirectConversation,
-    MAX_TIMELINE_LIMIT, SelfMembership, TimelineEditHistoryPage, TimelineEditSummary,
-    TimelineEditVersion, TimelineMessageQuery, TimelineMessageRecord, TimelinePage,
-    TimelinePagination, TimelineReactionSummary, TimelineReplyPreview, TimelineUserReaction,
-    select_reusable_direct_conversation,
+    BackupHistorySource, ChatConversationKind, ChatListAttachmentKind, ChatListAvatar,
+    ChatListMessageDeliveryState, ChatListMessagePreview, ChatListQuery, ChatListRow,
+    DeletionSource, ExistingDirectConversation, HistoryImportProvenance, HistoryImportSource,
+    MAX_TIMELINE_LIMIT, SelfMembership, TimelineAttachmentType, TimelineEditHistoryPage,
+    TimelineEditSummary, TimelineEditVersion, TimelineMessageQuery, TimelineMessageRecord,
+    TimelinePage, TimelinePagination, TimelineReactionSummary, TimelineReplyPreview,
+    TimelineUserReaction, select_reusable_direct_conversation,
 };
 #[cfg(test)]
 use transport_nostr::DirectoryRelayEventRecord as RelayEventRecord;
 pub use transport_nostr::{
     EngineReorgMetrics, MarmotRelayPlane, MarmotRelayPlaneAccountAdapter,
-    RelayEndpointClassification, RelayEndpointPolicy, RelayPlaneHealth, RelayRollupEntry,
-    RelayTelemetryRollup, RelayTelemetrySnapshot, retired_relay_hosts,
+    RelayEndpointClassification, RelayEndpointPolicy, RelayLiveness, RelayLivenessStatus,
+    RelayPlaneHealth, RelayRollupEntry, RelayTelemetryRollup, RelayTelemetrySnapshot,
+    retired_relay_hosts,
 };
 #[cfg(test)]
 use transport_nostr_adapter::parse_nip65_relay_set;
@@ -326,6 +408,14 @@ pub use transport_nostr_adapter::{
     RelayDeliveryStats, RelayLabelResolution, RelayLatencyStats, RelayRefusalStats,
     RelaySyncSnapshot, SubscriptionRefusalDisposition, SubscriptionRouteKind,
 };
+
+/// Member selection and the operation performed with the eligible members.
+/// A nonempty roster with no eligible members has no operation.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GroupMemberResult<T> {
+    pub operation: Option<T>,
+    pub member_outcomes: Vec<MemberResolutionOutcome>,
+}
 
 /// Canonical group-create result at the host response boundary.
 ///
@@ -390,8 +480,7 @@ use key_package_records::{
 };
 #[cfg(test)]
 use key_package_records::{
-    fresh_or_cached_key_package, latest_fresh_key_package_from_records,
-    validated_cached_key_package,
+    fresh_or_cached_key_package, select_key_packages_from_records, validated_cached_key_package,
 };
 use nostr_directory::DirectoryCache;
 use nostr_directory::display_name_for_profile;
@@ -416,23 +505,10 @@ const DIRECT_CONVERSATION_MEMBERS_BACKFILL_MARKER: &str = "direct-conversation-m
 pub(crate) use storage_sqlite::LOCAL_PUBLISH_FAILED_REASON;
 const APP_CACHE_DB_FILE: &str = "app-cache.sqlite3";
 const SHARED_DB_FILE: &str = "shared.sqlite3";
-const KEY_PACKAGE_CUTOVER_RELAY_SCAN_LIMIT: usize = 1_024;
 const SESSION_DB_FILE: &str = "session.sqlite";
 const KEY_PACKAGE_DIR: &str = "key-packages";
 const SDK_FIRST_SYNC_WAIT: Duration = Duration::from_millis(750);
 const SDK_DRAIN_WAIT: Duration = Duration::from_millis(250);
-/// How long a recovery attempt waits before the automatic seams may start
-/// another, doubling per attempt up to [`EPOCH_BACKFILL_RETRY_BACKOFF_CAP`].
-///
-/// Without pacing, the receive seam would start a recovery job after *every*
-/// inbound ingest. Progress (new coverage or admitted history) resets it to
-/// this floor, which matches the maintenance tick cadence.
-pub(crate) const EPOCH_BACKFILL_RETRY_BACKOFF: Duration = Duration::from_secs(15);
-/// Ceiling on the doubling in [`EPOCH_BACKFILL_RETRY_BACKOFF`]. A relay outage
-/// that outlasts this is not going to be resolved by trying harder, and the
-/// intent is durable, so a five-minute floor between attempts costs nothing but
-/// leaves recovery responsive when the relay returns.
-pub(crate) const EPOCH_BACKFILL_RETRY_BACKOFF_CAP: Duration = Duration::from_secs(5 * 60);
 const APP_RUNTIME_ACCOUNT_READY_WAIT: Duration = Duration::from_secs(45);
 /// Local worker operations include SQLite's bounded busy retry but no relay or
 /// blob transfer. A missing response beyond this point indicates a wedged
@@ -507,10 +583,32 @@ fn media_close_key(label: &str) -> String {
 }
 
 #[derive(Clone)]
+struct Nip46Adoption {
+    owner: std::sync::Weak<()>,
+    user: nostr::prelude::PublicKey,
+    session: Nip46Session,
+    completed: tokio::sync::watch::Receiver<bool>,
+}
+
+impl Nip46Adoption {
+    fn finished(&self) -> bool {
+        *self.completed.borrow() || self.completed.has_changed().is_err()
+    }
+}
+
+#[derive(Default)]
+struct Nip46Adoptions {
+    closed: bool,
+    active: Vec<Nip46Adoption>,
+}
+
+#[derive(Clone)]
 pub struct MarmotApp {
     block_list_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     moderation_reports: Arc<moderation_reports::ModerationReportState>,
     pub(crate) block_list_updates: Arc<tokio::sync::watch::Sender<u64>>,
+    #[cfg(test)]
+    notification_dispatches: Arc<std::sync::atomic::AtomicUsize>,
     root: PathBuf,
     /// Present for exclusive-root entry points. Every clone shares this cell,
     /// so the root remains exclusively owned until all database-capable app and
@@ -520,6 +618,8 @@ pub struct MarmotApp {
     /// it counts against the same App Group suspension rule as the databases
     /// (see [`Self::close_storage`]).
     root_runtime_lease: Arc<Mutex<Option<MarmotRootRuntimeLease>>>,
+    /// Account setup and signer handoff share one guard across runtime handles.
+    onboarding_transactions: Arc<Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>>,
     /// Latched as soon as [`Self::close_storage`] starts. Every database
     /// accessor checks it so a late call cannot silently reopen a database
     /// while terminal close is in progress or after it completes.
@@ -541,8 +641,16 @@ pub struct MarmotApp {
     relay_urls: Vec<String>,
     account_home: AccountHome,
     relay_plane: MarmotRelayPlane,
+    /// Each relay's NIP-11 caps for the history sweep; see [`Self::relay_caps`].
+    relay_caps: relay_caps::RelayCapsCache,
+    /// See [`Self::with_unvouched_relay_replies_for_test`].
+    #[cfg(any(test, feature = "test-support"))]
+    unvouched_relay_replies: bool,
     config: MarmotAppConfig,
     account_storages: Arc<Mutex<HashMap<String, SqliteAccountStorage>>>,
+    /// Per account, when an open of its database last applied a migration;
+    /// see [`Self::account_open_progress`].
+    account_open_progress: Arc<Mutex<HashMap<String, Arc<AccountOpenProgress>>>>,
     /// One encrypted media store per account (mdk#2314), over that account's
     /// cached storage handle. Its in-flight set and sweep cursor are per
     /// instance, so every caller shares this one.
@@ -562,6 +670,10 @@ pub struct MarmotApp {
     legacy_directory_cache_checked: Arc<Mutex<bool>>,
     #[cfg(test)]
     directory_test_clock: Option<Arc<std::sync::atomic::AtomicU64>>,
+    /// Maps tokio's (pausable) clock onto Unix ms for chat-list reads, so a
+    /// test advances mute expiry and window wake-ups together.
+    #[cfg(test)]
+    chat_list_virtual_clock: Option<(i64, tokio::time::Instant)>,
     #[cfg(test)]
     directory_cache_open_count: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
@@ -576,19 +688,53 @@ pub struct MarmotApp {
     test_relay_client: Option<Arc<dyn NostrRelayClient>>,
     #[cfg(test)]
     audit_v5_peel_slot: Option<(String, Arc<Mutex<client::audit_v5_probe::PeelSlot>>)>,
+    /// Fail every client's durable unlink mark, as a full or read-only disk
+    /// would. The runtime's own mark as it deactivates still lands.
+    #[cfg(test)]
+    test_fail_unlink_mark: Arc<AtomicBool>,
+    #[cfg(test)]
+    test_fail_runner_preparation: Arc<AtomicBool>,
+    /// How long `sign_out_and_wipe` waits for its `leaving` commit, in
+    /// place of about 30 seconds.
+    #[cfg(test)]
+    test_sign_out_leaving_wait: Arc<Mutex<Option<Duration>>>,
     shared_storage: Arc<Mutex<Option<SqliteSharedStorage>>>,
     pub(crate) presentation_signals: Arc<chat_presentation::signals::PresentationSignals>,
+    /// Live KeyPackages of this app's accounts that their clients have not
+    /// checked for new sign-ins yet (mdk#2628 3.2).
+    pub(crate) sign_in_nudges: Arc<client::sign_ins::SignInNudges>,
+    /// Each account's publish stop, by account id: set once its device group
+    /// unlinked this device, and shared by every publisher
+    /// [`Self::relay_client_for_account_id`] hands out for it (mdk#2628 D67).
+    unlinked_publish_stops: Arc<Mutex<HashMap<String, unlinked_publish_gate::AccountPublishStop>>>,
+    /// The accounts signing out through `sign_out_and_wipe` on this device,
+    /// by account id, with how many sign-outs of each are running: their
+    /// device group's removal of this device does not unlink it (mdk#2628
+    /// D67).
+    signing_out_accounts: Arc<Mutex<HashMap<String, usize>>>,
     account_state_ready: Arc<Mutex<HashSet<String>>>,
     chat_list_projection_warmed: Arc<Mutex<HashSet<String>>>,
-    chat_list_projection_stale: Arc<Mutex<HashSet<String>>>,
-    audit_log_tracker_config: Arc<Mutex<AuditLogTrackerConfig>>,
-    product_analytics: ProductAnalytics,
+    chat_list_projection_stale: Arc<Mutex<ChatListStaleness>>,
+    audit_log_source: Arc<Mutex<AuditLogSource>>,
+    audit_recorders: Arc<Mutex<HashMap<String, audit_log::AuditRecorderSlot>>>,
+    product_analytics: marmot_observability::ProductRecorder,
     startup_diagnostics: startup_diagnostics::NativeStartupDiagnostics,
     external_signers: Arc<Mutex<HashMap<String, RegisteredExternalSigner>>>,
+    nip46_owner: Arc<()>,
+    nip46_sessions: Arc<Mutex<HashMap<String, Nip46Session>>>,
+    nip46_adoptions: Arc<Mutex<Nip46Adoptions>>,
     public_indexer_copy_tasks: Arc<Mutex<PublicIndexerCopyTasks>>,
     /// In-memory view of the persisted per-kind authoring floors; see
     /// `sign_replaceable_identity_event`.
     replaceable_identity_created_at: Arc<Mutex<HashMap<(String, u64), u64>>>,
+    /// Per-account serialization for public sticker-pack/install mutations.
+    /// The mutex values are lifecycle-only; protocol truth and pending intent
+    /// remain in the account SQLCipher database.
+    sticker_mutation_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    emoji_set_mutation_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Cancelled for good when the runtime shuts down or storage closes:
+    /// every running emoji set install stops and later ones are refused.
+    emoji_install_stop: tokio_util::sync::CancellationToken,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -878,10 +1024,9 @@ impl SyncSummary {
 ///
 /// Catch-up processes deliveries incrementally, so a later transport, engine,
 /// or projection error cannot roll back earlier deliveries. Callers of
-/// [`AppClient::sync_with_partial_progress`] must report or otherwise consume
+/// [`MarmotApp::sync_account`] must report or otherwise consume
 /// `partial_summary`; dropping it would hide durable progress until the host
-/// takes a fresh storage snapshot. The compatibility [`AppClient::sync`] entry
-/// point retains its original [`AppError`] result.
+/// takes a fresh storage snapshot.
 #[derive(Debug, thiserror::Error)]
 #[error("{source}")]
 pub struct SyncFailure {
@@ -913,27 +1058,27 @@ impl From<AppError> for SyncFailure {
 pub(crate) struct ClassifiedSyncFailure {
     pub(crate) partial_summary: SyncSummary,
     pub(crate) source: AppError,
-    classification: app_telemetry::SyncFailureClassification,
+    classification: marmot_observability::SyncFailureClassification,
 }
 
 impl ClassifiedSyncFailure {
     pub(crate) fn at_stage(
         partial_summary: SyncSummary,
         source: AppError,
-        failure_stage: app_telemetry::SyncFailureStage,
+        failure_stage: marmot_observability::SyncFailureStage,
     ) -> Self {
         let error_class = source.sync_error_class();
         Self {
             partial_summary,
             source,
-            classification: app_telemetry::SyncFailureClassification::new(
+            classification: marmot_observability::SyncFailureClassification::new(
                 failure_stage,
                 error_class,
             ),
         }
     }
 
-    pub(crate) const fn classification(&self) -> app_telemetry::SyncFailureClassification {
+    pub(crate) const fn classification(&self) -> marmot_observability::SyncFailureClassification {
         self.classification
     }
 }
@@ -1085,19 +1230,62 @@ pub struct AppMessageQuery {
     pub limit: Option<usize>,
 }
 
-/// The group's oldest confirmed change that some group relays have not accepted
-/// yet (mdk#2255). Members who read only those relays cannot follow the group
-/// until they do; MDK keeps retrying them with the exact event. Reported as
-/// soon as a relay is owed; group changes fail only once `since` is two
-/// minutes old. A newer change can be owed to other relays as well.
+/// A confirmed change of yours that some group relays have not accepted yet
+/// (mdk#2255), or that a group relay refused (mdk#2333). Members who read only
+/// those relays may not have it, so they may not follow the group. MDK keeps
+/// retrying owed relays with the exact event; a refusal is final. The change
+/// named is the oldest one a relay refused, if the user has not acknowledged
+/// that refusal, or else the oldest one still owed. Reported at once; group
+/// changes fail at once on a refusal, and on an owed relay only once `since`
+/// is two minutes old. A newer change can be owed to other relays as well.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GroupCommitDelivery {
     /// Relays that have not accepted the change yet.
     pub owed_relay_urls: Vec<String>,
+    /// Relays that refused the change for good, until the user acknowledges
+    /// it (mdk#2333). MDK will not deliver the change there; members who read
+    /// only those relays may not have it. A refusal never says the relay
+    /// lacks the change.
+    #[serde(default)]
+    pub refused_relays: Vec<GroupCommitRefusedRelay>,
     /// Relays the change was published to.
     pub relay_count: u32,
     /// When the first relay accepted the change, in Unix seconds.
     pub since: u64,
+}
+
+/// A group relay that refused a confirmed change for good (mdk#2333).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GroupCommitRefusedRelay {
+    pub relay_url: String,
+    pub cause: GroupCommitRefusalCause,
+}
+
+/// Why a group relay refused a change for good.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupCommitRefusalCause {
+    /// Too large for the relay: its own size answer, its known limit, or the
+    /// 64 KiB commit floor at a relay whose limit is unknown. `size_class` is
+    /// absent when unknown, as after an earlier attempt that may have reached
+    /// the relay.
+    TooLarge {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        size_class: Option<EventSizeClass>,
+    },
+    /// Any other final answer from the relay.
+    Rejected,
+}
+
+impl From<cgka_traits::CommitRefusalCause> for GroupCommitRefusalCause {
+    fn from(cause: cgka_traits::CommitRefusalCause) -> Self {
+        match cause {
+            cgka_traits::CommitRefusalCause::TooLarge { size_class } => {
+                Self::TooLarge { size_class }
+            }
+            cgka_traits::CommitRefusalCause::Rejected => Self::Rejected,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1121,11 +1309,11 @@ pub struct MaintenanceRunSummary {
     pub failures: u32,
 }
 
-/// A welcome that a confirmed group create/invite could not deliver to its
-/// recipient (mdk#352). The commit is already durable, so the member is added
-/// but unjoinable until the welcome reaches them. Persisted so the repair
+/// A Welcome still owed after a canonical create or confirmed Add (mdk#352).
+/// Group state is already durable; pending does not prove whether the recipient
+/// received the Welcome. Persisted so the repair
 /// handle survives the call return and a restart; re-deliver it with
-/// [`AppClient::redeliver_welcome`].
+/// [`MarmotAppRuntime::redeliver_welcome`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingWelcomeDelivery {
     pub group_id_hex: String,
@@ -1133,6 +1321,35 @@ pub struct PendingWelcomeDelivery {
     pub message_id_hex: String,
     pub recipient_hex: String,
     pub recorded_at: u64,
+    /// Coarse size refusal on the observed attempt, not delivery evidence.
+    /// Legacy history may miss earlier exposure; absence means Unknown.
+    pub size_class: Option<cgka_traits::EventSizeClass>,
+}
+
+/// What [`MarmotAppRuntime::discard_failed_send`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiscardFailedSendOutcome {
+    /// The send is gone from this device: its timeline row, edits and media
+    /// references. Nothing was published.
+    Discarded,
+    /// The group has a send the engine may still publish, and this message
+    /// could be among them. Nothing changed; try again once the group's sends
+    /// settle.
+    StillSending,
+    /// No failed own send has this id: it was delivered, is still pending, a
+    /// peer's reaction confirmed it, or it is already gone. Nothing changed.
+    NotFailedSend,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiscardFailedSendResult {
+    pub outcome: DiscardFailedSendOutcome,
+    /// Ciphertext hashes of the discarded send's encrypted media, for purging
+    /// a host's decrypted-media cache. Empty unless the send was discarded.
+    pub media_ciphertext_sha256: Vec<String>,
+    /// True when the send was discarded but secure WAL truncation remains
+    /// pending. The next secure delete in this group retries it.
+    pub erasure_pending: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1348,22 +1565,6 @@ pub(crate) struct AppMessageProjection {
     pub(crate) moderation_grant: bool,
 }
 
-fn generate_telemetry_install_id() -> String {
-    let mut bytes = [0u8; 16];
-    OsRng.fill_bytes(&mut bytes);
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    let encoded = hex::encode(bytes);
-    format!(
-        "{}-{}-{}-{}-{}",
-        &encoded[0..8],
-        &encoded[8..12],
-        &encoded[12..16],
-        &encoded[16..20],
-        &encoded[20..32]
-    )
-}
-
 #[derive(Clone)]
 struct AccountProfile {
     account_id_hex: String,
@@ -1387,15 +1588,20 @@ struct KeyPackageRecord {
 
 struct OpenAppAccount {
     runtime: AppRuntime,
+    /// The app's own clone of the engine's connection, for the storage-only
+    /// work it schedules: the draft-commit observer and legacy message
+    /// promotion. Declared before the session guard, like the runtime.
+    engine_storage: SqliteAccountStorage,
     audit_v5_peel_slot: Arc<Mutex<client::audit_v5_probe::PeelSlot>>,
+    /// Where the Welcome peeler puts the pairing messages it opens; `None`
+    /// unless device groups are on.
+    #[cfg(feature = "unreleased-device-pairing")]
+    pairing_inbox: Option<client::device_pairing::PairingInbox>,
     session_guard: AppAccountSessionGuard,
     adapter: MarmotRelayPlaneAccountAdapter,
     routing: AppTransportRouting,
     state: AccountState,
     delivery_overflow_recovery_pending: bool,
-    delivery_overflow_recovery_marker_token: Option<u64>,
-    /// Loss the open imported, recorded once the client exists.
-    recovery_loss_imports: Vec<storage_sqlite::RecoveryLossImport>,
     signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner>,
 }
 
@@ -1447,6 +1653,30 @@ impl MarmotApp {
             .retain_safe_discovered_endpoints(endpoints, context)
     }
 
+    /// A relay's caps for the time-sliced history sweep (#2660), from its
+    /// NIP-11 document behind the relay dial gate and cached per canonical
+    /// relay URL. `None` (unknown) when the document is missing, malformed,
+    /// unreachable or refused, so the sweep infers the cap from full replies.
+    /// A document that advertises nothing is known: it reads as
+    /// [`RelayCaps::default`](transport_nostr_adapter::sweep::RelayCaps).
+    ///
+    /// Nothing refreshes in the background: a call on a stale entry fetches
+    /// again, so call it when a relay reconnects. Caps compare by value, so a
+    /// caller sees a change by comparing a known read with the caps it
+    /// planned with. An unknown read means no information, not a change: a
+    /// failed fetch reads as unknown until a later one succeeds.
+    // The recovery runner reads the cache through its host; this is the
+    // app-level read the dial-gate tests pin.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn relay_caps(
+        &self,
+        endpoint: &str,
+    ) -> Option<transport_nostr_adapter::sweep::RelayCaps> {
+        self.relay_caps
+            .caps(endpoint, self.config.allow_loopback_relay_endpoints)
+            .await
+    }
+
     /// Effective settings for this app instance, including its active consent permit.
     /// An unstarted instance reports export disabled even if a grant is persisted.
     /// Read `usage_diagnostics_settings` for the consent decision before startup.
@@ -1482,7 +1712,7 @@ impl MarmotApp {
         Ok(self
             .relay_telemetry_settings()?
             .export_config_with_runtime_and_endpoints(
-                config::RelayTelemetryRuntimeConfig::default(),
+                marmot_observability::RelayTelemetryRuntimeConfig::default(),
                 self.service_endpoints(),
             ))
     }
@@ -1531,6 +1761,29 @@ impl MarmotApp {
         self.config.cursor_persistence
     }
 
+    /// Treat every live reply this app's accounts read as one the account
+    /// pool's wire tap could not vouch for, as from a relay that sends a
+    /// frame the tap cannot attribute: an empty live count then proves
+    /// nothing (`ReplayLiveCount::sent_nothing`). For runner fixtures that
+    /// seed debt on a quiet group, which the group's own empty live REQ
+    /// would otherwise prove. Call it before cloning the app.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn with_unvouched_relay_replies_for_test(mut self) -> Self {
+        self.unvouched_relay_replies = true;
+        self
+    }
+
+    /// Whether live counts keep the wire tap's answer: always, outside
+    /// fixtures that opt out.
+    pub(crate) fn vouches_for_relay_replies(&self) -> bool {
+        #[cfg(any(test, feature = "test-support"))]
+        if self.unvouched_relay_replies {
+            return false;
+        }
+        true
+    }
+
     pub fn telemetry_install_id(&self) -> Result<String, AppError> {
         if self.product_analytics.permit().is_none() {
             return Err(ProductAnalyticsError::ConsentRequired.into());
@@ -1575,6 +1828,11 @@ impl MarmotApp {
         relay_urls: Vec<String>,
         mut config: MarmotAppConfig,
     ) -> Self {
+        // Unit tests skip SQLCipher's memory security and full fsync, which
+        // made up most of their run time. They change nothing a test here
+        // observes; storage-sqlite's own tests pin the production settings.
+        #[cfg(test)]
+        storage_sqlite::relax_storage_for_test_process();
         // These relay-only constructors are dev/test entry points (production
         // opens through `with_relays_and_account_home*`). Explicit test-policy
         // builds default them to instant settlement so multi-client tests are
@@ -1591,15 +1849,20 @@ impl MarmotApp {
             APP_RUNTIME_RELAY_REBUILD_LOOKBACK,
             config.allow_loopback_relay_endpoints,
         );
-        let product_analytics = ProductAnalytics::default();
-        product_analytics.silence(
+        marmot_observability::hand_in_http_builder(network_proxy::http_builder);
+        let product_analytics = marmot_observability::ProductRecorder::default();
+        marmot_observability::wiring::silence(
+            &product_analytics,
             config.usage_diagnostics_silent
                 || config.cursor_persistence == CursorPersistence::Frozen,
         );
         Self {
+            #[cfg(test)]
+            notification_dispatches: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             account_home: AccountHome::open(&root),
             root,
             root_runtime_lease: Arc::new(Mutex::new(None)),
+            onboarding_transactions: Arc::default(),
             storage_closed: Arc::new(AtomicBool::new(false)),
             storage_close_completed: Arc::new(AtomicBool::new(false)),
             storage_lifecycle: Arc::new(RwLock::new(())),
@@ -1607,11 +1870,15 @@ impl MarmotApp {
             audit_export_lifecycle: audit_export_lifecycle::AuditExportLifecycle::default(),
             relay_urls,
             relay_plane,
+            relay_caps: relay_caps::RelayCapsCache::default(),
+            #[cfg(any(test, feature = "test-support"))]
+            unvouched_relay_replies: false,
             config,
             block_list_locks: Arc::default(),
             moderation_reports: Arc::default(),
             block_list_updates: Arc::new(tokio::sync::watch::channel(0).0),
             account_storages: Arc::new(Mutex::new(HashMap::new())),
+            account_open_progress: Arc::default(),
             account_media_stores: Arc::new(Mutex::new(HashMap::new())),
             legacy_media_migrations: Arc::default(),
             close_registry: Default::default(),
@@ -1621,6 +1888,8 @@ impl MarmotApp {
             legacy_directory_cache_checked: Arc::new(Mutex::new(false)),
             #[cfg(test)]
             directory_test_clock: None,
+            #[cfg(test)]
+            chat_list_virtual_clock: None,
             #[cfg(test)]
             directory_cache_open_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
@@ -1635,17 +1904,33 @@ impl MarmotApp {
             test_relay_client: None,
             #[cfg(test)]
             audit_v5_peel_slot: None,
+            #[cfg(test)]
+            test_fail_unlink_mark: Arc::default(),
+            #[cfg(test)]
+            test_fail_runner_preparation: Arc::default(),
+            #[cfg(test)]
+            test_sign_out_leaving_wait: Arc::default(),
             shared_storage: Arc::new(Mutex::new(None)),
             presentation_signals: Arc::new(Default::default()),
+            sign_in_nudges: Arc::new(Default::default()),
+            unlinked_publish_stops: Arc::default(),
+            signing_out_accounts: Arc::default(),
             account_state_ready: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_warmed: Arc::new(Mutex::new(HashSet::new())),
-            chat_list_projection_stale: Arc::new(Mutex::new(HashSet::new())),
-            audit_log_tracker_config: Arc::new(Mutex::new(AuditLogTrackerConfig::default())),
+            chat_list_projection_stale: Arc::default(),
+            audit_log_source: Arc::default(),
+            audit_recorders: Arc::default(),
             product_analytics,
             startup_diagnostics: Default::default(),
             external_signers: Arc::new(Mutex::new(HashMap::new())),
+            nip46_owner: Arc::new(()),
+            nip46_sessions: Arc::default(),
+            nip46_adoptions: Arc::default(),
             public_indexer_copy_tasks: Arc::new(Mutex::new(PublicIndexerCopyTasks::default())),
             replaceable_identity_created_at: Arc::new(Mutex::new(HashMap::new())),
+            sticker_mutation_locks: Arc::new(Mutex::new(HashMap::new())),
+            emoji_set_mutation_locks: Arc::new(Mutex::new(HashMap::new())),
+            emoji_install_stop: tokio_util::sync::CancellationToken::new(),
         }
     }
 
@@ -1681,6 +1966,9 @@ impl MarmotApp {
         account_home: AccountHome,
         mut config: MarmotAppConfig,
     ) -> Self {
+        // As in `with_relays_and_config`.
+        #[cfg(test)]
+        storage_sqlite::relax_storage_for_test_process();
         // `deployment` is a public field, so a struct literal can skip
         // `with_deployment`; normalize once where the app keeps it.
         config.deployment = config.deployment.normalize();
@@ -1688,14 +1976,19 @@ impl MarmotApp {
             APP_RUNTIME_RELAY_REBUILD_LOOKBACK,
             config.allow_loopback_relay_endpoints,
         );
-        let product_analytics = ProductAnalytics::default();
-        product_analytics.silence(
+        marmot_observability::hand_in_http_builder(network_proxy::http_builder);
+        let product_analytics = marmot_observability::ProductRecorder::default();
+        marmot_observability::wiring::silence(
+            &product_analytics,
             config.usage_diagnostics_silent
                 || config.cursor_persistence == CursorPersistence::Frozen,
         );
         Self {
+            #[cfg(test)]
+            notification_dispatches: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             root: root.as_ref().to_path_buf(),
             root_runtime_lease: Arc::new(Mutex::new(None)),
+            onboarding_transactions: Arc::default(),
             storage_closed: Arc::new(AtomicBool::new(false)),
             storage_close_completed: Arc::new(AtomicBool::new(false)),
             storage_lifecycle: Arc::new(RwLock::new(())),
@@ -1704,11 +1997,15 @@ impl MarmotApp {
             relay_urls,
             account_home,
             relay_plane,
+            relay_caps: relay_caps::RelayCapsCache::default(),
+            #[cfg(any(test, feature = "test-support"))]
+            unvouched_relay_replies: false,
             config,
             block_list_locks: Arc::default(),
             moderation_reports: Arc::default(),
             block_list_updates: Arc::new(tokio::sync::watch::channel(0).0),
             account_storages: Arc::new(Mutex::new(HashMap::new())),
+            account_open_progress: Arc::default(),
             account_media_stores: Arc::new(Mutex::new(HashMap::new())),
             legacy_media_migrations: Arc::default(),
             close_registry: Default::default(),
@@ -1718,6 +2015,8 @@ impl MarmotApp {
             legacy_directory_cache_checked: Arc::new(Mutex::new(false)),
             #[cfg(test)]
             directory_test_clock: None,
+            #[cfg(test)]
+            chat_list_virtual_clock: None,
             #[cfg(test)]
             directory_cache_open_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
@@ -1732,17 +2031,33 @@ impl MarmotApp {
             test_relay_client: None,
             #[cfg(test)]
             audit_v5_peel_slot: None,
+            #[cfg(test)]
+            test_fail_unlink_mark: Arc::default(),
+            #[cfg(test)]
+            test_fail_runner_preparation: Arc::default(),
+            #[cfg(test)]
+            test_sign_out_leaving_wait: Arc::default(),
             shared_storage: Arc::new(Mutex::new(None)),
             presentation_signals: Arc::new(Default::default()),
+            sign_in_nudges: Arc::new(Default::default()),
+            unlinked_publish_stops: Arc::default(),
+            signing_out_accounts: Arc::default(),
             account_state_ready: Arc::new(Mutex::new(HashSet::new())),
             chat_list_projection_warmed: Arc::new(Mutex::new(HashSet::new())),
-            chat_list_projection_stale: Arc::new(Mutex::new(HashSet::new())),
-            audit_log_tracker_config: Arc::new(Mutex::new(AuditLogTrackerConfig::default())),
+            chat_list_projection_stale: Arc::default(),
+            audit_log_source: Arc::default(),
+            audit_recorders: Arc::default(),
             product_analytics,
             startup_diagnostics: Default::default(),
             external_signers: Arc::new(Mutex::new(HashMap::new())),
+            nip46_owner: Arc::new(()),
+            nip46_sessions: Arc::default(),
+            nip46_adoptions: Arc::default(),
             public_indexer_copy_tasks: Arc::new(Mutex::new(PublicIndexerCopyTasks::default())),
             replaceable_identity_created_at: Arc::new(Mutex::new(HashMap::new())),
+            sticker_mutation_locks: Arc::new(Mutex::new(HashMap::new())),
+            emoji_set_mutation_locks: Arc::new(Mutex::new(HashMap::new())),
+            emoji_install_stop: tokio_util::sync::CancellationToken::new(),
         }
     }
 
@@ -1768,6 +2083,7 @@ impl MarmotApp {
         *app.root_runtime_lease
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(lease);
+        audit_log::cleanup_expired_audit_logs(&app);
         Ok(app)
     }
 
@@ -1803,23 +2119,43 @@ impl MarmotApp {
     /// (including its clones and managed runtime workers). A concurrent open
     /// returns [`AppError::AccountSessionBusy`]. Drop the owning client before
     /// retrying.
+    #[cfg(feature = "test-support")]
     pub async fn client(&self, label: &str) -> Result<AppClient, AppError> {
-        #[cfg(test)]
-        let relay_plane = self
-            .test_relay_client
-            .as_ref()
-            .map(|client| MarmotRelayPlane::new(None, client.clone()))
-            .unwrap_or_else(|| {
-                MarmotRelayPlane::full_history_with_loopback(
-                    self.config.allow_loopback_relay_endpoints,
-                )
-            });
-        #[cfg(not(test))]
-        let relay_plane = MarmotRelayPlane::full_history_with_loopback(
-            self.config.allow_loopback_relay_endpoints,
-        );
-        self.client_with_relay_plane(label, &relay_plane, None)
+        self.client_with_relay_plane(label, &self.direct_client_relay_plane(), None)
             .await
+    }
+
+    /// Run one sync pass for the account on a client this call opens, owns
+    /// and drops: the one-shot catch-up `wn sync` runs. Hosts that keep
+    /// accounts running sync through [`MarmotAppRuntime`] instead.
+    ///
+    /// The two failures stay apart. The outer error is the open failing,
+    /// before anything syncs: an unknown account, or
+    /// [`AppError::AccountSessionBusy`] while a runtime worker or another open
+    /// from this [`MarmotApp`] holds the account's engine session. The inner
+    /// result is the pass: a [`SyncFailure`] carries the prefix the pass had
+    /// already applied durably, which the caller must report.
+    pub async fn sync_account(
+        &self,
+        label: &str,
+    ) -> Result<Result<SyncSummary, SyncFailure>, AppError> {
+        let mut client = self
+            .client_with_relay_plane(label, &self.direct_client_relay_plane(), None)
+            .await?;
+        // Boxed: the pass nests deep enough that one more layer of future
+        // overflows the compiler's layout query depth in a caller such as
+        // `wn`'s command future.
+        Ok(Box::pin(client.sync_with_partial_progress()).await)
+    }
+
+    /// The relay plane a directly owned client opens on: full history, or a
+    /// unit test's scripted relay client.
+    fn direct_client_relay_plane(&self) -> MarmotRelayPlane {
+        #[cfg(test)]
+        if let Some(client) = &self.test_relay_client {
+            return MarmotRelayPlane::new(None, client.clone());
+        }
+        MarmotRelayPlane::full_history_with_loopback(self.config.allow_loopback_relay_endpoints)
     }
 
     async fn runtime_local_client(
@@ -1855,8 +2191,14 @@ impl MarmotApp {
         if let Some(lifecycle) = &lifecycle {
             lifecycle.ensure_running()?;
         }
-        self.finish_client_open_network_maintenance(&mut client)
-            .await;
+        // An unlinked client does no maintenance (mdk#2628 D67).
+        if !client.device_unlinked() {
+            self.finish_client_open_network_maintenance(&mut client)
+                .await;
+        }
+        // Seated here, where the client is already held: in `client()` the
+        // extra await would copy the client through its stack.
+        client.seat_recovery_runner_in_place().await?;
         Ok(client)
     }
 
@@ -1881,7 +2223,15 @@ impl MarmotApp {
         let app = self.clone();
         // Resolve every supported account ref before touching label-keyed
         // caches or the session-owner registry.
-        let label = self.account_home().account(label)?.label;
+        let account = self.account_home().account(label)?;
+        // An account its device group unlinked never runs on this device
+        // again: it can only be wiped (mdk#2628 D67).
+        if account.unlinked {
+            return Err(AppError::AccountHome(
+                marmot_account::AccountHomeError::AccountUnlinked(account.label),
+            ));
+        }
+        let label = account.label;
         let relay_plane_for_open = relay_plane.clone();
         let permit = lifecycle
             .as_ref()
@@ -1925,75 +2275,70 @@ impl MarmotApp {
         {
             ms
         } else {
-            crate::client::epoch_stall::EPOCH_STALL_WEDGE_REARM_INTERVAL_MS
+            crate::client::history_recovery::epoch_stall::EPOCH_STALL_WEDGE_REARM_INTERVAL_MS
         };
         let _ = open.runtime.take_maintenance_activity();
-        let recovery_policy = if cfg!(feature = "test-policy-overrides")
-            && let Some(ms) = self.config.dev_epoch_backfill_retry_backoff_ms
-        {
-            client::recovery::RecoveryRetryPolicy {
-                base: Duration::from_millis(ms.max(1)),
-                cap: Duration::from_millis(ms.max(1).saturating_mul(20)),
-            }
-        } else {
-            client::recovery::RecoveryRetryPolicy {
-                base: EPOCH_BACKFILL_RETRY_BACKOFF,
-                cap: EPOCH_BACKFILL_RETRY_BACKOFF_CAP,
-            }
-        };
-        let recovery_owner = client::recovery::AccountRecoveryOwner::open(
-            &self.account_storage(&open.state.label)?.app_storage(),
-            client::recovery::wall_now_ms()?,
-            Instant::now(),
-            recovery_policy,
-        )?;
-        let incremental_request = if relay_plane
-            .subscription_rebuild_since(open.state.last_transport_timestamp)
-            .is_none()
-        {
-            Some(
-                self.account_storage(&open.state.label)?
-                    .app_storage()
-                    .request_recovery_observed(
-                        storage_sqlite::RecoveryRequest::IncrementalHistory,
-                        client::recovery::wall_now_ms()?,
-                    )?,
-            )
-        } else {
-            None
-        };
+        let recovery_owner = client::recovery::AccountRecoveryOwner::open();
+        // Before the client activates any REQ; a failed read trusts none.
+        let live_coverage = client::LiveCoverage::open(
+            self.account_storage(&open.state.label)?
+                .app_storage()
+                .recovery_coverage_mark()
+                .ok(),
+            &open.adapter,
+        )
+        .await;
         let cursor_audit_placements = open.adapter.delivery_placement_counts();
-        let recovery_loss_imports = open.recovery_loss_imports;
-        let audit_v5_enabled = open.runtime.session().audit_v5_enabled();
+        let audit = open.runtime.audit_recorder().clone();
+        let audit_v5_enabled = marmot_forensics::ForensicRecorder::records_v5(&audit);
         let mut client = AppClient {
             #[cfg(test)]
-            test_recovery_selection_witness: None,
+            test_after_checkpoint_save: None,
+            #[cfg(test)]
+            test_replay_sync_gate: None,
             audit_v5_probe: audit_v5_enabled.then(client::audit_v5_probe::WelcomeProbe::live),
             audit_v5_peel_slot: Some(open.audit_v5_peel_slot.clone()),
-            #[cfg(test)]
-            test_recovery_evidence: None,
-            #[cfg(test)]
-            test_comparison_results: None,
-            #[cfg(test)]
-            test_comparison_delay: None,
-            #[cfg(test)]
-            test_comparison_saved_cursor: None,
+            audit,
+            #[cfg(all(test, feature = "unreleased-device-pairing"))]
+            test_fail_roster_read: false,
             recovery_owner,
-            epoch_gap_windows: Default::default(),
-            // Unit tests run many directly owned clients in one process; each
-            // gets its own pool so one test's held job cannot stall another.
-            #[cfg(not(test))]
-            recovery_credits:
-                crate::runtime::account_worker::recovery_credits::shared_recovery_credit_pool(),
-            #[cfg(test)]
-            recovery_credits: crate::runtime::account_worker::recovery_credits::private_recovery_credit_pool_for_test(),
-            comparison_startup_requested: false,
+            history_recovery: client::history_recovery::HistoryRecovery::new(
+                client::history_recovery::HistoryRecoveryState {
+                    // Unit tests run many directly owned clients in one process; each
+                    // gets its own pool so one test's held job cannot stall another.
+                    #[cfg(not(test))]
+                    recovery_credits:
+                        crate::runtime::account_worker::recovery_credits::shared_recovery_credit_pool(),
+                    #[cfg(test)]
+                    recovery_credits: crate::runtime::account_worker::recovery_credits::private_recovery_credit_pool_for_test(),
+                    recovery_runner: Default::default(),
+                    pending_recovery_status_updates: std::collections::HashSet::new(),
+                    history_notice_baseline: None,
+                    recovery_status_owed: false,
+                    live_coverage: tokio::sync::Mutex::new(live_coverage),
+                    pending_epoch_stall_escalations: Vec::new(),
+                    runner_preparation_owed: false,
+                    runner_pruned_floor: None,
+                    settled_recovery_copies: std::collections::HashMap::new(),
+                    recovery_copy_settled: false,
+                    // Set with the open's goals, just below.
+                    runner_prune_clock: unix_now_seconds(),
+                    epoch_stall: crate::client::history_recovery::epoch_stall::EpochStallDetector::default()
+                        .with_wedge_rearm_interval_ms(wedge_rearm_interval_ms),
+                    pending_recovery_arm_writes: HashMap::new(),
+                    released_backfill_reload_pending: true,
+                    runner_post_join: HashMap::new(),
+                },
+            ),
             conversation_captures: Vec::new(),
             runtime_telemetry: None,
             send_telemetry: None,
+            read_state: None,
             app: self.clone(),
             maintenance_observation_generation: self.product_analytics.permit(),
+            received_private_key_package_generation: 0,
             runtime: open.runtime,
+            engine_storage: open.engine_storage,
             _session_guard: open.session_guard,
             adapter: open.adapter,
             routing: open.routing,
@@ -2006,8 +2351,27 @@ impl MarmotApp {
             seen_events_index,
             pending_seen_event_count: 0,
             pending_group_projection_updates: std::collections::HashSet::new(),
-            pending_recovery_status_updates: std::collections::HashSet::new(),
-            history_notice_baseline: None,
+            announced_convergence_parks: std::collections::HashSet::new(),
+            pending_convergence_park_notices: std::collections::HashSet::new(),
+            // A fresh client cannot know what hosts last read.
+            linked_devices_changed: true,
+            device_labels_refresh_due: true,
+            inactive_siblings: None,
+            leaving_siblings: HashMap::new(),
+            sibling_chat_gaps: Default::default(),
+            pending_recovery_words: None,
+            backup_restore: Default::default(),
+            key_package_refresh_overdue: None,
+            key_package_refresh_overdue_changed: true,
+            sign_in_schedule: Default::default(),
+            unrecognized_sign_ins_changed: true,
+            compromise_warning_changed: true,
+            compromise_warning_gather_due: true,
+            device_link_changed: true,
+            chat_history_imports_changed: true,
+            history_imports_inputs: None,
+            listed_history_imports: Vec::new(),
+            device_unlinked: false,
             cursor_audit_placements,
             pending_projection_updates: Vec::new(),
             pending_applied_sync_summary: SyncSummary::default(),
@@ -2015,13 +2379,16 @@ impl MarmotApp {
             retained_projection_failures: 0,
             pending_resumed_message_notifications: Default::default(),
             pending_push_leaf_reconciliations: Default::default(),
+            push_registration_share_queued: false,
+            pending_member_add_push_shares: Default::default(),
+            pending_own_add_push_snapshots: Default::default(),
+            push_announce_timing: Default::default(),
+            push_fetch_clock: client::PushFetchClock::new(notifications::unix_now_ms()),
+            accepted_push_announces: Default::default(),
+            push_repairs: Default::default(),
             pending_failed_sync_summary: SyncSummary::default(),
             pending_native_sync_summary: SyncSummary::default(),
             native_sync_deliveries: 0,
-            explicit_history_window_certified: false,
-            recovery_job_network_cut: false,
-            recovery_job_admission_expired: false,
-            pending_epoch_stall_escalations: Vec::new(),
             pending_convergence_groups: std::collections::HashSet::new(),
             stale_commit_acknowledgements: std::collections::HashMap::new(),
             undelivered_commit_acknowledgements: std::collections::HashMap::new(),
@@ -2034,13 +2401,20 @@ impl MarmotApp {
                 .config
                 .dev_fail_published_app_message_acknowledgement,
             pending_runtime_group_subscription_refresh: false,
+            #[cfg(test)]
+            fail_next_runner_preparation: self
+                .test_fail_runner_preparation
+                .swap(false, std::sync::atomic::Ordering::AcqRel),
             checkpointed_transport_timestamp,
+            saved_transport_timestamp: checkpointed_transport_timestamp,
+            observed_commit_version: None,
+            content_report_backfill_done: None,
             #[cfg(test)]
             cursor_seal_probe: std::sync::Mutex::new(None),
             #[cfg(test)]
             fail_ingest_of: None,
             delivery_overflow_recovery_pending: open.delivery_overflow_recovery_pending,
-            delivery_overflow_recovery_marker_token: open.delivery_overflow_recovery_marker_token,
+            delivery_overflow_recovery_marker_token: None,
             delivery_spill: Default::default(),
             #[cfg(test)]
             force_event_group_projection_unavailable: false,
@@ -2048,33 +2422,33 @@ impl MarmotApp {
             strict_quarantined_group_reads: false,
             #[cfg(test)]
             fail_drained_effect_checkpoints: false,
+            #[cfg(test)]
+            test_sent_push_gossip: Vec::new(),
+            #[cfg(test)]
+            test_push_device_can_fetch: None,
+            #[cfg(test)]
+            test_fail_push_announce_owed_write: false,
             pending_welcome_delivery_events: Vec::new(),
+            announced_welcome_failures: HashSet::new(),
+            sibling_welcome_carriers: HashSet::new(),
+            sibling_welcome_retirement_cursor: None,
             pending_superseded_change_events: Vec::new(),
             maintenance_failed_backlog: 0,
             unpublished_welcome_delivery: None,
-            epoch_stall: crate::client::epoch_stall::EpochStallDetector::default()
-                .with_wedge_rearm_interval_ms(wedge_rearm_interval_ms),
-            pending_recovery_arm_writes: HashMap::new(),
-            pending_recovery_capacity_writes: HashMap::new(),
-            released_backfill_reload_pending: true,
             #[cfg(test)]
             fail_next_released_backfill_reload: false,
             #[cfg(test)]
             fail_next_terminal_recovery_retire: false,
-            post_join_maintenance_subscriptions: HashMap::new(),
+            #[cfg(test)]
+            fail_next_convergence_retry_advance: false,
             encrypted_media_not_required_epochs: HashMap::new(),
             checkpoint_route_refresh_recomputes: 0,
+            #[cfg(feature = "unreleased-device-pairing")]
+            device_pairing: Box::new(client::device_pairing::DevicePairing::new(
+                open.pairing_inbox,
+            )),
         };
-        // Loss the open imported, and the startup history request, become
-        // audit rows once the client that records them exists.
-        client.record_recovery_loss_imports(recovery_loss_imports);
-        if let Some((ticket, transition)) = incremental_request {
-            client.record_recovery_request(
-                storage_sqlite::RecoveryCause::IncrementalHistory,
-                ticket,
-                transition,
-            );
-        }
+        client.record_open_coverage_goals();
         // Initial access also restores durable backfill work, with or without
         // new releases, so open does not read the intent table twice.
         client.transport_receipts()?;
@@ -2100,6 +2474,8 @@ impl MarmotApp {
         }
         // Hosts read the notice list after open; later changes raise an event.
         client.take_history_notice_changes();
+        client.sync_key_package_announcement_group()?;
+        client.note_stored_device_group_removal();
         Ok(client)
     }
 
@@ -2107,10 +2483,6 @@ impl MarmotApp {
         client
             .app
             .retire_cached_non_current_key_package(&client.state.label)
-            .await;
-        client
-            .app
-            .retire_relay_non_current_key_packages(&client.state.label)
             .await;
         if client
             .app
@@ -2133,7 +2505,7 @@ impl MarmotApp {
                     .app
                     .clear_key_package_cutover_replacement_pending(&client.state.label);
             } else {
-                match client.runtime.publish_fresh_key_package().await {
+                match client.publish_fresh_key_package_announced().await {
                     Ok(_) => tracing::info!(
                         target: "marmot_app::key_packages",
                         method = "finish_client_open_network_maintenance",
@@ -2142,7 +2514,7 @@ impl MarmotApp {
                     Err(error) => tracing::warn!(
                         target: "marmot_app::key_packages",
                         method = "finish_client_open_network_maintenance",
-                        error_kind = AppError::from(error).privacy_safe_kind(),
+                        error_kind = error.privacy_safe_kind(),
                         "deferred current key package replacement after strict cutover"
                     ),
                 }
@@ -2171,16 +2543,16 @@ impl MarmotApp {
         if self.cursor_persistence() == CursorPersistence::Advance {
             let result = async {
                 if client.runtime.key_package_generation_upgrade_due()? {
-                    client.runtime.publish_fresh_key_package().await?;
+                    client.publish_fresh_key_package_announced().await?;
                 }
-                Ok::<_, marmot_account::AccountError>(())
+                Ok::<_, AppError>(())
             }
             .await;
             if let Err(error) = result {
                 tracing::warn!(
                     target: "marmot_app::key_packages",
                     method = "finish_client_open_network_maintenance",
-                    error_kind = AppError::from(error).privacy_safe_kind(),
+                    error_kind = error.privacy_safe_kind(),
                     "key package generator upgrade remains retryable"
                 );
             }
@@ -2558,6 +2930,16 @@ impl MarmotApp {
             .await
     }
 
+    /// Give a local account both relay lists before a KeyPackage publish.
+    ///
+    /// Both lists are replaceable, so a publish replaces whatever the identity
+    /// already published. An identity imported offline has no cached copy, and
+    /// a kind 10002 with no write relay counts as missing, so an incomplete
+    /// cache is not absence: read the published lists first and adopt what the
+    /// read finds (it caches them). Publish the app's relays only for a list
+    /// that a complete read of those relays, and of the outboxes they
+    /// advertise, proves absent. An incomplete read or a published list with
+    /// no usable relay publishes nothing and fails (mdk#2550).
     async fn ensure_local_account_relay_lists(
         &self,
         label: &str,
@@ -2588,10 +2970,19 @@ impl MarmotApp {
         if default_relays.is_empty() {
             return Err(AppError::MissingRelayLists(status.missing));
         }
+        // Fails with `DirectoryLookupIncomplete` or `MissingRelayLists` rather
+        // than report a kind as missing that the read did not prove absent.
+        let published = self
+            .directory()
+            .resolve_account_relay_list_status_for_account_id(
+                &account.account_id_hex,
+                default_relays.clone(),
+            )
+            .await?;
         self.publish_missing_account_relay_lists_from_status(
             label,
             AccountRelayListBootstrap::new(default_relays.clone(), default_relays),
-            status,
+            published,
         )
         .await
     }
@@ -3909,6 +4300,25 @@ impl MarmotApp {
             )?)
     }
 
+    /// Queue the current registration for one joined group again; see
+    /// `queue_current_push_registration_share_for_group` in storage.
+    pub(crate) fn queue_current_push_registration_share_for_group(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+    ) -> Result<bool, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        Ok(self
+            .account_storage(&account.label)?
+            .app_storage()
+            .queue_current_push_registration_share_for_group(
+                &account.label,
+                group_id_hex,
+                notifications::unix_now_ms(),
+            )?)
+    }
+
     pub(crate) fn has_pending_push_registration_work(
         &self,
         account_ref: &str,
@@ -3992,6 +4402,20 @@ impl MarmotApp {
         account_ref: &str,
         group_id_hex: &str,
     ) -> Result<Vec<GroupPushTokenRecord>, AppError> {
+        Ok(self
+            .stored_group_push_tokens(account_ref, group_id_hex)?
+            .into_iter()
+            .map(|stored| stored.record)
+            .collect())
+    }
+
+    /// Every token record stored for `group_id_hex`, each with its checked
+    /// stored digest.
+    pub(crate) fn stored_group_push_tokens(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+    ) -> Result<Vec<notifications::StoredGroupPushToken>, AppError> {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;
         self.account_storage(&account.label)?
@@ -4002,6 +4426,203 @@ impl MarmotApp {
             .collect()
     }
 
+    /// Every tombstone stored for `group_id_hex`. Only those that kept their
+    /// owner-signed removal may be relayed.
+    pub(crate) fn group_push_token_tombstones(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+    ) -> Result<Vec<notifications::StoredPushTokenTombstone>, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        self.account_storage(&account.label)?
+            .app_storage()
+            .group_push_token_tombstones(group_id_hex)?
+            .into_iter()
+            .map(conversions::push_token_tombstone_from_account)
+            .collect()
+    }
+
+    /// The epoch after which this device owes `group_id_hex` a push snapshot,
+    /// if it owes one.
+    pub(crate) fn group_push_snapshot_owed(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+    ) -> Result<Option<u64>, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        Ok(self
+            .account_storage(&account.label)?
+            .app_storage()
+            .group_push_gossip_state(group_id_hex)?
+            .and_then(|state| state.snapshot_owed_after_epoch))
+    }
+
+    /// Every group this device owes a push snapshot, with the epoch its merged
+    /// epoch must pass first.
+    pub(crate) fn owed_group_push_snapshots(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<(String, u64)>, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        Ok(self
+            .account_storage(&account.label)?
+            .app_storage()
+            .owed_group_push_snapshots()?
+            .into_iter()
+            .filter_map(|state| {
+                state
+                    .snapshot_owed_after_epoch
+                    .map(|after_epoch| (state.group_id_hex, after_epoch))
+            })
+            .collect())
+    }
+
+    /// Record that this device owes `group_id_hex` a push snapshot once its
+    /// merged epoch passes `after_epoch`. The later of two owed epochs wins.
+    /// Returns false unless this device is a member of the projected group.
+    pub(crate) fn record_group_push_snapshot_owed(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+        after_epoch: u64,
+    ) -> Result<bool, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        Ok(self
+            .account_storage(&account.label)?
+            .app_storage()
+            .record_group_push_snapshot_owed(group_id_hex, after_epoch)?)
+    }
+
+    /// This device's push gossip state in `group_id_hex`, if it has any.
+    pub(crate) fn group_push_gossip_state(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+    ) -> Result<Option<storage_sqlite::AccountGroupPushGossipState>, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        Ok(self
+            .account_storage(&account.label)?
+            .app_storage()
+            .group_push_gossip_state(group_id_hex)?)
+    }
+
+    /// Every group where this device owes an announce besides the one that
+    /// ends its join window.
+    pub(crate) fn owed_group_push_announce_states(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<storage_sqlite::AccountGroupPushGossipState>, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        Ok(self
+            .account_storage(&account.label)?
+            .app_storage()
+            .owed_group_push_announce_states()?)
+    }
+
+    /// Record that this device owes `group_id_hex` an announce as of
+    /// `owed_at_ms`. Returns the value stored, or `None` unless this device
+    /// is a member of the projected group.
+    pub(crate) fn record_group_push_announce_owed(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+        owed_at_ms: i64,
+    ) -> Result<Option<i64>, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        Ok(self
+            .account_storage(&account.label)?
+            .app_storage()
+            .record_group_push_announce_owed(group_id_hex, owed_at_ms)?)
+    }
+
+    /// Every group where this device has a push join window open, or one that
+    /// ended without its announce yet.
+    pub(crate) fn joining_group_push_gossip_states(
+        &self,
+        account_ref: &str,
+    ) -> Result<Vec<storage_sqlite::AccountGroupPushGossipState>, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        Ok(self
+            .account_storage(&account.label)?
+            .app_storage()
+            .joining_group_push_gossip_states()?)
+    }
+
+    /// Record when this device's join to `group_id_hex` completed. Returns
+    /// false unless this device is a member of the projected group.
+    pub(crate) fn record_group_push_gossip_join(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+        joined_at_ms: i64,
+    ) -> Result<bool, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        Ok(self
+            .account_storage(&account.label)?
+            .app_storage()
+            .record_group_push_gossip_join(group_id_hex, joined_at_ms)?)
+    }
+
+    /// Count `counted_ms`, time during which this device could fetch, toward
+    /// every push join window whose join has completed.
+    pub(crate) fn count_push_join_window_time(
+        &self,
+        account_ref: &str,
+        counted_ms: i64,
+    ) -> Result<usize, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        Ok(self
+            .account_storage(&account.label)?
+            .app_storage()
+            .count_push_join_window_time(counted_ms)?)
+    }
+
+    /// Record that this device published, at `announced_at_ms`, an announce
+    /// in `group_id_hex` built while the owed announce stood at
+    /// `settles_owed`, settling it if it still does. Returns false unless
+    /// this device is a member of the projected group.
+    pub(crate) fn record_group_push_gossip_announce(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+        announced_at_ms: i64,
+        settles_owed: Option<i64>,
+    ) -> Result<bool, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        Ok(self
+            .account_storage(&account.label)?
+            .app_storage()
+            .record_group_push_gossip_announce(group_id_hex, announced_at_ms, settles_owed)?)
+    }
+
+    /// Replace the owed snapshot epoch of `group_id_hex` with `replacement`
+    /// (`None` settles it) while it is still `expected`.
+    pub(crate) fn replace_group_push_snapshot_owed(
+        &self,
+        account_ref: &str,
+        group_id_hex: &str,
+        expected: u64,
+        replacement: Option<u64>,
+    ) -> Result<bool, AppError> {
+        let account = self.account_home().account(account_ref)?;
+        self.ensure_account_state(&account.label)?;
+        Ok(self
+            .account_storage(&account.label)?
+            .app_storage()
+            .replace_group_push_snapshot_owed(group_id_hex, expected, replacement)?)
+    }
+
     /// Ingest inbound push-token gossip (kinds 447/448/449) into
     /// `group_push_tokens`. `active_leaves` is the carrying group's current
     /// authenticated account/device roster. Owners are verified by
@@ -4010,14 +4631,15 @@ impl MarmotApp {
     /// `(owner_ts, record_digest)` ordering primitive and tombstones (enforced by
     /// the storage `apply_*` calls) decide what mutates state. Because authority
     /// comes from each record's `owner_sig`, a kind 448 may carry — and apply —
-    /// records owned by members other than `message.sender`.
+    /// records owned by members other than `message.sender`. Returns the
+    /// entries that passed owner authentication and name a current member.
     pub(crate) fn ingest_push_gossip_message(
         &self,
         account_ref: &str,
         message: &ReceivedMessage,
         active_leaves: &[cgka_traits::engine::GroupMemberLeaf],
         profile: cgka_traits::group::ProtocolProfile,
-    ) -> Result<(), AppError> {
+    ) -> Result<notifications::PushGossipAction, AppError> {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;
         let group_id_hex = hex::encode(message.group_id.as_slice());
@@ -4038,34 +4660,30 @@ impl MarmotApp {
             &active_member_ids,
             profile,
         );
-        match action {
+        match &action {
             notifications::PushGossipAction::Upsert(records) => {
                 for record in records {
                     // A valid account signature does not make a departed
                     // sibling leaf eligible for a notification destination.
                     if active_leaves.contains(&(record.member_id_hex.clone(), record.leaf_index)) {
                         storage
-                            .apply_group_push_token(&account_group_push_token_from_app(&record))?;
+                            .apply_group_push_token(&account_group_push_token_from_app(record))?;
                     }
                 }
             }
             notifications::PushGossipAction::Remove(removals) => {
                 for removal in removals {
-                    let digest = removal.record_digest(&group_id_hex)?;
                     storage.apply_group_push_token_tombstone(
-                        &group_id_hex,
-                        &removal.member_id_hex,
-                        removal.leaf_index,
-                        removal.platform.platform_byte(),
-                        &removal.server_pubkey_hex,
-                        removal.owner_ts,
-                        &digest,
-                        notifications::unix_now_ms(),
+                        &conversions::account_push_token_tombstone_from_removal(
+                            &group_id_hex,
+                            removal,
+                            notifications::unix_now_ms(),
+                        )?,
                     )?;
                 }
             }
         }
-        Ok(())
+        Ok(action)
     }
 
     /// Apply immutable engine leaf-departure facts through the account-scoped storage boundary.
@@ -4103,19 +4721,14 @@ impl MarmotApp {
     ) -> Result<(), AppError> {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;
-        let digest = removal.record_digest(group_id_hex)?;
+        let tombstone = conversions::account_push_token_tombstone_from_removal(
+            group_id_hex,
+            removal,
+            notifications::unix_now_ms(),
+        )?;
         self.account_storage(&account.label)?
             .app_storage()
-            .apply_group_push_token_tombstone(
-                group_id_hex,
-                &removal.member_id_hex,
-                removal.leaf_index,
-                removal.platform.platform_byte(),
-                &removal.server_pubkey_hex,
-                removal.owner_ts,
-                &digest,
-                notifications::unix_now_ms(),
-            )?;
+            .apply_group_push_token_tombstone(&tombstone)?;
         Ok(())
     }
 
@@ -4133,9 +4746,12 @@ impl MarmotApp {
         // is authored by a peer, and the roster-derived classification of
         // that commit reads as an eviction. Now that peers apply a leave
         // within seconds (mdk#1736) the two writes land back to back, so the
-        // eviction must never overwrite the recorded intent.
-        if membership == SelfMembership::Removed
-            && storage.group_self_membership(group_id_hex)? == Some(SelfMembership::Left)
+        // eviction must never overwrite the recorded intent. Nor may a sibling
+        // removing this device's leaf (mdk#2628 D62).
+        if matches!(
+            membership,
+            SelfMembership::Removed | SelfMembership::DeviceRemoved
+        ) && storage.group_self_membership(group_id_hex)? == Some(SelfMembership::Left)
         {
             tracing::debug!(
                 target: "marmot_app",
@@ -4145,7 +4761,10 @@ impl MarmotApp {
             return Ok(());
         }
         storage.set_group_self_membership(group_id_hex, membership)?;
-        self.presentation_signals.wake();
+        // The chat-list row keeps its own copy of the membership. Nothing
+        // else rewrites it, and an idle account may skip the checkpoint save
+        // that used to mark the list stale (mdk#2923).
+        self.invalidate_chat_list_projection(&account.label);
         Ok(())
     }
 
@@ -4164,15 +4783,18 @@ impl MarmotApp {
             .group_self_membership(group_id_hex)?)
     }
 
-    pub(crate) fn account_group_self_memberships(
+    /// The saved `account_groups` row's standing a co-member read judges the
+    /// group by, or `None` when the group has no saved row (mdk#3273 PR 4).
+    pub(crate) fn stored_group_standing(
         &self,
         label: &str,
-    ) -> Result<std::collections::HashMap<String, SelfMembership>, AppError> {
+        group_id_hex: &str,
+    ) -> Result<Option<storage_sqlite::StoredGroupStanding>, AppError> {
         self.ensure_account_state(label)?;
         Ok(self
             .account_storage(label)?
             .app_storage()
-            .account_group_self_memberships()?)
+            .group_standing(group_id_hex)?)
     }
 
     pub(crate) fn arm_epoch_backfill_intents(
@@ -4304,11 +4926,15 @@ impl MarmotApp {
             .remove_stale_group_push_tokens(group_id_hex, active_members)?)
     }
 
-    pub fn group_push_debug_info(
+    /// `member_leaves` is the group's canonical device roster and
+    /// `local_leaf_index` this device's own leaf, both read from the live
+    /// session (mdk#2622).
+    pub(crate) fn group_push_debug_info(
         &self,
         account_ref: &str,
         group_id_hex: &str,
-        active_members: &[String],
+        member_leaves: &[cgka_traits::engine::GroupMemberLeaf],
+        local_leaf_index: Option<u32>,
     ) -> Result<GroupPushDebugInfo, AppError> {
         let account = self.account_home().account(account_ref)?;
         self.ensure_account_state(&account.label)?;
@@ -4323,14 +4949,19 @@ impl MarmotApp {
         let tokens = storage
             .group_push_tokens(group_id_hex)?
             .into_iter()
-            .map(group_push_token_from_account)
+            .map(|token| group_push_token_from_account(token).map(|stored| stored.record))
             .collect::<Result<Vec<_>, _>>()?;
+        let member_leaves = member_leaves
+            .iter()
+            .map(|leaf| (hex::encode(leaf.member.as_slice()), leaf.leaf_index))
+            .collect::<Vec<_>>();
         Ok(notifications::group_debug_info(
             settings,
             registration,
             tokens,
             &account.account_id_hex,
-            active_members,
+            &member_leaves,
+            local_leaf_index,
         ))
     }
 
@@ -4348,7 +4979,7 @@ impl MarmotApp {
         let pending = storage.pending_leave_requests()?;
         if !pending.is_empty() {
             for group in &mut groups {
-                group.leave_requested_at_ms = pending.get(&group.group_id_hex).copied();
+                group.stamp_leave_request(pending.get(&group.group_id_hex));
             }
         }
         let disbanding = storage.disbanding_group_ids_hex()?;
@@ -4376,7 +5007,12 @@ impl MarmotApp {
     /// would silently go stale.
     pub fn pending_leave_requests(&self, label: &str) -> Result<HashMap<String, u64>, AppError> {
         self.ensure_account_state(label)?;
-        Ok(self.account_storage(label)?.pending_leave_requests()?)
+        Ok(self
+            .account_storage(label)?
+            .pending_leave_requests()?
+            .into_iter()
+            .map(|(group_id_hex, request)| (group_id_hex, request.requested_at_ms))
+            .collect())
     }
 
     /// Group invites still pending the local device's confirmation decision.
@@ -4491,9 +5127,7 @@ impl MarmotApp {
             return Ok(Some(group));
         }
         let group_id = GroupId::new(group_id);
-        group.leave_requested_at_ms = storage
-            .leave_request(&group_id)?
-            .map(|request| request.requested_at_ms);
+        group.stamp_leave_request(storage.leave_request(&group_id)?.as_ref());
         let request = storage.disband_request(&group_id)?;
         group.disbanding = request
             .as_ref()
@@ -4504,6 +5138,10 @@ impl MarmotApp {
         Ok(Some(group))
     }
 
+    /// Write a group's `archived` flag to storage directly. A running account
+    /// worker would undo it at its next save of that group's record, so the
+    /// runtime calls this only for an account that runs no worker and
+    /// otherwise archives through the worker (mdk#178, mdk#3318).
     pub fn set_group_archived(
         &self,
         label: &str,
@@ -4532,6 +5170,49 @@ impl MarmotApp {
         Ok(group)
     }
 
+    /// Refuse to open the session of an account that holds or is joining a
+    /// device group while device groups are off (mdk#3012): an experimental test build's
+    /// root opened by an ordinary constructor, such as a push extension's.
+    /// That process could only refuse the device group's messages, and
+    /// reading one spends it for every opener of the account. Its drain
+    /// would also settle the device group's staged commits and queued
+    /// intents without the support they need: a staged commit, with no route
+    /// to publish it, is rolled back while its stored fanout still sends it.
+    /// So nothing of the account is hydrated, drained or sent here; the
+    /// experimental constructor opens it.
+    ///
+    /// The account is refused while the engine holds a group a device-group
+    /// row names, or waits on a link's Welcome it can still accept. Every
+    /// device group's row is written before the engine writes anything of it.
+    /// A row left by a creation that never reached the engine, or by a wait
+    /// that ran out, names nothing the engine can still hold or join, so it
+    /// refuses nothing, and this open's reconciliation drops it.
+    fn refuse_device_group_without_support(&self, label: &str) -> Result<(), AppError> {
+        use cgka_traits::storage::{DeviceGroupWelcomeStorage as _, GroupStorage as _};
+        if self.device_groups_enabled() {
+            return Ok(());
+        }
+        let storage = self.account_storage(label)?;
+        let now = unix_now_seconds();
+        // The engine accepts a link's Welcome only before its wait ends.
+        let waiting = storage
+            .device_group_welcome_expectations()?
+            .iter()
+            .any(|expected| now < expected.expires_at);
+        if waiting {
+            return Err(AppError::ExperimentalDeviceGroupsRequired);
+        }
+        for record in storage.app_storage().device_groups()? {
+            let group_id = GroupId::new(hex::decode(&record.group_id_hex)?);
+            match storage.get_group(&group_id) {
+                Ok(_) => return Err(AppError::ExperimentalDeviceGroupsRequired),
+                Err(cgka_traits::StorageError::NotFound) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
     fn open_account(
         &self,
         label: &str,
@@ -4542,28 +5223,23 @@ impl MarmotApp {
         // Account refs may be labels, hex pubkeys, or npubs. Ownership is keyed
         // by the canonical stored label so aliases cannot open a second engine.
         let label = account.label.as_str();
+        self.refuse_device_group_without_support(label)?;
         let session_guard = self.acquire_account_session(label)?;
         let state = self.load_state(label)?;
         let recovery_storage = self.account_storage(label)?;
-        recovery_storage
-            .app_storage()
-            .restore_unacknowledged_recovery_loss()?;
-        let recovery_loss_imports = recovery_storage
-            .app_storage()
-            .synchronize_account_delivery_loss(label)?;
-        let delivery_overflow_recovery = recovery_storage
-            .app_storage()
-            .account_delivery_recovery(label)?;
-        let notification_loss = recovery_storage
-            .app_storage()
-            .pending_recovery_demands()?
-            .into_iter()
-            .find(|demand| demand.cause == storage_sqlite::RecoveryCause::NotificationLoss);
-        let delivery_overflow_recovery_pending =
-            delivery_overflow_recovery.is_some() || notification_loss.is_some();
-        let delivery_overflow_recovery_marker_token = delivery_overflow_recovery
-            .map(|recovery| recovery.marker_token)
-            .or_else(|| notification_loss.and_then(|demand| demand.marker_token));
+        // Retain the local cursor guard until fallible conversion/import runs
+        // with current routing. Reopen never recreates old jobs.
+        let delivery_overflow_recovery_pending = {
+            let app = recovery_storage.app_storage();
+            !app.recovery_loss_snapshot(label, storage_sqlite::RecoveryLossCause::Queue)?
+                .is_empty()
+                || !app
+                    .recovery_loss_snapshot(
+                        label,
+                        storage_sqlite::RecoveryLossCause::NotificationConsumer,
+                    )?
+                    .is_empty()
+        };
         let signer = self.account_signer_for_summary(&account)?;
         let account_id = MemberId::new(hex::decode(&account.account_id_hex)?);
         let nostr_signer = signer.as_nostr_signer();
@@ -4577,10 +5253,22 @@ impl MarmotApp {
             .unwrap_or_else(|| Arc::new(Mutex::new(client::audit_v5_probe::PeelSlot::default())));
         #[cfg(not(test))]
         let audit_v5_peel_slot = Arc::new(Mutex::new(client::audit_v5_probe::PeelSlot::default()));
+        #[cfg(feature = "unreleased-device-pairing")]
+        let pairing_inbox = if self.device_groups_enabled() {
+            Some(client::device_pairing::PairingInbox::new(
+                PublicKey::from_hex(&account.account_id_hex)
+                    .map_err(|_| AppError::InvalidPublicKey)?,
+            ))
+        } else {
+            None
+        };
         let peeler: Box<dyn cgka_traits::peeler::TransportPeeler> =
             Box::new(client::audit_v5_probe::ProbePeeler {
                 inner: peeler,
                 slot: audit_v5_peel_slot.clone(),
+                storage: self.account_storage(label)?.app_storage(),
+                #[cfg(feature = "unreleased-device-pairing")]
+                pairing: pairing_inbox.clone(),
             });
         let session_path = self.account_dir(label).join(SESSION_DB_FILE);
         // The engine gets its own connection to `session.sqlite`, which no
@@ -4611,11 +5299,11 @@ impl MarmotApp {
         };
         // Optional forensic audit log. Enable `AuditLogSettings` before opening
         // an account session to record per-account/device JSONL at
-        // `<account_dir>/audit-<engine_id>-v4.jsonl`. The v4 schema contains
+        // `<account_dir>/audit-<engine_id>-v5.jsonl`. The v5 schema contains
         // privacy-safe derived values only: obfuscated identifiers, digests,
         // lengths, counts, reduced convergence data, and typed outcomes.
         let mut session_config = SessionConfig::with_storage(
-            engine_storage,
+            engine_storage.clone(),
             engine_storage_open,
             account_id.as_slice().to_vec(),
             peeler,
@@ -4655,90 +5343,109 @@ impl MarmotApp {
                 false
             }
         };
+        let audit_slot = self.audit_recorder_slot(label);
+        let mut audit_registration = audit_slot.lock().unwrap_or_else(|p| p.into_inner());
         if audit_log_enabled && let Some(recorder) = self.open_audit_recorder(label, &account_id) {
             session_config = session_config.recorder(recorder);
         }
         self.ensure_strict_cutover_replacement_intent_before_session_open(label)?;
-        let session =
-            AccountDeviceSession::open(session_config).map_err(external_signer_session_error)?;
-
-        let publish_client =
-            self.relay_client_for_account_id(&account.account_id_hex, nostr_signer.clone());
-        let recovery_storage = self.account_storage(label)?;
-        let recovery_label = label.to_owned();
-        let recovery_marker: transport_nostr::AccountDeliveryRecoveryMarker =
-            Arc::new(move |marker_token, dropped, earliest_created_at| {
-                recovery_storage
-                    .app_storage()
-                    .record_account_delivery_loss_bounded(
-                        &recovery_label,
-                        marker_token,
-                        dropped,
-                        unix_now_seconds(),
-                        earliest_created_at,
-                    )
-                    .map_err(|error| {
-                        if error.is_closed() {
-                            transport_nostr::AccountDeliveryRecoveryMarkerError::Closed
-                        } else {
-                            transport_nostr::AccountDeliveryRecoveryMarkerError::Retryable
-                        }
-                    })
-            });
-        let spill_storage = self.account_storage(label)?;
-        let spill_store: transport_nostr::AccountDeliverySpillStore = Arc::new(move |deliveries| {
-            spill_storage
-                .app_storage()
-                .spill_account_deliveries(
-                    deliveries,
-                    client::delivery_spill::ACCOUNT_DELIVERY_SPILL_LIMITS,
-                    unix_now_seconds(),
+        // The session opens before the transport is built, as it always has:
+        // building the adapter registers the account's delivery route.
+        let mut transport = None;
+        let mut runtime = AccountDeviceRuntime::open(session_config, || {
+            let publish_client =
+                self.relay_client_for_account_id(&account.account_id_hex, nostr_signer.clone());
+            let recovery_storage = self.account_storage(label)?;
+            let recovery_label = label.to_owned();
+            let recovery_marker: transport_nostr::AccountDeliveryRecoveryMarker =
+                Arc::new(move |marker_token, dropped, earliest_created_at, routes| {
+                    let routes = routes.map(|routes| {
+                        routes
+                            .iter()
+                            .map(|(route, earliest)| (reconciliation_route(*route), *earliest))
+                            .collect::<Vec<_>>()
+                    });
+                    recovery_storage
+                        .app_storage()
+                        .record_account_recovery_loss_routed(
+                            &recovery_label,
+                            storage_sqlite::RecoveryLossCause::Queue,
+                            marker_token,
+                            dropped,
+                            unix_now_seconds(),
+                            earliest_created_at,
+                            routes.as_deref(),
+                        )
+                        .map_err(|error| {
+                            if error.is_closed() {
+                                transport_nostr::AccountDeliveryRecoveryMarkerError::Closed
+                            } else {
+                                transport_nostr::AccountDeliveryRecoveryMarkerError::Retryable
+                            }
+                        })
+                });
+            let spill_storage = self.account_storage(label)?;
+            let spill_store: transport_nostr::AccountDeliverySpillStore =
+                Arc::new(move |deliveries| {
+                    spill_storage
+                        .app_storage()
+                        .spill_account_deliveries(
+                            deliveries,
+                            client::delivery_spill::ACCOUNT_DELIVERY_SPILL_LIMITS,
+                            unix_now_seconds(),
+                        )
+                        .map(|dispositions| {
+                            dispositions
+                                .into_iter()
+                                .map(client::delivery_spill::plane_spill_disposition)
+                                .collect()
+                        })
+                        .map_err(|error| {
+                            if error.is_closed() {
+                                transport_nostr::AccountDeliveryRecoveryMarkerError::Closed
+                            } else {
+                                transport_nostr::AccountDeliveryRecoveryMarkerError::Retryable
+                            }
+                        })
+                });
+            let adapter = relay_plane
+                .account_adapter_with_recovery_marker(
+                    account_id.clone(),
+                    publish_client,
+                    Some(recovery_marker),
+                    Some(spill_store),
                 )
-                .map(|dispositions| {
-                    dispositions
-                        .into_iter()
-                        .map(client::delivery_spill::plane_spill_disposition)
-                        .collect()
-                })
-                .map_err(|error| {
-                    if error.is_closed() {
-                        transport_nostr::AccountDeliveryRecoveryMarkerError::Closed
-                    } else {
-                        transport_nostr::AccountDeliveryRecoveryMarkerError::Retryable
-                    }
-                })
-        });
-        let adapter = relay_plane.account_adapter_with_recovery_marker(
-            account_id.clone(),
-            publish_client,
-            Some(recovery_marker),
-            Some(spill_store),
-        );
-        // The router spills what a raised cursor alone stopped a restart from
-        // fetching again, measured from this persisted floor.
-        adapter.open_transport_cursor(state.last_transport_timestamp);
+                .with_event_limits(self.relay_event_limits());
+            // The router spills what a raised cursor alone stopped a restart from
+            // fetching again, measured from this persisted floor.
+            adapter.open_transport_cursor(state.last_transport_timestamp);
 
-        let key_packages = AppKeyPackagePublisher {
-            app: self.clone(),
-            account_label: label.to_owned(),
-            signer: signer.clone(),
-        };
-        let routing = self.routing_for(&state)?;
-        let mut runtime =
-            AccountDeviceRuntime::new(session, adapter.clone(), routing.clone(), key_packages);
+            let key_packages = AppKeyPackagePublisher {
+                app: self.clone(),
+                account_label: label.to_owned(),
+                signer: signer.clone(),
+            };
+            let routing = self.routing_for(&state)?;
+            transport = Some((adapter.clone(), routing.clone()));
+            Ok::<_, AppError>((adapter, routing, key_packages))
+        })?;
+        *audit_registration = Some(runtime.audit_recorder().downgrade());
+        drop(audit_registration);
+        let (adapter, routing) = transport.expect("an opened runtime built its transport");
         if let Some(timing) = dev_maintenance_timing(&self.config) {
             runtime = runtime.with_maintenance_timing(timing);
         }
         Ok(OpenAppAccount {
             runtime,
+            engine_storage,
             audit_v5_peel_slot,
+            #[cfg(feature = "unreleased-device-pairing")]
+            pairing_inbox,
             session_guard,
             adapter,
             routing,
             state,
             delivery_overflow_recovery_pending,
-            delivery_overflow_recovery_marker_token,
-            recovery_loss_imports,
             signer: nostr_signer,
         })
     }
@@ -4933,6 +5640,10 @@ impl MarmotApp {
                 return true;
             }
         };
+        // Current means what the session keeps: a current-profile bundle for
+        // this account. One that only lacks a newly supported component is
+        // still joinable, so it is not deleted here; the runtime replaces it
+        // in its slot and keeps the old key for the grace.
         let is_current = key_package_from_hex_with_optional_source(
             &record.key_package_hex,
             &record.key_package_event_id,
@@ -4940,7 +5651,7 @@ impl MarmotApp {
         .ok()
         .and_then(|key_package| key_package_metadata(&key_package).ok())
         .is_some_and(|metadata| {
-            self.key_package_metadata_matches_current_support(&metadata)
+            metadata.protocol_profile == cgka_traits::group::ProtocolProfile::Current
                 && metadata.credential_identity_hex == record.account_id_hex
         });
         if is_current {
@@ -4982,120 +5693,6 @@ impl MarmotApp {
             ),
         }
         true
-    }
-
-    /// Scan the account's authoritative KeyPackage relays and best-effort
-    /// delete every still-discoverable legacy event. This runs on each account
-    /// open, so a crash or partial relay outage simply leaves work for the next
-    /// restart. Local private bundles have already been retired synchronously.
-    async fn retire_relay_non_current_key_packages(&self, label: &str) -> bool {
-        if self.key_package_cutover_scan_complete(label)
-            && !self.key_package_cutover_replacement_pending(label)
-        {
-            return false;
-        }
-        let account = match self.account_home().account(label) {
-            Ok(account) => account,
-            Err(error) => {
-                tracing::warn!(
-                    target: "marmot_app::key_packages",
-                    method = "retire_relay_non_current_key_packages",
-                    error_kind = AppError::from(error).privacy_safe_kind(),
-                    "could not resolve account for relay key package retirement"
-                );
-                return false;
-            }
-        };
-        let relay_lists = match self
-            .directory()
-            .account_relay_list_status_for_account_id(&account.account_id_hex)
-        {
-            Ok(relay_lists) => relay_lists,
-            Err(error) => {
-                tracing::warn!(
-                    target: "marmot_app::key_packages",
-                    method = "retire_relay_non_current_key_packages",
-                    error_kind = error.privacy_safe_kind(),
-                    "could not resolve relays for key package retirement"
-                );
-                return false;
-            }
-        };
-        let source_relays = relay_lists
-            .nip65
-            .relays
-            .iter()
-            .cloned()
-            .map(TransportEndpoint)
-            .collect::<Vec<_>>();
-        if source_relays.is_empty() {
-            return false;
-        }
-        let records = match self
-            .directory()
-            .fetch_key_package_events_for_account_id_with_limit(
-                &account.account_id_hex,
-                &source_relays,
-                KEY_PACKAGE_CUTOVER_RELAY_SCAN_LIMIT,
-            )
-            .await
-        {
-            Ok(records) => records,
-            Err(error) => {
-                tracing::warn!(
-                    target: "marmot_app::key_packages",
-                    method = "retire_relay_non_current_key_packages",
-                    error_kind = error.privacy_safe_kind(),
-                    "deferred relay key package retirement scan"
-                );
-                return false;
-            }
-        };
-
-        let mut non_current_event_count = 0usize;
-        let mut accepted_delete_count = 0usize;
-        let mut delete_failure_count = 0usize;
-        for record in records {
-            let event_id = record.event.id.clone();
-            let endpoints = record.endpoints.clone();
-            let is_current = key_package_from_record(record)
-                .ok()
-                .and_then(|fetched| key_package_metadata(&fetched.key_package).ok())
-                .is_some_and(|metadata| {
-                    self.key_package_metadata_matches_current_support(&metadata)
-                });
-            if is_current {
-                continue;
-            }
-            if !self.mark_key_package_cutover_replacement_pending(label) {
-                delete_failure_count += 1;
-                continue;
-            }
-            non_current_event_count += 1;
-            match self
-                .delete_key_package_event(label, &event_id, endpoints)
-                .await
-            {
-                Ok(accepted) => accepted_delete_count += accepted,
-                Err(_) => delete_failure_count += 1,
-            }
-        }
-        if delete_failure_count == 0 {
-            // The marker helper emits its own privacy-safe warning. It is not
-            // a relay deletion failure, so do not fold it into this counter.
-            let _ = self.mark_key_package_cutover_scan_complete(label);
-        }
-        if non_current_event_count > 0 {
-            tracing::info!(
-                target: "marmot_app::key_packages",
-                method = "retire_relay_non_current_key_packages",
-                non_current_event_count,
-                accepted_delete_count,
-                delete_failure_count,
-                "completed relay key package retirement scan"
-            );
-        }
-        non_current_event_count > 0
     }
 
     fn key_package_cutover_replacement_pending_path(&self, label: &str) -> PathBuf {
@@ -5172,34 +5769,6 @@ impl MarmotApp {
         Ok(())
     }
 
-    fn key_package_cutover_scan_complete(&self, label: &str) -> bool {
-        self.key_package_cutover_scan_complete_path(label).exists()
-    }
-
-    fn mark_key_package_cutover_scan_complete(&self, label: &str) -> Result<(), AppError> {
-        let path = self.key_package_cutover_scan_complete_path(label);
-        let result = path
-            .parent()
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "cutover marker has no parent directory",
-                )
-            })
-            .and_then(fs_private::create_dir_all_private)
-            .and_then(|()| fs_private::write_private(&path, b"complete\n"))
-            .map_err(AppError::from);
-        if let Err(error) = &result {
-            tracing::warn!(
-                target: "marmot_app::key_packages",
-                method = "mark_key_package_cutover_scan_complete",
-                error_kind = error.privacy_safe_kind(),
-                "could not persist completed key package relay scan"
-            );
-        }
-        result
-    }
-
     pub fn local_key_package_records(
         &self,
         label: &str,
@@ -5238,11 +5807,11 @@ impl MarmotApp {
     > {
         let storage = self.account_storage(label)?;
         cgka_traits::StorageProvider::with_read_snapshot(&storage, |storage| {
-            let owned = cgka_engine::key_package::durably_owned_key_packages(
+            let owned = marmot_session::durably_owned_key_packages(
                 storage,
                 cgka_traits::group::ProtocolProfile::Current,
             )
-            .map_err(cgka_session::SessionError::from)?;
+            .map_err(marmot_session::SessionError::from)?;
             #[cfg(test)]
             self.run_inventory_snapshot_between_reads_for_test();
             let lifecycle = storage.key_package_lifecycle()?;
@@ -5351,6 +5920,80 @@ impl MarmotApp {
         bootstrap_relays: Vec<TransportEndpoint>,
         method: &'static str,
     ) -> Result<Vec<AccountKeyPackageRecord>, AppError> {
+        Ok(self
+            .fetch_validated_account_key_packages(label, bootstrap_relays, method)
+            .await?
+            .into_iter()
+            .map(account_key_package_record_from_fetched)
+            .collect())
+    }
+
+    /// The account's published KeyPackages, each validated, oldest first.
+    pub(crate) async fn fetch_validated_account_key_packages(
+        &self,
+        label: &str,
+        bootstrap_relays: Vec<TransportEndpoint>,
+        method: &'static str,
+    ) -> Result<Vec<nostr_directory::FetchedKeyPackage>, AppError> {
+        let (account_id_hex, source_relays, _) = self
+            .account_key_package_source_relays(label, bootstrap_relays)
+            .await?;
+        let mut relay_records = self
+            .directory()
+            .fetch_key_package_events_for_account_id(&account_id_hex, &source_relays)
+            .await?;
+        sort_directory_records(&mut relay_records);
+        let mut packages = Vec::new();
+        for record in relay_records {
+            match key_package_from_record(record) {
+                Ok(fetched) => packages.push(fetched),
+                Err(err) => {
+                    tracing::warn!(
+                        target: "marmot_app::key_packages",
+                        method = method,
+                        error_kind = err.privacy_safe_kind(),
+                        "skipping invalid key package event while listing account packages"
+                    );
+                }
+            }
+        }
+        Ok(packages)
+    }
+
+    /// Read every KeyPackage slot of the account for new sign-ins (mdk#2628
+    /// 3.2), from the relays its KeyPackages are listed from, under the
+    /// inviter's rules, and `own_slot` on its own (3.4). A read of the
+    /// configured directory relays, when the account lists none, is never
+    /// complete: they need not be where its KeyPackages are.
+    pub(crate) async fn read_account_key_package_slots(
+        &self,
+        label: &str,
+        own_slot: Option<&str>,
+    ) -> Result<nostr_directory::AccountKeyPackageSlots, AppError> {
+        let (account_id_hex, source_relays, listed) = self
+            .account_key_package_source_relays(label, Vec::new())
+            .await?;
+        let mut slots = self
+            .directory()
+            .read_account_key_package_slots(&account_id_hex, &source_relays, own_slot)
+            .await?;
+        slots.complete &= listed;
+        // A relay's own finished read still shows what that relay serves, so
+        // the relays it found empty stand.
+        if let Some(own_slot) = slots.own_slot.as_mut() {
+            own_slot.complete &= listed;
+        }
+        Ok(slots)
+    }
+
+    /// The account id, the relays its KeyPackages are listed from, and
+    /// whether those are the account's own listed relays rather than the
+    /// configured directory relays it falls back to.
+    async fn account_key_package_source_relays(
+        &self,
+        label: &str,
+        bootstrap_relays: Vec<TransportEndpoint>,
+    ) -> Result<(String, Vec<TransportEndpoint>, bool), AppError> {
         let account = self.account_home().account(label)?;
         let account_id_hex = account.account_id_hex;
 
@@ -5391,7 +6034,8 @@ impl MarmotApp {
                 .collect(),
             "account key package listing",
         );
-        if source_relays.is_empty() {
+        let listed = !source_relays.is_empty();
+        if !listed {
             source_relays = self.directory().directory_source_relays(&[]);
         }
         if source_relays.is_empty() {
@@ -5399,29 +6043,7 @@ impl MarmotApp {
                 MissingRelayListKind::Nip65,
             ]));
         }
-
-        let mut relay_records = self
-            .directory()
-            .fetch_key_package_events_for_account_id(&account_id_hex, &source_relays)
-            .await?;
-        sort_directory_records(&mut relay_records);
-        let mut packages = Vec::new();
-        for record in relay_records {
-            match key_package_from_record(record) {
-                Ok(fetched) => {
-                    packages.push(account_key_package_record_from_fetched(fetched));
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        target: "marmot_app::key_packages",
-                        method = method,
-                        error_kind = err.privacy_safe_kind(),
-                        "skipping invalid key package event while listing account packages"
-                    );
-                }
-            }
-        }
-        Ok(packages)
+        Ok((account_id_hex, source_relays, listed))
     }
 
     pub async fn account_key_package_records(
@@ -5786,11 +6408,11 @@ impl MarmotApp {
                     .await?;
                 let mut fetched = fresh_or_cached_key_package(
                     &account_id,
-                    latest_fresh_key_package_from_records(
+                    select_key_packages_from_records(
                         &account_id,
-                        records,
+                        &records,
                         self.directory().directory_freshness_for_test(),
-                        &self.deployment().key_package_client_preference,
+                        None,
                     )?,
                     Some(entry.clone()),
                 )?;
@@ -6042,8 +6664,18 @@ impl MarmotApp {
         self.chat_list_projection_stale
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(state.label.clone());
+            .invalidate(&state.label);
         Ok(())
+    }
+
+    /// Rebuild `label`'s chat list on its next read and wake presentation,
+    /// without writing anything.
+    pub(crate) fn invalidate_chat_list_projection(&self, label: &str) {
+        self.chat_list_projection_stale
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .invalidate(label);
+        self.presentation_signals.wake();
     }
 
     fn save_state_delta_clearing_local_group_deletion_frontiers_and_acking_application_events(
@@ -6063,7 +6695,7 @@ impl MarmotApp {
         self.chat_list_projection_stale
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(delta.label.clone());
+            .invalidate(&delta.label);
         self.presentation_signals.wake();
         Ok(())
     }
@@ -6106,7 +6738,7 @@ impl MarmotApp {
             self.chat_list_projection_stale
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .insert(delta.label.clone());
+                .invalidate(&delta.label);
         }
         Ok(row)
     }
@@ -6131,7 +6763,7 @@ impl MarmotApp {
         self.chat_list_projection_stale
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(label.to_owned());
+            .invalidate(label);
         self.chat_list_projection_warmed
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -6177,7 +6809,7 @@ impl MarmotApp {
     /// URIs) used for push notifications, scoped to the local account. The
     /// unread window is already kind-9 filtered, but the real chat kind is
     /// passed for correctness.
-    fn chat_list_mention_classifier(
+    pub(crate) fn chat_list_mention_classifier(
         account_id_hex: &str,
     ) -> impl Fn(&str, &[Vec<String>]) -> bool + use<> {
         let account_id_hex = account_id_hex.to_owned();
@@ -6192,11 +6824,19 @@ impl MarmotApp {
     }
 
     fn ensure_chat_list_projection(&self, account: &AccountSummary) -> Result<(), AppError> {
-        let stale = self
-            .chat_list_projection_stale
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains(&account.label);
+        // The generation this rebuild covers. An invalidation while it runs
+        // moves the generation past it, so the list stays stale for the
+        // next read instead of the rebuild clearing a mark it never saw.
+        let (stale, generation) = {
+            let staleness = self
+                .chat_list_projection_stale
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (
+                staleness.is_stale(&account.label),
+                staleness.generation(&account.label),
+            )
+        };
         let warmed = self
             .chat_list_projection_warmed
             .lock()
@@ -6212,6 +6852,12 @@ impl MarmotApp {
         } else {
             storage.ensure_chat_list_rows(&account.account_id_hex, &classifier)?;
         }
+        #[cfg(test)]
+        CHAT_LIST_REFRESH_HOOK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
         self.chat_list_projection_warmed
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -6219,7 +6865,7 @@ impl MarmotApp {
         self.chat_list_projection_stale
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&account.label);
+            .record_rebuilt(&account.label, generation);
         Ok(())
     }
 
@@ -6369,8 +7015,8 @@ impl MarmotApp {
     /// a running account engine (see [`SqliteAccountStorage::close`] for what
     /// that does to in-flight transactions).
     /// [`MarmotAppRuntime::shutdown_and_close`] is the sequenced entry point
-    /// host apps should use; it stops admitting runtime work before calling
-    /// this and drains the workers afterwards.
+    /// host apps should use; it stops admission and settles NIP-46 adoption
+    /// before calling this, then drains workers afterwards.
     ///
     /// **Terminal.** [`Self::storage_is_closed`] latches, and every database
     /// accessor then fails with
@@ -6411,7 +7057,12 @@ impl MarmotApp {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.storage_closed.store(true, Ordering::Release);
+        self.nip46_adoptions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .closed = true;
         let _ = self.abort_all_public_indexer_copies();
+        self.stop_emoji_set_installs();
         self.presentation_signals.catalog_changed();
 
         // Empty the lookup caches so nothing reaches a closed handle through
@@ -6616,6 +7267,18 @@ impl MarmotApp {
         Ok(store)
     }
 
+    /// The account's storage if it is already open, and only while app
+    /// storage is: it never opens a database, so a drop path cannot reopen one
+    /// that `shutdown_and_close` or a removal let go of.
+    pub(crate) fn open_account_storage(&self, label: &str) -> Option<SqliteAccountStorage> {
+        self.ensure_storage_open("account storage").ok()?;
+        self.account_storages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(label)
+            .cloned()
+    }
+
     /// Observe account-open admission before analytics or cache locks; preserve the original storage result.
     fn account_storage(&self, label: &str) -> Result<SqliteAccountStorage, AppError> {
         let probe = self
@@ -6624,6 +7287,18 @@ impl MarmotApp {
         let result = self.account_storage_observed(label, &probe);
         probe.finish(result.is_ok());
         result
+    }
+
+    /// The progress clock every open of `label`'s database advances, whoever
+    /// opens it, so a starting worker sees migrations it waits behind
+    /// (mdk#3145).
+    pub(crate) fn account_open_progress(&self, label: &str) -> Arc<AccountOpenProgress> {
+        self.account_open_progress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(label.to_owned())
+            .or_default()
+            .clone()
     }
 
     /// Reuse the caller's scope across analytics admission and native open work; the caller owns retirement.
@@ -6699,10 +7374,13 @@ impl MarmotApp {
                 SqlcipherDatabaseKind::Session,
             )?
         };
-        let migration_observation =
-            self.product_analytics
-                .begin(ProductFamily::Storage, "migration", ProductUnit::Attempt);
+        let migration_observation = self.product_analytics.operation(
+            ProductFamily::Storage,
+            "migration",
+            ProductUnit::Attempt,
+        );
         probe.phase(NativeStartupStage::EncryptedStoreOpen);
+        let account_open = self.account_open_progress(label);
         let observer = |progress| {
             use storage_sqlite::{StorageOpenPhase as Phase, StorageOpenProgress as Progress};
             match progress {
@@ -6715,15 +7393,20 @@ impl MarmotApp {
                 Progress::MigrationStarted(version) => {
                     probe.progress(NativeStartupStage::MigrationApply, Some(version), false)
                 }
-                Progress::MigrationFinished { version, success } => probe.progress(
+                Progress::MigrationFinished { version, success } => {
                     if success {
-                        NativeStartupStage::MigrationInspection
-                    } else {
-                        NativeStartupStage::MigrationApply
-                    },
-                    Some(version),
-                    success,
-                ),
+                        account_open.migration_applied();
+                    }
+                    probe.progress(
+                        if success {
+                            NativeStartupStage::MigrationInspection
+                        } else {
+                            NativeStartupStage::MigrationApply
+                        },
+                        Some(version),
+                        success,
+                    )
+                }
             }
         };
         let opened = SqliteAccountStorage::open_encrypted_observed(&path, &key, &observer);
@@ -6798,6 +7481,32 @@ impl MarmotApp {
         Ok(update)
     }
 
+    /// Import a sibling's history for one chat (mdk#2628 4.2a), with the
+    /// chat-list refresh in the same transaction. `None` when every event was
+    /// already held or skipped.
+    pub(crate) fn import_account_app_events(
+        &self,
+        label: &str,
+        group_id_hex: &str,
+        source: &storage_sqlite::HistoryImportProvenance,
+        events: &[storage_sqlite::ImportedAppEvent],
+    ) -> Result<(usize, Option<AppProjectionUpdate>), AppError> {
+        let storage = self.account_storage(label)?;
+        cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
+            let import = storage.app_storage().import_app_events_with_provenance(
+                group_id_hex,
+                source,
+                events,
+                unix_now_seconds(),
+            )?;
+            if import.update.changes.is_empty() {
+                return Ok((import.imported, None));
+            }
+            self.app_projection_update(label, import.update)
+                .map(|update| (import.imported, Some(update)))
+        })
+    }
+
     /// Reconcile a local publication with its engine-stamped source authority.
     /// A resolved verdict stays immutable across later echoes and admin changes.
     pub(crate) fn record_account_app_event_refreshing_moderation_grant(
@@ -6847,12 +7556,12 @@ impl MarmotApp {
     ) -> Result<Option<AppProjectionUpdate>, AppError> {
         let observation = self
             .product_analytics
-            .begin(
+            .operation(
                 ProductFamily::MessageAction,
                 "publication",
                 ProductUnit::Transition,
             )
-            .map(ProductObservation::counts_only);
+            .map(marmot_observability::ProductOperation::counts_only);
         let storage = self.account_storage(label)?;
         let update = cgka_traits::StorageProvider::with_transaction(&storage, |storage| {
             let authority_update = storage.app_storage().finalize_app_event_authority(
@@ -7136,6 +7845,33 @@ impl MarmotApp {
             .into())
     }
 
+    /// Drop one failed own send from storage; see
+    /// [`SqliteAppStorage::discard_failed_send`](storage_sqlite::SqliteAppStorage::discard_failed_send).
+    /// `None` when the row is not a failed own send.
+    pub(crate) fn discard_failed_send(
+        &self,
+        label: &str,
+        group_id_hex: &str,
+        message_id_hex: &str,
+    ) -> Result<Option<(SecurePruneAppEventsResult, AppProjectionUpdate)>, AppError> {
+        let account = self.account_home().account(label)?;
+        let classifier = Self::chat_list_mention_classifier(&account.account_id_hex);
+        let discarded = self
+            .account_storage(&account.label)?
+            .app_storage()
+            .discard_failed_send(
+                group_id_hex,
+                message_id_hex,
+                &account.account_id_hex,
+                &classifier,
+            )?;
+        discarded
+            .map(|(outcome, update)| {
+                Ok((outcome, self.app_projection_update(&account.label, update)?))
+            })
+            .transpose()
+    }
+
     fn migrate_legacy_account_projection_if_needed(&self, label: &str) -> Result<(), AppError> {
         let path = self.legacy_account_projection_path(label);
         if !path.exists() {
@@ -7246,7 +7982,7 @@ impl MarmotApp {
             &self.account_storage(label)?,
             cgka_traits::group::ProtocolProfile::Current,
         )
-        .map_err(|error| AppError::from(cgka_session::SessionError::from(error)))
+        .map_err(|error| AppError::from(marmot_session::SessionError::from(error)))
     }
 
     #[cfg(test)]
@@ -7397,7 +8133,7 @@ impl MarmotApp {
         self.chat_list_projection_stale
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(label);
+            .forget(label);
     }
 
     fn shared_storage_path(&self) -> PathBuf {
@@ -7436,12 +8172,57 @@ impl MarmotApp {
         account_id_hex: &str,
         signer: Arc<dyn transport_nostr_peeler::MarmotNostrSigner>,
     ) -> Arc<dyn NostrRelayClient> {
+        let stop = self.account_publish_stop(account_id_hex);
+        // The publisher sends nothing once the account is unlinked, and no
+        // event over a relay's known limit (mdk#2334).
+        let guard = |client: Arc<dyn NostrRelayClient>| -> Arc<dyn NostrRelayClient> {
+            let client = Arc::new(transport_nostr::KnownLimitPublishClient::new(
+                client,
+                self.relay_event_limits(),
+            ));
+            Arc::new(unlinked_publish_gate::UnlinkedPublishGate::new(
+                client, stop,
+            ))
+        };
         #[cfg(test)]
         if let Some(client) = &self.test_relay_client {
-            return client.clone();
+            return guard(client.clone());
         }
-        self.relay_plane
-            .account_publish_client(account_id_hex, signer)
+        // The one place an account publisher is built (see clippy.toml).
+        #[allow(clippy::disallowed_methods)]
+        let client = self
+            .relay_plane
+            .account_publish_client(account_id_hex, signer);
+        guard(client)
+    }
+
+    /// The relay event limits every publish of this app keeps to (mdk#2334):
+    /// the deployment's, and for large events the relays' NIP-11 documents.
+    fn relay_event_limits(&self) -> Arc<dyn transport_nostr::RelayEventLimits> {
+        Arc::new(relay_event_limits::AppRelayEventLimits::new(
+            &self.config.deployment.relay_event_limits,
+            self.relay_caps.clone(),
+            self.config.allow_loopback_relay_endpoints,
+        ))
+    }
+
+    /// The time chat-list reads test mute expiry against (Unix ms). Live
+    /// windows also wake by it, so a window and its reads agree on "now".
+    pub(crate) fn chat_list_now_ms(&self) -> i64 {
+        #[cfg(test)]
+        if let Some((base_ms, started)) = self.chat_list_virtual_clock {
+            let elapsed = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
+            return base_ms.saturating_add(elapsed);
+        }
+        notifications::unix_now_ms()
+    }
+
+    /// Chat-list time starts at `base_ms` and follows tokio's clock, which a
+    /// test pauses and advances. Call inside the test's runtime.
+    #[cfg(test)]
+    fn with_virtual_chat_list_clock(mut self, base_ms: i64) -> Self {
+        self.chat_list_virtual_clock = Some((base_ms, tokio::time::Instant::now()));
+        self
     }
 
     #[cfg(test)]
@@ -7479,20 +8260,30 @@ impl MarmotApp {
         if public_key.to_hex() != account.account_id_hex {
             return Err(AppError::ExternalSignerMismatch);
         }
+        self.pin_external_signer(&account.account_id_hex, public_key, signer);
+        Ok(())
+    }
+
+    fn pin_external_signer(
+        &self,
+        account_id: &str,
+        public_key: nostr::prelude::PublicKey,
+        signer: Arc<dyn ExternalAccountSigner>,
+    ) -> Option<Arc<dyn ExternalAccountSigner>> {
         let mut signers = self
             .external_signers
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match signers.entry(account.account_id_hex.clone()) {
+        let previous = match signers.entry(account_id.to_owned()) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.get().replace(signer),
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(RegisteredExternalSigner::new(public_key, signer));
+                None
             }
-        }
+        };
         drop(signers);
-        self.relay_plane
-            .evict_account_publish_client(&account.account_id_hex);
-        Ok(())
+        self.relay_plane.evict_account_publish_client(account_id);
+        previous
     }
 
     fn account_signer_for_summary(
@@ -7510,6 +8301,7 @@ impl MarmotApp {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .get(&account.account_id_hex)
+                .filter(|signer| signer.has_signer())
                 .map(RegisteredExternalSigner::account_signer)
                 .ok_or_else(|| {
                     AppError::ExternalSignerUnavailable(account.account_id_hex.clone())
@@ -7535,7 +8327,8 @@ impl MarmotApp {
         self.external_signers
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains_key(account_id_hex)
+            .get(account_id_hex)
+            .is_some_and(RegisteredExternalSigner::has_signer)
     }
 
     fn account_home(&self) -> AccountHome {
@@ -7554,12 +8347,53 @@ impl MarmotApp {
         // negotiation: each group's required component id selects exactly one.
         components.insert(GROUP_ENCRYPTED_MEDIA_V1_COMPONENT_ID);
         components.insert(GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID);
+        // A new group requires account-devices when every founding device
+        // advertises it (mdk#2628, item 2.3); an existing group gains it only
+        // through an admin's activation (item 2.4). Advertising it makes
+        // leaves eligible and lets this device join groups that require it.
+        components.insert(ACCOUNT_DEVICES_COMPONENT_ID);
+        if self.device_groups_enabled() {
+            components.insert(DEVICE_ROSTER_COMPONENT_ID);
+        }
         components.into_iter().collect()
+    }
+
+    /// Whether this device advertises the device roster and so can create and
+    /// join its account's device group. The roster spec is adopted; this still
+    /// requires explicit dev-build capability and runtime intent (mdk#2628 D98).
+    pub(crate) fn device_groups_enabled(&self) -> bool {
+        cfg!(any(
+            feature = "dev-device-groups",
+            feature = "test-policy-overrides"
+        )) && self.config.dev_device_groups
+    }
+
+    /// Whether a user's Leave takes an admin account off the chat's admin
+    /// list itself before its SelfRemove (mdk#2628 D99): only while device
+    /// groups are on. Otherwise an admin's Leave is refused with
+    /// `AdminCannotSelfRemove` until the host demotes the account
+    /// (`self_demote_admin`), as before 0.15 (mdk#3014 interim). Fills
+    /// [`conversation_presentation::ConversationAuthority::admin_leave_steps_down`].
+    pub fn admin_leave_steps_down(&self) -> bool {
+        self.device_groups_enabled()
+    }
+
+    /// The convergence settlement window the engine runs under, in
+    /// milliseconds: the pinned v1 window, or a test-policy build's
+    /// override, read as `open_account` reads it (mdk#970).
+    pub(crate) fn settlement_quiescence_ms(&self) -> u64 {
+        if cfg!(feature = "test-policy-overrides") {
+            self.config
+                .dev_settlement_quiescence_ms
+                .unwrap_or(marmot_session::V1_SETTLEMENT_QUIESCENCE_MS)
+        } else {
+            marmot_session::V1_SETTLEMENT_QUIESCENCE_MS
+        }
     }
 
     fn key_package_metadata_matches_current_support(
         &self,
-        metadata: &cgka_engine::key_package::KeyPackageMetadata,
+        metadata: &marmot_session::KeyPackageMetadata,
     ) -> bool {
         metadata.protocol_profile == cgka_traits::group::ProtocolProfile::Current
             && self
@@ -7604,23 +8438,6 @@ pub(crate) fn external_signer_error(
         AppError::ExternalSignerRejected
     } else {
         AppError::Publish(format!("{context}: {error}"))
-    }
-}
-
-/// Recover a cancelled external-signer proof from a session-open failure.
-///
-/// The account-identity proof is signed synchronously through the external
-/// signer while the device session is opened (the engine builds it during
-/// `AccountDeviceSession::open`). That signing hook returns `String`, so a
-/// user-cancelled Amber prompt travels up as an opaque engine error carrying
-/// the `EXTERNAL_SIGNER_REJECTED` sentinel — recover the typed rejection here so
-/// callers see `AppError::ExternalSignerRejected` instead of a generic session
-/// error, matching `external_signer_error` on the other signer paths.
-pub(crate) fn external_signer_session_error(error: cgka_session::SessionError) -> AppError {
-    if error.to_string().contains(EXTERNAL_SIGNER_REJECTED) {
-        AppError::ExternalSignerRejected
-    } else {
-        AppError::from(error)
     }
 }
 
@@ -7688,9 +8505,144 @@ fn app_feature_registry() -> FeatureRegistry {
     registry
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Runs once inside this thread's next chat-list refresh, after its
+    /// generation snapshot and before it records the rebuild.
+    static CHAT_LIST_REFRESH_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Per-account chat-list invalidation, as generations rather than a flag.
+/// Each invalidation advances the account's generation; a rebuild records
+/// the generation it snapshotted before it read anything. The list is stale
+/// while the generation is ahead of the last one rebuilt, so an invalidation
+/// that lands during a rebuild survives it (mdk#2923).
+#[derive(Default)]
+struct ChatListStaleness(HashMap<String, (u64, u64)>);
+
+impl ChatListStaleness {
+    /// Make `label`'s next read rebuild its chat list.
+    fn invalidate(&mut self, label: &str) {
+        let (generation, _) = self.0.entry(label.to_owned()).or_default();
+        *generation += 1;
+    }
+
+    /// Whether an invalidation is newer than `label`'s last rebuild.
+    fn is_stale(&self, label: &str) -> bool {
+        self.0
+            .get(label)
+            .is_some_and(|(generation, rebuilt)| generation > rebuilt)
+    }
+
+    /// The generation a rebuild starting now covers.
+    fn generation(&self, label: &str) -> u64 {
+        self.0.get(label).map_or(0, |(generation, _)| *generation)
+    }
+
+    /// A rebuild that snapshotted `generation` finished. Concurrent rebuilds
+    /// can finish out of order, so the newest snapshot wins.
+    fn record_rebuilt(&mut self, label: &str, generation: u64) {
+        if let Some((_, rebuilt)) = self.0.get_mut(label) {
+            *rebuilt = (*rebuilt).max(generation);
+        }
+    }
+
+    /// `label`'s caches were evicted. Advances the generation like an
+    /// invalidation instead of removing it, so generations never go back:
+    /// a refresh of the evicted incarnation still running holds an older
+    /// snapshot and can never mark a later invalidation rebuilt.
+    fn forget(&mut self, label: &str) {
+        self.invalidate(label);
+    }
+}
+
 #[derive(Clone)]
 struct AppTransportRouting {
-    inner: Arc<RwLock<AppRoutingState>>,
+    inner: Arc<SharedAppRouting>,
+}
+
+/// One pointer per clone: every client and session carries the routing.
+struct SharedAppRouting {
+    state: RwLock<AppRoutingState>,
+    /// Bumped when the account's routes change, and from the client's other
+    /// recovery chokepoints. The account's recovery runner, if one runs,
+    /// reads its debt again (mdk#2660 phase 4).
+    recovery_runner_wake: tokio::sync::watch::Sender<u64>,
+    /// What replacements changed that the account's recovery runner has not
+    /// settled yet. `None` until a runner tracks them, so nothing is kept
+    /// while none runs.
+    route_changes: Mutex<Option<RouteChanges>>,
+    /// What the account's recovery runner last found catching up; `None`
+    /// until one has surveyed.
+    recovery_runner_catching_up: tokio::sync::watch::Sender<
+        Option<std::collections::BTreeSet<client::history_recovery::recovery_runner::UnitKey>>,
+    >,
+}
+
+/// What routing replacements changed since the account's recovery runner
+/// last settled them (mdk#2660 section 3), as (route, relay) pairs keyed as
+/// the recovery ledger keys them ([`ledger_route_pairs`]). Not `Debug`: it
+/// carries routes and relays.
+#[derive(Default)]
+pub(crate) struct RouteChanges {
+    /// Each pair a replacement dropped, with the group it dropped from;
+    /// `None` for the inbox. A rebuild of every group drops nothing here:
+    /// only one group's own replacement, or the inbox's, may.
+    pub(crate) dropped: BTreeSet<(Option<Vec<u8>>, TransportReconciliationRoute, String)>,
+    /// Some route changed since the last settle, or tracking just began.
+    pub(crate) changed: bool,
+}
+
+impl RouteChanges {
+    fn record(
+        &mut self,
+        group: Option<&GroupId>,
+        before: &BTreeSet<(TransportReconciliationRoute, String)>,
+        after: &BTreeSet<(TransportReconciliationRoute, String)>,
+    ) {
+        self.dropped
+            .extend(before.difference(after).map(|(route, relay)| {
+                (
+                    group.map(|group| group.as_slice().to_vec()),
+                    route.clone(),
+                    relay.clone(),
+                )
+            }));
+        self.changed = true;
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.dropped.extend(other.dropped);
+        self.changed |= other.changed;
+    }
+}
+
+/// The (route, relay) pairs the recovery ledger keys `group_routes` and
+/// `inbox` by: each group route with a 32-byte transport id, and the inbox,
+/// with each relay spelled as the ledger spells it.
+pub(crate) fn ledger_route_pairs<'a>(
+    group_routes: impl IntoIterator<Item = &'a TransportGroupSubscription>,
+    inbox: &[TransportEndpoint],
+) -> BTreeSet<(TransportReconciliationRoute, String)> {
+    let relay = |endpoint: &TransportEndpoint| transport_nostr::canonical_relay(endpoint.as_str());
+    group_routes
+        .into_iter()
+        .filter_map(|route| {
+            let id = <[u8; 32]>::try_from(route.transport_group_id.as_slice()).ok()?;
+            Some(
+                route.endpoints.iter().map(move |endpoint| {
+                    (TransportReconciliationRoute::Group(id), relay(endpoint))
+                }),
+            )
+        })
+        .flatten()
+        .chain(
+            inbox
+                .iter()
+                .map(|endpoint| (TransportReconciliationRoute::Inbox, relay(endpoint))),
+        )
+        .collect()
 }
 
 #[derive(Clone, Debug)]
@@ -7705,8 +8657,87 @@ struct AppRoutingState {
 impl AppTransportRouting {
     fn new(state: AppRoutingState) -> Self {
         Self {
-            inner: Arc::new(RwLock::new(state)),
+            inner: Arc::new(SharedAppRouting {
+                state: RwLock::new(state),
+                recovery_runner_wake: tokio::sync::watch::channel(0).0,
+                route_changes: Mutex::default(),
+                recovery_runner_catching_up: tokio::sync::watch::channel(None).0,
+            }),
         }
+    }
+
+    /// Keep what replacements change from now on, for the account's recovery
+    /// runner to settle. The first settle checks every route.
+    fn track_route_changes(&self) {
+        self.route_changes().get_or_insert_with(|| RouteChanges {
+            changed: true,
+            ..RouteChanges::default()
+        });
+    }
+
+    /// What replacements changed since the last take, if a runner tracks them.
+    fn take_route_changes(&self) -> Option<RouteChanges> {
+        self.route_changes().as_mut().map(std::mem::take)
+    }
+
+    /// Put back changes a settle could not write, ahead of newer ones.
+    fn restore_route_changes(&self, changes: RouteChanges) {
+        if let Some(held) = self.route_changes().as_mut() {
+            held.merge(changes);
+        }
+    }
+
+    fn record_route_changes(&self, record: impl FnOnce(&mut RouteChanges)) {
+        if let Some(changes) = self.route_changes().as_mut() {
+            record(changes);
+        }
+    }
+
+    fn route_changes(&self) -> std::sync::MutexGuard<'_, Option<RouteChanges>> {
+        self.inner
+            .route_changes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The sender a recovery runner wakes on.
+    fn recovery_runner_wake(&self) -> tokio::sync::watch::Sender<u64> {
+        self.inner.recovery_runner_wake.clone()
+    }
+
+    /// Where a recovery runner leaves what its last survey found catching up.
+    fn recovery_runner_catching_up(
+        &self,
+    ) -> tokio::sync::watch::Sender<
+        Option<std::collections::BTreeSet<client::history_recovery::recovery_runner::UnitKey>>,
+    > {
+        self.inner.recovery_runner_catching_up.clone()
+    }
+
+    /// What the account's recovery runner last found catching up; `None`
+    /// until one has surveyed.
+    fn recovery_runner_catching_up_now(
+        &self,
+    ) -> Option<std::collections::BTreeSet<client::history_recovery::recovery_runner::UnitKey>>
+    {
+        self.inner.recovery_runner_catching_up.borrow().clone()
+    }
+
+    /// A receiver that changes whenever what the runner finds catching up
+    /// does: a unit starts or stops owing, breaks or is re-armed.
+    fn subscribe_recovery_runner_catching_up(
+        &self,
+    ) -> tokio::sync::watch::Receiver<
+        Option<std::collections::BTreeSet<client::history_recovery::recovery_runner::UnitKey>>,
+    > {
+        self.inner.recovery_runner_catching_up.subscribe()
+    }
+
+    /// Wake the account's recovery runner, if one runs. Coalesces.
+    fn wake_recovery_runner(&self) {
+        self.inner
+            .recovery_runner_wake
+            .send_modify(|count| *count = count.wrapping_add(1));
     }
 
     /// Atomically replace every current/prior subscription for one group.
@@ -7742,7 +8773,16 @@ impl AppTransportRouting {
         state
             .group_routes
             .retain(|route| route.group_id != *group_id);
+        self.record_route_changes(|changes| {
+            changes.record(
+                Some(group_id),
+                &ledger_route_pairs(&installed, &[]),
+                &ledger_route_pairs(&routes, &[]),
+            )
+        });
         state.group_routes.extend(routes);
+        drop(state);
+        self.wake_recovery_runner();
         true
     }
 
@@ -7764,17 +8804,37 @@ impl AppTransportRouting {
     }
 
     fn replace(&self, state: AppRoutingState) {
-        *self.write() = state;
+        let mut installed = self.write();
+        let routes_changed = installed.local_inbox_endpoints != state.local_inbox_endpoints
+            || installed.group_routes != state.group_routes;
+        if routes_changed {
+            // A rebuild or a restore may leave a group out for a while, so
+            // only the inbox drops anything here.
+            self.record_route_changes(|changes| {
+                changes.record(
+                    None,
+                    &ledger_route_pairs([], &installed.local_inbox_endpoints),
+                    &ledger_route_pairs([], &state.local_inbox_endpoints),
+                )
+            });
+        }
+        *installed = state;
+        drop(installed);
+        if routes_changed {
+            self.wake_recovery_runner();
+        }
     }
 
     fn read(&self) -> RwLockReadGuard<'_, AppRoutingState> {
         self.inner
+            .state
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn write(&self) -> RwLockWriteGuard<'_, AppRoutingState> {
         self.inner
+            .state
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -7885,13 +8945,14 @@ impl AppKeyPackagePublisher {
             ));
         }
         Ok(NostrKeyPackagePublication {
+            // A blank or over-long name is left out, never published truncated.
             client_name: self
                 .app
                 .config
                 .key_package_client_name
                 .as_deref()
                 .map(str::trim)
-                .filter(|name| !name.is_empty())
+                .filter(|name| transport_nostr_adapter::is_valid_client_name(name))
                 .map(str::to_owned),
             account_id: publication.account_id.clone(),
             key_package: publication.key_package.clone(),
@@ -7982,15 +9043,27 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
         let mut nostr_publication = self.nostr_publication(publication)?;
         let event: NostrTransportEvent = serde_json::from_slice(&artifact.bytes)
             .map_err(|error| KeyPackagePublishError::unexposed(error.to_string()))?;
-        // A retry belongs to its durable signed artifact, not the current host config.
-        nostr_publication.client_name = event
-            .tag_value(transport_nostr_adapter::CLIENT_TAG)
-            .map(str::to_owned);
+        // A retry belongs to its durable signed artifact, not the current host
+        // config. An artifact whose tag the shared reader rejects no longer
+        // matches its publication, so it is never resent. One signed before
+        // names were bounded with a name over 64 bytes is such an artifact:
+        // it is reported unusable, and the runtime replaces it with a freshly
+        // signed KeyPackage (mdk#2628, D8).
+        nostr_publication.client_name =
+            transport_nostr_adapter::key_package_client_name(&event).map(str::to_owned);
         if event.id != hex::encode(artifact.id.as_slice())
             || event.created_at != artifact.created_at.0
         {
             return Err(KeyPackagePublishError::unexposed(
                 "persisted KeyPackage event identity does not match lifecycle record",
+            ));
+        }
+        if !nostr_publication
+            .matches_prepared_event(&event)
+            .map_err(|error| KeyPackagePublishError::unexposed(error.to_string()))?
+        {
+            return Err(KeyPackagePublishError::unusable_artifact(
+                "persisted KeyPackage event no longer matches its publication",
             ));
         }
         let relay_client = self.app.relay_client_for_account_id(
@@ -8000,7 +9073,13 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
         let outcome = NostrKeyPackagePublisher::new(relay_client)
             .publish_prepared_key_package(&nostr_publication, &event)
             .await
-            .map_err(|e| KeyPackagePublishError::exposed(e.to_string()))?;
+            .map_err(|error| {
+                // A size refusal by every relay reaches the caller typed
+                // (mdk#2334); the lifecycle sees the failure as before.
+                KeyPackagePublishError::exposed(error.to_string()).with_event_size_class(
+                    error::publish_size_refusal(&error).map(|cause| cause.size_class),
+                )
+            })?;
         let accepted = outcome
             .accepted
             .into_iter()
@@ -8048,11 +9127,122 @@ impl KeyPackagePublisher for AppKeyPackagePublisher {
 
         Ok(KeyPackagePublishReceipt { accepted, failed })
     }
+
+    async fn withdraw_key_package_slot(
+        &self,
+        withdrawal: &KeyPackageSlotWithdrawal,
+    ) -> Result<KeyPackagePublishReceipt, KeyPackagePublishError> {
+        let event = transport_nostr_adapter::key_package_slot_deletion_event(
+            &withdrawal.account_id,
+            &withdrawal.slot_id,
+            withdrawal.created_at.0,
+        );
+        Ok(self
+            .publish_deletion_request(
+                &withdrawal.account_id,
+                event,
+                &withdrawal.endpoints,
+                "key package slot withdrawal",
+            )
+            .await)
+    }
+
+    async fn delete_key_package_event(
+        &self,
+        deletion: &KeyPackageEventDeletion,
+    ) -> Result<KeyPackagePublishReceipt, KeyPackagePublishError> {
+        let event = transport_nostr_adapter::key_package_event_deletion_event(
+            &deletion.account_id,
+            &hex::encode(deletion.event_id.as_slice()),
+            deletion.created_at.0,
+        );
+        Ok(self
+            .publish_deletion_request(
+                &deletion.account_id,
+                event,
+                &deletion.endpoints,
+                "key package event deletion",
+            )
+            .await)
+    }
+}
+
+impl AppKeyPackagePublisher {
+    /// Send one deletion request to each of `endpoints`, each checked on its
+    /// own: an unusable endpoint must not stop the deletion at the others,
+    /// and one relay's acknowledgement must not cancel the send to the rest.
+    async fn publish_deletion_request(
+        &self,
+        account_id: &MemberId,
+        event: transport_nostr_peeler::NostrTransportEvent,
+        endpoints: &[TransportEndpoint],
+        purpose: &'static str,
+    ) -> KeyPackagePublishReceipt {
+        let mut failed = Vec::new();
+        let mut requests: Vec<NostrEventPublishRequest> = Vec::new();
+        for endpoint in endpoints {
+            match self
+                .app
+                .relay_plane
+                .sanitize_relay_endpoints(vec![endpoint.clone()], purpose)
+            {
+                Ok(endpoints) => {
+                    if !requests
+                        .iter()
+                        .any(|request| request.endpoints == endpoints)
+                    {
+                        requests.push(NostrEventPublishRequest {
+                            endpoints,
+                            event: event.clone(),
+                            required_acks: 1,
+                        });
+                    }
+                }
+                Err(_) => failed.push(endpoint.clone()),
+            }
+        }
+        let relay_client = self.app.relay_client_for_account_id(
+            &hex::encode(account_id.as_slice()),
+            self.signer.as_nostr_signer(),
+        );
+        let mut outcomes = relay_client
+            .publish_events_for_account(account_id, &requests)
+            .await
+            .into_iter();
+        let mut accepted = Vec::new();
+        for request in requests {
+            match outcomes.next() {
+                Some(Ok(outcome)) if !outcome.accepted.is_empty() => {
+                    accepted.extend(outcome.accepted.into_iter().map(|receipt| receipt.endpoint))
+                }
+                _ => failed.extend(request.endpoints),
+            }
+        }
+        KeyPackagePublishReceipt { accepted, failed }
+    }
 }
 
 fn empty_key_package_lifecycle(stable_slot_id: String) -> cgka_traits::KeyPackageLifecycleState {
     cgka_traits::KeyPackageLifecycleState::slot_only(stable_slot_id)
 }
+
+/// The coverage ledger's key for a route the relay plane placed a delivery
+/// on.
+pub(crate) fn reconciliation_route(
+    route: transport_nostr::DeliveryRoute,
+) -> storage_sqlite::TransportReconciliationRoute {
+    match route {
+        transport_nostr::DeliveryRoute::Inbox => {
+            storage_sqlite::TransportReconciliationRoute::Inbox
+        }
+        transport_nostr::DeliveryRoute::Group(id) => {
+            storage_sqlite::TransportReconciliationRoute::Group(id)
+        }
+    }
+}
+
+// Storage lists every route a loss generation the plane records may name.
+const _: () = assert!(transport_nostr::MAX_DELIVERY_LOSS_ROUTES == storage_sqlite::MAX_LOSS_ROUTES);
 
 fn unix_now_seconds() -> u64 {
     SystemTime::now()
@@ -8068,6 +9258,16 @@ pub(crate) fn history_floor(anchor_secs: u64) -> cgka_traits::transport::Timesta
     cgka_traits::transport::Timestamp(
         anchor_secs.saturating_sub(HISTORY_FLOOR_CLOCK_SKEW_ALLOWANCE.as_secs()),
     )
+}
+
+/// The last second a retained route owes recovered history: its switch plus
+/// [`HISTORY_FLOOR_CLOCK_SKEW_ALLOWANCE`], from its subscription floor
+/// ([`history_floor`] of that switch). Later traffic there comes from members
+/// that have not applied the switch, and its live subscription delivers it.
+pub(crate) fn retained_route_goal_until(retained_since: cgka_traits::transport::Timestamp) -> u64 {
+    retained_since
+        .0
+        .saturating_add(2 * HISTORY_FLOOR_CLOCK_SKEW_ALLOWANCE.as_secs())
 }
 
 fn sqlite_file_requires_key(path: &Path) -> bool {

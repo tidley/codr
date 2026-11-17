@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 
-use cgka_engine::canonicalization::CanonicalizationPolicy;
 use cgka_traits::agent_text_stream::{
     AGENT_TEXT_STREAM_QUIC_COMPONENT, AGENT_TEXT_STREAM_ROLE_FANOUT,
     AGENT_TEXT_STREAM_ROLE_RECEIVE, AGENT_TEXT_STREAM_ROLE_SEND, AgentTextStreamQuicPolicyV1,
@@ -24,6 +23,7 @@ use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MarmotAppEvent as Marmo
 use cgka_traits::engine::{GroupEvent, GroupHydrationQuarantineReason};
 use cgka_traits::group::{Group, ProtocolProfile};
 use cgka_traits::{GroupId, MemberId, TransportEndpoint, TransportGroupSubscription};
+use marmot_session::CanonicalizationPolicy;
 use serde::{Deserialize, Serialize};
 
 use crate::media::{EncryptedMediaVersion, media_imeta_tags_preserve_message};
@@ -112,10 +112,13 @@ impl std::fmt::Debug for AppInitialGroupImage {
 /// requirement.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AppCreateGroupOptions {
+    pub member_resolution: nostr_directory::MemberResolutionPolicy,
     /// Initial group routing relays. Omitted uses the app configuration.
     pub relays: Option<Vec<String>>,
     pub description: String,
     /// Invited account references granted admin in the founding group state.
+    /// Accepts local aliases and public-key references. The creator remains an
+    /// admin and may be listed redundantly; an empty list keeps creator-only rights.
     pub initial_admins: Vec<String>,
     pub initial_image: Option<AppInitialGroupImage>,
     pub disappearing_message_secs: u64,
@@ -171,15 +174,16 @@ pub struct AppGroupRecord {
     pub archived: bool,
     #[serde(default)]
     pub pending_confirmation: bool,
-    /// Current locally observed MLS roster size. `None` only for legacy
-    /// projections that have not yet been hydrated by an upgraded runtime.
+    /// Number of member accounts in the locally observed MLS roster; an
+    /// account with several devices in the group counts once. `None` only for
+    /// legacy projections that have not yet been hydrated by an upgraded runtime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub member_count: Option<u64>,
-    /// Hex member ids when this group is currently a Direct conversation
-    /// (empty name, roster size 2). Persisted as the peer-keyed reuse index.
+    /// Hex account ids when this group is currently a Direct conversation
+    /// (empty name, two member accounts). Persisted as the peer-keyed reuse index.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub direct_member_ids_hex: Option<Vec<String>>,
-    /// Current authoritative two-member roster, including explicitly named groups.
+    /// Current authoritative two-account roster, including explicitly named groups.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub presentation_member_ids_hex: Option<Vec<String>>,
     /// Whether the local account is still a member of this group, and if not,
@@ -202,6 +206,13 @@ pub struct AppGroupRecord {
     /// only way a cold launch can rediscover it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub leave_requested_at_ms: Option<u64>,
+    /// The outstanding leave is blocked: the selected branch makes this
+    /// account the group's last active admin, so nothing it sends can finish
+    /// the leave, and only a user Cancel (`cancel_leave`) clears it (mdk#3014).
+    /// Derived with `leave_requested_at_ms` from the same engine row, and only
+    /// ever true while that is `Some`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub leave_blocked: bool,
     /// Whether ordinary outbound work is gated by a local request or an
     /// authenticated inbound disband candidate awaiting convergence.
     #[serde(default)]
@@ -226,6 +237,52 @@ pub struct AppGroupRecord {
     pub via_welcome_message_id_hex: Option<String>,
 }
 
+/// Whether this device can turn on `marmot.group.account-devices.v1` in a
+/// group now, so its own devices can later add and remove each other there
+/// without an admin. A host asks before offering the action. Every answer is a
+/// fact about the whole group: it never says which members or devices hold
+/// it back.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AppAccountDevicesActivation {
+    /// This device's account is an admin and every device in the group is
+    /// ready.
+    Eligible,
+    /// Only an admin can turn it on.
+    NotAdmin,
+    /// The group already has it, for good.
+    AlreadyEnabled,
+    /// The group predates the current protocol profile and never gets it.
+    LegacyGroup,
+    /// At least one device in the group runs a client that does not support
+    /// it yet.
+    MembersNeedUpdate,
+    /// At least one device's leaf carries data under the component's id,
+    /// which another client wrote before activation. A client update does not
+    /// clear it: that device has to replace its leaf without the data, or
+    /// leave and be added again.
+    DevicesNeedReplacement,
+    /// At least one account has more devices in the group than the limit.
+    DeviceLimitExceeded,
+}
+
+impl From<Option<cgka_traits::error::AccountDevicesActivationRefusal>>
+    for AppAccountDevicesActivation
+{
+    fn from(refusal: Option<cgka_traits::error::AccountDevicesActivationRefusal>) -> Self {
+        use cgka_traits::error::AccountDevicesActivationRefusal as Refusal;
+        match refusal {
+            None => Self::Eligible,
+            Some(Refusal::NotAdmin) => Self::NotAdmin,
+            Some(Refusal::AlreadyRequired) => Self::AlreadyEnabled,
+            Some(Refusal::LegacyProfile) => Self::LegacyGroup,
+            Some(Refusal::UnsupportedLeaves) => Self::MembersNeedUpdate,
+            Some(Refusal::LeafCarriesData) => Self::DevicesNeedReplacement,
+            Some(Refusal::LeafLimitExceeded) => Self::DeviceLimitExceeded,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AppProtocolProfile {
@@ -243,11 +300,50 @@ impl From<ProtocolProfile> for AppProtocolProfile {
     }
 }
 
+/// One member account of a group. An account with several devices in the
+/// group has one leaf per device but still one record here.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppGroupMemberRecord {
     pub member_id_hex: String,
     pub account: Option<String>,
     pub local: bool,
+    /// How many of this account's devices (current leaves) are in the group.
+    #[serde(default = "one_device")]
+    pub device_count: u32,
+}
+
+fn one_device() -> u32 {
+    1
+}
+
+/// Group the engine's per-leaf roster by account, in first-leaf order, with
+/// each account's leaf count (spec `foundation/identity.md`, "Devices").
+/// Every projection a host sees counts and lists these accounts, never leaves.
+pub(crate) fn member_accounts(members: &[cgka_traits::group::Member]) -> Vec<(MemberId, u32)> {
+    let mut accounts: Vec<(MemberId, u32)> = Vec::with_capacity(members.len());
+    let mut positions: HashMap<&MemberId, usize> = HashMap::with_capacity(members.len());
+    for member in members {
+        match positions.entry(&member.id) {
+            std::collections::hash_map::Entry::Occupied(position) => {
+                let devices = &mut accounts[*position.get()].1;
+                *devices = devices.saturating_add(1);
+            }
+            std::collections::hash_map::Entry::Vacant(position) => {
+                position.insert(accounts.len());
+                accounts.push((member.id.clone(), 1));
+            }
+        }
+    }
+    accounts
+}
+
+/// Number of distinct member accounts in a per-leaf roster.
+pub(crate) fn member_account_count(members: &[cgka_traits::group::Member]) -> usize {
+    members
+        .iter()
+        .map(|member| &member.id)
+        .collect::<std::collections::HashSet<_>>()
+        .len()
 }
 
 /// Lightweight local roster projection for one group.
@@ -269,9 +365,17 @@ pub struct AppGroupMlsState {
     pub protocol_profile: AppProtocolProfile,
     pub lifecycle_state: AppGroupLifecycleState,
     pub epoch: u64,
+    /// Number of member accounts. An account with several devices in the
+    /// group counts once.
     pub member_count: usize,
     #[serde(default)]
     pub unrecoverable: bool,
+    /// Convergence stopped retrying a batch that kept failing (mdk#2684).
+    /// The group waits for new input from another member or an explicit
+    /// `retry_group_convergence`; sends stay queued meanwhile. Unlike
+    /// `unrecoverable`, nothing is lost and a retry can clear it.
+    #[serde(default)]
+    pub convergence_parked: bool,
     pub required_app_components: Vec<u16>,
     pub disbanding_enabled: bool,
     /// True while all ordinary outbound group work, including application
@@ -318,6 +422,9 @@ pub struct AppGroupRosterMember {
     pub is_self: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    /// How many of this account's devices (current leaves) are in the group.
+    #[serde(default = "one_device")]
+    pub device_count: u32,
 }
 
 /// Lightweight membership projection for roster screens and change detection.
@@ -331,6 +438,7 @@ pub struct AppGroupRoster {
     /// display-name changes do not.
     pub roster_revision: u64,
     pub self_membership: SelfMembership,
+    /// Number of member accounts, one per entry in `members`.
     pub member_count: usize,
     pub lifecycle_state: AppGroupLifecycleState,
 }
@@ -359,6 +467,7 @@ pub(crate) fn app_group_roster_from_session(
                 is_admin: admin_ids.contains(&member.member_id_hex),
                 is_self: member.member_id_hex == my_account_id_hex,
                 display_name: display_names.get(&member.member_id_hex).cloned(),
+                device_count: member.device_count,
             }
         })
         .collect();
@@ -367,12 +476,13 @@ pub(crate) fn app_group_roster_from_session(
         SelfMembership::Member => 0,
         SelfMembership::Left => 1,
         SelfMembership::Removed => 2,
+        SelfMembership::DeviceRemoved => 3,
     };
     AppGroupRoster {
         group_id_hex: group_record.group_id_hex,
         members,
         epoch,
-        roster_revision: epoch.saturating_mul(3).saturating_add(membership_revision),
+        roster_revision: epoch.saturating_mul(4).saturating_add(membership_revision),
         self_membership: group_record.self_membership,
         member_count: mls_state.member_count,
         lifecycle_state: mls_state.lifecycle_state,
@@ -470,6 +580,11 @@ pub enum AppGroupHydrationQuarantineReason {
     GroupRecordLoadFailed,
     /// Hydrate found a stranded pending commit, but recovery itself failed.
     PendingCommitRecoveryFailed,
+    /// A read of past group state could not restore the live group, which
+    /// sits on that past state, in session or at account open. A retry or
+    /// re-join cannot clear it, and the next account open restores the live
+    /// state.
+    RewindRestoreFailed,
 }
 
 impl From<GroupHydrationQuarantineReason> for AppGroupHydrationQuarantineReason {
@@ -482,6 +597,7 @@ impl From<GroupHydrationQuarantineReason> for AppGroupHydrationQuarantineReason 
             GroupHydrationQuarantineReason::PendingCommitRecoveryFailed => {
                 Self::PendingCommitRecoveryFailed
             }
+            GroupHydrationQuarantineReason::RewindRestoreFailed => Self::RewindRestoreFailed,
         }
     }
 }
@@ -688,6 +804,15 @@ impl std::fmt::Debug for AppGroupRecord {
 }
 
 impl AppGroupRecord {
+    /// Stamp the read-time leave fields from this group's durable request.
+    pub(crate) fn stamp_leave_request(
+        &mut self,
+        request: Option<&cgka_traits::storage::LeaveRequest>,
+    ) {
+        self.leave_requested_at_ms = request.map(|request| request.requested_at_ms);
+        self.leave_blocked = request.is_some_and(|request| request.blocked.is_some());
+    }
+
     pub(crate) fn new(
         group_id_hex: String,
         nostr_routing: AppGroupNostrRoutingComponent,
@@ -720,6 +845,7 @@ impl AppGroupRecord {
             presentation_member_ids_hex: None,
             self_membership: SelfMembership::Member,
             leave_requested_at_ms: None,
+            leave_blocked: false,
             disbanding: false,
             disband_request: None,
             disbanded: false,
@@ -759,7 +885,7 @@ impl AppGroupRecord {
         if let Some(group) = group {
             record.protocol_profile = group.protocol_profile.into();
             record.nostr_routing_last_epoch = group.epoch.0;
-            record.member_count = u64::try_from(group.members.len()).ok();
+            record.member_count = u64::try_from(member_account_count(&group.members)).ok();
             record.unrecoverable = group.unrecoverable;
             record.disbanded = group.disbanded.is_some();
             record.set_direct_member_ids_from_roster(&group.members);
@@ -800,7 +926,7 @@ impl AppGroupRecord {
         self.profile = projection.profile.clone();
         if let Some(group) = projection.group_metadata {
             self.protocol_profile = group.protocol_profile.into();
-            self.member_count = u64::try_from(group.members.len()).ok();
+            self.member_count = u64::try_from(member_account_count(&group.members)).ok();
             self.unrecoverable = group.unrecoverable;
             self.disbanded = group.disbanded.is_some();
             self.set_direct_member_ids_from_roster(&group.members);
@@ -811,19 +937,19 @@ impl AppGroupRecord {
         &mut self,
         members: &[cgka_traits::group::Member],
     ) {
-        self.presentation_member_ids_hex = (members.len() == 2
-            && members
+        // Two accounts make a two-person roster however many devices either
+        // of them has in the group.
+        let accounts = member_accounts(members);
+        self.presentation_member_ids_hex = (accounts.len() == 2
+            && accounts.iter().all(|(id, _)| id.as_slice().len() == 32))
+        .then(|| {
+            let mut ids: Vec<_> = accounts
                 .iter()
-                .all(|member| member.id.as_slice().len() == 32)
-            && members[0].id != members[1].id)
-            .then(|| {
-                let mut ids: Vec<_> = members
-                    .iter()
-                    .map(|member| hex::encode(member.id.as_slice()))
-                    .collect();
-                ids.sort_unstable();
-                ids
-            });
+                .map(|(id, _)| hex::encode(id.as_slice()))
+                .collect();
+            ids.sort_unstable();
+            ids
+        });
         self.direct_member_ids_hex = if self.profile.name.trim().is_empty() {
             self.presentation_member_ids_hex.clone()
         } else {
@@ -1069,7 +1195,9 @@ mod prior_nostr_route_tests {
             disbanded: None,
             join_epoch: EpochId(0),
             local_copy_install_epoch: EpochId(0),
+            self_removed_sibling_slots: Default::default(),
             local_copy_welcome_created_at: None,
+            device_roster_departures: Vec::new(),
         }
     }
 
@@ -1996,7 +2124,9 @@ mod delete_moderation_grant_tests {
             disbanded: None,
             join_epoch: EpochId(0),
             local_copy_install_epoch: EpochId(0),
+            self_removed_sibling_slots: Default::default(),
             local_copy_welcome_created_at: None,
+            device_roster_departures: Vec::new(),
         }
     }
 
@@ -2250,16 +2380,30 @@ pub(crate) fn observe_event(
                 outer_transport_at,
                 allow_loopback_http,
             ) else {
-                summary.events.push(event.clone());
+                summary.events.push(host_group_event(event));
                 return None;
             };
             message.authority = *authority;
+            // A device-group kind is read only in the device group this
+            // account trusts, whose events never reach a chat's projection.
+            // Anywhere else it is no message: no host summary, no stored row,
+            // no notification.
+            if crate::client::device_group::is_device_group_kind(message.kind) {
+                tracing::debug!(
+                    target: "marmot_app::groups",
+                    method = "observe_event",
+                    kind = message.kind,
+                    "ignoring a device-group kind outside the device group",
+                );
+                summary.events.push(host_group_event(event));
+                return None;
+            }
             // Gossip remains available to native ingestion, but must never enter
             // the host message summary, including a partially applied batch.
             if !crate::notifications::is_push_gossip_kind(message.kind) {
                 summary.messages.push(message.clone());
             }
-            summary.events.push(event.clone());
+            summary.events.push(host_group_event(event));
             Some(message)
         }
         _ => {
@@ -2271,9 +2415,44 @@ pub(crate) fn observe_event(
                     GroupConfirmationProjection::Preserve,
                 );
             }
-            summary.events.push(event.clone());
+            summary.events.push(host_group_event(event));
             None
         }
+    }
+}
+
+/// The copy of an engine event that hosts receive. A departure's removed leaves
+/// and a message's sender leaf are device destinations MDK consumes itself, so
+/// no leaf index reaches a host. Hosts still learn which accounts left, and
+/// `LocalGroupCopyTerminated` tells them when this device's own leaf was
+/// removed.
+pub(crate) fn host_group_event(event: &GroupEvent) -> GroupEvent {
+    match event {
+        GroupEvent::MessageReceived {
+            sender_leaf_index: Some(_),
+            ..
+        } => {
+            let mut event = event.clone();
+            if let GroupEvent::MessageReceived {
+                sender_leaf_index, ..
+            } = &mut event
+            {
+                *sender_leaf_index = None;
+            }
+            event
+        }
+        GroupEvent::GroupMemberLeavesRemoved {
+            group_id,
+            epoch,
+            departed_members,
+            ..
+        } => GroupEvent::GroupMemberLeavesRemoved {
+            group_id: group_id.clone(),
+            epoch: *epoch,
+            leaves: Vec::new(),
+            departed_members: departed_members.clone(),
+        },
+        event => event.clone(),
     }
 }
 
@@ -2281,6 +2460,7 @@ pub(crate) fn event_group_id(event: &GroupEvent) -> Option<&GroupId> {
     match event {
         GroupEvent::LocalGroupCopyTerminated { group_id, .. }
         | GroupEvent::LocalGroupCopyRestored { group_id }
+        | GroupEvent::QueuedIntentRefused { group_id, .. }
         | GroupEvent::GroupMemberLeavesRemoved { group_id, .. }
         | GroupEvent::GroupCreated { group_id }
         | GroupEvent::GroupJoined { group_id, .. }
@@ -2369,7 +2549,7 @@ pub(crate) fn add_group(
 /// passage that would have ended a stall run; the seams that already observe
 /// explicitly are the only exception.
 pub(crate) fn fail_if_publish_failed(
-    effects: &marmot_account::AccountDeviceEffects,
+    effects: &marmot_session::AccountDeviceEffects,
 ) -> Result<(), AppError> {
     if effects.failures.is_empty() {
         return Ok(());
@@ -2379,8 +2559,8 @@ pub(crate) fn fail_if_publish_failed(
     let mut any_rolled_back = false;
     for resolution in &effects.pending {
         match resolution {
-            marmot_account::PendingResolution::Confirmed { .. } => any_confirmed = true,
-            marmot_account::PendingResolution::RolledBack { .. } => any_rolled_back = true,
+            marmot_session::PendingResolution::Confirmed { .. } => any_confirmed = true,
+            marmot_session::PendingResolution::RolledBack { .. } => any_rolled_back = true,
         }
     }
 
@@ -2423,7 +2603,17 @@ pub(crate) fn fail_if_publish_failed(
     Err(publish_failure_error(&effects.failures))
 }
 
-pub(crate) fn publish_failure_error(failures: &[marmot_account::PublishFailure]) -> AppError {
+pub(crate) fn publish_failure_error(failures: &[marmot_session::PublishFailure]) -> AppError {
+    if let Some(cause) = failures.first().and_then(|failure| failure.oversized)
+        && failures
+            .iter()
+            .all(|failure| failure.oversized == Some(cause))
+    {
+        return AppError::EventTooLarge {
+            artifact: cause.artifact,
+            size_class: cause.size_class,
+        };
+    }
     AppError::Publish(
         failures
             .iter()
@@ -2434,7 +2624,7 @@ pub(crate) fn publish_failure_error(failures: &[marmot_account::PublishFailure])
 }
 
 pub(crate) fn send_summary_from_effects(
-    effects: &marmot_account::AccountDeviceEffects,
+    effects: &marmot_session::AccountDeviceEffects,
 ) -> SendSummary {
     SendSummary {
         published: effects
@@ -2464,7 +2654,7 @@ pub(crate) fn send_summary_from_effects(
 /// per-message answer in `effects.published_app_messages` and reports that,
 /// because one pass can publish unrelated work alongside a retained message.
 pub(crate) fn accept_disposition_from_effects(
-    effects: &marmot_account::AccountDeviceEffects,
+    effects: &marmot_session::AccountDeviceEffects,
 ) -> cgka_traits::SendAcceptDisposition {
     if effects
         .reports
@@ -2754,13 +2944,14 @@ mod fail_if_publish_failed_tests {
         GroupId, MemberId, MessageId, TransportEndpoint, TransportEndpointReceipt,
         TransportPublishReport,
     };
-    use marmot_account::{
+    use marmot_session::{
         AccountDeviceEffects, PendingResolution, PublishFailure, UnresolvedPublish,
         UnresolvedPublishReason, WelcomeDeliveryFailure,
     };
 
     fn failure(reason: &str) -> PublishFailure {
         PublishFailure {
+            oversized: None,
             message_id: MessageId::new(vec![0xab; 32]),
             reason: reason.to_owned(),
         }
@@ -2869,6 +3060,7 @@ mod fail_if_publish_failed_tests {
             group_id: GroupId::new(vec![0xcd; 16]),
         });
         effects.welcome_failures.push(WelcomeDeliveryFailure {
+            size_class: None,
             message_id: publish_failure.message_id,
             recipient: MemberId::new(vec![0xef; 32]),
             group_id: Some(GroupId::new(vec![0xcd; 16])),
@@ -2889,6 +3081,7 @@ mod fail_if_publish_failed_tests {
             group_id: GroupId::new(vec![0xcd; 16]),
         });
         effects.welcome_failures.push(WelcomeDeliveryFailure {
+            size_class: None,
             message_id: MessageId::new(vec![0x11; 32]),
             recipient: MemberId::new(vec![0xef; 32]),
             group_id: Some(GroupId::new(vec![0xcd; 16])),
@@ -2919,6 +3112,60 @@ mod fail_if_publish_failed_tests {
 
     // The hard-error message joins all failure reasons, unchanged from the
     // original contract.
+    #[test]
+    fn only_matching_definitive_size_failures_become_a_typed_error() {
+        let cause = marmot_session::OversizedEvent {
+            artifact: crate::OversizedArtifact::Commit,
+            size_class: crate::EventSizeClass::Under64Kib,
+        };
+        let mut first = failure("relay rejected event (too-large)");
+        first.oversized = Some(cause);
+        let mut second = first.clone();
+        let mut effects = AccountDeviceEffects {
+            failures: vec![first.clone(), second.clone()],
+            ..Default::default()
+        };
+        assert!(matches!(
+            fail_if_publish_failed(&effects),
+            Err(AppError::EventTooLarge {
+                artifact: crate::OversizedArtifact::Commit,
+                size_class: crate::EventSizeClass::Under64Kib,
+            })
+        ));
+        second.oversized = None;
+        effects.failures[1] = second.clone();
+        assert!(matches!(
+            fail_if_publish_failed(&effects),
+            Err(AppError::Publish(_))
+        ));
+        second.oversized = Some(marmot_session::OversizedEvent {
+            artifact: cause.artifact,
+            size_class: crate::EventSizeClass::Over4Mib,
+        });
+        effects.failures[1] = second.clone();
+        assert!(matches!(
+            fail_if_publish_failed(&effects),
+            Err(AppError::Publish(_))
+        ));
+        second.oversized = Some(marmot_session::OversizedEvent {
+            artifact: crate::OversizedArtifact::Welcome,
+            size_class: cause.size_class,
+        });
+        effects.failures[1] = second;
+        assert!(matches!(
+            fail_if_publish_failed(&effects),
+            Err(AppError::Publish(_))
+        ));
+        effects.failures = vec![first];
+        effects.pending.push(PendingResolution::Confirmed {
+            pending: pending_ref(),
+        });
+        assert!(
+            fail_if_publish_failed(&effects).is_ok(),
+            "typed cause never replaces an already confirmed outcome"
+        );
+    }
+
     #[test]
     fn hard_error_joins_all_failure_reasons() {
         let mut effects = AccountDeviceEffects::default();
@@ -2969,6 +3216,7 @@ mod group_roster_api_tests {
             member_id_hex: self_id.to_owned(),
             account: Some("alice".to_owned()),
             local: true,
+            device_count: 1,
         }];
         let mls_state = AppGroupMlsState {
             group_id_hex: record.group_id_hex.clone(),
@@ -2977,6 +3225,7 @@ mod group_roster_api_tests {
             epoch: 7,
             member_count: 1,
             unrecoverable: false,
+            convergence_parked: false,
             required_app_components: Vec::new(),
             disbanding_enabled: false,
             disbanding: false,
@@ -2993,7 +3242,7 @@ mod group_roster_api_tests {
             HashMap::from([(self_id.to_owned(), "Alice".to_owned())]),
         );
         assert_eq!(roster.epoch, 7);
-        assert_eq!(roster.roster_revision, 23);
+        assert_eq!(roster.roster_revision, 30);
         assert_eq!(roster.self_membership, SelfMembership::Removed);
         assert_eq!(roster.member_count, 1);
         assert_eq!(roster.lifecycle_state, AppGroupLifecycleState::Stable);
@@ -3001,5 +3250,59 @@ mod group_roster_api_tests {
         assert!(roster.members[0].is_admin);
         assert!(roster.members[0].is_self);
         assert_eq!(roster.members[0].display_name.as_deref(), Some("Alice"));
+    }
+
+    fn leaves(accounts: &[u8]) -> Vec<cgka_traits::group::Member> {
+        accounts
+            .iter()
+            .map(|account| cgka_traits::group::Member {
+                id: MemberId::new(vec![*account; 32]),
+                credential: Vec::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn member_accounts_list_each_account_once_with_its_devices() {
+        let members = leaves(&[0xaa, 0xbb, 0xbb, 0xcc, 0xaa]);
+        assert_eq!(
+            member_accounts(&members),
+            vec![
+                (MemberId::new(vec![0xaa; 32]), 2),
+                (MemberId::new(vec![0xbb; 32]), 2),
+                (MemberId::new(vec![0xcc; 32]), 1),
+            ]
+        );
+        assert_eq!(member_account_count(&members), 3);
+    }
+
+    /// Two accounts are a two-person roster however many devices either has;
+    /// one account on two devices is not.
+    #[test]
+    fn two_person_roster_follows_accounts_not_leaves() {
+        let pair = Some(vec!["aa".repeat(32), "bb".repeat(32)]);
+        for roster in [
+            &[0xaa, 0xbb][..],
+            &[0xaa, 0xbb, 0xbb],
+            &[0xaa, 0xaa, 0xbb],
+            &[0xbb, 0xaa, 0xbb, 0xaa],
+        ] {
+            let mut record = test_record();
+            record.profile.name = String::new();
+            record.set_direct_member_ids_from_roster(&leaves(roster));
+            assert_eq!(record.presentation_member_ids_hex, pair, "{roster:?}");
+            assert_eq!(record.direct_member_ids_hex, pair, "{roster:?}");
+        }
+        for roster in [
+            &[0xaa, 0xaa][..],
+            &[0xaa, 0xbb, 0xcc],
+            &[0xaa, 0xbb, 0xbb, 0xcc],
+        ] {
+            let mut record = test_record();
+            record.profile.name = String::new();
+            record.set_direct_member_ids_from_roster(&leaves(roster));
+            assert_eq!(record.presentation_member_ids_hex, None, "{roster:?}");
+            assert_eq!(record.direct_member_ids_hex, None, "{roster:?}");
+        }
     }
 }

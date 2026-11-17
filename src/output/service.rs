@@ -11,10 +11,46 @@ use std::{
 };
 
 #[derive(Deserialize)]
-struct Registration {
-    url: String,
-    pid: u32,
-    password: Option<String>,
+pub(crate) struct Registration {
+    pub(crate) url: String,
+    pub(crate) pid: u32,
+    pub(crate) password: Option<String>,
+}
+
+pub(crate) async fn registration(config: &crate::BridgeConfig) -> Result<Registration> {
+    let file = config
+        .opencode_service_file
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("OpenCode service registration is not configured"))?;
+    let bytes = tokio::fs::read(file)
+        .await
+        .map_err(|_| anyhow::anyhow!("OpenCode service registration unavailable"))?;
+    ensure!(
+        bytes.len() <= 64 * 1024,
+        "OpenCode service registration too large"
+    );
+    let registration: Registration = serde_json::from_slice(&bytes)
+        .map_err(|_| anyhow::anyhow!("Invalid OpenCode service registration"))?;
+    let url = reqwest::Url::parse(&registration.url)
+        .map_err(|_| anyhow::anyhow!("Invalid OpenCode service address"))?;
+    ensure!(
+        url.scheme() == "http"
+            && url
+                .host_str()
+                .and_then(|host| host
+                    .trim_matches(['[', ']'])
+                    .parse::<std::net::IpAddr>()
+                    .ok())
+                .is_some_and(|ip| ip.is_loopback())
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
+            && url.path() == "/"
+            && registration.pid > 0,
+        "OpenCode service must use a loopback HTTP address"
+    );
+    Ok(registration)
 }
 
 #[derive(Default)]
@@ -125,34 +161,7 @@ impl Reader {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("OpenCode service registration is not configured"))?;
         // Never include registration contents (which contain authentication) in diagnostics.
-        let bytes = tokio::fs::read(file)
-            .await
-            .map_err(|_| anyhow::anyhow!("OpenCode service registration unavailable"))?;
-        ensure!(
-            bytes.len() <= 64 * 1024,
-            "OpenCode service registration too large"
-        );
-        let registration: Registration = serde_json::from_slice(&bytes)
-            .map_err(|_| anyhow::anyhow!("Invalid OpenCode service registration"))?;
-        let url = reqwest::Url::parse(&registration.url)
-            .map_err(|_| anyhow::anyhow!("Invalid OpenCode service address"))?;
-        ensure!(
-            url.scheme() == "http"
-                && url
-                    .host_str()
-                    .and_then(|host| host
-                        .trim_matches(['[', ']'])
-                        .parse::<std::net::IpAddr>()
-                        .ok())
-                    .is_some_and(|ip| ip.is_loopback())
-                && url.username().is_empty()
-                && url.password().is_none()
-                && url.query().is_none()
-                && url.fragment().is_none()
-                && url.path() == "/"
-                && registration.pid > 0,
-            "OpenCode service must use a loopback HTTP address"
-        );
+        let registration = registration(config).await?;
         let cached = {
             let mut sessions = self
                 .sessions
