@@ -1,6 +1,6 @@
 # Combined codr daemon
 
-The 0.12.0 development source can host the bridge and MDK 0.17.0 messaging runtime in one process.
+The unpublished 0.12.0 release candidate hosts the bridge and MDK 0.17.0 messaging runtime in one process.
 It does not spawn `wn-agent`. MDK keeps ownership of keys, account storage,
 cryptography, relay transport, and invitations. The existing private
 `marmot.agent-control.v2` socket remains available to local setup tools.
@@ -19,6 +19,23 @@ on `PATH` before invoking Cargo. The installer verifies upstream archive hashes;
 Intel macOS builds the exact compiler source with Homebrew LLVM 21. CI installs
 the same compiler before host and standalone-connector builds. Platform CI still
 has to verify the target-specific outputs; a local Linux check is not that proof.
+
+This prerequisite also applies to `cargo test` and `cargo clippy`, not only
+release packaging: the pinned `marmot-markdown` dependency runs its native build
+script during those checks. In an isolated check runner, expose the complete
+verified compiler installation on `PATH`, or set `ODIN` to its absolute executable
+path in the check process environment. Verify `"$ODIN" version` when using that
+override; it must report `dev-2026-10` and commit `84bc3fc`. A missing-Odin build
+script failure does not qualify the Rust checks. Managed workers must leave
+compiler provisioning and check-environment configuration to their supervisor;
+do not disable Markdown or change the MDK pin to work around a missing tool.
+
+For native Linux musl release builds, install `musl-tools` and select `musl-gcc`
+as Cargo's target linker (`CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER` or
+`CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER`, as appropriate). CI uses native
+runners for both architectures. Host `cc` can select glibc's static `libm` for
+MDK Markdown, which cannot be mixed with Rust's musl CRT. This does not change
+the standalone compatibility connector's GNU target or macOS linker.
 
 ## MDK 0.17 storage boundary
 
@@ -152,9 +169,10 @@ phone receipt; a live phone round trip remains a separate deployment check.
   confirmation. Unsupported layouts still require the manual handover.
 - This MVP reuses existing 0.9 account homes. Fresh identity setup still uses
   local 0.9 setup first; a new one-binary account-creation wizard is not included.
-- Messaging runs on its own runtime threads. A failed messaging start is
-  reported without terminating desktop service. This is not process-level
-  crash isolation.
+- Messaging runs on its own runtime threads, not in a separate process. In
+  0.12.0 an embedded worker exit or panic, including during startup, stops the
+  combined service for supervisor recovery. Durable bridge state is retained;
+  this is not process-level crash isolation.
 - The existing bridge still has messaging waits in its event loop, and desktop
   queueing still requires a mapped White Noise group. Removing those contracts
   is a separate part of the architecture change; do not claim full desktop

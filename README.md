@@ -23,7 +23,7 @@ The current setup code uses **👾** as the public name and display name when it
 
 ## Install
 
-The 0.12.0 development source updates MDK to 0.17.0. Its account-storage migration
+The unpublished 0.12.0 release candidate updates MDK to 0.17.0. Its account-storage migration
 is not an automatic update from the released 0.14 cohort. Keep the running
 installation unchanged until a separately approved, backed-up migration; see the
 [combined-runtime storage boundary](docs/COMBINED.md#mdk-017-storage-boundary).
@@ -48,7 +48,26 @@ Or give your coding agent this prompt, with your own public key:
 
 [Full installation and upgrade guide →](docs/INSTALL.md)
 
-### New in 0.11.2
+### In the 0.12.0 release candidate (unpublished)
+
+- OpenCode V2 phone prompts use the configured authenticated local API, with a
+  saved message ID and native acceptance receipt. Uncertain submissions reconcile
+  by ID without another POST or fallback terminal typing. Other agents retain
+  terminal delivery; acceptance does not mean task completion.
+- Serial controls such as `/recent /unmute` validate together and run left-to-right.
+  Launches, updates and permission answers still need separate messages.
+- Wide Markdown tables display as labelled rows on phones, preserving links and
+  formatting without changing native history.
+- An exited or panicked embedded messaging worker stops the combined service so
+  the existing supervisor can recover it.
+- Linux packaging selects the musl linker for MDK Markdown's math dependency.
+  All four platform package lanes still need to qualify the repaired source.
+
+See the [0.12.0 notes](docs/releases/0.12.0.md) for credits and the MDK storage
+boundary, and the [release handoff](docs/releases/0.12.0-readiness.md) for evidence
+and outstanding checks. These are source changes, not an installed update.
+
+### Released in 0.11.2
 
 - Phone permission cards accept ordinary `1` or `2` replies for allow-once or
   deny. Scrolling command blocks remain, without approval codes or quoted replies.

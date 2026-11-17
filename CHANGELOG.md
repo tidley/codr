@@ -1,11 +1,15 @@
 # Changelog
 
-## [0.12.0] - In development
+## [0.12.0] - Release candidate
 
-Changes planned for the next minor release. Not yet published.
+Not yet published. See the [release notes and contributor credits](docs/releases/0.12.0.md)
+and [packaging evidence and release handoff](docs/releases/0.12.0-readiness.md).
 
 ### Fixed
 
+- Select the native `musl-gcc` linker for Linux x86_64 and ARM64 release and
+  preview packages. MDK Markdown's math dependency must not link glibc's static
+  `libm` into Rust's musl executable. Keep the static-loader and package checks.
 - Stop the combined service if its embedded messaging worker exits or panics,
   including during startup, so the existing service supervisor can restart it.
   Do not remain apparently healthy with phone messaging offline. Preserve durable

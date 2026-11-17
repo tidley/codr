@@ -3,6 +3,19 @@ import unittest
 
 
 class CombinedPackagingTests(unittest.TestCase):
+    def test_linux_packages_link_native_math_against_musl_not_host_glibc(self):
+        workflow = (Path(__file__).resolve().parents[1] / ".github/workflows/build.yml").read_text()
+        # MDK Markdown links libm. Host cc selects glibc's static libm even
+        # with Rust's musl CRT, causing unresolved __frexp/__ldexp on both CPUs.
+        for name, end in (("binaries", "linux-preview"), ("linux-preview", "publish-linux-preview")):
+            job = workflow.split(f"  {name}:\n", 1)[1].split(f"  {end}:\n", 1)[0]
+            self.assertIn("\n    env:\n", job, f"{name} must set target-specific linkers for the whole job")
+            job_env = job.split("\n    env:\n", 1)[1].split("    steps:\n", 1)[0]
+            for arch in ("X86_64", "AARCH64"):
+                with self.subTest(job=name, arch=arch):
+                    self.assertIn(f"      CARGO_TARGET_{arch}_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc\n", job_env)
+            self.assertIn("musl-tools", job)
+
     def test_packaging_installs_target_for_the_active_pinned_toolchain(self):
         workflow = (Path(__file__).resolve().parents[1] / ".github/workflows/build.yml").read_text()
         for name, end in (("binaries", "linux-preview"), ("linux-preview", "publish-linux-preview")):

@@ -543,6 +543,14 @@ async fn terminal_ack_without_native_input_warns_once_and_never_retries_after_re
         Some(1),
         "A terminal acknowledgement must retain native acceptance intent"
     );
+    // Without a pre-submission history baseline, matching text is deliberately
+    // insufficient to clear the safety latch. Diagnose that separately from
+    // failure to reconcile the late receipt below.
+    assert_eq!(
+        saved["mappings"][&key]["submissions"][0]["before"],
+        json!([]),
+        "The fixture must capture an empty native-input baseline before submission"
+    );
     saved["mappings"][&key]["submissions"][0]["submitted_at"] = json!(now() - 120);
     bridge.state = serde_json::from_value(saved).unwrap();
     bridge.save().unwrap();
@@ -596,7 +604,8 @@ async fn terminal_ack_without_native_input_warns_once_and_never_retries_after_re
     bridge.reconcile(vec![agent]).await.unwrap();
     assert!(
         bridge.state.mappings[&key].submissions.is_empty(),
-        "Late native evidence releases the safety latch"
+        "Late native evidence releases the safety latch; remaining submissions: {:?}",
+        bridge.state.mappings[&key].submissions
     );
     assert!(bridge.state.mappings[&key].queue_flight.is_none());
     assert_eq!(bridge.state.outbox.iter().filter(|item| item.text == "The agent has now received your earlier message. This chat's delivery pause is cleared.").count(), 1);
