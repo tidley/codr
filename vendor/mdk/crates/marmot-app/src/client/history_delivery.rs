@@ -294,6 +294,7 @@ impl AppClient {
             Err(error) => Err(error),
         };
         if let Err(error) = result {
+            self.device_group_work_changed = true;
             tracing::warn!(
                 target: TRACE_TARGET,
                 method = "drive_history_deliveries",
@@ -319,6 +320,7 @@ impl AppClient {
                     &hex::encode(add.slot),
                     add.added_at,
                 )?;
+                self.note_history_dispatch_changed();
             }
             account.forget_sibling_add(&add)?;
         }
@@ -1004,6 +1006,7 @@ impl AppClient {
                 bundle,
                 received_at: now,
             })?;
+        self.note_history_dispatch_changed();
         Ok(())
     }
 
@@ -1125,6 +1128,7 @@ impl AppClient {
         };
         if let Some(owed) = storage.owe_history_delivery_again(&app_event_id)? {
             back_off_blossom_history(&storage, &owed)?;
+            self.note_history_dispatch_changed();
             tracing::debug!(
                 target: TRACE_TARGET,
                 method = "history_delivery_withdrawn",
@@ -1141,6 +1145,7 @@ impl AppClient {
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
         if let Some(owed) = storage.owe_history_delivery_again(app_event_id)? {
             back_off_blossom_history(&storage, &owed)?;
+            self.note_history_dispatch_changed();
             tracing::debug!(
                 target: TRACE_TARGET,
                 method = "history_delivery_failed",

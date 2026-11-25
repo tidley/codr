@@ -1,7 +1,7 @@
 # MDK sources used by the combined codr daemon
 
 Source: <https://github.com/marmot-protocol/mdk>, revision
-`4df811aea99269b437a6023be9446a5141e93cbe` (MDK 0.17.0), MIT license.
+`3fce95465cdea1edc8456dbd1c6691d1c8dc1f2e` (stable MDK 0.19.0), MIT license.
 
 These three crates contain codr's existing `patches/mdk-codr.patch` changes.
 Other MDK crates remain Git dependencies pinned to that same revision.
@@ -19,7 +19,17 @@ Founding-admin controls and their validation are now upstream. The remaining
 local protocol extension is opt-in media references on timeline-message lookup.
 The patch includes its wire/default and deleted-message regressions.
 
-The declared storage cohort is `mdk-0.17`. First opening an older account upgrades
+The declared storage cohort is `mdk-0.19`. First opening an older account upgrades
 its schema; downgrade is unsupported. Opening real account data requires explicit
 migration approval and a verified stopped backup. Updating this source does not
 authorize that migration. Never restore old MLS state after newer traffic.
+
+All four upstream 0.19.0 cohort tags peel to the revision above. The three crates,
+audit schemas, product-event catalogue and `fixtures/agent-control-v2-rich-context.json`
+protocol-test golden are copied from that source. The only
+crate-source differences are the published Codr patch; the workspace narrows
+membership and replaces other internal paths with immutable Git dependencies.
+The upstream stream/QUIC APIs and crates are removed, not shimmed back in. Codr
+uses durable sends and edits; timeline recovery also recognizes parented thread
+messages, without admitting non-chat custom events. See
+[the upgrade handoff](../../docs/MDK-0.19.md) for migration and verification limits.

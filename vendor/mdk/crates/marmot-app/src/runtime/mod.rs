@@ -10,8 +10,6 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use cgka_traits::agent_text_stream::AGENT_TEXT_STREAM_EXPORTER_CACHE_KEY;
-use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
 use cgka_traits::engine::GroupEvent;
 use cgka_traits::storage::{KeyPackageBundleStorage, MaintenanceStorage};
 use cgka_traits::transport_adapter::TransportEndpointRejectionCategory;
@@ -28,7 +26,6 @@ use tokio::sync::{
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{sleep, timeout};
 
-use crate::agent_streams::AgentStreamWatchManager;
 use crate::client::read_state::read_state_channel;
 use crate::client::sign_out::{SiblingSignOut, SignOutAdminLeave, SignOutLeave};
 use crate::directory_resources::directory_account;
@@ -41,8 +38,8 @@ use crate::{
     APP_RUNTIME_RELAY_REBUILD_LOOKBACK, APP_RUNTIME_WORKER_RESPONSE_WAIT, AccountCatchUpFailure,
     AccountKeyPackageInventoryEntry, AccountKeyPackageRecord, AccountKeyPackageRelayEvent,
     AccountRelayListBootstrap, AccountRelayListStatus, AccountUnread, AgentOperationEventRequest,
-    AgentTextStreamFinishRequest, AppBlobEndpoint, AppCreateGroupOptions, AppDisbandRequest,
-    AppError, AppGroupConversationSnapshot, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord,
+    AppBlobEndpoint, AppCreateGroupOptions, AppDisbandRequest, AppError,
+    AppGroupConversationSnapshot, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord,
     AppGroupRoster, AppMessageQuery, AppMessageRecord, AppProjectionUpdate, AppQuarantinedGroup,
     AuditLogDeleteOutcome, AuditLogFile, AuditLogRetention, AuditLogSettings, AuditLogSource,
     AuditLogTrackerUpdateResult, BackgroundNotificationCollection, BackupSettings, ChatListRow,
@@ -55,7 +52,7 @@ use crate::{
     ReceivedMessage, RecoveryWords, RelayTelemetryExportConfig, RelayTelemetryRuntimeConfig,
     RelayTelemetrySettings, RetentionSweepReport, SecureDeleteExpiredResult, SendSummary,
     TimelineMessageQuery, TimelineMessageRecord, TimelinePage, UserDirectoryRefresh,
-    UserProfileMetadata, default_profile_pseudonym, unix_now_seconds,
+    UserProfileMetadata, WELCOME_WAVE_SHUTDOWN_WAIT, default_profile_pseudonym, unix_now_seconds,
 };
 use marmot_observability::{
     AppPerformanceOperation, AppPerformanceTelemetry, SyncErrorClass, SyncFailureClassification,
@@ -68,13 +65,8 @@ const MEDIA_COMMAND_QUEUE_LIMIT: usize = 8;
 /// Attachment downloads in flight at once across every account of a runtime.
 pub(crate) const ATTACHMENT_TRANSFER_LIMIT: usize = 4;
 
-pub(crate) mod account_worker;
-mod agent_publisher;
-mod agent_stream_watch;
-pub use agent_publisher::{
-    AgentPublisher, AgentPublisherOptions, AgentPublisherRecord, AgentPublisherRouting,
-};
 mod account_attention;
+pub(crate) mod account_worker;
 mod audit_delivery_status;
 mod audit_otlp_delivery;
 pub use audit_otlp_delivery::AuditOtlpAttemptOutcome;
@@ -98,6 +90,7 @@ pub(crate) use conversation_window::{SendCapture, publish_conversation_captures_
 pub(crate) mod attachment_controls;
 pub(crate) mod attachment_permission;
 pub use attachment_controls::{
+    AttachmentBodyRemoval, AttachmentBodyRemovalPage, AttachmentBodyRemovalState,
     AttachmentControl, AttachmentDownloadPolicy, AttachmentTransferState, AttachmentTransferStatus,
     RuntimeAttachmentTransferSubscription,
 };
@@ -121,6 +114,11 @@ pub use attachment_history::{
 mod avatar_access;
 pub use avatar_access::{LocalAvatarRead, MAX_AVATAR_BATCH_BYTES, MAX_AVATAR_BATCH_ITEMS};
 mod commands;
+mod draft_files;
+pub use draft_files::{
+    MAX_MESSAGE_DRAFT_ATTACHMENT_FILE_BYTES, MAX_MESSAGE_DRAFT_ATTACHMENTS,
+    MessageDraftAttachmentFileRequest,
+};
 mod event_routing;
 mod local_submission_queue;
 mod local_submissions;
@@ -146,21 +144,22 @@ pub use user_blocks::RuntimeBlockListSubscription;
 
 // Re-export the public surface so `crate::runtime::Item` and the
 // `marmot_app::...` paths in `lib.rs` resolve unchanged after the split.
-pub use agent_stream_watch::StreamStartView;
 pub use subscriptions::{
-    AgentStreamWatchOptions, AgentTextStreamCryptoContext, ChatListUpdateTrigger,
-    RuntimeAgentStreamUpdate, RuntimeAgentStreamWatch, RuntimeChatListSubscription,
-    RuntimeChatListUpdate, RuntimeChatsSubscription, RuntimeEventsSubscription,
-    RuntimeGroupStateSubscription, RuntimeMessagesSubscription, RuntimeNotificationsSubscription,
-    RuntimeTimelineMessageUpdate, RuntimeTimelineMessagesSubscription, TimelineWindowHandle,
+    ChatListUpdateTrigger, RuntimeChatListSubscription, RuntimeChatListUpdate,
+    RuntimeChatsSubscription, RuntimeEventsSubscription, RuntimeGroupStateSubscription,
+    RuntimeMessagesSubscription, RuntimeNotificationsSubscription, RuntimeTimelineMessageUpdate,
+    RuntimeTimelineMessagesSubscription, TimelineWindowHandle,
 };
 
 // Bring split-out items the orchestration core references back into scope.
 pub(crate) use account_worker::{
     AccountStartupProgress, AccountWorkerCommand, AccountWorkerRuntime, Emit, ManagedAccountWorker,
-    ReadClass, ReadReply, Unpublished, WorkerLane, WorkerUnitGauge,
-    publish_app_runtime_group_state_updated, spawn_app_runtime_account_worker,
+    ReadClass, ReadReply, Unpublished, WorkerCommands, WorkerLane, WorkerUnitGauge,
+    observe_on_account_worker, publish_app_runtime_group_state_updated,
+    spawn_app_runtime_account_worker,
 };
+#[cfg(test)]
+pub(crate) use account_worker::{TestWorkerReceiver, test_worker_channel};
 pub(crate) use audit_tracker::{
     AuditLogTrackerUploader, post_audit_log_tracker_update_for_runtime,
 };
@@ -174,11 +173,6 @@ pub(crate) use account_worker::{
     AccountWorkerReconnectBackoff, STARTUP_HYDRATION_BATCH_SIZE_FOR_TEST,
 };
 #[cfg(test)]
-pub(crate) use agent_stream_watch::{
-    broker_trust_for_candidate, latest_agent_stream_start, parse_quic_candidate,
-    parse_quic_candidates,
-};
-#[cfg(test)]
 pub(crate) use subscriptions::{
     TIMELINE_WINDOW_LIMIT, TimelineOrder, TimelineQueryFn, TimelineSubscriptionSignal,
     TimelineWindow, TimelineWindowEdge, apply_projection_to_window, chat_list_row_fingerprint,
@@ -190,12 +184,6 @@ pub(crate) use subscriptions::{
 // orchestration core itself no longer references after the split.
 #[cfg(test)]
 use crate::TimelineMessageChange;
-#[cfg(test)]
-use crate::messages::STREAM_ROUTE_QUIC;
-#[cfg(test)]
-use cgka_traits::app_event::{
-    MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, STREAM_ROUTE_TAG, STREAM_TAG,
-};
 
 #[derive(Clone)]
 pub struct MarmotAppRuntime {
@@ -393,7 +381,6 @@ pub struct RuntimeSharedServices {
     product_worker: Arc<StdMutex<Option<JoinHandle<()>>>>,
     diagnostics_executor: Arc<StdMutex<Option<tokio::runtime::Handle>>>,
     relay_plane: MarmotRelayPlane,
-    agent_streams: AgentStreamWatchManager,
     lifecycle: RuntimeLifecycle,
     relay_telemetry_exporter: Arc<StdMutex<Option<JoinHandle<()>>>>,
     relay_telemetry_runtime_config: Arc<StdMutex<RelayTelemetryRuntimeConfig>>,
@@ -503,7 +490,6 @@ impl Default for RuntimeSharedServices {
             observer: marmot_observability::Observer::default(),
             product_worker: Arc::new(StdMutex::new(None)),
             diagnostics_executor: Arc::new(StdMutex::new(None)),
-            agent_streams: AgentStreamWatchManager::default(),
             lifecycle: RuntimeLifecycle::new(),
             relay_telemetry_exporter: Arc::new(StdMutex::new(None)),
             relay_telemetry_runtime_config: Arc::new(StdMutex::new(
@@ -609,7 +595,6 @@ impl RuntimeSharedServices {
             observer: marmot_observability::Observer::sharing(&app.product_analytics),
             product_worker: Arc::new(StdMutex::new(None)),
             diagnostics_executor: Arc::new(StdMutex::new(None)),
-            agent_streams: AgentStreamWatchManager::default(),
             lifecycle,
             relay_telemetry_exporter: Arc::new(StdMutex::new(None)),
             relay_telemetry_runtime_config: Arc::new(StdMutex::new(
@@ -635,10 +620,6 @@ impl RuntimeSharedServices {
 
     pub fn app_performance_telemetry(&self) -> AppPerformanceTelemetry {
         AppPerformanceTelemetry::clone(self.observer.performance())
-    }
-
-    pub fn agent_streams(&self) -> AgentStreamWatchManager {
-        self.agent_streams.clone()
     }
 
     /// Test-only hook: install the barrier the detached post-create-group
@@ -855,6 +836,9 @@ struct RuntimeLifecycleInner {
     stopping: AtomicBool,
     running: AtomicBool,
     stop_tx: watch::Sender<bool>,
+    /// When shutdown began: Welcome waves in flight get the shutdown bound
+    /// from here (mdk#3466 L3).
+    shutdown_began: std::sync::OnceLock<tokio::time::Instant>,
     active_account_opens: AtomicUsize,
     account_opens_drained: Notify,
 }
@@ -872,6 +856,7 @@ impl RuntimeLifecycle {
                 stopping: AtomicBool::new(false),
                 running: AtomicBool::new(false),
                 stop_tx,
+                shutdown_began: std::sync::OnceLock::new(),
                 active_account_opens: AtomicUsize::new(0),
                 account_opens_drained: Notify::new(),
             }),
@@ -879,12 +864,28 @@ impl RuntimeLifecycle {
     }
 
     pub(crate) fn begin_shutdown(&self) -> bool {
+        // Record the start before the latch, so every caller that sees the
+        // runtime stopping, a concurrent one included, sees the same
+        // Welcome-wave deadline (mdk#3466 L3).
+        self.inner
+            .shutdown_began
+            .get_or_init(tokio::time::Instant::now);
         let was_stopping = self.inner.stopping.swap(true, Ordering::AcqRel);
         self.inner.running.store(false, Ordering::Release);
         if !was_stopping {
             self.inner.stop_tx.send_replace(true);
         }
         !was_stopping
+    }
+
+    /// When the Welcome waves still in flight are cancelled: the shutdown
+    /// bound after shutdown began, shared by the runtime and every worker
+    /// (mdk#3466 L3). None before shutdown begins.
+    pub(crate) fn welcome_wave_deadline(&self) -> Option<tokio::time::Instant> {
+        self.inner
+            .shutdown_began
+            .get()
+            .map(|began| *began + WELCOME_WAVE_SHUTDOWN_WAIT)
     }
 
     pub(crate) fn mark_running(&self) {
@@ -1049,12 +1050,11 @@ pub struct ManagedAccount {
 /// [`MarmotAppRuntime::sign_out_and_wipe`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WipeOutcome {
-    /// Active MLS groups whose local leave call succeeded, not confirmed removal,
-    /// except a chat whose leave the sign-out waits for (an admin chat the
-    /// account steps down in, or one this device was already leaving), which
-    /// counts only once this device sees its removal (mdk#2818).
-    /// A chat this device is no longer in, its copy removed or disbanded, is
-    /// neither counted nor reported as a failure.
+    /// Active MLS groups whose member Leave completed its submission.
+    /// Queued member Leaves appear in `group_leave_failures`.
+    /// An admin Leave or an already pending Leave counts once the device
+    /// sees its removal. A peer must commit a member's SelfRemove to remove it.
+    /// Chats already removed from this device or disbanded are skipped.
     pub groups_left: u32,
     /// Per-group leave failures. Best-effort: the wipe does not abort on these.
     pub group_leave_failures: Vec<GroupLeaveFailure>,
@@ -1214,7 +1214,9 @@ pub(crate) fn wipe_failure_reason(err: &AppError) -> String {
             return "transport error".to_owned();
         }
         AppError::TransportClosed => "transport error",
-        AppError::Publish(_) | AppError::EventTooLarge { .. } => "relay publish failed",
+        AppError::Publish(_) | AppError::EventTooLarge { .. } | AppError::NoUsableRelay => {
+            "relay publish failed"
+        }
         AppError::Storage(_) | AppError::Sqlite(_) | AppError::SqlcipherKeyDerivation(_) => {
             "local storage error"
         }
@@ -1486,38 +1488,21 @@ pub struct RuntimeAccountError {
     pub message: String,
 }
 
-/// A kind-1200 agent-text-stream **start** observed in a group. The inner
-/// event's stream metadata lives on `message.tags`; clients use it to open the
-/// ephemeral QUIC preview. Raw message subscribers receive this as
-/// [`RuntimeMessageUpdate::AgentStreamStarted`]; materialized timeline
-/// subscribers see the same kind-1200 as a timeline row. The eventual kind-9
-/// stream-final flows as a normal [`RuntimeMessageUpdate::Message`] carrying
-/// `stream`/`stream-start` tags.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RuntimeAgentStreamMessage {
-    pub account_id_hex: String,
-    pub account_label: String,
-    pub message: ReceivedMessage,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuntimeMessageUpdate {
     Message(RuntimeMessageReceived),
-    AgentStreamStarted(RuntimeAgentStreamMessage),
 }
 
 impl RuntimeMessageUpdate {
     pub fn account_id_hex(&self) -> &str {
         match self {
             Self::Message(update) => &update.account_id_hex,
-            Self::AgentStreamStarted(update) => &update.account_id_hex,
         }
     }
 
     pub fn message(&self) -> &ReceivedMessage {
         match self {
             Self::Message(update) => &update.message,
-            Self::AgentStreamStarted(update) => &update.message,
         }
     }
 }
@@ -1538,7 +1523,6 @@ pub enum MarmotAppEvent {
         group_id: GroupId,
     },
     MessageReceived(RuntimeMessageReceived),
-    AgentStreamStarted(RuntimeAgentStreamMessage),
     ProjectionUpdated(RuntimeProjectionUpdate),
     GroupEvent(RuntimeGroupEvent),
     AccountError(RuntimeAccountError),
@@ -2075,13 +2059,38 @@ impl MarmotAppRuntime {
     /// different accounts can create separate groups, each with both participants
     /// as admins.
     /// See [`Self::pending_welcome_deliveries`] for delivery failures.
+    ///
+    /// Equivalent to [`Self::start_direct_conversation_with_options`] with
+    /// default options: a new group has disappearing messages disabled.
     pub async fn start_direct_conversation(
         &self,
         account_ref: &str,
         peer_account_id: &str,
     ) -> Result<GroupId, AppError> {
+        self.start_direct_conversation_with_options(
+            account_ref,
+            peer_account_id,
+            crate::DirectConversationOptions::default(),
+        )
+        .await
+    }
+
+    /// [`Self::start_direct_conversation`] with founding options for a new
+    /// group. A nonzero `disappearing_message_secs` is written into the
+    /// founding MLS state and Welcome, with no follow-up retention commit.
+    /// Options never change a reused or retried conversation: its group id,
+    /// duration and roles stay as founded, whatever duration the retry
+    /// proposes. A nonzero duration also requires the peer's KeyPackages to
+    /// support message retention, exactly as [`Self::create_group_with_options`]
+    /// does; a peer without it fails the start and nothing is created.
+    pub async fn start_direct_conversation_with_options(
+        &self,
+        account_ref: &str,
+        peer_account_id: &str,
+        options: crate::DirectConversationOptions,
+    ) -> Result<GroupId, AppError> {
         self.accounts
-            .start_direct_conversation(account_ref, peer_account_id)
+            .start_direct_conversation(account_ref, peer_account_id, options)
             .await
     }
 
@@ -2488,21 +2497,6 @@ impl MarmotAppRuntime {
             .export_encrypted_secret_key(account_ref, passphrase, caller_context)
     }
 
-    pub async fn agent_text_stream_exporter_secret(
-        &self,
-        account_ref: &str,
-        group_id: &GroupId,
-    ) -> Result<SecretBytes, AppError> {
-        self.accounts
-            .exporter_secret(
-                account_ref,
-                group_id,
-                AGENT_TEXT_STREAM_EXPORTER_CACHE_KEY,
-                32,
-            )
-            .await
-    }
-
     pub async fn invite_members(
         &self,
         account_ref: &str,
@@ -2630,8 +2624,8 @@ impl MarmotAppRuntime {
 
     /// This account's own devices, from the roster of the device group this
     /// device trusts: this device first, then by when each was linked. Empty
-    /// until this device trusts a device group, and without explicit dev
-    /// capability and runtime intent. Refresh on `LinkedDevicesChanged`.
+    /// until this device trusts a device group, and unless the host
+    /// turns device groups on. Refresh on `LinkedDevicesChanged`.
     /// An unreadable roster is `DeviceGroupRefused("roster_unavailable")`.
     pub async fn linked_devices(
         &self,
@@ -2661,8 +2655,8 @@ impl MarmotAppRuntime {
     /// inviters stop treating it as fresh, so a host warns the user. True
     /// once its publication is a week old with the refresh still held back;
     /// a routine refresh never shows.
-    /// Always false until this device trusts a device group, and without
-    /// explicit dev capability and runtime intent. Refresh on
+    /// Always false until this device trusts a device group, and unless the
+    /// host turns device groups on. Refresh on
     /// `KeyPackageRefreshOverdueChanged`.
     pub async fn key_package_refresh_overdue(&self, account_ref: &str) -> Result<bool, AppError> {
         self.accounts.key_package_refresh_overdue(account_ref).await
@@ -2673,8 +2667,8 @@ impl MarmotAppRuntime {
     /// KeyPackage in a slot neither this device nor its device group's roster
     /// knows. One that `before_this_device` was signed in before this device
     /// was; ask whether the user still has it. Any other is new; ask whether
-    /// it was them. Always empty without explicit dev capability and runtime
-    /// intent. Refresh on `UnrecognizedSignInsChanged`.
+    /// it was them. Always empty unless the host turns device groups
+    /// on. Refresh on `UnrecognizedSignInsChanged`.
     pub async fn unrecognized_sign_ins(
         &self,
         account_ref: &str,
@@ -2723,7 +2717,7 @@ impl MarmotAppRuntime {
 
     /// Whether this device started fresh and still has no device group, so
     /// the host can say that only chats it is invited to from now on are
-    /// here. Always false without explicit dev capability and runtime intent.
+    /// here. Always false unless the host turns device groups on.
     /// Refresh on `UnrecognizedSignInsChanged`.
     pub async fn started_fresh(&self, account_ref: &str) -> Result<bool, AppError> {
         self.accounts.started_fresh(account_ref).await
@@ -2736,8 +2730,8 @@ impl MarmotAppRuntime {
     /// a session with its remote signer, published where the account's
     /// devices did not; the host writes the wording and never says the
     /// account's devices stopped them. Rejections already in the first
-    /// roster this device trusts count as seen. Always empty without explicit
-    /// dev capability and runtime intent. Refresh on
+    /// roster this device trusts count as seen. Always empty unless the host
+    /// turns device groups on. Refresh on
     /// `CompromiseWarningChanged`.
     pub async fn compromise_warning(
         &self,
@@ -2829,8 +2823,8 @@ impl MarmotAppRuntime {
     /// longer has, because the chat doesn't take a same-account removal; a
     /// chat admin can remove it. The device is one this account removed, or
     /// one its device group stopped listing, as after a failed link. Zero
-    /// until this device trusts a device group, and without explicit dev
-    /// capability and runtime intent. Read it when showing the
+    /// until this device trusts a device group, and unless the host
+    /// turns device groups on. Read it when showing the
     /// device list; it is not evented.
     pub async fn removed_device_leftover_chats(&self, account_ref: &str) -> Result<u32, AppError> {
         self.accounts
@@ -2849,8 +2843,8 @@ impl MarmotAppRuntime {
     /// KeyPackages don't meet is passed over and not counted, so zero
     /// does not mean the new device reaches every chat. A chat admin can
     /// turn the component on; removing a device frees its leaves.
-    /// Zero until this device trusts a device group, and without explicit
-    /// dev capability and runtime intent. Read it when
+    /// Zero until this device trusts a device group, and unless the host
+    /// turns device groups on. Read it when
     /// showing the device list; it is not evented.
     pub async fn chats_closed_to_linked_devices(&self, account_ref: &str) -> Result<u32, AppError> {
         self.accounts
@@ -3075,6 +3069,65 @@ impl MarmotAppRuntime {
     ) -> Result<Option<crate::GroupCommitDelivery>, AppError> {
         self.accounts
             .group_commit_delivery(account_ref, group_id)
+            .await
+    }
+
+    /// The group's changes of yours that were not applied (mdk#2332), oldest
+    /// first. Each one's call got an unresolved answer (`CompletionUnknown`,
+    /// or a queued change's `AcceptedPending`), and its commit was then rolled
+    /// back: no relay received it, none would take it, or every relay refused
+    /// it. Nothing reached members and MDK does not send it again. A record
+    /// stays until [`Self::acknowledge_change_not_delivered`] or the group's
+    /// local state is removed; another change confirming does not clear it.
+    /// A direct change is also announced by
+    /// [`GroupEvent::GroupChangeNotDelivered`] and a queued one by
+    /// [`GroupEvent::QueuedIntentRefused`], but the events are only
+    /// notifications: read this on start to catch any you missed. A local
+    /// read.
+    ///
+    /// [`GroupEvent::GroupChangeNotDelivered`]: cgka_traits::engine::GroupEvent::GroupChangeNotDelivered
+    /// [`GroupEvent::QueuedIntentRefused`]: cgka_traits::engine::GroupEvent::QueuedIntentRefused
+    pub async fn group_changes_not_delivered(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<Vec<crate::GroupChangeNotDelivered>, AppError> {
+        self.accounts
+            .group_changes_not_delivered(account_ref, group_id)
+            .await
+    }
+
+    /// The group's own commit that has not confirmed yet, if any (mdk#2332).
+    /// It is `Sending`, or `Stuck` once it is ten minutes past its first
+    /// attempt while some relay may hold it and none has acknowledged it:
+    /// MDK keeps sending it and never gives it up. While it is pending, group
+    /// changes fail with [`AppError::GroupCommitPending`]; disbanding and an
+    /// admin's leave are still accepted. It ends by confirming, which needs
+    /// no signal, or by being given up, which
+    /// [`Self::group_changes_not_delivered`] records for a change of yours.
+    /// Poll while showing it. A local read.
+    pub async fn group_pending_commit(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<Option<crate::GroupPendingCommit>, AppError> {
+        self.accounts
+            .group_pending_commit(account_ref, group_id)
+            .await
+    }
+
+    /// Delete one of [`Self::group_changes_not_delivered`] by its
+    /// `commit_id_hex` once the user has seen it (mdk#2332). Returns false,
+    /// changing nothing, when the group holds no such record. A malformed id
+    /// is an `AppError::Hex`.
+    pub async fn acknowledge_change_not_delivered(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        commit_id_hex: &str,
+    ) -> Result<bool, AppError> {
+        self.accounts
+            .acknowledge_change_not_delivered(account_ref, group_id, commit_id_hex)
             .await
     }
 
@@ -3393,7 +3446,10 @@ impl MarmotAppRuntime {
     /// edit, delete, agent, group system, push token) are rejected so an app
     /// cannot forge protocol events. Custom events project into the timeline
     /// as standalone rows with the `custom_event` trigger but do not bump the
-    /// chat-list preview or raise push notifications.
+    /// chat-list preview or raise push notifications. A kind-1111 thread
+    /// message (a lowercase `e` naming its parent) is the exception: it is chat
+    /// activity like kind 9. New code sends those with
+    /// [`Self::send_thread_message`].
     pub async fn send_custom_event(
         &self,
         account_ref: &str,
@@ -3532,6 +3588,22 @@ impl MarmotAppRuntime {
         attachments: Vec<MessageDraftAttachment>,
     ) -> Result<crate::SelectedMessageDraft, AppError> {
         self.accounts.app.save_message_draft_if_revision(
+            account,
+            expected,
+            content,
+            reply,
+            attachments,
+        )
+    }
+    pub fn save_message_draft_inputs_if_revision(
+        &self,
+        account: &str,
+        expected: &crate::MessageDraftRevision,
+        content: &str,
+        reply: Option<&str>,
+        attachments: Vec<crate::MessageDraftAttachmentInput>,
+    ) -> Result<crate::SelectedMessageDraft, AppError> {
+        self.accounts.app.save_message_draft_inputs_if_revision(
             account,
             expected,
             content,
@@ -4294,6 +4366,7 @@ impl MarmotAppRuntime {
                 AppMessageIntent::Reply {
                     target_message_id: target_message_id.to_owned(),
                     text: text.to_owned(),
+                    tags: Vec::new(),
                 },
             )
             .await?;
@@ -4352,7 +4425,8 @@ impl MarmotAppRuntime {
     /// text. Recipients honor an edit only when its authenticated author
     /// matches the target's author. As a fail-fast check against this device's
     /// current view, the send refuses with [`AppError::InvalidEditTarget`]
-    /// unless the target is an available chat message this account sent;
+    /// unless the target is an available chat or NIP-22 comment this account sent
+    /// (kind 1111 with a numeric lowercase `k` or a lowercase `e` tag);
     /// recipients remain authoritative. Competing edits resolve by `created_at`,
     /// then the larger event id. The chat-list preview is
     /// intentionally left untouched so an edit doesn't reorder the
@@ -4371,6 +4445,7 @@ impl MarmotAppRuntime {
                 AppMessageIntent::Edit {
                     target_message_id: target_message_id.to_owned(),
                     content: content.to_owned(),
+                    tags: Vec::new(),
                 },
             )
             .await
@@ -4430,6 +4505,44 @@ impl MarmotAppRuntime {
                     message_tags,
                     attachments,
                     caption,
+                },
+            )
+            .await?;
+        let _ = self.publish_chat_list_projection_refresh(
+            account_ref,
+            &hex::encode(group_id.as_slice()),
+            ChatListUpdateTrigger::NewLastMessage,
+        );
+        Ok(summary)
+    }
+
+    /// Send a NIP-22 thread message (kind 1111) answering `parent_message_id`:
+    /// text, already-uploaded attachments, or both, plus application tags
+    /// such as NIP-30 `emoji`. MDK finds the parent's thread in this device's
+    /// timeline and builds the `E`/`K`/`P` root and `e`/`k` parent tags;
+    /// callers cannot pass those. An inline reply stays
+    /// [`Self::reply_to_message`] (kind 9), also when it answers a thread
+    /// message.
+    pub async fn send_thread_message(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        parent_message_id: &str,
+        content: String,
+        attachments: Vec<MediaAttachmentReference>,
+        message_tags: Vec<Vec<String>>,
+    ) -> Result<SendSummary, AppError> {
+        let summary = self
+            .accounts
+            .send_app_event(
+                account_ref,
+                group_id,
+                AppMessageIntent::ThreadMessage {
+                    parent_message_id: parent_message_id.to_owned(),
+                    content,
+                    attachments,
+                    message_tags,
+                    placement: None,
                 },
             )
             .await?;
@@ -4503,7 +4616,10 @@ impl MarmotAppRuntime {
     }
 
     /// Welcomes a confirmed create/invite could not deliver and that still await
-    /// re-delivery for `account_ref` (mdk#352), oldest first.
+    /// re-delivery for `account_ref` (mdk#352), oldest first. The read waits
+    /// for the Welcome deliveries already under way when the account worker
+    /// takes it up (mdk#3466), so after a create or invite returns it reports
+    /// that delivery's first attempt.
     pub async fn pending_welcome_deliveries(
         &self,
         account_ref: &str,
@@ -4524,64 +4640,6 @@ impl MarmotAppRuntime {
             .await
     }
 
-    /// Anchor a kind-1200 agent text stream start. The `created_at` argument is
-    /// retained for call-site stability; the worker stamps the inner event with
-    /// its own clock so the canonical id matches the authoring time. Returns the
-    /// built inner event (its tags carry the stream id, route, and brokers).
-    pub async fn start_agent_text_stream(
-        &self,
-        account_ref: &str,
-        group_id: &GroupId,
-        stream_id: &[u8],
-        created_at: u64,
-        quic_candidates: Vec<String>,
-    ) -> Result<(MarmotInnerEvent, SendSummary), AppError> {
-        self.start_agent_text_stream_with_parent(
-            account_ref,
-            group_id,
-            stream_id,
-            created_at,
-            None,
-            quic_candidates,
-        )
-        .await
-    }
-
-    /// Anchor a kind-1200 agent text stream start, optionally threading it to the
-    /// inbound message that triggered the agent turn.
-    pub async fn start_agent_text_stream_with_parent(
-        &self,
-        account_ref: &str,
-        group_id: &GroupId,
-        stream_id: &[u8],
-        _created_at: u64,
-        parent_message_id: Option<String>,
-        quic_candidates: Vec<String>,
-    ) -> Result<(MarmotInnerEvent, SendSummary), AppError> {
-        self.accounts
-            .start_agent_text_stream(
-                account_ref,
-                group_id,
-                stream_id.to_vec(),
-                parent_message_id,
-                quic_candidates,
-            )
-            .await
-    }
-
-    /// Send the kind-9 stream-final chat carrying `stream`/`stream-hash`/
-    /// `stream-chunks` tags. Returns the built inner event.
-    pub async fn finish_agent_text_stream(
-        &self,
-        account_ref: &str,
-        group_id: &GroupId,
-        request: AgentTextStreamFinishRequest,
-    ) -> Result<(MarmotInnerEvent, SendSummary), AppError> {
-        self.accounts
-            .finish_agent_text_stream(account_ref, group_id, request)
-            .await
-    }
-
     pub async fn publish_key_package(&self, account_ref: &str) -> Result<usize, AppError> {
         self.accounts.publish_key_package(account_ref).await
     }
@@ -4590,7 +4648,7 @@ impl MarmotAppRuntime {
     /// device: ask a device already signed in to link this one. When this
     /// device already trusts a group, the confirmed link moves only this
     /// device to the answering group, keeping old trust until Made. Refused unless
-    /// the build has `unreleased-device-pairing` and device groups are on.
+    /// the host turns device groups on.
     pub async fn start_device_link(
         &self,
         account_ref: &str,
@@ -5052,6 +5110,8 @@ impl MarmotAppRuntime {
     ///    each counts as left only once this device sees the commit that
     ///    removes it (mdk#2818). It keeps its leaf, and reports why, in any
     ///    other chat its account is an active admin of.
+    ///    A new member Leave still in the outbound queue is reported as
+    ///    unfinished before the wipe proceeds.
     /// 2. Best-effort deletion of this device's KeyPackage slot, always (no
     ///    toggle): one kind 5 naming only that slot, so the account's other
     ///    devices keep theirs.
@@ -5192,6 +5252,12 @@ impl MarmotAppRuntime {
                 {
                     Ok(SignOutLeave::Left) => outcome.groups_left += 1,
                     Ok(SignOutLeave::Recorded) => waiting.push((group_id, group_id_hex)),
+                    Ok(SignOutLeave::Unfinished) => {
+                        outcome.group_leave_failures.push(GroupLeaveFailure {
+                            group_id_hex,
+                            reason: "leave was still queued".to_owned(),
+                        });
+                    }
                     Ok(SignOutLeave::Kept(kept)) => {
                         outcome.group_leave_failures.push(GroupLeaveFailure {
                             group_id_hex,
@@ -5662,6 +5728,61 @@ impl MarmotAppRuntime {
         follows.sort();
         follows.dedup();
         Ok(follows)
+    }
+
+    /// Network-free, keyset-paged availability of this account's direct follows.
+    pub fn follow_availability_page(
+        &self,
+        account_ref: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<crate::FollowAvailabilityPage, AppError> {
+        let account = self.accounts.resolve(account_ref)?;
+        Ok(self.accounts.app.directory().follow_availability_page(
+            &directory_account(&account),
+            after,
+            limit,
+        )?)
+    }
+
+    /// Refresh direct-follow availability without occupying an account worker.
+    pub async fn refresh_follow_availability(
+        &self,
+        account_ref: &str,
+    ) -> Result<crate::FollowAvailabilityRefreshStatus, AppError> {
+        let account = self.accounts.resolve(account_ref)?;
+        Ok(self
+            .accounts
+            .app
+            .directory()
+            .refresh_follow_availability(&directory_account(&account))
+            .await?)
+    }
+
+    pub fn follow_availability_status(
+        &self,
+        account_ref: &str,
+    ) -> Result<crate::FollowAvailabilityRefreshStatus, AppError> {
+        let account = self.accounts.resolve(account_ref)?;
+        Ok(self
+            .accounts
+            .app
+            .directory()
+            .follow_availability_status(&account.account_id_hex))
+    }
+
+    /// Cancel only the operation the caller observed. Committed rows remain readable.
+    pub fn cancel_follow_availability(
+        &self,
+        account_ref: &str,
+        operation_id: u64,
+    ) -> Result<bool, AppError> {
+        let account = self.accounts.resolve(account_ref)?;
+        Ok(self
+            .accounts
+            .app
+            .directory()
+            .cancel_follow_availability(&account.account_id_hex, operation_id))
     }
 
     /// Network-free cached previews of public events referenced from message
@@ -6700,6 +6821,17 @@ impl MarmotAppRuntime {
             self.accounts.shutdown().await;
         };
         let relay_plane = async {
+            // Welcome waves publish through the relay plane: keep it up
+            // until none counts or the shutdown bound passes (mdk#3466 L3).
+            // A create's or invite's wave counts from before its host was
+            // answered, so a shutdown begun from that answer waits for it.
+            if let Some(deadline) = self.shared.lifecycle().welcome_wave_deadline() {
+                self.accounts
+                    .app
+                    .welcome_waves_in_flight
+                    .ended_by(deadline)
+                    .await;
+            }
             #[cfg(test)]
             self.stall_shutdown_phase_for_test(ShutdownTestPhase::RelayPlane)
                 .await;
@@ -6765,6 +6897,14 @@ impl MarmotAppRuntime {
     /// statement holding a connection guard and rolls an uncommitted
     /// transaction back on close; later work sees `Closed` and cannot reopen
     /// storage.
+    ///
+    /// Welcome waves still publishing, or about to after their create or
+    /// invite answered, keep the relay plane up in the graceful
+    /// phase, until none counts or `WELCOME_WAVE_SHUTDOWN_WAIT` after shutdown
+    /// began (mdk#3466 L3), so the close never waits for them. A wave that
+    /// settles there meets closed storage: a Welcome it delivered stays owed,
+    /// and the next start sends it once more. A recipient who already joined
+    /// drops that duplicate.
     ///
     /// **Terminal.** This runtime and the [`MarmotApp`] it came from are done:
     /// every later database access fails with
@@ -6879,9 +7019,9 @@ fn is_transient_account_catch_up_error(error: &AppError) -> bool {
 }
 
 async fn run_account_catch_up_pass(
-    commands: Vec<mpsc::Sender<AccountWorkerCommand>>,
+    commands: Vec<WorkerCommands>,
     response_wait: Duration,
-) -> Vec<(mpsc::Sender<AccountWorkerCommand>, Result<(), AppError>)> {
+) -> Vec<(WorkerCommands, Result<(), AppError>)> {
     let mut responses = Vec::with_capacity(commands.len());
     let mut outcomes = Vec::with_capacity(commands.len());
     for command in commands {
@@ -6915,7 +7055,7 @@ async fn run_account_catch_up_pass(
 }
 
 async fn catch_up_account_commands_with_retry(
-    commands: Vec<mpsc::Sender<AccountWorkerCommand>>,
+    commands: Vec<WorkerCommands>,
     response_wait: Duration,
     retry_delays: &[Duration],
 ) -> Result<(), AppError> {
@@ -7977,7 +8117,9 @@ impl AccountManager {
                     );
                     let (shutdown_tx, shutdown_rx) = oneshot::channel();
                     let (command_tx, command_rx) = mpsc::channel(8);
-                    let unit = Arc::new(WorkerUnitGauge::default());
+                    let unit = Arc::new(WorkerUnitGauge::recording(
+                        self.shared.observer.performance().clone(),
+                    ));
                     let (read_state_tx, read_state) = read_state_channel();
                     let (unlinked_tx, unlinked_rx) = oneshot::channel();
                     self.deactivate_when_unlinked(
@@ -7998,7 +8140,6 @@ impl AccountManager {
                             unit: unit.clone(),
                             read_state: read_state_tx,
                         },
-                        command_tx.clone(),
                         command_rx,
                         ready_tx,
                         startup_progress.clone(),
@@ -8009,7 +8150,7 @@ impl AccountManager {
                         ManagedAccountWorker {
                             ready: false,
                             handle,
-                            commands: command_tx,
+                            commands: WorkerCommands::observed(command_tx, unit.clone()),
                             media_admission: Arc::new(Semaphore::new(MEDIA_COMMAND_QUEUE_LIMIT)),
                             shutdown: shutdown_tx,
                             unit,
@@ -8219,7 +8360,7 @@ impl AccountManager {
         Ok(())
     }
 
-    async fn running_account_commands(&self) -> Vec<mpsc::Sender<AccountWorkerCommand>> {
+    async fn running_account_commands(&self) -> Vec<WorkerCommands> {
         self.workers
             .lock()
             .await
@@ -8233,7 +8374,7 @@ impl AccountManager {
 
     async fn catch_up_account_commands(
         &self,
-        commands: Vec<mpsc::Sender<AccountWorkerCommand>>,
+        commands: Vec<WorkerCommands>,
     ) -> Result<(), AppError> {
         self.shared.lifecycle().ensure_running()?;
         catch_up_account_commands_with_retry(
@@ -8411,10 +8552,7 @@ impl AccountManager {
             .await
     }
 
-    async fn worker_commands(
-        &self,
-        account_ref: &str,
-    ) -> Result<mpsc::Sender<AccountWorkerCommand>, AppError> {
+    async fn worker_commands(&self, account_ref: &str) -> Result<WorkerCommands, AppError> {
         self.worker_lane(account_ref)
             .await
             .map(|lane| lane.commands)
@@ -8438,14 +8576,7 @@ impl AccountManager {
         &self,
         account_ref: &str,
         class: ReadClass,
-    ) -> Result<
-        (
-            mpsc::Sender<AccountWorkerCommand>,
-            ReadReply<T>,
-            oneshot::Receiver<T>,
-        ),
-        AppError,
-    > {
+    ) -> Result<(WorkerCommands, ReadReply<T>, oneshot::Receiver<T>), AppError> {
         let lane = self.worker_lane(account_ref).await?;
         let (respond, response) = lane.read_reply(self.shared.observer.performance(), class);
         Ok((lane.commands, respond, response))
@@ -8473,7 +8604,7 @@ impl AccountManager {
     async fn worker_commands_for_setup(
         &self,
         account_ref: &str,
-    ) -> Result<mpsc::Sender<AccountWorkerCommand>, AppError> {
+    ) -> Result<WorkerCommands, AppError> {
         self.shared.lifecycle().ensure_running()?;
         let account = self.resolve(account_ref)?;
         self.worker_commands_for_account(account)
@@ -8484,7 +8615,7 @@ impl AccountManager {
     async fn media_worker_commands(
         &self,
         account_ref: &str,
-    ) -> Result<(mpsc::Sender<AccountWorkerCommand>, OwnedSemaphorePermit), AppError> {
+    ) -> Result<(WorkerCommands, OwnedSemaphorePermit), AppError> {
         self.shared.lifecycle().ensure_running()?;
         let account = self.resolve(account_ref)?;
         self.setup_records()

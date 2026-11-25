@@ -137,9 +137,9 @@ class HandoverTests(unittest.TestCase):
         self.assertIn("--messaging-home",unit)
         self.assertIn("CODR_SERVICE_NAME="+update.WORKER,unit)
 
-    def test_legacy_handover_cannot_open_the_new_017_storage_cohort(self):
-        self.info["storage_cohort"] = "mdk-0.17"
-        self.info["connector"]["version"] = "0.17.0"
+    def test_legacy_handover_cannot_open_the_new_019_storage_cohort(self):
+        self.info["storage_cohort"] = "mdk-0.19"
+        self.info["connector"]["version"] = "0.19.0"
         before = (self.account / "session.sqlite").read_bytes()
         self.assertEqual(self.perform()["status"], "failed")
         self.assertFalse(any("stop" in call or "start" in call for call in self.calls))

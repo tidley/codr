@@ -600,31 +600,55 @@ impl AppClient {
                 // A removed or disbanded copy never converges again, so a rival
                 // its removal left unresolved stays pending for good; waking
                 // the copy for it would do nothing.
-                if self.runtime.has_pending_convergence_inputs(group_id)?
+                let pending_inputs = self.runtime.has_pending_convergence_inputs(group_id)?;
+                let checking_handoff = !pending_inputs
+                    && matches!(
+                        self.runtime.epoch_state(group_id),
+                        Some(cgka_traits::EpochState::Stable { .. })
+                    )
+                    && self.has_epoch_gap_handoff(group_id);
+                let deferred_delay = if checking_handoff {
+                    self.runtime.deferred_peel_cutoff_delay_ms(group_id)?
+                } else {
+                    None
+                };
+                let replay_due = checking_handoff && deferred_delay == Some(0);
+                // Secondary replication cannot withhold inbound replay or its handoff.
+                if checking_handoff && deferred_delay != Some(0) {
+                    self.finish_epoch_gap_handoff(group_id)?;
+                }
+                if pending_inputs
                     && !self
                         .runtime
                         .group_record(group_id)
                         .is_ok_and(|group| group.is_terminal())
                 {
-                    Ok(ConvergenceScheduleState::PendingUnopenable)
-                } else if self.runtime.has_queued_outbound_intents(group_id)?
-                    && !self
+                    return Ok(ConvergenceScheduleState::PendingUnopenable);
+                }
+                let queued_outbound = self.runtime.has_queued_outbound_intents(group_id)?;
+                let fanouts_block_work = (replay_due || queued_outbound)
+                    && self
                         .runtime
-                        .queued_outbound_intents_blocked_by_fanouts(group_id)?
-                {
+                        .queued_outbound_intents_blocked_by_fanouts(group_id)?;
+                if replay_due && !fanouts_block_work {
+                    return Ok(ConvergenceScheduleState::Ready);
+                }
+                if queued_outbound && !fanouts_block_work {
                     // Restarted queued sends must get their ordinary wake even
                     // when secondary replication retains a longer retry cutoff.
                     // The drain uses the same durable publication safety gate.
                     Ok(ConvergenceScheduleState::PendingOutbound {
                         retry_after_ms: None,
                     })
-                } else if self.runtime.has_pending_outbound_fanouts(group_id)? {
+                } else if fanouts_block_work
+                    || self.runtime.has_pending_outbound_fanouts(group_id)?
+                {
                     // Required publication and pending MLS still gate queued
                     // sends. Other local mutations retain fanout precedence.
                     Ok(ConvergenceScheduleState::PendingOutbound {
                         retry_after_ms: self.runtime.outbound_fanout_retry_delay_ms(group_id)?,
                     })
-                } else if self.runtime.has_queued_outbound_intents(group_id)?
+                } else if queued_outbound
                     || (matches!(
                         self.runtime.epoch_state(group_id),
                         Some(cgka_traits::EpochState::Stable { .. })
@@ -653,7 +677,11 @@ impl AppClient {
                     let lifecycle_delay = self
                         .runtime
                         .scheduled_self_remove_auto_commit_delay_ms(group_id)?;
-                    let deferred_delay = self.runtime.deferred_peel_cutoff_delay_ms(group_id)?;
+                    let deferred_delay = if checking_handoff {
+                        deferred_delay
+                    } else {
+                        self.runtime.deferred_peel_cutoff_delay_ms(group_id)?
+                    };
                     match lifecycle_delay.into_iter().chain(deferred_delay).min() {
                         Some(0) => Ok(ConvergenceScheduleState::Ready),
                         Some(remaining_ms) => {
@@ -848,7 +876,10 @@ impl AppClient {
         &mut self,
         rebuild_since: Option<cgka_traits::transport::Timestamp>,
     ) -> Result<(), AppError> {
-        self.runtime.sync_transport_groups(rebuild_since).await?;
+        let step = self.lane_step(RuntimeOp::RouteRefresh);
+        let applied = self.runtime.sync_transport_groups(rebuild_since).await;
+        step.finish(&applied);
+        applied?;
         self.synchronize_native_replay().await?;
         self.warm_encrypted_media_epoch_secrets("post_subscription_sync");
         Ok(())
@@ -1111,13 +1142,16 @@ impl AppClient {
             )
             .into());
         }
-        self.relay_plane
+        let step = self.lane_step(RuntimeOp::RelayReconnect);
+        let reconnected = self
+            .relay_plane
             .reconnect_relay(
                 self.adapter.account_id(),
                 cgka_traits::TransportEndpoint(canonical_url),
             )
-            .await
-            .map_err(AppError::from)
+            .await;
+        step.finish(&reconnected);
+        reconnected.map_err(AppError::from)
     }
 
     pub(crate) async fn prepare_transport(&mut self) -> Result<(), AppError> {
@@ -1456,6 +1490,16 @@ impl AppClient {
             }
         };
         summary.merge(drained);
+        if self.has_in_place_recovery_runner() {
+            self.queue_epoch_gap_handoffs();
+        }
+        if let Err(error) = self.check_direct_epoch_handoffs() {
+            return Err(ClassifiedSyncFailure::at_stage(
+                summary,
+                error,
+                SyncFailureStage::Unknown,
+            ));
+        }
         self.drain_epoch_stall_escalations(&mut summary);
         Ok(summary)
     }
@@ -1624,10 +1668,11 @@ impl AppClient {
                     cgka_traits::engine::GroupEvent::GroupJoined {
                         group_id,
                         via_welcome,
+                        forwarded,
                         ..
-                    } => self.note_invitation_admission(group_id, Some(via_welcome))?,
+                    } => self.note_invitation_admission(group_id, Some(via_welcome), forwarded)?,
                     cgka_traits::engine::GroupEvent::GroupCreated { group_id } => {
-                        self.note_invitation_admission(group_id, None)?
+                        self.note_invitation_admission(group_id, None, &Default::default())?
                     }
                     _ => {}
                 }
@@ -2277,7 +2322,7 @@ impl AppClient {
     pub async fn next_event(&mut self) -> Result<SyncSummary, AppError> {
         loop {
             let mut native_changes = self.adapter.replay_changes().await;
-            if self.admit_native_turn().await? {
+            if self.admit_native_turn(None).await? {
                 self.retry_pending_runtime_group_subscription_refresh()
                     .await?;
                 let summary = self.take_pending_applied_sync_summary();
@@ -2442,8 +2487,7 @@ impl AppClient {
                     return Ok(transport_nostr::AccountDeliveryReceive::Overflow(overflow));
                 }
             };
-            let event_id = hex::encode(delivery.message.id.as_slice());
-            if self.transport_receipts()?.contains(&event_id) {
+            if self.transport_receipts()?.skips(&delivery)? {
                 self.record_durable_transport_reconciliation_delivery(&delivery);
                 self.adapter.release_account_delivery(&delivery.message.id);
                 self.settle_spilled_delivery();
@@ -2485,8 +2529,7 @@ impl AppClient {
         delivery: &cgka_traits::TransportDelivery,
         inventory_write: InventoryWrite,
     ) -> Result<(SyncSummary, RecoveredDelivery, Option<InventoryRecord>), AppError> {
-        let event_id = hex::encode(delivery.message.id.as_slice());
-        if self.transport_receipts()?.contains(&event_id) {
+        if self.transport_receipts()?.skips(delivery)? {
             let inventory_record = match inventory_write {
                 InventoryWrite::Immediate => {
                     self.record_durable_transport_reconciliation_delivery(delivery);
@@ -2703,7 +2746,8 @@ impl AppClient {
         let overflowed = loop {
             let mut native_changes = self.adapter.replay_changes().await;
             self.native_sync_deliveries = counts.deliveries;
-            let native_result = self.admit_native_turn().await;
+            // A drain's turns are part of the unit that runs the drain.
+            let native_result = self.admit_native_turn(None).await;
             counts.deliveries = self.native_sync_deliveries;
             let native_progress = match native_result {
                 Ok(progress) => progress,
@@ -2826,8 +2870,11 @@ impl AppClient {
                     .dev_fail_sync_before_delivery
                     .is_some_and(|limit| counts.deliveries >= limit);
             std::mem::swap(&mut self.pending_applied_sync_summary, &mut summary);
-            let receipts = match self.transport_receipts() {
-                Ok(receipts) => receipts,
+            let (receipts, skipped) = match self.transport_receipts().and_then(|mut receipts| {
+                let skipped = receipts.skips(&delivery)?;
+                Ok((receipts, skipped))
+            }) {
+                Ok(checked) => checked,
                 Err(error) => {
                     self.prepend_pending_applied_summary(&mut summary);
                     return Err(self
@@ -2842,8 +2889,7 @@ impl AppClient {
                         .await);
                 }
             };
-            let event_id = hex::encode(delivery.message.id.as_slice());
-            if receipts.contains(&event_id) {
+            if skipped {
                 self.record_durable_transport_reconciliation_delivery(&delivery);
                 self.adapter.release_account_delivery(&delivery.message.id);
                 counts.skipped = counts.skipped.saturating_add(1);
@@ -2914,7 +2960,7 @@ impl AppClient {
             // durable trace of must stay fetchable, so the relay re-serves it on
             // a later drain instead of this one skipping it as already seen.
             if !ingested.must_stay_fetchable {
-                self.remember_seen_event(event_id);
+                self.remember_seen_event(hex::encode(message_id.as_slice()));
             }
             counts.deliveries = counts.deliveries.saturating_add(1);
             if summary == SyncSummary::default() {
@@ -3423,10 +3469,12 @@ impl AppClient {
                 category: cgka_traits::InputRejectionCategory::NotAddressedToThisDevice,
             }
         ) {
+            let account_id_hex = hex::encode(client.runtime.self_id().as_slice());
+            client.app.sign_in_nudges.nudge(&account_id_hex);
             client
                 .app
-                .sign_in_nudges
-                .nudge(&hex::encode(client.runtime.self_id().as_slice()));
+                .device_group_wakes
+                .sign_in_nudged(&account_id_hex);
         }
         let queued = client.pending_applied_effects.len();
         client.retain_effect_projection(
@@ -4026,7 +4074,11 @@ impl AppClient {
         self.prune_plaintext_retention_for_group(group_id)?;
         self.save_state_with_pending_local_group_deletion_frontier_clears()?;
         self.publish_checkpointed_resumed_message_notifications()
-            .await
+            .await?;
+        if self.has_in_place_recovery_runner() {
+            self.convergence_schedule_state(group_id)?;
+        }
+        Ok(())
     }
 
     /// Dispatch only after source finalization and the account checkpoint. A
@@ -4045,10 +4097,11 @@ impl AppClient {
                 self.app
                     .reaction_target(&self.state.label, &hex::encode(group.as_slice()), &id)?;
             if message.is_some_and(|message| {
-                matches!(
+                (matches!(
                     message.kind,
                     MARMOT_APP_EVENT_KIND_CHAT | MARMOT_APP_EVENT_KIND_POLL
-                ) && !message.deleted
+                ) || message.thread_message)
+                    && !message.deleted
                     && !message.invalidated
             }) {
                 groups.insert(group.clone());
@@ -4202,7 +4255,7 @@ impl AppClient {
         ) else {
             return Ok(false);
         };
-        if message.kind != MARMOT_APP_EVENT_KIND_CHAT {
+        if !cgka_traits::is_chat_message(message.kind, &message.tags) {
             return Ok(false);
         }
         let group_id_hex = hex::encode(group_id.as_slice());
@@ -4283,13 +4336,15 @@ impl AppClient {
             }
             return Ok(());
         }
-        let retains_encrypted_media = matches!(
-            message.kind,
-            MARMOT_APP_EVENT_KIND_CHAT | MARMOT_APP_EVENT_KIND_REACTION
-        ) && media_imeta_tags_are_valid(
-            &message.tags,
-            self.app.allow_loopback_blob_endpoints(),
-        );
+        let retains_encrypted_media =
+            (matches!(
+                message.kind,
+                MARMOT_APP_EVENT_KIND_CHAT | MARMOT_APP_EVENT_KIND_REACTION
+            ) || crate::messages::is_nip22_comment(message.kind, &message.tags))
+                && media_imeta_tags_are_valid(
+                    &message.tags,
+                    self.app.allow_loopback_blob_endpoints(),
+                );
         if let Err(error) = self
             .app
             .directory()
@@ -5165,10 +5220,11 @@ impl AppClient {
                     cgka_traits::engine::GroupEvent::GroupJoined {
                         group_id,
                         via_welcome,
+                        forwarded,
                         ..
-                    } => self.note_invitation_admission(group_id, Some(via_welcome))?,
+                    } => self.note_invitation_admission(group_id, Some(via_welcome), forwarded)?,
                     cgka_traits::engine::GroupEvent::GroupCreated { group_id } => {
-                        self.note_invitation_admission(group_id, None)?
+                        self.note_invitation_admission(group_id, None, &Default::default())?
                     }
                     _ => {}
                 }
@@ -5929,6 +5985,7 @@ mod runtime_group_subscription_refresh_tests {
                 via_welcome: cgka_traits::MessageId::new(vec![0x75; 32]),
                 welcomer: None,
                 explicitly_confirmed: true,
+                forwarded: Default::default(),
             }],
             ..Default::default()
         };
@@ -6236,6 +6293,7 @@ mod runtime_group_subscription_refresh_tests {
                 via_welcome: cgka_traits::MessageId::new(vec![0x77; 32]),
                 welcomer: None,
                 explicitly_confirmed: true,
+                forwarded: Default::default(),
             }],
             ..Default::default()
         };
@@ -6475,6 +6533,7 @@ mod runtime_group_subscription_refresh_tests {
                 });
                 effects.failures.push(marmot_session::PublishFailure {
                     oversized: None,
+                    no_usable_relay: false,
                     message_id: cgka_traits::MessageId::new(vec![0x74; 32]),
                     reason: "primary publication failure".into(),
                 });
@@ -6791,6 +6850,9 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    #[cfg(feature = "test-policy-overrides")]
+    mod epoch_gap_retirement_tests;
+
     /// #2151: the projection must preserve the source key carried by an
     /// authenticated reaction after retention retired the previous cached key.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7077,6 +7139,52 @@ mod tests {
                 .pending_recovery_arm_writes
                 .is_empty()
         );
+    }
+
+    /// A refusal arms its epoch gap even when it is stamped near this copy's
+    /// Welcome, where a retained deferral would not count (mdk#3536). The
+    /// engine kept nothing, and a refused recovery fetch leaves its second
+    /// covered, so the gap is what fetches the event again once the backlog
+    /// drains.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refusal_near_this_copys_welcome_still_arms_an_epoch_gap() {
+        use cgka_traits::ingest::{InboundResourceLimit, IngestOutcome};
+        use cgka_traits::storage::GroupStorage;
+        let dir = tempfile::tempdir().unwrap();
+        AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = MarmotApp::with_relay_and_config(
+            dir.path(),
+            "wss://relay.example",
+            crate::MarmotAppConfig::white_noise(),
+        )
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+        let mut client = client_on_app_relay_plane(&app, "alice").await;
+        let group = client
+            .create_group("refused", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members");
+        // Model a Welcome-installed copy; one this device created has no
+        // Welcome time to compare against.
+        let storage = app.account_storage("alice").unwrap();
+        let welcome_at = crate::unix_now_seconds();
+        let mut record = storage.get_group(&group).unwrap();
+        record.local_copy_welcome_created_at = Some(cgka_traits::transport::Timestamp(welcome_at));
+        storage.put_group(&record).unwrap();
+
+        client.detect_epoch_stall(
+            Some(group.clone()),
+            "near-the-welcome",
+            &IngestOutcome::ResourceRefused {
+                group_id: group.clone(),
+                resource: InboundResourceLimit::TransportDeferredCapacity,
+            },
+            cgka_traits::transport::Timestamp(welcome_at - 60),
+        );
+        assert!(client.has_pending_epoch_backfill());
     }
 
     /// A commit or retry can release several retained messages in one effects batch.
@@ -7875,7 +7983,7 @@ mod tests {
                 None
             };
             make_group_terminal(&client, &group, disbanded);
-            client.drop_settled_epoch_backfill_intents();
+            client.queue_epoch_gap_handoffs();
             assert!(
                 client
                     .history_recovery
@@ -8233,6 +8341,9 @@ mod tests {
         assert_eq!(buffered, ingested);
     }
 }
+
+#[cfg(test)]
+mod own_echo_tests;
 
 #[cfg(test)]
 mod queued_outbound_schedule_tests;

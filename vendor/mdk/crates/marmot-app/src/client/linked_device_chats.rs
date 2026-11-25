@@ -8,7 +8,17 @@
 //! "Approving"). Each Add uses one of the private KeyPackages the new device
 //! handed this device, never a published one, and its sibling Welcome goes
 //! out as a 461 (3.5b-2); the chat's history follows from the confirmed Add
-//! (4.2b). Other devices add it only through gap filling (3.5e).
+//! (4.2b). Other devices add it only through gap filling (3.5e), and leave
+//! it to this device while this device is active (mdk#3537): for
+//! [`LINK_CHAT_ADD_SECS`] after the roster's `linked_at`, until this
+//! device's last heartbeat, or that `linked_at`, is
+//! [`APPROVER_ACTIVE_SECS`](super::device_heartbeats::APPROVER_ACTIVE_SECS)
+//! old, in the chats this device holds a leaf in. This pass publishes no
+//! gap-fill claim; it, and this device's own gap filling, pass over a chat
+//! while another linked device holds a live claim to add the new device
+//! there, whatever its slot, as after this device came back to find its
+//! siblings had taken over.
+//! A sibling from before that rule still fills at once.
 //!
 //! - Each maintenance pass reads the chats anew: every chat this device is in
 //!   and can commit in, in chat-list order, so the chats the user sees first
@@ -44,11 +54,12 @@
 use cgka_traits::GroupId;
 use cgka_traits::app_components::{DeviceRosterV1, DeviceSlotId, DeviceStatusV1, DeviceTagClaim};
 use cgka_traits::engine::SiblingKeyPackage;
+use std::collections::HashSet;
 use storage_sqlite::{ChatListQuery, DeviceLinkOutcome, ReceivedPrivateKeyPackage};
 
 use super::AppClient;
 use super::device_group::{Exchange, device_slot};
-use super::private_key_packages::PrivateKeyPackageSelection;
+use super::private_key_packages::{ChatStockSupport, PrivateKeyPackageSelection};
 use crate::{AppError, unix_now_seconds};
 
 const TRACE_TARGET: &str = "marmot_app::client::linked_device_chats";
@@ -70,10 +81,18 @@ pub(crate) const LINK_CHAT_ADDS_PER_PASS: usize = 10;
 pub(crate) const LINK_CHAT_ADD_SECS: u64 = 7 * 24 * 60 * 60;
 
 /// A new device this device adds to its chats.
-struct NewDevice {
-    slot: DeviceSlotId,
+pub(super) struct NewDevice {
+    pub(super) link_ref: String,
+    pub(super) slot: DeviceSlotId,
     /// The signature key the device tags its leaves with.
     tag_signature_key: Vec<u8>,
+    pub(super) expires_at: u64,
+}
+
+enum LinkMembership {
+    Missing,
+    Present,
+    Ineligible,
 }
 
 impl AppClient {
@@ -87,11 +106,21 @@ impl AppClient {
         if !self.app.device_groups_enabled() || self.runtime.maintenance_is_paused() {
             return 0;
         }
+        if let Err(error) = self.prune_link_chat_progress(unix_now_seconds()) {
+            self.device_group_work_changed = true;
+            tracing::warn!(
+                target: TRACE_TARGET,
+                method = "prune_link_chat_progress",
+                error_kind = error.privacy_safe_kind(),
+                "could not prune expired link progress"
+            );
+        }
         let mut budget = LINK_CHAT_ADDS_PER_PASS;
         if let Err(error) = self
             .try_add_linked_devices_to_chats(held, &mut budget, selection)
             .await
         {
+            self.device_group_work_changed = true;
             tracing::warn!(
                 target: TRACE_TARGET,
                 method = "add_linked_devices_to_chats",
@@ -99,6 +128,7 @@ impl AppClient {
                 "could not add linked devices to chats"
             );
         }
+        self.send_recorded_acceptances().await;
         LINK_CHAT_ADDS_PER_PASS - budget
     }
 
@@ -120,9 +150,12 @@ impl AppClient {
         if new_devices.is_empty() {
             return Ok(());
         }
-        let chats = self.sibling_commit_chats_in_list_order()?;
+        let (chats, scan_complete) = self.sibling_commit_chats_in_list_order()?;
         let mut first_error: Option<AppError> = None;
-        'devices: for device in new_devices {
+        // Chats whose acceptance this scan recorded: no device is added to
+        // them before that acceptance is sent, after the scan.
+        let mut awaiting_acceptance = HashSet::new();
+        for device in new_devices {
             match self.device_setting_ready(&exchange, &device.slot, |settings| {
                 settings.add_to_all_chats
             }) {
@@ -134,31 +167,74 @@ impl AppClient {
                 }
             }
             let mut owed = Vec::new();
+            let mut expected = Vec::new();
+            let mut stock_wanted = 0u32;
+            let mut complete = scan_complete;
             for chat in &chats {
-                match self.chat_owed_to(&exchange.roster, &device, chat) {
-                    Ok(true) => owed.push(chat.clone()),
-                    Ok(false) => {}
+                match self.link_chat_membership(&exchange.roster, &device, chat) {
+                    Ok(LinkMembership::Missing) => {
+                        stock_wanted = stock_wanted.saturating_add(1);
+                        match self.chat_stock_support(
+                            chat,
+                            &exchange,
+                            &device.slot,
+                            unix_now_seconds(),
+                            selection,
+                        ) {
+                            Ok(ChatStockSupport::Unsupported) => {}
+                            Ok(_) => {
+                                owed.push(chat.clone());
+                                expected.push(chat);
+                            }
+                            Err(error) => {
+                                complete = false;
+                                first_error.get_or_insert(error);
+                            }
+                        }
+                    }
+                    Ok(LinkMembership::Present) => expected.push(chat),
+                    Ok(LinkMembership::Ineligible) => {}
                     Err(error) => {
+                        complete = false;
                         first_error.get_or_insert(error);
                     }
                 }
             }
-            if owed.is_empty() {
-                continue;
-            }
-            if let Err(error) = self.want_private_key_packages(
-                &device.slot,
-                u32::try_from(owed.len()).unwrap_or(u32::MAX),
-            ) {
+            let mut remaining = owed.len();
+            if stock_wanted > 0
+                && let Err(error) = self.want_private_key_packages(&device.slot, stock_wanted)
+            {
                 first_error.get_or_insert(error);
             }
             for chat in owed {
                 if *budget == 0 {
-                    break 'devices;
+                    break;
+                }
+                // A sibling took this chat over by gap filling while this
+                // device was away: leave it the Add (mdk#3537).
+                if self
+                    .approver_claim_wait(&exchange, &chat, &device.slot, unix_now_seconds())
+                    .is_some()
+                {
+                    continue;
                 }
                 match self.group_quiet(&chat) {
                     Ok(true) => {}
                     Ok(false) => continue,
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                        continue;
+                    }
+                }
+                if awaiting_acceptance.contains(&chat) {
+                    continue;
+                }
+                match self.record_unrecorded_acceptance(&chat) {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        awaiting_acceptance.insert(chat.clone());
+                        continue;
+                    }
                     Err(error) => {
                         first_error.get_or_insert(error);
                         continue;
@@ -180,12 +256,29 @@ impl AppClient {
                     };
                 *budget -= 1;
                 selection.record_attempt(&device.slot, &candidate.key_package_ref_hex);
-                if let Err(error) = self
+                let result = self
                     .add_sibling_to_chat(&chat, &device.slot, candidate)
-                    .await
-                {
+                    .await;
+                if let Err(error) = result {
                     first_error.get_or_insert(error);
+                } else if complete {
+                    // Spending stock or queuing the Add is not confirmation.
+                    match self.link_chat_membership(&exchange.roster, &device, &chat) {
+                        Ok(LinkMembership::Present) => remaining -= 1,
+                        Ok(_) => {}
+                        Err(error) => {
+                            complete = false;
+                            first_error.get_or_insert(error);
+                        }
+                    }
                 }
+            }
+            if complete
+                && let Err(error) = self
+                    .report_link_chats(&exchange, &device, &expected, remaining)
+                    .await
+            {
+                first_error.get_or_insert(error);
             }
         }
         first_error.map_or(Ok(()), Err)
@@ -395,7 +488,7 @@ impl AppClient {
     /// decided to remove is none of them, while its removal waits to commit
     /// or is made again; nor is one in a slot a roster state this device
     /// applied held as `removed`, while this device keeps that record's key.
-    fn devices_to_add_to_chats(
+    pub(super) fn devices_to_add_to_chats(
         &self,
         exchange: &Exchange,
         now: u64,
@@ -415,6 +508,7 @@ impl AppClient {
             })
             .filter_map(|link| {
                 let slot = device_slot(&link.slot_hex).ok()?;
+                let expires_at = link.decided_at?.saturating_add(LINK_CHAT_ADD_SECS);
                 if excluded.contains(&slot) {
                     return None;
                 }
@@ -425,6 +519,8 @@ impl AppClient {
                     .then(|| entry.tag_signature_key.clone())?
                     .map(|tag_signature_key| NewDevice {
                         slot,
+                        expires_at,
+                        link_ref: link.key_package_ref_hex,
                         tag_signature_key,
                     })
             })
@@ -432,29 +528,39 @@ impl AppClient {
     }
 
     /// Whether `chat` takes a same-account Add and doesn't hold `device` yet.
-    fn chat_owed_to(
+    fn link_chat_membership(
         &self,
         roster: &DeviceRosterV1,
         device: &NewDevice,
         chat: &GroupId,
-    ) -> Result<bool, AppError> {
+    ) -> Result<LinkMembership, AppError> {
+        use cgka_traits::error::SiblingAddRefusal;
         if !self.invitation_allows_sibling_add(chat)? {
-            return Ok(false);
+            return Ok(LinkMembership::Ineligible);
         }
-        if self.runtime.chat_sibling_add_refusal(chat)?.is_some() {
-            return Ok(false);
+        let refusal = self.runtime.chat_sibling_add_refusal(chat)?;
+        if refusal.is_some_and(|r| r != SiblingAddRefusal::AccountLeaves) {
+            return Ok(LinkMembership::Ineligible);
         }
-        Ok(!self
+        let present = self
             .runtime
             .own_account_leaf_claims(chat, roster)?
             .into_iter()
             .any(|(key, claim)| {
                 claim == DeviceTagClaim::Device(device.slot) || key == device.tag_signature_key
-            }))
+            });
+        Ok(if present {
+            // A successful Add can itself fill the last account leaf.
+            LinkMembership::Present
+        } else if refusal.is_some() {
+            LinkMembership::Ineligible
+        } else {
+            LinkMembership::Missing
+        })
     }
 
     /// [`Self::sibling_commit_chats`], in the order the chat list shows them.
-    fn sibling_commit_chats_in_list_order(&self) -> Result<Vec<GroupId>, AppError> {
+    fn sibling_commit_chats_in_list_order(&self) -> Result<(Vec<GroupId>, bool), AppError> {
         let order: std::collections::HashMap<String, usize> = self
             .app
             .account_storage(&self.state.label)?
@@ -466,14 +572,14 @@ impl AppClient {
             .enumerate()
             .map(|(position, row)| (row.group_id_hex, position))
             .collect();
-        let mut chats = self.sibling_commit_chats();
+        let (mut chats, complete) = self.sibling_commit_chat_scan();
         chats.sort_by_key(|chat| {
             order
                 .get(&hex::encode(chat.as_slice()))
                 .copied()
                 .unwrap_or(usize::MAX)
         });
-        Ok(chats)
+        Ok((chats, complete))
     }
 
     /// How many chats this device is in take no same-account Add, so no

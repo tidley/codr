@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 
 use super::canonical_membership::{deliver_events, deliver_new, published_key_package};
 use super::*;
-use crate::client::sign_ins::SlotOutcome;
+use crate::client::sign_ins::{SlotOutcome, SlotReadEnd};
 use crate::{
     CompromiseWarningReason, ConfirmedDeviceLink, SignInResponse, UnrecognizedSignIn,
     UnrecognizedSignInState,
@@ -32,7 +32,7 @@ fn sign_in_app_at(
         MarmotAppConfig::white_noise()
             .with_dev_settlement_quiescence_ms(0)
             .with_dev_scheduled_convergence_delay_ms(0)
-            .with_dev_device_groups(device_groups),
+            .with_device_groups(device_groups),
     )
     .with_test_relay_client(relay)
 }
@@ -1288,9 +1288,12 @@ async fn a_foreign_publication_in_its_own_slot_is_replaced() {
     let forged_at = published_at(&phone) + 2;
     publish_into_slot(&account, &slot, "not a key package", forged_at);
 
+    phone.key_package_lifecycle_changed = false;
     let report = phone.check_sign_ins().await.unwrap();
     assert_eq!(report.slots[&slot], SlotOutcome::OwnSlotForeign);
     assert!(report.foreign.replacing);
+    // The supersession wakes the worker's KeyPackage catch-up (mdk#2923).
+    assert!(phone.key_package_lifecycle_changed);
     assert!(report.own_slot_complete);
     assert!(phone.unrecognized_sign_ins().unwrap().is_empty());
     // It holds no KeyPackage, so it warns of nothing.
@@ -1301,9 +1304,11 @@ async fn a_foreign_publication_in_its_own_slot_is_replaced() {
     // Its own publication, now the slot's newest, is never mistaken for a
     // foreign one.
     let before = account.relay.published_events.lock().unwrap().len();
+    phone.key_package_lifecycle_changed = false;
     let report = phone.check_sign_ins().await.unwrap();
     assert_eq!(report.slots[&slot], SlotOutcome::OwnSlot);
     assert!(!report.foreign.replacing);
+    assert!(!phone.key_package_lifecycle_changed, "nothing to replace");
     phone.run_due_maintenance().await.unwrap();
     assert_eq!(account.relay.published_events.lock().unwrap().len(), before);
 }
@@ -1988,4 +1993,220 @@ async fn next_sign_ins_changed(
     })
     .await
     .expect("UnrecognizedSignInsChanged");
+}
+
+/// Start a check's read on `client` and run it beside the client to its
+/// end, as the account worker does.
+async fn spawned_read(
+    start: crate::client::sign_ins::SlotReadStart,
+) -> (
+    crate::client::sign_ins::RunningSlotRead,
+    crate::client::sign_ins::SlotReadResult,
+) {
+    let mut read = start.spawn();
+    let result = read.result().await;
+    (read, result)
+}
+
+/// S1 (mdk#3466): a read beside the writer is judged only against the
+/// KeyPackages this device had when it started. The phone rotates its
+/// KeyPackage while its read runs, so the read returns a publication of its
+/// own slot that the snapshot lacks; the continuation reads again rather
+/// than taking it for a foreign publication and replacing it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_whose_own_key_packages_changed_reads_again() {
+    let account = Account::new(1, true);
+    let relay = &account.relay;
+    let mut phone = account.open(0).await;
+    published_key_package(&mut phone, relay).await;
+
+    let start = phone.start_sign_in_slot_read().unwrap().unwrap();
+    phone.rotate_key_package().await.unwrap();
+    let (read, result) = spawned_read(start).await;
+    let SlotReadEnd::ReadAgain(again) = phone
+        .finish_sign_in_slot_read(read.into_own(), result, false)
+        .await
+    else {
+        panic!("a read whose own KeyPackages changed reads again");
+    };
+    let (read, result) = spawned_read(*again).await;
+    let SlotReadEnd::Checked(report) = phone
+        .finish_sign_in_slot_read(read.into_own(), result, true)
+        .await
+    else {
+        panic!("an unchanged second read is judged");
+    };
+    let report = report.unwrap();
+    assert_eq!(
+        report.slots.get(&own_slot(&phone)),
+        Some(&SlotOutcome::OwnSlot)
+    );
+    assert!(!report.foreign.replacing);
+    assert!(listed(&mut phone).is_empty());
+}
+
+/// S1's double change: this device's own KeyPackages change during the
+/// read and again during the read after it, so the check records nothing.
+/// The phone's first check would have taken its baseline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_changed_twice_records_nothing() {
+    let account = Account::new(1, true);
+    let relay = &account.relay;
+    let mut phone = account.open(0).await;
+    published_key_package(&mut phone, relay).await;
+
+    let start = phone.start_sign_in_slot_read().unwrap().unwrap();
+    phone.rotate_key_package().await.unwrap();
+    let (read, result) = spawned_read(start).await;
+    let SlotReadEnd::ReadAgain(again) = phone
+        .finish_sign_in_slot_read(read.into_own(), result, false)
+        .await
+    else {
+        panic!("a read whose own KeyPackages changed reads again");
+    };
+    phone.rotate_key_package().await.unwrap();
+    let (read, result) = spawned_read(*again).await;
+    assert!(matches!(
+        phone
+            .finish_sign_in_slot_read(read.into_own(), result, true)
+            .await,
+        SlotReadEnd::Unjudged
+    ));
+    let storage = phone.app.account_storage("alice").unwrap().app_storage();
+    assert_eq!(storage.sign_in_baseline().unwrap(), None);
+    assert!(phone.compromise_warning().unwrap().is_empty());
+}
+
+/// S1 for an acceptance (mdk#3466): a read beside the writer finds this
+/// device's slot empty at a relay that had not accepted its current
+/// publication. While the read is out, the writer's maintenance resends that
+/// same publication and the relay accepts it. The empty answer is from
+/// before the acceptance, so the continuation reads again rather than
+/// pairing it with the acceptance and replacing a KeyPackage the relay
+/// serves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_empty_read_from_before_an_acceptance_makes_no_refill() {
+    let account = Account::new(1, true);
+    let mut phone = account.open(0).await;
+    published_key_package(&mut phone, &account.relay).await;
+    // As the account worker does: a due check reads beside the writer, so
+    // the writer's maintenance pass does not read in place.
+    phone.detach_sign_in_reads();
+    let slot = own_slot(&phone);
+    let published = publish_two_days_ago(&phone);
+    // The relay never took this publication: its one attempt failed, and it
+    // serves nothing in the slot. Its retry is due.
+    {
+        let storage = phone.app.account_storage("alice").unwrap();
+        let mut lifecycle = storage.key_package_lifecycle().unwrap().unwrap();
+        assert!(!lifecycle.publication_targets.is_empty());
+        for target in &mut lifecycle.publication_targets {
+            target.state = cgka_traits::TransportFanoutAttemptState::AttemptedFailed;
+            target.attempt_count = 1;
+            target.last_attempt_at = Some(cgka_traits::Timestamp(published));
+        }
+        storage.put_key_package_lifecycle(&lifecycle).unwrap();
+    }
+    relay_empties_slot(&account.relay, &slot);
+
+    let start = phone.start_sign_in_slot_read().unwrap().unwrap();
+    let (read, result) = spawned_read(start).await;
+    phone.run_due_maintenance().await.unwrap();
+    assert!(
+        relay_serves_slot(&account.relay, &slot),
+        "the retry reached the relay"
+    );
+    assert_eq!(published_at(&phone), published, "the same publication");
+
+    let report = match phone
+        .finish_sign_in_slot_read(read.into_own(), result, false)
+        .await
+    {
+        SlotReadEnd::Checked(report) => report,
+        SlotReadEnd::ReadAgain(again) => {
+            let (read, result) = spawned_read(*again).await;
+            let SlotReadEnd::Checked(report) = phone
+                .finish_sign_in_slot_read(read.into_own(), result, true)
+                .await
+            else {
+                panic!("an unchanged second read is judged");
+            };
+            report
+        }
+        SlotReadEnd::Unjudged => panic!("one change leaves the read judged"),
+    };
+    // An answered check that asks for no refill; a failed read proves nothing.
+    let refilling = report.map(|report| report.refilling);
+    assert!(
+        matches!(refilling, Ok(false)),
+        "a stale empty read asked to replace a KeyPackage the relay serves: {refilling:?}"
+    );
+    phone.run_due_maintenance().await.unwrap();
+    assert_eq!(
+        published_at(&phone),
+        published,
+        "no KeyPackage replaced the one the relay serves"
+    );
+}
+
+/// S3 and T3 (mdk#3466): a check's look changes nothing of the account, and
+/// its read, beside the writer, writes none of the inputs whose answers are
+/// reused while a write count is unchanged, the owned KeyPackage list's and
+/// the recovery answer's. The look borrows the client immutably, so it
+/// changes nothing in memory either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_look_and_the_read_write_nothing_of_the_account() {
+    let account = Account::new(1, true);
+    let relay = &account.relay;
+    let mut phone = account.open(0).await;
+    published_key_package(&mut phone, relay).await;
+    let counts = |phone: &AppClient| {
+        (
+            phone.engine_storage.write_count(),
+            phone.engine_storage.key_package_write_count(),
+            phone.engine_storage.recovery_notice_write_count(),
+        )
+    };
+    let storage = phone.app.account_storage("alice").unwrap().app_storage();
+    let before = counts(&phone);
+
+    let start = phone.start_sign_in_slot_read().unwrap().unwrap();
+    assert_eq!(counts(&phone), before, "the look writes nothing");
+    assert_eq!(storage.sign_in_baseline().unwrap(), None);
+    let (_, result) = spawned_read(start).await;
+    result.unwrap();
+    assert_eq!(counts(&phone), before, "the read writes no counted input");
+    assert_eq!(storage.sign_in_baseline().unwrap(), None);
+}
+
+/// Session maintenance wakes the worker's KeyPackage catch-up only when it
+/// changed what the catch-up reads, so the catch-up's own deadline decides
+/// otherwise once maintenance leaves the tick (mdk#2923, mdk#3265). A run
+/// with nothing to change leaves the flag clear; one that publishes a
+/// replacement KeyPackage sets it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn maintenance_wakes_the_key_package_catch_up_only_when_its_answer_changes() {
+    let account = Account::new(1, true);
+    let mut phone = account.open(0).await;
+    published_key_package(&mut phone, &account.relay).await;
+    phone.run_due_maintenance().await.unwrap();
+
+    phone.key_package_lifecycle_changed = false;
+    phone.run_due_maintenance().await.unwrap();
+    assert!(
+        !phone.key_package_lifecycle_changed,
+        "nothing changed, so the catch-up waits for its deadline"
+    );
+
+    let slot = own_slot(&phone);
+    let forged_at = published_at(&phone) + 2;
+    publish_into_slot(&account, &slot, "not a key package", forged_at);
+    phone.check_sign_ins().await.unwrap();
+    phone.key_package_lifecycle_changed = false;
+    phone.run_due_maintenance().await.unwrap();
+    assert!(published_at(&phone) > forged_at, "a replacement went out");
+    assert!(
+        phone.key_package_lifecycle_changed,
+        "the replacement changed what the catch-up reads"
+    );
 }

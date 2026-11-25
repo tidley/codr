@@ -152,9 +152,9 @@ pub enum AppError {
     #[error("device group refused: {0}")]
     DeviceGroupRefused(&'static str),
     /// The account holds or is joining a device group and this app has
-    /// device groups off, so its session did not open (mdk#3012). Only the
-    /// experimental device-group constructor opens it.
-    #[error("account holds or is joining a device group: open it with experimental device groups")]
+    /// device groups off, so its session did not open (mdk#3012). Only an
+    /// app with device groups on (the default) opens it.
+    #[error("account holds or is joining a device group: open it with device groups on")]
     ExperimentalDeviceGroupsRequired,
     #[error("unknown local group")]
     UnknownGroup(String),
@@ -214,32 +214,19 @@ pub enum AppError {
     /// `acknowledge_group_commit_undelivered` and retry.
     #[error("the group's last change has not reached every relay yet; try again shortly")]
     GroupCommitUndelivered(String),
+    /// The group's own last commit has not confirmed yet (mdk#2332), so the
+    /// group cannot take another change: `group_pending_commit` shows it.
+    /// Retryable once it confirms or is given up. No acknowledgement
+    /// releases it, so it wins over `GroupCommitUndelivered` and
+    /// `GroupCatchingUp`.
+    #[error("the group's last change is still being sent; try again once it is applied")]
+    GroupCommitPending(String),
     /// Host-supplied draft attachment metadata failed validation before storage.
     #[error("invalid message draft: {0}")]
     InvalidMessageDraft(String),
     /// The composer changed after the caller selected it; reload before retrying.
     #[error("message draft revision no longer matches")]
     MessageDraftRevisionConflict,
-    #[error("no agent text stream start found for this group")]
-    AgentStreamMissingStart,
-    #[error("agent publisher: {0}")]
-    AgentStreamPublisher(String),
-    /// The finish expectation disagrees with the sealed transcript. Retrying
-    /// with the same inputs cannot succeed.
-    #[error("stream finalize does not match the sealed transcript")]
-    AgentStreamFinishMismatch,
-    /// The durable final send failed after sealing. The sealed transcript is
-    /// retained, so the same finish request may be retried.
-    #[error("agent stream durable send failed: {0}")]
-    AgentStreamSendFailed(#[source] Box<AppError>),
-    #[error("agent text stream start has no confirmed message id yet")]
-    AgentStreamStartNotConfirmed,
-    #[error("unsupported agent text stream route (only brokered QUIC is supported)")]
-    AgentStreamUnsupportedRoute,
-    #[error("agent text stream start has no usable quic:// candidate")]
-    AgentStreamMissingCandidate,
-    #[error("invalid quic candidate: {0}")]
-    AgentStreamInvalidCandidate(String),
     #[error("publish failed: {0}")]
     Publish(String),
     /// Every target refused this artifact for size on the observed attempt.
@@ -251,6 +238,12 @@ pub enum AppError {
         artifact: crate::OversizedArtifact,
         size_class: crate::EventSizeClass,
     },
+    /// The group has no relay this device may send to: the transport refuses
+    /// every relay the send targets before sending anything, as the host-safety
+    /// rule refuses a private-network address (mdk#3276). Nothing was sent, a
+    /// commit rolled back, and a retry is refused the same way (mdk#3305).
+    #[error("no usable relay")]
+    NoUsableRelay,
     #[error("default relays are required to publish account relay lists")]
     MissingDefaultRelays,
     #[error("missing account relay lists: {0:?}")]
@@ -285,9 +278,9 @@ pub enum AppError {
     /// The local per-account cap; it guards against runaway clients only.
     #[error("too many moderation reports; try again later")]
     ModerationReportRateLimited,
-    /// An edit must target an available chat message this account sent;
+    /// An edit must target an available chat or NIP-22 comment this account sent;
     /// nothing was published.
-    #[error("edit target must be an available self-authored chat message")]
+    #[error("edit target must be an available self-authored chat or NIP-22 comment")]
     InvalidEditTarget,
     #[error("relay directory fetch failed: {0}")]
     RelayDirectory(String),
@@ -325,8 +318,6 @@ pub enum AppError {
     InvalidNostrRouting(String),
     #[error("invalid group avatar URL: {0}")]
     InvalidGroupAvatarUrl(String),
-    #[error("invalid agent text stream policy: {0}")]
-    InvalidAgentTextStreamPolicy(String),
     #[error("invalid encrypted media: {0}")]
     InvalidEncryptedMedia(String),
     /// A media reference was encrypted under `source_epoch`, but the message
@@ -747,18 +738,12 @@ impl AppError {
             Self::GroupRemoved(_) => "group_removed",
             Self::GroupCatchingUp(_) => "group_catching_up",
             Self::GroupCommitUndelivered(_) => "group_commit_undelivered",
+            Self::GroupCommitPending(_) => "group_commit_pending",
             Self::InvalidMessageDraft(_) => "invalid_message_draft",
             Self::MessageDraftRevisionConflict => "message_draft_revision_conflict",
-            Self::AgentStreamMissingStart => "agent_stream_missing_start",
-            Self::AgentStreamPublisher(_) => "agent_stream_publisher",
-            Self::AgentStreamFinishMismatch => "agent_stream_finish_mismatch",
-            Self::AgentStreamSendFailed(_) => "agent_stream_send_failed",
-            Self::AgentStreamStartNotConfirmed => "agent_stream_start_not_confirmed",
-            Self::AgentStreamUnsupportedRoute => "agent_stream_unsupported_route",
-            Self::AgentStreamMissingCandidate => "agent_stream_missing_candidate",
-            Self::AgentStreamInvalidCandidate(_) => "agent_stream_invalid_candidate",
             Self::Publish(_) => "publish",
             Self::EventTooLarge { .. } => "event_too_large",
+            Self::NoUsableRelay => "no_usable_relay",
             Self::MissingDefaultRelays => "missing_default_relays",
             Self::MissingRelayLists(_) => "missing_relay_lists",
             Self::UserBlocked => "user_blocked",
@@ -788,7 +773,6 @@ impl AppError {
             Self::InvalidAppComponent(_) => "invalid_app_component",
             Self::InvalidNostrRouting(_) => "invalid_nostr_routing",
             Self::InvalidGroupAvatarUrl(_) => "invalid_group_avatar_url",
-            Self::InvalidAgentTextStreamPolicy(_) => "invalid_agent_text_stream_policy",
             Self::InvalidEncryptedMedia(_) => "invalid_encrypted_media",
             Self::MediaReferenceStaleEpoch { .. } => "media_reference_stale_epoch",
             Self::MediaReferenceEpochUnsettled { .. } => "media_reference_epoch_unsettled",

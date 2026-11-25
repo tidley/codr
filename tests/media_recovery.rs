@@ -7,7 +7,11 @@ use tokio::{io::AsyncWriteExt, net::UnixListener};
 
 #[tokio::test]
 async fn timeline_summaries_are_resolved_to_complete_refs_before_download() {
-    for kind in ["image/png", "application/zip"] {
+    for (kind, message_kind, parent) in [
+        ("image/png", 9, None),
+        ("application/zip", 9, None),
+        ("image/png", 1111, Some("parent")),
+    ] {
         let root = tempfile::tempdir().unwrap();
         let image = root.path().join("download.png");
         std::fs::write(&image, b"image fixture").unwrap();
@@ -27,7 +31,7 @@ async fn timeline_summaries_are_resolved_to_complete_refs_before_download() {
                     assert_eq!(request["type"], "timeline_message_get");
                     assert_eq!(request["include_media"], true);
                     json!({"type":"timeline_message","account_id_hex":"aa".repeat(32),"group_id_hex":"bb","message_id_hex":"one",
-                    "message":{"message_id_hex":"one","availability":"available","kind":9,"text":"Look at this.",
+                    "message":{"message_id_hex":"one","availability":"available","kind":message_kind,"reply_to_message_id_hex":parent,"text":"Look at this.",
                          "sender":{"account_id_hex":"11".repeat(32)},"attachments":[{"media_type":kind,"file_name":"test.png"}]},
                     "media":[reference]})
                 } else {

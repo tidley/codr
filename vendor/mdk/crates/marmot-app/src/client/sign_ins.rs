@@ -38,6 +38,13 @@
 //!   rejected stays up, saying so, until dismissed. That answer holds only
 //!   while the roster does: a sign-in dismissed here is listed again once the
 //!   roster has no entry for its slot.
+//! - **Removed.** A slot the roster records as `removed` held a device the
+//!   user linked and removed, which answers its sign-in for good: the sign-in
+//!   goes, unless this device rejected it, and once the record expires no
+//!   publication from before the removal, allowing the directory's future
+//!   skew, lists it again. A removed device
+//!   comes back only in a new slot, so a later publication in the old one is
+//!   a new sign-in.
 //! - **Gone.** A sign-in whose slot a complete read finds holding no valid
 //!   KeyPackage, fresh or not, stays listed, marked as no longer signed in.
 //!   A stale publication never signs a slot out, and only a complete read
@@ -72,18 +79,22 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
+use tokio::task::{AbortHandle, JoinHandle};
+use tokio_util::sync::CancellationToken;
+
 use cgka_traits::app_components::{
     DEVICE_ROSTER_COMPONENT_ID, DeviceRosterV1, DeviceSlotId, RejectedSlotReasonV1, RejectedSlotV1,
 };
 use cgka_traits::storage::MaintenanceStorage as _;
-use cgka_traits::{MessageId, Timestamp, TransportEndpoint};
+use cgka_traits::{MessageId, Timestamp, TransportEndpoint, TransportFanoutAttemptState};
 use marmot_session::{ForeignSlotOutcome, ForeignSlotPublication};
-use nostr_directory::OwnSlotRead;
+use nostr_directory::{AccountKeyPackageSlots, Directory, OwnSlotRead};
 use storage_sqlite::{ObservedSignIn, SignInAnswer, SignInCheck, SignInRecord, SqliteAppStorage};
 
-use super::AppClient;
 use super::device_group::device_slot;
-use crate::{AppError, unix_now_seconds};
+use super::{AppClient, LaneStep};
+use crate::{AppError, MarmotApp, unix_now_seconds};
+use transport_nostr::MarmotRelayPlane;
 
 /// How often a running device reads its account's slots.
 const SIGN_IN_CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
@@ -192,6 +203,39 @@ pub(crate) struct SignInCheckReport {
 pub(crate) struct SignInSchedule {
     due: Option<Instant>,
     pub(crate) last: Option<Instant>,
+    /// The account worker reads the slots beside the writer (mdk#3466): a
+    /// due check asks it for a read instead of reading here.
+    detached: bool,
+    /// A due check the worker has not taken yet. It stays due until the
+    /// worker's read settles, so each maintenance pass asks again and the
+    /// worker joins the read in flight.
+    requested: bool,
+    /// The worker's read is in flight. A nudge waits until its continuation
+    /// has restarted the schedule, and then brings the next check forward,
+    /// as it did while the read held the worker: the read may have started
+    /// before what nudged it.
+    reading: bool,
+}
+
+impl SignInSchedule {
+    /// When the next check comes due, in unix seconds as of `now_unix` and
+    /// `now`, brought forward a minute after the last when `nudged`
+    /// (mdk#3265). `Some(0)` before the first check. `None` while the
+    /// worker's read is requested or in flight: its settling re-reads what
+    /// maintenance owes.
+    pub(crate) fn next_due_unix(&self, nudged: bool, now: Instant, now_unix: u64) -> Option<u64> {
+        if self.requested || self.reading {
+            return None;
+        }
+        let Some(mut due) = self.due else {
+            return Some(0);
+        };
+        if nudged {
+            due = due.min(self.last.map_or(now, |last| last + SIGN_IN_NUDGE_INTERVAL));
+        }
+        let ahead = due.saturating_duration_since(now);
+        Some(now_unix.saturating_add(ahead.as_secs() + u64::from(ahead.subsec_nanos() > 0)))
+    }
 }
 
 #[cfg(all(test, feature = "test-policy-overrides"))]
@@ -221,6 +265,14 @@ impl SignInNudges {
         }
     }
 
+    /// Whether a KeyPackage of `account_id_hex` arrived since the last
+    /// [`Self::take`], without taking it.
+    pub(crate) fn peek(&self, account_id_hex: &str) -> bool {
+        self.0
+            .lock()
+            .is_ok_and(|accounts| accounts.get(account_id_hex).copied().unwrap_or(false))
+    }
+
     /// Whether a KeyPackage of `account_id_hex` arrived since the last call.
     /// The first call starts tracking the account.
     fn take(&self, account_id_hex: &str) -> bool {
@@ -231,12 +283,15 @@ impl SignInNudges {
 }
 
 /// This device's slot, every publication it made that may still be served
-/// there, by event id, and the relays its current one went to.
-#[derive(Debug, Default)]
-struct OwnKeyPackages {
+/// there, by event id, the relays its current one went to, and which of
+/// them accepted it. A relay that accepts it while a read is out may have
+/// answered that read before it did, so the read is not judged.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct OwnKeyPackages {
     slot: Option<String>,
     events: BTreeSet<String>,
     targets: Vec<TransportEndpoint>,
+    accepted: Vec<TransportEndpoint>,
 }
 
 impl AppClient {
@@ -249,7 +304,7 @@ impl AppClient {
         }
         let now = Instant::now();
         let account_id_hex = hex::encode(self.runtime.self_id().as_slice());
-        if self.app.sign_in_nudges.take(&account_id_hex) {
+        if !self.sign_in_schedule.reading && self.app.sign_in_nudges.take(&account_id_hex) {
             let schedule = &mut self.sign_in_schedule;
             let earliest = schedule
                 .last
@@ -257,42 +312,140 @@ impl AppClient {
             schedule.due = Some(schedule.due.map_or(earliest, |due| due.min(earliest)));
         }
         if self.sign_in_schedule.due.is_none_or(|due| now >= due) {
-            let next = match self.check_sign_ins().await {
-                Ok(report) => next_check_after(&report),
-                Err(error) => {
+            if self.sign_in_schedule.detached {
+                // The worker reads beside the writer and runs the rest of
+                // the check, the schedule's included, once the read returns.
+                // Its read begins after this pass, whose session maintenance
+                // can drop an expired `removed` record: record them now.
+                if let Err(error) = self.record_trusted_sign_in_removals() {
                     tracing::warn!(
                         target: "marmot_app::client::sign_ins",
-                        method = "check_sign_ins",
+                        method = "drive_sign_ins",
                         error_kind = error.privacy_safe_kind(),
-                        "could not check the account's key packages for new sign-ins; retrying later"
+                        "could not record removed devices' slots; the check retries"
                     );
-                    SIGN_IN_CHECK_RETRY
                 }
-            };
-            self.sign_in_schedule.last = Some(now);
-            self.sign_in_schedule.due = Some(now + next);
+                self.sign_in_schedule.requested = true;
+            } else {
+                let report = self.check_sign_ins().await;
+                self.scheduled_sign_in_check_ended(now, report.as_ref());
+            }
         }
-        if let Err(error) = self.commit_sign_in_rejections().await {
-            tracing::warn!(
-                target: "marmot_app::client::sign_ins",
-                method = "commit_sign_in_rejections",
-                error_kind = error.privacy_safe_kind(),
-                "could not record sign-in rejections in the device group; retrying later"
-            );
-        }
+        self.commit_sign_in_rejections_best_effort().await;
     }
 
     /// Read every slot of the account and record each unrecognized one. See
-    /// the module docs for what counts.
+    /// the module docs for what counts. The read runs here, for a client
+    /// no account worker owns; the worker runs it beside the writer
+    /// ([`Self::start_sign_in_slot_read`], [`Self::finish_sign_in_slot_read`]).
     pub(crate) async fn check_sign_ins(&mut self) -> Result<SignInCheckReport, AppError> {
-        if !self.app.device_groups_enabled() {
+        let Some(mut start) = self.begin_sign_in_slot_read()? else {
             return Ok(SignInCheckReport::default());
+        };
+        let mut again = false;
+        loop {
+            let SlotReadStart { own, read } = start;
+            let result = read
+                .run(None)
+                .await
+                .expect("an uncancelled read returns its result");
+            match self.finish_sign_in_slot_read(own, result, again).await {
+                SlotReadEnd::Checked(report) => return report,
+                SlotReadEnd::ReadAgain(next) => {
+                    start = *next;
+                    again = true;
+                }
+                SlotReadEnd::Unjudged => {
+                    return Err(AppError::DeviceGroupRefused("key_packages_changed"));
+                }
+            }
+        }
+    }
+
+    /// Begin a slot read: record the removed slots of the trusted roster
+    /// ([`Self::record_sign_in_removals`]), then take the look
+    /// ([`Self::start_sign_in_slot_read`]). The write comes before the read,
+    /// which can fail, so a removal this device has not recorded yet, as
+    /// after an upgrade, is recorded before the same maintenance pass can
+    /// drop its expired record. It writes only while the roster has one.
+    pub(crate) fn begin_sign_in_slot_read(&mut self) -> Result<Option<SlotReadStart>, AppError> {
+        if !self.app.device_groups_enabled() {
+            return Ok(None);
+        }
+        self.record_trusted_sign_in_removals()?;
+        self.start_sign_in_slot_read()
+    }
+
+    /// Record the removed slots of the trusted roster, if this device trusts
+    /// a device group ([`Self::record_sign_in_removals`]).
+    fn record_trusted_sign_in_removals(&mut self) -> Result<(), AppError> {
+        if let Some((_, roster)) = self.trusted_device_roster()? {
+            let storage = self.app.account_storage(&self.state.label)?.app_storage();
+            self.record_sign_in_removals(&storage, &roster)?;
+        }
+        Ok(())
+    }
+
+    /// The look before a slot read: this device's own KeyPackages, and the
+    /// read's inputs. It changes nothing, in memory or in storage. `None`
+    /// while device groups are off, when there is nothing to check.
+    pub(crate) fn start_sign_in_slot_read(&self) -> Result<Option<SlotReadStart>, AppError> {
+        if !self.app.device_groups_enabled() {
+            return Ok(None);
         }
         let own = self.own_key_packages()?;
-        let read = self
-            .app
-            .read_account_key_package_slots(&self.state.label, own.slot.as_deref())
-            .await?;
+        let read = SlotRead {
+            directory: self.app.directory(),
+            relay_plane: self.app.relay_plane.clone(),
+            account_id_hex: hex::encode(self.runtime.self_id().as_slice()),
+            own_slot: own.slot.clone(),
+            step: self.lane_step(crate::RuntimePerformanceOperation::SignInSlotRead),
+        };
+        Ok(Some(SlotReadStart { own, read }))
+    }
+
+    /// A slot read's continuation, on the writer. It judges the read only
+    /// if this device's own KeyPackages are as they were when it started;
+    /// otherwise it reads once more, and after a second change it records
+    /// nothing. Today's checks run against current state.
+    pub(crate) async fn finish_sign_in_slot_read(
+        &mut self,
+        own: OwnKeyPackages,
+        read: SlotReadResult,
+        again: bool,
+    ) -> SlotReadEnd {
+        if !self.app.device_groups_enabled() {
+            return SlotReadEnd::Checked(Ok(SignInCheckReport::default()));
+        }
+        let read = match read {
+            Ok(read) => read,
+            Err(error) => return SlotReadEnd::Checked(Err(error)),
+        };
+        let current = match self.own_key_packages() {
+            Ok(current) => current,
+            Err(error) => return SlotReadEnd::Checked(Err(error)),
+        };
+        if current != own {
+            if again {
+                return SlotReadEnd::Unjudged;
+            }
+            return match self.begin_sign_in_slot_read() {
+                Ok(Some(start)) => SlotReadEnd::ReadAgain(Box::new(start)),
+                Ok(None) => SlotReadEnd::Checked(Ok(SignInCheckReport::default())),
+                Err(error) => SlotReadEnd::Checked(Err(error)),
+            };
+        }
+        SlotReadEnd::Checked(self.judge_sign_in_slot_read(current, read).await)
+    }
+
+    /// Classify a read of every slot of the account against this device's
+    /// own KeyPackages, record each unrecognized one, and act on its own
+    /// slot. See the module docs for what counts.
+    async fn judge_sign_in_slot_read(
+        &mut self,
+        own: OwnKeyPackages,
+        read: AccountKeyPackageSlots,
+    ) -> Result<SignInCheckReport, AppError> {
         let trusted = self.trusted_device_roster()?;
         if !read.reached {
             // A relay whose own read finished still shows the slot empty,
@@ -303,6 +456,9 @@ impl AppClient {
         }
         let roster = trusted.map(|(_, roster)| roster);
         let storage = self.app.account_storage(&self.state.label)?.app_storage();
+        if let Some(roster) = roster.as_ref() {
+            self.record_sign_in_removals(&storage, roster)?;
+        }
         let rejected_here = rejected_slots_here(&storage.sign_ins()?);
 
         let mut report = SignInCheckReport {
@@ -384,6 +540,11 @@ impl AppClient {
             }
         }
         report.refilling = self.refill_own_slot(&own, read.own_slot.as_ref(), roster.as_ref())?;
+        // A superseded or emptied slot makes the KeyPackage catch-up due
+        // without time passing (mdk#2923).
+        if report.foreign.replacing || report.refilling {
+            self.key_package_lifecycle_changed = true;
+        }
         Ok(report)
     }
 
@@ -437,6 +598,80 @@ impl AppClient {
             self.sign_in_schedule.due = Some(now + next_check_after(&report));
         }
         self.unrecognized_sign_ins()
+    }
+
+    /// The account worker reads the slots beside the writer from now on.
+    pub(crate) fn detach_sign_in_reads(&mut self) {
+        self.sign_in_schedule.detached = true;
+    }
+
+    /// The worker's read began or settled. While one is in flight, a nudge
+    /// waits for the check after it.
+    pub(crate) fn sign_in_reading(&mut self, reading: bool) {
+        self.sign_in_schedule.reading = reading;
+    }
+
+    /// Whether a due check asked for a read since the last call.
+    pub(crate) fn take_sign_in_check_request(&mut self) -> bool {
+        std::mem::take(&mut self.sign_in_schedule.requested)
+    }
+
+    /// Whether a scheduled check would run now: with device groups on and
+    /// maintenance running, as [`Self::drive_sign_ins`] requires.
+    pub(crate) fn scheduled_sign_in_check_may_run(&self) -> bool {
+        self.app.device_groups_enabled() && !self.runtime.maintenance_is_paused()
+    }
+
+    /// The scheduled check's tail: restart the schedule from the check, as
+    /// [`Self::drive_sign_ins`] does.
+    pub(crate) fn scheduled_sign_in_check_ended(
+        &mut self,
+        started: Instant,
+        report: Result<&SignInCheckReport, &AppError>,
+    ) {
+        let next = match report {
+            Ok(report) => next_check_after(report),
+            Err(error) => {
+                tracing::warn!(
+                    target: "marmot_app::client::sign_ins",
+                    method = "check_sign_ins",
+                    error_kind = error.privacy_safe_kind(),
+                    "could not check the account's key packages for new sign-ins; retrying later"
+                );
+                SIGN_IN_CHECK_RETRY
+            }
+        };
+        self.sign_in_schedule.last = Some(started);
+        self.sign_in_schedule.due = Some(started + next);
+    }
+
+    /// A host check's tail, as [`Self::check_sign_ins_now`] ends: restart
+    /// the schedule unless maintenance is paused, and answer with the
+    /// sign-ins listed after the check.
+    pub(crate) fn host_sign_in_check_ended(
+        &mut self,
+        started: Instant,
+        report: Result<SignInCheckReport, AppError>,
+    ) -> Result<Vec<UnrecognizedSignIn>, AppError> {
+        let report = report?;
+        if !self.runtime.maintenance_is_paused() {
+            self.sign_in_schedule.last = Some(started);
+            self.sign_in_schedule.due = Some(started + next_check_after(&report));
+        }
+        self.unrecognized_sign_ins()
+    }
+
+    /// Commit any rejection the roster still lacks, as each check does.
+    pub(crate) async fn commit_sign_in_rejections_best_effort(&mut self) {
+        if let Err(error) = self.commit_sign_in_rejections().await {
+            self.device_group_work_changed = true;
+            tracing::warn!(
+                target: "marmot_app::client::sign_ins",
+                method = "commit_sign_in_rejections",
+                error_kind = error.privacy_safe_kind(),
+                "could not record sign-in rejections in the device group; retrying later"
+            );
+        }
     }
 
     /// The sign-ins this device does not recognize, the earliest to appear
@@ -608,6 +843,8 @@ impl AppClient {
         if to == SignInAnswer::Rejected
             && let Err(error) = self.commit_sign_in_rejections().await
         {
+            // Maintenance commits it 15 s on (mdk#3265).
+            self.device_group_work_changed = true;
             tracing::warn!(
                 target: "marmot_app::client::sign_ins",
                 method = "answer_sign_in",
@@ -723,12 +960,15 @@ impl AppClient {
     /// the roster again, so one the roster lost is committed anew. A rejection
     /// settled from another device's commit is lost if that commit later
     /// loses convergence, and that device may never come back to repair it.
+    /// A slot the roster records as `removed` is recorded here, so its
+    /// sign-in goes and stays gone once the record does.
     pub(crate) fn recheck_sign_in_rejections(&mut self) {
         let ended = self.trusted_device_roster().and_then(|roster| {
             let Some((_, roster)) = roster else {
                 return Ok(());
             };
             let storage = self.app.account_storage(&self.state.label)?.app_storage();
+            self.record_sign_in_removals(&storage, &roster)?;
             for record in storage.sign_ins()? {
                 if record.answer == SignInAnswer::Rejected && linked(&record, &roster) {
                     end_rejection(&storage, &record)?;
@@ -753,13 +993,26 @@ impl AppClient {
         }
     }
 
+    /// Record each slot `roster` records as `removed`, so its sign-in goes
+    /// and stays gone once the record does ([`removed_slots`]).
+    fn record_sign_in_removals(
+        &mut self,
+        storage: &SqliteAppStorage,
+        roster: &DeviceRosterV1,
+    ) -> Result<(), AppError> {
+        let removed = removed_slots(roster, self.app.config.directory_max_future_skew);
+        if storage.record_sign_in_removals(&removed)? {
+            self.unrecognized_sign_ins_changed = true;
+        }
+        Ok(())
+    }
+
     /// Whether this device rejected the sign-in whose KeyPackage it found in
     /// `published_slot`, its `d` as published, which a link records in the
     /// roster as `slot` ([`rejects_slot`]). It keeps that rejection until the
     /// roster holds the slot as a device, whether or not it has a device
     /// group and whether or not the roster has the rejection yet, and does
     /// not link the slot meanwhile (device-group.md, "Before answering").
-    #[cfg_attr(not(feature = "unreleased-device-pairing"), allow(dead_code))]
     pub(crate) fn rejected_sign_in_here(
         &self,
         published_slot: &str,
@@ -829,6 +1082,12 @@ impl AppClient {
             // its slot empty: there is no slot of its own to read yet.
             slot: Some(lifecycle.stable_slot_id).filter(|slot| !slot.is_empty()),
             events,
+            accepted: lifecycle
+                .publication_targets
+                .iter()
+                .filter(|target| target.state == TransportFanoutAttemptState::Accepted)
+                .map(|target| target.endpoint.clone())
+                .collect(),
             targets: lifecycle
                 .publication_targets
                 .into_iter()
@@ -863,7 +1122,6 @@ fn rejected_slots_here(records: &[SignInRecord]) -> BTreeSet<String> {
 /// of a device's slot leaves that device linkable. One the roster can name
 /// also refuses any other spelling a link would record as that slot, since
 /// that link would end it.
-#[cfg_attr(not(feature = "unreleased-device-pairing"), allow(dead_code))]
 fn rejects_slot(records: &[SignInRecord], published_slot: &str, slot: &DeviceSlotId) -> bool {
     records.iter().any(|record| {
         record.answer == SignInAnswer::Rejected
@@ -986,7 +1244,8 @@ fn roster_slot(slot_hex: &str) -> Option<DeviceSlotId> {
 /// How `record` is listed, if it is. A sign-in this device rejected is not,
 /// nor one it dismissed while the roster has an entry for its slot. One
 /// another device answered keeps its prompt, saying so, only while that
-/// prompt waited here for a new sign-in. A device that was
+/// prompt waited here for a new sign-in; a device the user removed is no
+/// such answer and leaves the list. A device that was
 /// here before this one, or a sign-in this device put off or linked itself,
 /// leaves the list once the roster answers it.
 fn listed_state(
@@ -1024,10 +1283,31 @@ fn listed_state(
             },
         );
     }
-    if roster.rejected_slots.contains_key(&slot) {
-        return keeps_prompt.then_some(UnrecognizedSignInState::RejectedElsewhere);
+    if let Some(rejected) = roster.rejected_slots.get(&slot) {
+        // A `removed` slot held a device the user linked and then removed:
+        // no one said it was not them, so there is nothing to ask or report.
+        return (keeps_prompt && rejected.reason == RejectedSlotReasonV1::NotMe)
+            .then_some(UnrecognizedSignInState::RejectedElsewhere);
     }
     Some(waiting)
+}
+
+/// Each slot `roster` records as `removed`, as a sign-in names it, with the
+/// time through which a publication there is the removed device's: that
+/// record's `rejected_at`, plus `skew`, the future skew the directory accepts
+/// from a publisher's clock. The user linked the device and removed it.
+fn removed_slots(roster: &DeviceRosterV1, skew: Duration) -> Vec<(String, u64)> {
+    roster
+        .rejected_slots
+        .iter()
+        .filter(|(_, rejected)| rejected.reason == RejectedSlotReasonV1::Removed)
+        .map(|(slot, rejected)| {
+            (
+                hex::encode(slot),
+                rejected.rejected_at.saturating_add(skew.as_secs()),
+            )
+        })
+        .collect()
 }
 
 /// Whether the roster holds `record`'s slot as a device: the user confirmed
@@ -1073,6 +1353,145 @@ fn rejected_slot(
             tag_signature_key: None,
         },
     )))
+}
+
+/// A slot read's result: every slot of the account, as its relays serve it.
+pub(crate) type SlotReadResult = Result<AccountKeyPackageSlots, AppError>;
+
+/// A slot read the look began: this device's own KeyPackages as they were,
+/// and the read.
+pub(crate) struct SlotReadStart {
+    own: OwnKeyPackages,
+    read: SlotRead,
+}
+
+impl SlotReadStart {
+    /// Run the read beside the writer.
+    pub(crate) fn spawn(self) -> RunningSlotRead {
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(self.read.run(Some(cancel.clone())));
+        RunningSlotRead {
+            own: self.own,
+            ends_on_drop: EndOnDrop {
+                cancel,
+                abort: task.abort_handle(),
+            },
+            task,
+        }
+    }
+}
+
+/// What a slot read's continuation decided.
+pub(crate) enum SlotReadEnd {
+    /// Today's check ran, against current state.
+    Checked(Result<SignInCheckReport, AppError>),
+    /// This device's own KeyPackages changed during the read: read again.
+    ReadAgain(Box<SlotReadStart>),
+    /// They changed again during that read: nothing was recorded.
+    Unjudged,
+}
+
+/// A slot read's inputs. The read runs beside the writer and holds only
+/// these: the directory's public handle, the relay plane for its endpoint
+/// filter, the account id, this device's slot and the read's telemetry
+/// step. It holds nothing of the client: no engine, session, account
+/// storage, published read state or subscription.
+struct SlotRead {
+    directory: Directory<MarmotApp>,
+    relay_plane: MarmotRelayPlane,
+    account_id_hex: String,
+    own_slot: Option<String>,
+    step: LaneStep,
+}
+
+impl SlotRead {
+    /// Read every slot. With `cancel`, the read stops between stages and
+    /// returns `None`; see [`crate::read_account_key_package_slots`].
+    async fn run(self, cancel: Option<CancellationToken>) -> Option<SlotReadResult> {
+        let SlotRead {
+            directory,
+            relay_plane,
+            account_id_hex,
+            own_slot,
+            step,
+        } = self;
+        let read = crate::read_account_key_package_slots(
+            &directory,
+            &relay_plane,
+            &account_id_hex,
+            own_slot.as_deref(),
+            cancel.as_ref(),
+        )
+        .await?;
+        step.finish(&read);
+        Some(read)
+    }
+}
+
+/// A slot read running beside the writer. Dropped unended, it ends its task:
+/// a worker aborted at shutdown's timeout drops its reads with it, as it
+/// dropped the read it once awaited inline.
+pub(crate) struct RunningSlotRead {
+    own: OwnKeyPackages,
+    task: JoinHandle<Option<SlotReadResult>>,
+    ends_on_drop: EndOnDrop,
+}
+
+/// Cancels a read and aborts its task when dropped. A no-op once the task
+/// has ended.
+struct EndOnDrop {
+    cancel: CancellationToken,
+    abort: AbortHandle,
+}
+
+impl Drop for EndOnDrop {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        self.abort.abort();
+    }
+}
+
+impl RunningSlotRead {
+    /// The read's result once its task ends. Cancel-safe.
+    pub(crate) async fn result(&mut self) -> SlotReadResult {
+        match (&mut self.task).await {
+            Ok(Some(read)) => read,
+            Ok(None) => Err(AppError::BlockingTask("sign-in slot read cancelled".into())),
+            Err(error) => Err(AppError::BlockingTask(
+                if error.is_panic() {
+                    "sign-in slot read panicked"
+                } else {
+                    "sign-in slot read cancelled"
+                }
+                .to_owned(),
+            )),
+        }
+    }
+
+    /// This device's own KeyPackages as they were when the read started.
+    pub(crate) fn into_own(self) -> OwnKeyPackages {
+        self.own
+    }
+
+    /// Stop the read at its next stage, without waiting for it.
+    pub(crate) fn cancel(&self) {
+        self.ends_on_drop.cancel.cancel();
+    }
+
+    /// Whether the read's task has ended.
+    pub(crate) fn is_finished(&self) -> bool {
+        self.task.is_finished()
+    }
+
+    /// Stop the read at its next stage and wait for its task to end.
+    pub(crate) async fn end(self) {
+        let RunningSlotRead {
+            task, ends_on_drop, ..
+        } = self;
+        ends_on_drop.cancel.cancel();
+        let _ = task.await;
+        drop(ends_on_drop);
+    }
 }
 
 #[cfg(test)]

@@ -2,7 +2,9 @@
 //! (kind 10030, read only).
 //!
 //! Egress is explicit. Discovery, `fetch_emoji_set` and `user_emoji_list`
-//! read text events from relays and never fetch an image. Image bytes come
+//! read text events from relays and never fetch an image. Sets are read from
+//! the account's relays and the runtime's configured relays together, as
+//! sticker packs are; the account's own list only from the account's relays. Image bytes come
 //! only from `fetch_emoji_set_asset` (one preview), `fetch_emoji_set_cover`
 //! (the set's cover) and `install_emoji_set` (every emoji of a set), each of
 //! which tells the image host the user's IP address, so hosts call them only
@@ -14,7 +16,9 @@
 //! Installing snapshots one set version: each emoji is downloaded once,
 //! validated, and stored with its SHA-256 under the account. Reading an
 //! installed emoji never touches the network, and a later change of URL or
-//! image cannot replace what was installed until the user reinstalls.
+//! image cannot replace what was installed until the user reinstalls. A retry
+//! of the same version retains verified installed images when a refresh fails.
+//! Installing a different version replaces the snapshot as a whole.
 //! Nothing here builds a group message: hosts re-upload installed bytes as
 //! encrypted attachments, so no set URL or address reaches a chat.
 
@@ -76,6 +80,9 @@ const EMOJI_DOWNLOAD_CONCURRENCY: usize = 4;
 /// Relay reads in flight at once when resolving a user list's pointers.
 const EMOJI_SET_READ_CONCURRENCY: usize = 4;
 const MAX_FUTURE_EVENT_SKEW_SECONDS: u64 = 5 * 60;
+
+/// A same-version install's verified stored images, by shortcode.
+type InstalledEmojiSnapshot = HashMap<String, (StoredInstalledEmoji, Vec<u8>)>;
 
 /// Why an `emoji` entry was not offered or not installed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -211,6 +218,7 @@ pub struct AppEmojiSetSyncResult {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppEmojiSetInstallResult {
     pub set: AppEmojiSet,
+    /// Available images after this install, including verified same-version fallbacks.
     pub installed_count: u32,
     /// Every entry not installed: the set's parse-time skips first, then
     /// install-time ones (downloads, validation, caps).
@@ -683,7 +691,11 @@ struct EmojiAccountContext {
     label: String,
     account_id_hex: String,
     storage: SqliteAppStorage,
+    /// The account's own relays: the kind-10030 list is read from these only.
     endpoints: Vec<TransportEndpoint>,
+    /// Set reads (discovery, one set, the sets a list points to): the
+    /// account's relays plus the runtime's configured relays.
+    set_read_endpoints: Vec<TransportEndpoint>,
 }
 
 impl MarmotApp {
@@ -732,8 +744,9 @@ impl MarmotApp {
         .await
     }
 
-    /// Fetch the newest kind-30030 sets from the account's relays (the ones
-    /// sticker discovery uses), keeping only the newest version of each
+    /// Fetch the newest kind-30030 sets from the account's relays and the
+    /// runtime's configured relays (the ones sticker discovery uses), keeping
+    /// only the newest version of each
     /// address. Text only: never fetches an image. A `search` that is an
     /// `npub` or hex public key narrows the fetch to that author; other text
     /// is matched locally by [`MarmotApp::emoji_sets`].
@@ -751,12 +764,15 @@ impl MarmotApp {
         if let Some(author) = search.and_then(author_search) {
             filter = filter.author(author);
         }
+        // The event budget scales with the relays queried, so one relay's
+        // answers cannot crowd out another's newer versions.
         let fetched = self
             .relay_plane
             .fetch_public_events(
-                context.endpoints.clone(),
+                context.set_read_endpoints.clone(),
                 vec![filter],
-                MAX_DISCOVERY_EMOJI_SETS * 2,
+                (MAX_DISCOVERY_EMOJI_SETS * 2)
+                    .saturating_mul(context.set_read_endpoints.len().max(1)),
             )
             .await
             .map_err(|_| AppError::EmojiSetNetwork("emoji set discovery failed".into()))?;
@@ -776,7 +792,8 @@ impl MarmotApp {
     }
 
     /// Fetch one set by coordinate or `naddr` (its relay hints, at most 8,
-    /// are tried as well as the account's relays). Text only.
+    /// are tried as well as the account's and the runtime's configured
+    /// relays). Text only.
     pub async fn fetch_emoji_set(
         &self,
         account_ref: &str,
@@ -972,10 +989,11 @@ impl MarmotApp {
 
     /// Install the stored version of a set: download every emoji once,
     /// validate it and store its bytes and SHA-256 under the account,
-    /// replacing any earlier snapshot of the same set. Entries that are
-    /// invalid, duplicated, fail to download or validate, or go over a cap
-    /// are reported, not fatal. This reveals the user's IP address to every
-    /// image host in the set.
+    /// replacing an earlier version of the set. A same-version retry keeps a
+    /// verified installed image when refreshing it fails or does not fit, and
+    /// that entry stays installed. Other entries that are invalid, duplicated,
+    /// fail to download or validate, or go over a cap are reported, not fatal.
+    /// This reveals the user's IP address to every image host in the set.
     ///
     /// `expected_event_id_hex` is the version the user was shown. When the
     /// stored version is another one (a sync or fetch replaced it), the call
@@ -1010,7 +1028,7 @@ impl MarmotApp {
         };
         // Read under the lock, so no other install or uninstall changes the
         // version, the set count or the byte budget before the write.
-        let (set, budget) = {
+        let (set, budget, previous) = {
             let (storage, coordinate) = (storage.clone(), coordinate.clone());
             let expected = expected_event_id_hex.to_owned();
             read_blocking(move || install_plan(&storage, &coordinate, &expected)).await?
@@ -1020,7 +1038,7 @@ impl MarmotApp {
         let (kept, install_skips) = tokio::select! {
             biased;
             () = &mut stop => return Err(AppError::EmojiSetInstallCancelled),
-            downloaded = self.download_set(&set.emoji, budget, control) => downloaded,
+            downloaded = self.download_set(&set.emoji, budget, control, previous) => downloaded,
         };
         // A cancellation in the poll that finished the downloads still wins
         // over a failed result.
@@ -1182,21 +1200,28 @@ impl MarmotApp {
 
     /// Download a set's emoji in order, a few at a time, keeping those that
     /// validate and still fit `budget`; one that does not fit is skipped and
-    /// later, smaller ones are still tried. Once the bytes transferred,
-    /// valid or not, reach twice the budget, the rest are skipped without
-    /// being fetched (beyond the few already in flight). Each finished entry
-    /// advances `control`'s progress. No download starts once `control` or
-    /// the app's install stop is cancelled; returning early is the caller's
-    /// `select!`.
+    /// later, smaller ones are still tried. Verified `previous` bytes remain
+    /// installed, and unreported, when their refresh fails or cannot fit.
+    /// Once the bytes transferred, valid or not, reach twice the budget, the
+    /// rest are skipped without being fetched (beyond the few already in
+    /// flight). Each finished entry advances `control`'s progress. No
+    /// download starts once `control` or the app's install stop is
+    /// cancelled; returning early is the caller's `select!`.
     async fn download_set(
         &self,
         entries: &[StoredEmojiSetEntry],
         budget: u64,
         control: &EmojiSetInstallControl,
+        mut previous: InstalledEmojiSnapshot,
     ) -> (Vec<(StoredInstalledEmoji, Vec<u8>)>, Vec<AppEmojiSkip>) {
         let mut kept = Vec::new();
         let mut skipped = Vec::new();
-        let mut used = 0_u64;
+        // Reserve every fallback before downloading: an early new image must
+        // not consume the space occupied by an old image later in the set.
+        let mut used = previous
+            .values()
+            .map(|(_, bytes)| bytes.len() as u64)
+            .sum::<u64>();
         let mut fetched = 0_u64;
         // Owned inputs keep the stream's closure free of higher-ranked
         // borrows, which the FFI's `Send` future bound cannot prove.
@@ -1227,13 +1252,17 @@ impl MarmotApp {
                 shortcode: Some(entry.shortcode.clone()),
                 reason,
             };
-            match result {
+            let mut retained = previous.remove(&entry.shortcode);
+            let reason = match result {
                 Ok(image) => {
                     let len = image.bytes.len() as u64;
-                    if used.saturating_add(len) > budget {
-                        skipped.push(skip(AppEmojiSkipReason::OverCap));
+                    let old_len = retained.as_ref().map_or(0, |(_, bytes)| bytes.len() as u64);
+                    let next_used = used.saturating_sub(old_len).saturating_add(len);
+                    if next_used > budget {
+                        Some(AppEmojiSkipReason::OverCap)
                     } else {
-                        used += len;
+                        used = next_used;
+                        retained = None;
                         kept.push((
                             StoredInstalledEmoji {
                                 shortcode: entry.shortcode.clone(),
@@ -1246,9 +1275,15 @@ impl MarmotApp {
                             },
                             image.bytes,
                         ));
+                        None
                     }
                 }
-                Err(reason) => skipped.push(skip(reason)),
+                Err(reason) => Some(reason),
+            };
+            // An entry that keeps its earlier image is installed, not skipped.
+            match retained {
+                Some(image) => kept.push(image),
+                None => skipped.extend(reason.map(skip)),
             }
             if fetched >= budget.saturating_mul(2) {
                 break;
@@ -1256,11 +1291,16 @@ impl MarmotApp {
         }
         drop(downloads);
         control.finish_entries(entries.len().saturating_sub(done), 0);
-        skipped.extend(entries.iter().skip(done).map(|entry| AppEmojiSkip {
-            position: None,
-            shortcode: Some(entry.shortcode.clone()),
-            reason: AppEmojiSkipReason::OverCap,
-        }));
+        for entry in entries.iter().skip(done) {
+            match previous.remove(&entry.shortcode) {
+                Some(image) => kept.push(image),
+                None => skipped.push(AppEmojiSkip {
+                    position: None,
+                    shortcode: Some(entry.shortcode.clone()),
+                    reason: AppEmojiSkipReason::OverCap,
+                }),
+            }
+        }
         (kept, skipped)
     }
 
@@ -1274,8 +1314,13 @@ impl MarmotApp {
         let filter = address.filter()?;
         // Hints only add candidates: every version passes NIP-01 replacement
         // ordering, so an old version on a hint relay cannot hide a newer one.
+        // The account's own emoji list (kind 10030) is read from its relays
+        // only, as `user_emoji_list` reads it: no hints, no configured
+        // relays. Another account's list keeps its hints.
+        let own_list = address.kind == USER_EMOJI_LIST_KIND
+            && address.author_pubkey_hex == context.account_id_hex;
         let mut found = false;
-        if !relay_hints.is_empty() {
+        if !relay_hints.is_empty() && !own_list {
             match self
                 .fetch_set_versions(context, &coordinate, relay_hints.to_vec(), filter.clone())
                 .await
@@ -1285,8 +1330,15 @@ impl MarmotApp {
                 Err(error) => return Err(error),
             }
         }
+        // Lists (kind 10030) stay on the account's relays, as before; sets
+        // read the wider set.
+        let endpoints = if address.kind == USER_EMOJI_LIST_KIND {
+            context.endpoints.clone()
+        } else {
+            context.set_read_endpoints.clone()
+        };
         match self
-            .fetch_set_versions(context, &coordinate, context.endpoints.clone(), filter)
+            .fetch_set_versions(context, &coordinate, endpoints, filter)
             .await
         {
             Ok(_) => {}
@@ -1306,9 +1358,10 @@ impl MarmotApp {
         endpoints: Vec<TransportEndpoint>,
         filter: Filter,
     ) -> Result<bool, AppError> {
+        let max_events = MAX_REPLACEABLE_VERSIONS_PER_FETCH.saturating_mul(endpoints.len().max(1));
         let events = self
             .relay_plane
-            .fetch_public_events(endpoints, vec![filter], MAX_REPLACEABLE_VERSIONS_PER_FETCH)
+            .fetch_public_events(endpoints, vec![filter], max_events)
             .await
             .map_err(|_| AppError::EmojiSetNetwork("emoji set fetch failed".into()))?
             .events;
@@ -1351,7 +1404,8 @@ impl MarmotApp {
                 None => by_author.push((author, vec![pointer.identifier.clone()])),
             }
         }
-        let endpoints = context.endpoints.clone();
+        let endpoints = context.set_read_endpoints.clone();
+        let relays = endpoints.len().max(1);
         let mut reads = futures::stream::iter(by_author)
             .map(|(author, identifiers)| {
                 let endpoints = endpoints.clone();
@@ -1364,7 +1418,7 @@ impl MarmotApp {
                 async move {
                     let read = self
                         .relay_plane
-                        .fetch_public_events(endpoints, vec![filter], limit)
+                        .fetch_public_events(endpoints, vec![filter], limit.saturating_mul(relays))
                         .await;
                     (read, limit)
                 }
@@ -1378,6 +1432,8 @@ impl MarmotApp {
             };
             // A relay applies `limit` to the whole filter: a full reply may be
             // all versions of one set, hiding another of the same author.
+            // Replies from several relays can reach `limit` together; that
+            // reads as incomplete too, never as complete when it is not.
             complete &= fetched.complete && fetched.events.len() < limit;
             for event in fetched.events {
                 if let Ok(set) = stored_set_from_event(&event, allow_loopback)
@@ -1438,7 +1494,8 @@ impl MarmotApp {
         .await
     }
 
-    /// The relays sticker discovery uses: the account's outbox relays.
+    /// The account's outbox relays, and for set reads those plus the
+    /// runtime's configured relays: the relays sticker pack reads use.
     fn emoji_context(&self, account_ref: &str) -> Result<EmojiAccountContext, AppError> {
         let account = self.account_home().account(account_ref)?;
         let relay_lists = self
@@ -1454,6 +1511,7 @@ impl MarmotApp {
             label: account.label.clone(),
             account_id_hex: account.account_id_hex,
             storage: self.account_storage(&account.label)?.app_storage(),
+            set_read_endpoints: crate::stickers::pack_read_endpoints(self, &endpoints),
             endpoints,
         })
     }
@@ -1477,7 +1535,7 @@ fn ingest_discovered_sets(
     let mut seen = HashSet::new();
     let mut discovered = 0;
     let mut updated = 0;
-    for event in events.into_iter().take(MAX_DISCOVERY_EMOJI_SETS * 2) {
+    for event in events {
         if event.kind != Kind::Custom(EMOJI_SET_KIND) {
             continue;
         }
@@ -1617,12 +1675,13 @@ fn shown_version(
 
 /// The shown version to install and the byte budget it may use, refused
 /// before any download when the set has no valid emoji, would exceed the
-/// installed set count, or no storage is left.
+/// installed set count, or no storage is left. A same-version install also
+/// returns the verified installed images as fallbacks, corrupt rows excluded.
 fn install_plan(
     storage: &SqliteAppStorage,
     coordinate: &str,
     expected_event_id_hex: &str,
-) -> Result<(StoredEmojiSet, u64), AppError> {
+) -> Result<(StoredEmojiSet, u64, InstalledEmojiSnapshot), AppError> {
     let set = shown_version(storage, coordinate, expected_event_id_hex)?;
     if set.emoji.is_empty() {
         return Err(no_valid_emoji());
@@ -1646,7 +1705,23 @@ fn install_plan(
             "installed emoji storage is full".into(),
         ));
     }
-    Ok((set, budget))
+    let mut previous = InstalledEmojiSnapshot::new();
+    let same_version = installed_sets.iter().any(|installed| {
+        installed.coordinate == coordinate
+            && installed.version.event_id_hex == set.version.event_id_hex
+    });
+    if same_version {
+        for entry in &set.emoji {
+            // A stored image that fails its hash check is no fallback,
+            // fetching again can repair it.
+            if let Some((row, bytes)) =
+                storage.intact_installed_custom_emoji_bytes(coordinate, &entry.shortcode)?
+            {
+                previous.insert(entry.shortcode.clone(), (row.emoji, bytes));
+            }
+        }
+    }
+    Ok((set, budget, previous))
 }
 
 /// Run a local read on the blocking pool, so account resolution, a cold

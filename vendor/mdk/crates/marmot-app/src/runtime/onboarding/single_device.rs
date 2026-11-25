@@ -50,6 +50,9 @@ impl AccountSetup<'_> {
                 continue;
             }
             let event_id_hex = event.id.clone();
+            let client = event
+                .tag_value("client")
+                .and_then(client_label::client_label);
             let published_at = event.created_at;
             let parsed =
                 crate::key_package_records::key_package_from_record(DirectoryRelayEventRecord {
@@ -83,6 +86,7 @@ impl AccountSetup<'_> {
                     && metadata
                         .as_ref()
                         .is_some_and(|m| m.not_before <= now && m.not_after > now),
+                client,
             });
         }
         // Missing any selected source remains inconclusive even if others reached EOSE.
@@ -95,17 +99,28 @@ impl AccountSetup<'_> {
         } else {
             OnboardingDeviceDiscovery::Unknown
         };
-        checkpoint.snapshot.single_device_notice = Some(OnboardingSingleDeviceNotice {
+        let mut notice = OnboardingSingleDeviceNotice {
             discovery,
             other_packages: packages,
             discovery_complete,
             acknowledged_at: None,
-        });
-        checkpoint.set(
-            OnboardingStep::SingleDevice,
-            OnboardingStatus::NeedsInput,
-            findings,
-        );
+        };
+        // After a staleness recheck, keep the user's acknowledgment while
+        // discovery shows nothing beyond what they acknowledged.
+        let status = match checkpoint
+            .stale_device_acknowledgment
+            .take()
+            .filter(|acknowledged| acknowledged.covers(&notice, &findings))
+        {
+            Some(acknowledged) => {
+                notice.acknowledged_at = acknowledged.notice.acknowledged_at;
+                checkpoint.single_device_acknowledged = true;
+                OnboardingStatus::Passed
+            }
+            None => OnboardingStatus::NeedsInput,
+        };
+        checkpoint.snapshot.single_device_notice = Some(notice);
+        checkpoint.set(OnboardingStep::SingleDevice, status, findings);
         Ok(())
     }
 

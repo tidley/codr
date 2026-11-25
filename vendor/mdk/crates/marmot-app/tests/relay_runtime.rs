@@ -12,9 +12,7 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use cgka_engine::account_identity_proof::ACCOUNT_IDENTITY_PROOF_EXTENSION_TYPE;
 use cgka_engine::key_package::key_package_metadata;
 use cgka_traits::app_components::GROUP_ENCRYPTED_MEDIA_V2_COMPONENT_ID;
-use cgka_traits::app_event::{
-    MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_REACTION, STREAM_TAG,
-};
+use cgka_traits::app_event::{MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_REACTION};
 use cgka_traits::engine::KeyPackage;
 use cgka_traits::{GroupId, TransportEndpoint};
 use marmot_account::{AccountHome, AccountHomeError, AccountSecretStore, KeychainSecretStore};
@@ -562,6 +560,14 @@ async fn mock_relay() -> (TestRelay, String) {
 }
 
 async fn mock_app(dir: &tempfile::TempDir) -> (TestRelay, MarmotApp, String) {
+    mock_app_with(dir, |config| config).await
+}
+
+/// [`mock_app`] with its config adjusted by `configure`.
+async fn mock_app_with(
+    dir: &tempfile::TempDir,
+    configure: impl FnOnce(MarmotAppConfig) -> MarmotAppConfig,
+) -> (TestRelay, MarmotApp, String) {
     // Opt in at ordinary app fixtures; shared relay/setup helpers also serve
     // ignored diagnostics and nightly replay, which keep their original settings.
     storage_sqlite::relax_storage_for_test_process();
@@ -572,9 +578,11 @@ async fn mock_app(dir: &tempfile::TempDir) -> (TestRelay, MarmotApp, String) {
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
         url.clone(),
-        MarmotAppConfig::white_noise()
-            .with_allow_loopback_blob_endpoints(true)
-            .with_allow_loopback_relay_endpoints(true),
+        configure(
+            MarmotAppConfig::white_noise()
+                .with_allow_loopback_blob_endpoints(true)
+                .with_allow_loopback_relay_endpoints(true),
+        ),
     );
     (relay, app, url)
 }
@@ -2495,9 +2503,13 @@ async fn app_runtime_create_identity_bootstraps_managed_account_and_key_package(
             .count(),
         1
     );
+    // At most one relay-list/follow-list fetch, plus the background sign-in
+    // check's read of this account's KeyPackage slots, which device groups
+    // (on by default) start at the worker's first maintenance pass. That
+    // read does not block setup, so it may or may not have completed here.
     let relay_health = runtime.shared_services().relay_plane().relay_health().await;
     assert!(
-        relay_health.directory_completed_fetches <= 1,
+        relay_health.directory_completed_fetches <= 2,
         "generated setup must not add synchronous relay-list/follow-list refetches; observed {} directory fetches",
         relay_health.directory_completed_fetches,
     );
@@ -3322,10 +3334,24 @@ async fn local_account_key_packages_are_readable_while_startup_is_held() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn app_runtime_rotate_publishes_key_package_to_nip65_outbox_relays() {
+    rotate_publishes_key_package_to_nip65_outbox_relays(false).await;
+}
+
+/// The relay lists go out before the account's first open, so the device
+/// groups' publish gate looks for a stored removal before the KeyPackage
+/// cutover has classified the fresh account; that look must not leave it
+/// without a slot to rotate in (mdk#3477).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn app_runtime_rotate_publishes_key_package_to_nip65_outbox_relays_with_device_groups() {
+    rotate_publishes_key_package_to_nip65_outbox_relays(true).await;
+}
+
+async fn rotate_publishes_key_package_to_nip65_outbox_relays(device_groups: bool) {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
     home.create_account("bob").unwrap();
-    let (_relay, app, url) = mock_app(&dir).await;
+    let (_relay, app, url) =
+        mock_app_with(&dir, |config| config.with_device_groups(device_groups)).await;
 
     app.publish_account_relay_list_kind("bob", "nip65", vec![endpoint(&url)], vec![endpoint(&url)])
         .await
@@ -3539,48 +3565,6 @@ async fn app_runtime_executes_group_and_message_intents_on_managed_accounts() {
         )
     })
     .await;
-
-    let stream_id = [0x44; 32];
-    runtime
-        .start_agent_text_stream(
-            &alice.account.account_id_hex,
-            &group_id,
-            &stream_id,
-            123,
-            vec!["quic://127.0.0.1:4450".to_owned()],
-        )
-        .await
-        .unwrap();
-    let stream_event = wait_for_event(&mut events, |event| {
-        matches!(
-            event,
-            MarmotAppEvent::AgentStreamStarted(stream)
-                if stream.account_id_hex == bob_id
-                    && stream.message.group_id == group_id
-                    && stream.message.kind == cgka_traits::MARMOT_APP_EVENT_KIND_AGENT_STREAM_START
-                    && tag_value(&stream.message.tags, STREAM_TAG)
-                        == Some(hex::encode(stream_id).as_str())
-        )
-    })
-    .await;
-    let MarmotAppEvent::AgentStreamStarted(stream_event) = stream_event else {
-        panic!("expected agent stream start event");
-    };
-    let group_id_hex = hex::encode(group_id.as_slice());
-    let stream_id_hex = hex::encode(stream_id);
-    let stream_crypto = runtime
-        .agent_text_stream_crypto_for_start_event(
-            Some(&bob.account.account_id_hex),
-            Some(group_id_hex.as_str()),
-            Some(stream_id_hex.as_str()),
-            &stream_event.message.message_id_hex,
-        )
-        .await
-        .unwrap();
-    assert_eq!(stream_crypto.account_id_hex, bob.account.account_id_hex);
-    assert_eq!(stream_crypto.group_id, group_id);
-    assert_eq!(stream_crypto.stream_id, stream_id.to_vec());
-    assert_eq!(stream_crypto.policy_max_plaintext_frame_len, Some(4096));
 
     runtime.shutdown().await;
 }
@@ -5151,10 +5135,13 @@ async fn app_runtime_uploads_armed_backfill_row_without_visible_activity() {
     // messages at his live epoch. Present-dated so they clear any since floor;
     // none yields visible summary content, so the summary-gated schedule stays
     // silent and only the armed-backfill schedule can deliver these rows.
+    // Stamped past the clock-skew margin after bob's Welcome: traffic within
+    // it may be the group's pre-Welcome history, which is not stall evidence.
     let created_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs();
+        .as_secs()
+        + cgka_traits::group::PRE_WELCOME_CLOCK_SKEW_SECS;
     for arm in 0..BACKFILL_THRESHOLD {
         publish_garbage_group_message(&url, &nostr_group_id_hex, created_at, &format!("arm-{arm}"))
             .await;
@@ -5189,6 +5176,11 @@ async fn app_runtime_uploads_armed_backfill_row_without_visible_activity() {
          tracker even though the arming traffic produced no visible activity",
     );
 
+    // The read answers from the published read state: fence the worker
+    // first, so it has published every write it made before.
+    marmot_app::worker_fences::worker_round_trip(&runtime, "bob")
+        .await
+        .unwrap();
     assert!(
         !runtime
             .group_recovery_status("bob", &group_id)
@@ -6295,6 +6287,13 @@ async fn live_muted_chat_notifies_direct_mentions_but_not_ordinary_messages() {
         .unwrap()
         .operation
         .expect("eligible fixture members");
+    // The create's Welcome wave runs beside the worker (mdk#3466): wait for
+    // it to publish before Bob catches up, so his join notification comes
+    // before the subscription.
+    timeout(Duration::from_secs(10), runtime.drain_in_flight_work())
+        .await
+        .expect("the create's Welcome wave settles")
+        .unwrap();
     let group_hex = hex::encode(group_id.as_slice());
     app.set_local_notifications_enabled(&bob_id, true).unwrap();
     runtime.catch_up_accounts().await.unwrap();
@@ -6438,6 +6437,12 @@ async fn concurrent_wake_collection_and_foreground_subscription_share_notificati
         .unwrap()
         .operation
         .expect("eligible fixture members");
+    // The create's Welcome wave runs beside the worker (mdk#3466): wait for
+    // it to publish before Bob catches up and mutes the chat.
+    timeout(Duration::from_secs(10), runtime.drain_in_flight_work())
+        .await
+        .expect("the create's Welcome wave settles")
+        .unwrap();
 
     app.set_local_notifications_enabled(&bob.account.account_id_hex, true)
         .unwrap();
@@ -7644,7 +7649,7 @@ async fn app_runtime_starts_directory_subscriptions_for_known_users() {
     let health = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             let health = runtime.shared_services().relay_plane().relay_health().await;
-            if health.directory_active_subscriptions == 1
+            if health.directory_active_subscriptions == 2
                 // A relay recovery can legitimately complete another rebuild
                 // before this poll observes the initial one. This counter is
                 // monotonic, so waiting for exact equality races that recovery.
@@ -7657,7 +7662,7 @@ async fn app_runtime_starts_directory_subscriptions_for_known_users() {
     })
     .await
     .expect("directory subscriptions should complete asynchronously");
-    assert_eq!(health.directory_active_subscriptions, 1);
+    assert_eq!(health.directory_active_subscriptions, 2);
     assert!(health.directory_completed_subscription_syncs >= 1);
     runtime.shutdown().await;
 }
@@ -7850,7 +7855,7 @@ async fn app_runtime_message_subscription_returns_snapshot_then_live_updates() {
         )
         .await
         .unwrap();
-    let update = wait_for_message_update(&mut subscription, |update| {
+    wait_for_message_update(&mut subscription, |update| {
         matches!(
             update,
             RuntimeMessageUpdate::Message(message)
@@ -7860,7 +7865,6 @@ async fn app_runtime_message_subscription_returns_snapshot_then_live_updates() {
         )
     })
     .await;
-    assert!(matches!(update, RuntimeMessageUpdate::Message(_)));
 
     runtime.shutdown().await;
 }
@@ -9835,13 +9839,15 @@ async fn relay_app_runtime_projects_typed_reactions_and_deletes() {
     assert!(bad_media.to_string().contains("media plaintext_sha256"));
 }
 
+/// New groups no longer carry the retired agent text stream component
+/// (`0x8006`), so neither member's record holds it
+/// (agent-text-stream-quic-v1.md, "Retirement").
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn relay_app_runtime_creates_default_agent_text_stream_group() {
+async fn new_groups_omit_the_retired_agent_text_stream_component() {
     let dir = tempfile::tempdir().unwrap();
     let home = AccountHome::open(dir.path());
     home.create_account("alice").unwrap();
     home.create_account("bob").unwrap();
-    let alice_id = home.account("alice").unwrap().account_id_hex;
 
     let (_relay, app, _url) = mock_app(&dir).await;
     let mut bob = app.client("bob").await.unwrap();
@@ -9855,47 +9861,18 @@ async fn relay_app_runtime_creates_default_agent_text_stream_group() {
         .operation
         .expect("eligible fixture members");
     let group_id_hex = hex::encode(group_id.as_slice());
-
-    let alice_group = app.group("alice", &group_id_hex).unwrap().unwrap();
-    assert!(alice_group.agent_text_stream.required);
-    assert_eq!(alice_group.agent_text_stream.component_id, 0x8006);
-    assert_eq!(
-        alice_group.agent_text_stream.component,
-        "marmot.group.agent-text-stream.quic.v1"
-    );
-    assert_eq!(
-        alice_group.agent_text_stream.required_member_roles,
-        vec!["receive".to_owned()]
-    );
-    assert_eq!(
-        alice_group.agent_text_stream.allowed_member_roles,
-        vec!["receive".to_owned(), "send".to_owned()]
-    );
-    assert_eq!(
-        alice_group.agent_text_stream.data_hex,
-        "010300001000000000000000"
-    );
-
     bob.sync().await.unwrap();
-    let bob_group = app.group("bob", &group_id_hex).unwrap().unwrap();
-    assert!(bob_group.agent_text_stream.required);
 
-    alice.send(&group_id, b"write a summary").await.unwrap();
-    let prompt = bob.sync().await.unwrap();
-    assert_eq!(prompt.messages.len(), 1);
-    assert_eq!(prompt.messages[0].sender, alice_id);
-    assert_eq!(
-        prompt.messages[0].sender_display_name.as_deref(),
-        Some("alice")
-    );
-    assert_eq!(prompt.messages[0].plaintext, "write a summary");
-
-    let alice_secret = alice.agent_text_stream_exporter_secret(&group_id).unwrap();
-    let bob_secret = bob.agent_text_stream_exporter_secret(&group_id).unwrap();
-    let repeated_alice_secret = alice.agent_text_stream_exporter_secret(&group_id).unwrap();
-
-    assert_eq!(alice_secret, bob_secret);
-    assert_eq!(alice_secret, repeated_alice_secret);
+    for label in ["alice", "bob"] {
+        let group = app.group(label, &group_id_hex).unwrap().unwrap();
+        assert!(
+            group
+                .unknown_components
+                .iter()
+                .all(|component| component.component_id != 0x8006),
+            "{label}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -14024,6 +14001,22 @@ async fn direct_roles(
 }
 
 #[cfg(feature = "test-policy-overrides")]
+fn direct_options(disappearing_message_secs: u64) -> marmot_app::DirectConversationOptions {
+    marmot_app::DirectConversationOptions {
+        disappearing_message_secs,
+    }
+}
+
+#[cfg(feature = "test-policy-overrides")]
+fn direct_retention(app: &MarmotApp, account_label: &str, group: &GroupId) -> u64 {
+    app.group(account_label, &hex::encode(group.as_slice()))
+        .unwrap()
+        .expect("projected direct conversation")
+        .message_retention
+        .disappearing_message_secs
+}
+
+#[cfg(feature = "test-policy-overrides")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn direct_start_is_shared() {
     use std::task::Poll;
@@ -14057,13 +14050,23 @@ async fn direct_start_is_shared() {
         .await
         .expect("the restarted worker must hold startup before either start");
     gate.arm(1);
-    let mut lost_response = Box::pin(runtime.start_direct_conversation(alice_id, &bob_npub));
+    // Only the first admitted start founds the group; every later start
+    // proposes another duration and must keep the founding one.
+    let mut lost_response = Box::pin(runtime.start_direct_conversation_with_options(
+        alice_id,
+        &bob_npub,
+        direct_options(300),
+    ));
     std::future::poll_fn(|cx| {
         assert!(lost_response.as_mut().poll(cx).is_pending());
         Poll::Ready(())
     })
     .await;
-    let mut concurrent = Box::pin(runtime.start_direct_conversation(alice_id, bob_id));
+    let mut concurrent = Box::pin(runtime.start_direct_conversation_with_options(
+        alice_id,
+        bob_id,
+        direct_options(600),
+    ));
     std::future::poll_fn(|cx| {
         assert!(concurrent.as_mut().poll(cx).is_pending());
         Poll::Ready(())
@@ -14084,7 +14087,7 @@ async fn direct_start_is_shared() {
     gate.release();
     let (first, second) = tokio::join!(
         concurrent,
-        runtime.start_direct_conversation(alice_id, &bob_npub)
+        runtime.start_direct_conversation_with_options(alice_id, &bob_npub, direct_options(60))
     );
     let group_id = first.unwrap();
     assert_eq!(second.unwrap(), group_id);
@@ -14094,6 +14097,7 @@ async fn direct_start_is_shared() {
         direct_roles(&runtime, alice_id, &group_id).await,
         (1, expected.clone())
     );
+    assert_eq!(direct_retention(&app, &alice.account.label, &group_id), 300);
 
     wait_for_event(&mut events, |event| {
         matches!(
@@ -14107,11 +14111,12 @@ async fn direct_start_is_shared() {
         direct_roles(&runtime, bob_id, &group_id).await,
         (1, expected.clone())
     );
+    assert_eq!(direct_retention(&app, &bob.account.label, &group_id), 300);
     for _ in 0..2 {
         for (account, peer) in [(alice_id, bob_id), (bob_id, alice_id)] {
             assert_eq!(
                 runtime
-                    .start_direct_conversation(account, peer)
+                    .start_direct_conversation_with_options(account, peer, direct_options(3_600))
                     .await
                     .unwrap(),
                 group_id
@@ -14121,6 +14126,9 @@ async fn direct_start_is_shared() {
                 (1, expected.clone())
             );
         }
+    }
+    for label in [&alice.account.label, &bob.account.label] {
+        assert_eq!(direct_retention(&app, label, &group_id), 300);
     }
     runtime.shutdown().await;
 }
@@ -14231,7 +14239,7 @@ async fn direct_retry_survives_restart() {
         .set_create_group_catch_up_barrier(Some(catch_up.clone()));
     rejecting.store(true, Ordering::Relaxed);
     let group_id = runtime
-        .start_direct_conversation(alice_id, bob_id)
+        .start_direct_conversation_with_options(alice_id, bob_id, direct_options(300))
         .await
         .unwrap();
     assert!(app.groups(&alice.account.label).unwrap().is_empty());
@@ -14252,7 +14260,7 @@ async fn direct_retry_survives_restart() {
     let mut repaired_events = runtime.subscribe();
     assert_eq!(
         runtime
-            .start_direct_conversation(alice_id, bob_id)
+            .start_direct_conversation_with_options(alice_id, bob_id, direct_options(600))
             .await
             .unwrap(),
         group_id
@@ -14269,6 +14277,7 @@ async fn direct_retry_survives_restart() {
         direct_roles(&runtime, alice_id, &group_id).await,
         (1, expected.clone())
     );
+    assert_eq!(direct_retention(&app, &alice.account.label, &group_id), 300);
     assert!(app.groups(&bob.account.label).unwrap().is_empty());
     catch_up.notify_one();
     runtime.shutdown().await;
@@ -14286,12 +14295,13 @@ async fn direct_retry_survives_restart() {
     runtime.catch_up_accounts().await.unwrap();
     assert_eq!(
         runtime
-            .start_direct_conversation(alice_id, bob_id)
+            .start_direct_conversation_with_options(alice_id, bob_id, direct_options(60))
             .await
             .unwrap(),
         group_id
     );
     assert_eq!(app.groups(&alice.account.label).unwrap().len(), 1);
+    assert_eq!(direct_retention(&app, &alice.account.label, &group_id), 300);
     let pending = runtime.pending_welcome_deliveries(alice_id).await.unwrap();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].group_id_hex, group_hex);
@@ -14314,13 +14324,16 @@ async fn direct_retry_survives_restart() {
         direct_roles(&runtime, bob_id, &group_id).await,
         (1, expected.clone())
     );
+    // The Welcome retained across restart carries the founding duration.
+    assert_eq!(direct_retention(&app, &bob.account.label, &group_id), 300);
     assert_eq!(
         runtime
-            .start_direct_conversation(bob_id, alice_id)
+            .start_direct_conversation_with_options(bob_id, alice_id, direct_options(3_600))
             .await
             .unwrap(),
         group_id
     );
+    assert_eq!(direct_retention(&app, &bob.account.label, &group_id), 300);
     assert_eq!(
         direct_roles(&runtime, alice_id, &group_id).await,
         (1, expected)
@@ -15802,6 +15815,12 @@ async fn app_runtime_exposes_welcome_redelivery_surface() {
         .operation
         .expect("eligible fixture members");
 
+    // The create's Welcome wave runs beside the worker (mdk#3466): until it
+    // settles, its Welcome is still outstanding. Wait for it.
+    timeout(Duration::from_secs(10), runtime.drain_in_flight_work())
+        .await
+        .expect("the create's Welcome wave settles")
+        .unwrap();
     // The welcome delivered over the live relay, so nothing is queued...
     assert!(
         runtime
@@ -16917,8 +16936,10 @@ impl nostr_relay_builder::prelude::QueryPolicy for OnboardingPaymentRequired {
         Box::pin(async { PolicyResult::Reject("payment-required: subscription needed".into()) })
     }
 }
+// The relay builder sends a rejected query's reason behind an `error: `
+// wrapper, as some public relays do (mdk#3439).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn onboarding_access_restricted_query_is_not_a_missing_record() {
+async fn onboarding_payment_required_query_is_not_a_missing_record() {
     use nostr::prelude::ToBech32;
     let dir = tempfile::tempdir().unwrap();
     let relay = LocalRelay::new(RelayBuilder::default().query_policy(OnboardingPaymentRequired));
@@ -16949,7 +16970,7 @@ async fn onboarding_access_restricted_query_is_not_a_missing_record() {
     );
     assert_eq!(
         result.steps[0].findings[0].issue,
-        marmot_app::OnboardingIssue::AccessRestricted
+        marmot_app::OnboardingIssue::PaymentRequired
     );
     runtime.shutdown_and_close().await.unwrap();
 }
@@ -18111,6 +18132,12 @@ async fn user_blocks_dm_history_send_gate_and_invite_admission() {
         .unwrap()
         .operation
         .expect("eligible fixture members");
+    // The create's Welcome wave runs beside the worker (mdk#3466): wait for
+    // it to publish while Alice's block applies.
+    timeout(Duration::from_secs(10), runtime.drain_in_flight_work())
+        .await
+        .expect("the create's Welcome wave settles")
+        .unwrap();
     sleep(Duration::from_millis(500)).await;
     assert!(
         runtime

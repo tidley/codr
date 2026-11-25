@@ -121,7 +121,7 @@ pub async fn prepare(
             || recovered["message_id_hex"] != message["message_id_hex"]
             || row["message_id_hex"] != message["message_id_hex"]
             || row["availability"] != "available"
-            || row["kind"] != 9
+            || !crate::wire::is_chat_timeline_row(row)
             || row["sender"]["account_id_hex"].as_str().is_none()
             || row["sender"]["account_id_hex"] != message["sender"]["account_id_hex"]
             || row["text_truncated"] == true

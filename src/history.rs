@@ -103,7 +103,7 @@ async fn last_own(
             rows.iter()
                 .filter(|row| {
                     row["sender"]["is_self"] == true
-                        && row["kind"] == 9
+                        && crate::wire::is_chat_timeline_row(row)
                         && row["availability"] == "available"
                 })
                 .filter_map(|row| row["recorded_at"].as_u64())

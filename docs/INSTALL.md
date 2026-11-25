@@ -5,12 +5,15 @@ the supported 0.9.0 setup. For an existing account, use the explicit
 [combined-service handover](COMBINED.md), not the legacy two-service setup flow.
 Fresh identity creation still uses local 0.9 setup before that handover.
 
-**0.12.2 is an unpublished release candidate, not an automatic upgrade.** Its
-MDK 0.17 storage cohort differs from the released MDK 0.14 cohort. The older
+**Issue #31's working source is not an automatic upgrade.** It keeps the Codr
+version at 0.12.2 but changes messaging to the MDK 0.19 storage cohort, incompatible
+with the earlier 0.14 and 0.17 cohorts. The older
 bootstrap/handover instructions below do not authorize that migration. Keep the
 running installation unchanged until separate approval and a verified stopped
-backup; see the [storage boundary](COMBINED.md#mdk-017-storage-boundary) and
-[release qualification record](releases/0.12.2-readiness.md). The immutable
+backup; see the [storage boundary](COMBINED.md#mdk-019-storage-boundary) and
+[current source/local-handover record](MDK-0.19.md). The following packaging
+history belongs to the earlier 0.17-based source, not proof for the 0.19 candidate.
+The immutable
 `v0.12.0` and `v0.12.1` tags remain unchanged. PR #27 fixed the 0.12.0 Linux
 x86_64 startup crash; 0.12.1 passed startup smokes but failed later upstream
 policy fixtures because `zstd` was missing. PR #29 installs the prerequisite

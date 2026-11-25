@@ -2,6 +2,7 @@
 
 use super::AppClient;
 use crate::{AppError, AppGroupRecord, SelfMembership};
+use cgka_traits::engine::ForwardedInvitation;
 use cgka_traits::storage::{GroupStorage, LeaveRequestStorage};
 use cgka_traits::{EngineError, GroupId};
 use storage_sqlite::InvitationDecision;
@@ -131,7 +132,7 @@ impl AppClient {
     /// Ordinary UserLeave includes an already accepted current copy. Unknown
     /// identity/trust and a held MAX leave ordinary leaf departure independent.
     pub(super) fn record_user_leave_decision(
-        &self,
+        &mut self,
         group_id: &GroupId,
     ) -> Result<Option<InvitationDecision>, AppError> {
         if !self.app.device_groups_enabled()
@@ -154,11 +155,19 @@ impl AppClient {
         {
             return Ok(None);
         }
-        Ok(Some(store.record_invitation_decision(
-            &chat,
-            admission.generation,
-            true,
-        )?))
+        let decision = store.record_invitation_decision(&chat, admission.generation, true)?;
+        self.send_invitation_decisions_next_turn();
+        Ok(Some(decision))
+    }
+
+    /// This device owes its siblings invitation decisions: its user answered
+    /// one, or branch selection withdrew the update that carried them. They
+    /// get them on the worker's next turn, through the same send a sibling
+    /// Add's acceptance takes ([`Self::send_recorded_acceptances`]), not at
+    /// the next maintenance pass (mdk#3566).
+    pub(super) fn send_invitation_decisions_next_turn(&mut self) {
+        self.acceptances_recorded = true;
+        self.invitation_decisions_changed = true;
     }
 
     /// An existing automatic Add obligation never spreads an invitation this
@@ -181,7 +190,7 @@ impl AppClient {
     /// Pending invitation acceptance uses its existing presentation guard.
     /// UserLeave records its current admission separately, including accepted copies.
     pub(super) fn record_local_invitation_decision(
-        &self,
+        &mut self,
         group_id: &GroupId,
         declined: bool,
     ) -> Result<Option<InvitationDecision>, AppError> {
@@ -201,11 +210,13 @@ impl AppClient {
         let Some(admission) = account.invitation_admission(group_id)? else {
             return Ok(None);
         };
-        Ok(Some(account.app_storage().record_invitation_decision(
+        let decision = account.app_storage().record_invitation_decision(
             &chat,
             admission.generation,
             declined,
-        )?))
+        )?;
+        self.send_invitation_decisions_next_turn();
+        Ok(Some(decision))
     }
 
     /// Called from the real admitted lifecycle event, including durable replay.
@@ -213,25 +224,34 @@ impl AppClient {
         &mut self,
         group_id: &GroupId,
         via_welcome: Option<&cgka_traits::MessageId>,
+        forwarded: &ForwardedInvitation,
     ) -> Result<(), AppError> {
         if !self.app.device_groups_enabled() || self.is_device_group(group_id)? {
             return Ok(());
         }
         let account = self.app.account_storage(&self.state.label)?;
-        let Some(admission) = account.invitation_admission(group_id)? else {
-            return Ok(());
+        let accepted = match account.invitation_admission(group_id)? {
+            // An unidentified copy stays local-only. Only the sibling that
+            // added it can say it is confirmed there (mdk#3546).
+            None => forwarded.confirmed && self.acceptable_pending_invitation(group_id)?.is_some(),
+            Some(admission) => {
+                if admission.via_welcome.as_ref() != via_welcome {
+                    return Ok(());
+                }
+                let storage = account.app_storage();
+                let chat = hex::encode(group_id.as_slice());
+                if admission.created_locally {
+                    storage.ensure_founding_invitation_decision(&chat, admission.generation)?;
+                }
+                storage.owe_installed_invitation_decision(&chat, &admission.generation)?;
+                // A decision this admission makes actionable applies on the
+                // worker's next turn (mdk#3566).
+                self.invitation_decisions_changed = true;
+                self.accepted_invitation_projection(group_id)?.is_some()
+            }
         };
-        if admission.via_welcome.as_ref() != via_welcome {
-            return Ok(());
-        }
-        let storage = account.app_storage();
-        let chat = hex::encode(group_id.as_slice());
-        if admission.created_locally {
-            storage.ensure_founding_invitation_decision(&chat, admission.generation)?;
-        }
-        storage.owe_installed_invitation_decision(&chat, &admission.generation)?;
         // The enclosing projection batch persists any presentation change.
-        if self.accepted_invitation_projection(group_id)?.is_some() {
+        if accepted {
             let chat = hex::encode(group_id.as_slice());
             if let Some(group) = self
                 .state
@@ -244,6 +264,72 @@ impl AppClient {
             }
         }
         Ok(())
+    }
+
+    /// Before a sibling Add of `chat`, which makes no claim or KeyPackage
+    /// spend first: a confirmed copy holding no decision for its generation,
+    /// such as one accepted while device groups were off, records the
+    /// acceptance a founder records (mdk#3546). Returns whether it did; the
+    /// caller then leaves the Add to a later pass, and sends what it recorded
+    /// once its scan ends ([`Self::send_recorded_acceptances`]), so the
+    /// sibling installs its copy settled and no send takes in device-group
+    /// traffic mid-scan. Only a copy founded here, or whose presented
+    /// invitation is that admission's own Welcome, counts as accepted: a row
+    /// rebuilt after a local deletion is unconfirmed by default and carries no
+    /// Welcome.
+    pub(super) fn record_unrecorded_acceptance(
+        &mut self,
+        group_id: &GroupId,
+    ) -> Result<bool, AppError> {
+        let Some(group) = self.state_group_record(group_id) else {
+            return Ok(false);
+        };
+        if group.pending_confirmation {
+            return Ok(false);
+        }
+        let account = self.app.account_storage(&self.state.label)?;
+        let Some(admission) = account.invitation_admission(group_id)? else {
+            return Ok(false);
+        };
+        let chat = hex::encode(group_id.as_slice());
+        let storage = account.app_storage();
+        if storage
+            .invitation_decision(&chat, &admission.generation)?
+            .is_some()
+        {
+            return Ok(false);
+        }
+        let accepted_here = match &admission.via_welcome {
+            None => admission.created_locally,
+            Some(welcome) => {
+                group.via_welcome_message_id_hex == Some(hex::encode(welcome.as_slice()))
+            }
+        };
+        if !accepted_here {
+            return Ok(false);
+        }
+        storage.ensure_founding_invitation_decision(&chat, admission.generation)?;
+        // A value the decision format cannot hold is not recorded.
+        if storage
+            .invitation_decision(&chat, &admission.generation)?
+            .is_none()
+        {
+            return Ok(false);
+        }
+        self.acceptances_recorded = true;
+        Ok(true)
+    }
+
+    /// Send, once a sibling-Add scan has ended, the acceptances it recorded,
+    /// with any other owed small state. Other owed state alone waits for
+    /// ordinary maintenance.
+    pub(super) async fn send_recorded_acceptances(&mut self) {
+        if !std::mem::take(&mut self.acceptances_recorded) {
+            return;
+        }
+        if let Err(error) = self.send_owed_small_state().await {
+            tracing::warn!(target: "marmot_app::client::invitation_decisions", method = "send_recorded_acceptances", error_kind = error.privacy_safe_kind(), "recorded acceptances wait for ordinary small-state sending");
+        }
     }
 
     /// Native founding can be recovered by the ordinary projection reconcile
@@ -278,7 +364,21 @@ impl AppClient {
         else {
             return Ok(None);
         };
-        if decision.declined || account.leave_request(group_id)?.is_some() {
+        if decision.declined {
+            return Ok(None);
+        }
+        self.acceptable_pending_invitation(group_id)
+    }
+
+    /// A pending invitation on an active local copy that an acceptance may
+    /// resolve: no Leave requested, still a member, and its inviter not
+    /// blocked here.
+    fn acceptable_pending_invitation(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Option<AppGroupRecord>, AppError> {
+        let account = self.app.account_storage(&self.state.label)?;
+        if account.leave_request(group_id)?.is_some() {
             return Ok(None);
         }
         let native = self.runtime.group_record(group_id)?;
@@ -332,24 +432,58 @@ impl AppClient {
             .is_some_and(|decision| decision.declined))
     }
 
+    /// Send and apply the invitation decisions changed since the last call:
+    /// one this device's user made goes to the siblings, and a sibling's that
+    /// won here is applied, on the worker's turn after the change instead of
+    /// at the next maintenance pass (mdk#3566). What is left owed retries
+    /// with maintenance. Returns whether it ran.
+    ///
+    /// Not while maintenance is paused or runs no pass
+    /// ([`Self::maintenance_passes`]): the flag stays set and the work
+    /// stays stored, for the next run that does.
+    pub(crate) async fn drive_changed_invitation_decisions(&mut self) -> bool {
+        if self.runtime.maintenance_is_paused()
+            || !matches!(self.maintenance_passes(), Ok(super::MaintenancePasses::Run))
+            || !std::mem::take(&mut self.invitation_decisions_changed)
+        {
+            return false;
+        }
+        self.send_recorded_acceptances().await;
+        self.drive_invitation_decisions().await;
+        true
+    }
+
     pub(crate) async fn drive_invitation_decisions(&mut self) {
         if !self.app.device_groups_enabled() || self.runtime.maintenance_is_paused() {
             return;
         }
         if let Err(error) = self.try_invitation_decisions().await {
+            self.invitation_work_held = true;
             tracing::warn!(target: "marmot_app::client::invitation_decisions", method = "drive_invitation_decisions", error_kind = error.privacy_safe_kind(), "invitation work remains for ordinary maintenance");
         }
     }
 
+    /// Apply each owed decision once. Work a pass leaves for a reason that
+    /// passes on its own is held, and maintenance retries it 15 s later
+    /// (mdk#3265); work that waits for an event is not.
     async fn try_invitation_decisions(&mut self) -> Result<(), AppError> {
         let account = self.app.account_storage(&self.state.label)?;
         let storage = account.app_storage();
         let mut first_error = None;
+        let mut held = false;
         for work in storage.invitation_decision_work()? {
-            let result = self.apply_invitation_work(&work).await;
-            if let Err(error) = result {
-                first_error.get_or_insert(error);
+            match self.apply_invitation_work(&work).await {
+                Ok(left) => held |= left,
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
             }
+        }
+        self.invitation_work_held = held;
+        if first_error.is_some() {
+            // A failure retries with maintenance, not on every worker turn
+            // a pending projection would have asked for.
+            self.invitation_decisions_changed = false;
         }
         match first_error {
             Some(error) => Err(error),
@@ -357,10 +491,14 @@ impl AppClient {
         }
     }
 
+    /// Apply one decision's work. Returns whether it is left owed for a
+    /// reason that passes on its own: its chat's projection still saving,
+    /// the chat not yet quiet or stable for a Leave, or its copy not yet
+    /// projected.
     async fn apply_invitation_work(
         &mut self,
         work: &storage_sqlite::InvitationDecisionWork,
-    ) -> Result<(), AppError> {
+    ) -> Result<bool, AppError> {
         let decision = &work.decision;
         let group_id = GroupId::new(hex::decode(&decision.group_id_hex)?);
         let account = self.app.account_storage(&self.state.label)?;
@@ -369,7 +507,7 @@ impl AppClient {
             // Retain the value, with no work until an exact native admission
             // re-arms it. Unknown values never cause a join or a fetch.
             storage.defer_uninstalled_invitation_decision(decision)?;
-            return Ok(());
+            return Ok(false);
         }
         // The queued projection is newer than the saved row. Let its existing
         // checkpoint commit before adopting that row or applying this choice.
@@ -377,12 +515,14 @@ impl AppClient {
             .pending_group_projection_updates
             .contains(&decision.group_id_hex)
         {
-            return Ok(());
+            // The worker saves it as this turn ends: try again on its next.
+            self.invitation_decisions_changed = true;
+            return Ok(true);
         }
         let group = self.app.group(&self.state.label, &decision.group_id_hex)?;
         if self.is_device_group(&group_id)? {
             storage.defer_uninstalled_invitation_decision(decision)?;
-            return Ok(());
+            return Ok(false);
         }
         if group.is_none() {
             // Only an actual local deletion retires this copy's application
@@ -396,8 +536,9 @@ impl AppClient {
                 && self.has_local_group_deletion_frontier(&group_id)?
             {
                 storage.defer_uninstalled_invitation_decision(decision)?;
+                return Ok(false);
             }
-            return Ok(());
+            return Ok(true);
         }
         // Winning values durably owe this pass. Reuse its retry ownership to
         // wake an existing gap even if only application state changed, with no
@@ -442,15 +583,19 @@ impl AppClient {
                 } else {
                     false
                 };
-                if native_member
-                    && (last_admin
-                        || authority.disbanding
+                if native_member {
+                    let settling = authority.disbanding
                         || authority.lifecycle != cgka_traits::GroupLifecycleState::Stable
-                        || !self.group_quiet(&group_id)?)
-                {
-                    // Keep the exact work owed before push drain, sync or a
-                    // queued refusal. The native send rechecks after send sync.
-                    return Ok(());
+                        || !self.group_quiet(&group_id)?;
+                    if last_admin || settling {
+                        // Keep the exact work owed before push drain, sync or
+                        // a queued refusal. The native send rechecks after
+                        // send sync. A last admin is not retried: nothing
+                        // re-arms this work when the chat's admins change, so
+                        // it waits for the next maintenance run, up to an
+                        // hour (the linked account's heartbeat).
+                        return Ok(settling);
+                    }
                 }
             }
             if native_member && !leave_requested {
@@ -470,16 +615,21 @@ impl AppClient {
             if leave_requested || !native_member {
                 if group.is_some() {
                     self.set_group_invite_confirmation(&group_id, false, true)?;
+                    self.invitations_settled.push(group_id.clone());
                 }
                 // Native Leave owns the departure already, but application
                 // work stays owed until its fallible presentation save succeeds.
                 storage
                     .invitation_decline_handed_off(&decision.group_id_hex, &decision.generation)?;
                 storage.mark_invitation_decision_applied(decision)?;
+            } else {
+                // The Leave was not requested: the decline stays owed.
+                return Ok(true);
             }
         } else if work.apply_owed {
             if let Some(projection) = self.accepted_invitation_projection(&group_id)? {
                 self.set_group_invite_confirmation(&group_id, false, projection.archived)?;
+                self.invitations_settled.push(group_id.clone());
                 storage.mark_invitation_decision_applied(decision)?;
             } else if group.as_ref().is_none_or(|group| {
                 !group.pending_confirmation || group.self_membership != SelfMembership::Member
@@ -491,6 +641,6 @@ impl AppClient {
                 storage.mark_invitation_decision_applied(decision)?;
             }
         }
-        Ok(())
+        Ok(false)
     }
 }

@@ -475,7 +475,7 @@ async fn worker_lookup_skips_reconcile() {
     let account = app.account_home().create_account("alice").unwrap();
     let runtime = app.runtime();
     let manager = runtime.accounts();
-    let (commands, received) = mpsc::channel(1);
+    let (commands, received) = crate::runtime::test_worker_channel(1);
     let (shutdown, stopped) = oneshot::channel();
     manager.workers.lock().await.insert(
         account.account_id_hex.clone(),
@@ -1409,55 +1409,6 @@ fn message_kind_filter_treats_none_and_empty_as_unrestricted() {
 }
 
 #[test]
-fn parse_quic_candidate_ignores_path_query_and_fragment_after_authority() {
-    // Per transports/quic.md a receiver MUST ignore any path, query, or
-    // fragment after the authority. A spec-valid start payload from another
-    // implementation that appends one of these must still be watchable: the
-    // authority (and thus the resolvable port) stops at the first '/', '?',
-    // or '#'.
-    for (candidate, authority, server_name) in [
-        (
-            "quic://relay.example:443/path",
-            "relay.example:443",
-            "relay.example",
-        ),
-        (
-            "quic://relay.example:443?x=1",
-            "relay.example:443",
-            "relay.example",
-        ),
-        (
-            "quic://relay.example:443#frag",
-            "relay.example:443",
-            "relay.example",
-        ),
-        (
-            "quic://relay.example:443/p?x=1#frag",
-            "relay.example:443",
-            "relay.example",
-        ),
-        (
-            "quic://[2001:db8::1]:443?x=1",
-            "[2001:db8::1]:443",
-            "2001:db8::1",
-        ),
-        (
-            "quic://[2001:db8::1]:443#frag",
-            "[2001:db8::1]:443",
-            "2001:db8::1",
-        ),
-    ] {
-        let parsed = parse_quic_candidate(candidate)
-            .unwrap_or_else(|_| panic!("candidate should parse: {candidate}"));
-        assert_eq!(parsed.authority, authority, "authority for {candidate}");
-        assert_eq!(
-            parsed.server_name, server_name,
-            "server name for {candidate}"
-        );
-    }
-}
-
-#[test]
 fn stamp_published_profile_created_at_replaces_zero_with_now() {
     // FFI-published profiles arrive with created_at == 0; they must be
     // stamped so the cached own-account entry survives a directory refresh
@@ -1585,7 +1536,7 @@ async fn managed_account_worker_shutdown_aborts_unresponsive_task_after_timeout(
         }
     }
 
-    let (commands, _commands_rx) = mpsc::channel(1);
+    let (commands, _commands_rx) = crate::runtime::test_worker_channel(1);
     let (shutdown, _shutdown_rx) = oneshot::channel();
     let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let drop_signal = DropSignal(dropped.clone());
@@ -1660,8 +1611,8 @@ fn timeline_test_record(message_id_hex: &str, timeline_at: u64) -> TimelineMessa
         history_import_provenance: None,
         reply_to_message_id_hex: None,
         reply_preview: None,
+        thread: None,
         media: None,
-        agent_text_stream: None,
         reactions: Default::default(),
     }
 }
@@ -1702,24 +1653,6 @@ fn direct_conversation_group_system_projection_does_not_claim_new_chat_list_acti
         ChatListUpdateTrigger::from_timeline_changes(&[change], false),
         ChatListUpdateTrigger::SnapshotRefresh,
     );
-}
-
-#[test]
-fn agent_stream_updates_still_advance_the_chat_list_like_new_messages() {
-    for trigger in [
-        crate::TimelineUpdateTrigger::AgentStreamStarted,
-        crate::TimelineUpdateTrigger::AgentStreamFinished,
-    ] {
-        let change = TimelineMessageChange::Upsert {
-            trigger,
-            message: Box::new(timeline_test_record("agent-stream", 10)),
-        };
-
-        assert_eq!(
-            ChatListUpdateTrigger::from_timeline_changes(&[change], false),
-            ChatListUpdateTrigger::NewLastMessage,
-        );
-    }
 }
 
 #[test]
@@ -1909,38 +1842,6 @@ async fn timeline_subscription_recv_ends_when_runtime_shutdown_begins() {
 
     assert!(subscription.recv().await.is_none());
     drop(updates_tx);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn agent_stream_watch_recv_prioritizes_terminal_update() {
-    let lifecycle = RuntimeLifecycle::new();
-    let (updates_tx, updates) = mpsc::channel(1);
-    updates_tx
-        .try_send(RuntimeAgentStreamUpdate::Progress {
-            seq: 1,
-            text: "searching".to_owned(),
-        })
-        .expect("provisional queue should accept first update");
-    let (terminal_tx, terminal) = oneshot::channel();
-    let expected = RuntimeAgentStreamUpdate::Finished {
-        text: "done".to_owned(),
-        transcript_hash_hex: "00".to_owned(),
-        chunk_count: 1,
-    };
-    terminal_tx
-        .send(expected.clone())
-        .expect("terminal receiver should be alive");
-    let handle = tokio::spawn(async {});
-    let mut watch = RuntimeAgentStreamWatch {
-        stream_id_hex: "stream".to_owned(),
-        updates,
-        terminal: Some(terminal),
-        abort: handle.abort_handle(),
-        stopping: lifecycle.subscribe_shutdown(),
-    };
-
-    assert_eq!(watch.recv().await, Some(expected));
-    assert!(watch.recv().await.is_none());
 }
 
 #[test]
@@ -2945,39 +2846,6 @@ fn chat_list_expiry_tracking_includes_new_interaction_state() {
     assert!(chat_list_mute_expiries(&[indefinite]).is_empty());
 }
 
-#[test]
-fn latest_agent_stream_start_accepts_mixed_case_filter() {
-    let stream_id_hex = hex::encode([0xab; 32]);
-    let (message_id_hex, start, sender) = latest_agent_stream_start(
-        vec![AppMessageRecord {
-            authority: None,
-            message_id_hex: "11".repeat(32),
-            direction: "inbound".to_owned(),
-            group_id_hex: "22".repeat(32),
-            sender: "33".repeat(32),
-            plaintext: String::new(),
-            kind: MARMOT_APP_EVENT_KIND_AGENT_STREAM_START,
-            tags: vec![
-                vec![STREAM_TAG.to_owned(), stream_id_hex.clone()],
-                vec![STREAM_ROUTE_TAG.to_owned(), STREAM_ROUTE_QUIC.to_owned()],
-            ],
-            source_epoch: None,
-            retention: None,
-            recorded_at: 0,
-            received_at: 0,
-            insert_order: 0,
-            invalidated: false,
-            moderation_grant: false,
-        }],
-        Some(&stream_id_hex.to_uppercase()),
-    )
-    .unwrap();
-
-    assert_eq!(message_id_hex, "11".repeat(32));
-    assert_eq!(start.stream_id_hex, stream_id_hex);
-    assert_eq!(sender, "33".repeat(32));
-}
-
 fn chat_list_test_row(group_id_hex: &str, title: &str) -> ChatListRow {
     ChatListRow {
         group_id_hex: group_id_hex.to_owned(),
@@ -3048,49 +2916,19 @@ fn recovery_record_maps_chat_message_to_message_update() {
     )
     .expect("update");
 
-    match update {
-        RuntimeMessageUpdate::Message(received) => {
-            assert_eq!(received.account_id_hex, "ac".repeat(32));
-            assert_eq!(received.account_label, "alice");
-            assert_eq!(received.message.message_id_hex, "11".repeat(32));
-            assert_eq!(
-                received.message.sender_display_name.as_deref(),
-                Some("Alice")
-            );
-            assert_eq!(received.message.source_epoch, 7);
-            assert_eq!(
-                hex::encode(received.message.group_id.as_slice()),
-                group_id_hex
-            );
-        }
-        other => panic!("expected Message update, got {other:?}"),
-    }
-}
-
-#[test]
-fn recovery_record_reclassifies_agent_stream_start() {
-    let group_id_hex = "cd".repeat(32);
-    let record = message_record(
-        &"22".repeat(32),
-        &group_id_hex,
-        MARMOT_APP_EVENT_KIND_AGENT_STREAM_START,
+    let RuntimeMessageUpdate::Message(received) = update;
+    assert_eq!(received.account_id_hex, "ac".repeat(32));
+    assert_eq!(received.account_label, "alice");
+    assert_eq!(received.message.message_id_hex, "11".repeat(32));
+    assert_eq!(
+        received.message.sender_display_name.as_deref(),
+        Some("Alice")
     );
-
-    let update = received_message_update_from_record(
-        "ac".repeat(32).as_str(),
-        "alice",
-        record,
-        &HashMap::new(),
-    )
-    .expect("update");
-
-    match update {
-        RuntimeMessageUpdate::AgentStreamStarted(received) => {
-            assert_eq!(received.message.message_id_hex, "22".repeat(32));
-            assert_eq!(received.message.sender_display_name, None);
-        }
-        other => panic!("expected AgentStreamStarted update, got {other:?}"),
-    }
+    assert_eq!(received.message.source_epoch, 7);
+    assert_eq!(
+        hex::encode(received.message.group_id.as_slice()),
+        group_id_hex
+    );
 }
 
 #[test]
@@ -3294,7 +3132,7 @@ async fn account_manager_shutdown_drains_worker_inserted_by_in_flight_catch_up()
         let _ = catch_up_waiting_tx.send(());
         insertion_released.await;
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let (commands, _command_rx) = mpsc::channel(1);
+        let (commands, _command_rx) = crate::runtime::test_worker_channel(1);
         let handle = tokio::spawn(async move {
             let _ = shutdown_rx.await;
             let _ = worker_exited_tx.send(());
@@ -3359,7 +3197,7 @@ fn invite_catch_up_is_not_spawned_after_shutdown_stops_accepting_tasks() {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .accepting = false;
 
-    let (command, _receiver) = mpsc::channel(1);
+    let (command, _receiver) = crate::runtime::test_worker_channel(1);
     manager.spawn_invite_catch_up(command);
 
     assert!(
@@ -3370,46 +3208,6 @@ fn invite_catch_up_is_not_spawned_after_shutdown_stops_accepting_tasks() {
             .handles
             .is_empty()
     );
-}
-
-// Sender-controlled broker candidates must clear the shared dial-safety gate
-// at resolve time: literal-IP authorities resolve without DNS, so these cover
-// the canonical non-public classes end to end (issue #331).
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn broker_resolve_rejects_non_public_candidates_without_dev_opt_in() {
-    for authority in [
-        "10.0.0.5:4433",      // private
-        "169.254.169.254:80", // link-local (cloud metadata)
-        "100.64.0.1:4433",    // CGNAT
-        "192.168.1.1:4433",   // private
-        "127.0.0.1:4433",     // loopback
-        "[::1]:4433",         // loopback v6
-        "[fc00::1]:4433",     // unique-local
-    ] {
-        let result = agent_stream_watch::resolve_broker_addr(authority, false).await;
-        assert!(
-            matches!(result, Err(AppError::AgentStreamInvalidCandidate(_))),
-            "{authority} must be rejected without the dev opt-in"
-        );
-    }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn broker_resolve_dev_opt_in_admits_loopback_only() {
-    let addr = agent_stream_watch::resolve_broker_addr("127.0.0.1:4433", true)
-        .await
-        .expect("loopback resolves under the dev opt-in");
-    assert!(addr.ip().is_loopback());
-
-    // The opt-in opens loopback only; private/link-local candidates stay
-    // rejected even in dev mode.
-    for authority in ["10.0.0.5:4433", "169.254.169.254:80", "[fc00::1]:4433"] {
-        let result = agent_stream_watch::resolve_broker_addr(authority, true).await;
-        assert!(
-            matches!(result, Err(AppError::AgentStreamInvalidCandidate(_))),
-            "{authority} must be rejected even with the dev opt-in"
-        );
-    }
 }
 
 /// A group speaks for who you know only while you are actually in it. Each
@@ -3730,7 +3528,7 @@ async fn finished_worker_is_replaced_on_first_requested_lookup() {
     .await
     .expect("stand-in worker finishes");
     let (shutdown, _shutdown_rx) = oneshot::channel();
-    let (old_commands, _old_receiver) = mpsc::channel(1);
+    let (old_commands, _old_receiver) = crate::runtime::test_worker_channel(1);
     manager.workers.lock().await.insert(
         account.account_id_hex.clone(),
         ManagedAccountWorker {
@@ -3769,7 +3567,7 @@ async fn finished_worker_is_replaced_on_first_batch_reconcile() {
     .await
     .expect("stand-in worker finishes");
     let (shutdown, _shutdown_rx) = oneshot::channel();
-    let (old_commands, _old_receiver) = mpsc::channel(1);
+    let (old_commands, _old_receiver) = crate::runtime::test_worker_channel(1);
     manager.workers.lock().await.insert(
         account.account_id_hex.clone(),
         ManagedAccountWorker {
@@ -3912,25 +3710,18 @@ async fn a_ready_worker_completes_one_span_per_startup_stage() {
     runtime.shutdown().await;
 }
 
-/// The maintenance phases every completed tick passes through, in tick order
-/// (mdk#2923). The key-package catch-up runs only when one is due.
-const MAINTENANCE_TICK_PHASES: [RuntimeOp; 11] = [
-    RuntimeOp::WorkerMaintenanceContentBackfill,
-    RuntimeOp::WorkerMaintenanceLegacyPromotion,
-    RuntimeOp::WorkerMaintenanceCompaction,
-    RuntimeOp::WorkerMaintenancePush,
-    RuntimeOp::WorkerMaintenanceRecovery,
-    RuntimeOp::WorkerMaintenancePostJoin,
-    RuntimeOp::WorkerMaintenanceDue,
+/// The phases every completed session maintenance run passes through, in
+/// order, inside its `worker_maintenance_due` span (mdk#2923). Since mdk#3265
+/// it runs on the worker's schedule, not inside a tick.
+const SESSION_MAINTENANCE_PHASES: [RuntimeOp; 3] = [
     RuntimeOp::WorkerMaintenanceAppPasses,
     RuntimeOp::WorkerMaintenanceSession,
     RuntimeOp::WorkerMaintenanceEffects,
-    RuntimeOp::WorkerMaintenanceHistoryDispatch,
 ];
 
-/// A worker's first maintenance tick, which fires on entry, records one span
-/// per phase inside its `worker_maintenance` span, and the passes it sets off
-/// record their own.
+/// A worker's first session maintenance run, which it makes as it opens,
+/// records one span per phase inside its `worker_maintenance_due` span, and
+/// the passes the worker runs as it opens record their own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_maintenance_tick_records_one_span_per_phase() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -3942,15 +3733,15 @@ async fn a_maintenance_tick_records_one_span_per_phase() {
     runtime.accounts().reconcile().await.expect("alice starts");
 
     timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
-        while startup_stage_snapshot(&runtime, RuntimeOp::WorkerMaintenance).completed == 0 {
+        while startup_stage_snapshot(&runtime, RuntimeOp::WorkerMaintenanceDue).completed == 0 {
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("the first maintenance tick completes");
+    .expect("the first session maintenance run completes");
 
-    let ticks = startup_stage_snapshot(&runtime, RuntimeOp::WorkerMaintenance);
-    for operation in MAINTENANCE_TICK_PHASES {
+    let ticks = startup_stage_snapshot(&runtime, RuntimeOp::WorkerMaintenanceDue);
+    for operation in SESSION_MAINTENANCE_PHASES {
         let phase = startup_stage_snapshot(&runtime, operation);
         assert_eq!(
             (phase.successes, phase.completed, phase.in_flight),
@@ -3959,8 +3750,8 @@ async fn a_maintenance_tick_records_one_span_per_phase() {
             operation.as_str()
         );
     }
-    // The passes the tick sets due run on later loop turns, and its
-    // housekeeping batch on the blocking pool, so wait for each to complete.
+    // The passes run on later loop turns, and the housekeeping batch on the
+    // blocking pool, so wait for each to complete.
     for operation in [
         RuntimeOp::WorkerPresentationPass,
         RuntimeOp::WorkerAvatarPass,
@@ -3978,16 +3769,593 @@ async fn a_maintenance_tick_records_one_span_per_phase() {
     runtime.shutdown().await;
 }
 
+/// Step the test's held clock by `by`, then let the worker run.
+async fn advance_held_clock(by: Duration) {
+    tokio::time::pause();
+    tokio::time::advance(by).await;
+    tokio::time::resume();
+    for _ in 0..200 {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// On an idle account the account worker samples the push fetch clock only
+/// while push timing is owed (mdk#2923 step B). A token change on an
+/// unsettled clock goes out at once as a plain self-update and owes an
+/// announce; that wakes the worker's Push job, which re-arms every 15 s
+/// while it is owed, and the announce follows within 30 s, with no missed
+/// wake and no busy loop. Owed timing that appears with no worker turn to
+/// see it is the watchdog's to find, which runs the job.
+// Holds the clock, which needs the current-thread runtime.
+#[tokio::test(flavor = "current_thread")]
+async fn the_worker_samples_push_timing_only_while_owed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let account = AccountHome::open(dir.path())
+        .create_account("alice")
+        .expect("create alice");
+    let relay = Arc::new(ScriptedPushRelayClient::default());
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(relay.clone());
+    let group = {
+        let mut client = app.client(&account.label).await.expect("client");
+        client
+            .create_group("push timing", &[])
+            .await
+            .expect("group")
+            .operation
+            .expect("no members to resolve")
+    };
+    let group_hex = hex::encode(group.as_slice());
+    let mut push_now_ms = crate::notifications::unix_now_ms();
+    let push_override = crate::client::TestPushOverrideGuard::set(
+        app.account_dir(&account.label),
+        crate::client::TestPushOverride {
+            now_ms: push_now_ms,
+            can_fetch: true,
+            turn_wake: true,
+        },
+    );
+    let set_push_clock = |now_ms: i64| push_override.update(|over| over.now_ms = now_ms);
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.accounts().reconcile().await.expect("alice starts");
+    let count = |operation| startup_stage_snapshot(&runtime, operation).completed;
+    let push_runs = || startup_stage_snapshot(&runtime, RuntimeOp::WorkerMaintenancePush).started;
+    let missed = || count(RuntimeOp::WatchdogMissedWakePush);
+    timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
+        while count(RuntimeOp::WorkerMaintenance) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the worker opens");
+    // Fifteen seconds of the worker's time and the push clock together. Tokio
+    // rounds a deadline up to its next millisecond, so the worker's clock
+    // moves one more: a deadline armed 15 s before the step then fires in it
+    // even when no real time passed in between (mdk#3462).
+    let step = async |push_now_ms: &mut i64| {
+        *push_now_ms += 15_000;
+        set_push_clock(*push_now_ms);
+        advance_held_clock(Duration::from_millis(15_001)).await;
+    };
+    let gossip = || {
+        app.group_push_gossip_state(&account.label, &group_hex)
+            .expect("gossip state")
+    };
+    // A wake starts the Push job on a later turn, once the worker's clock
+    // reaches its next millisecond. A fixed number of yields can end sooner
+    // on a fast runner (mdk#3462), so wait until it has run since `runs`.
+    let push_ran_since = async |runs: u64, what: &str| {
+        timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
+            while push_runs() == runs {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{what}"));
+    };
+
+    // Steps until the Push job has not run for `need` steps in a row. A
+    // deadline it still holds is at most 15 s ahead, so it fires within one.
+    let rest = async |push_now_ms: &mut i64, need: usize| {
+        let mut quiet = 0;
+        for _ in 0..10 {
+            let before = push_runs();
+            step(push_now_ms).await;
+            quiet = if push_runs() == before { quiet + 1 } else { 0 };
+            if quiet == need {
+                break;
+            }
+        }
+        quiet
+    };
+
+    // Three quiet steps, so its last look is more than one 30 s step old and
+    // says nothing about now.
+    assert_eq!(
+        rest(&mut push_now_ms, 3).await,
+        3,
+        "the Push job rests with nothing owed"
+    );
+    let rested = push_runs();
+    app.set_native_push_enabled(&account.label, true)
+        .expect("native push");
+    runtime
+        .upsert_push_registration(
+            &account.label,
+            crate::PushPlatform::Fcm,
+            "alice-token",
+            &nostr::prelude::Keys::generate().public_key().to_hex(),
+            None,
+        )
+        .await
+        .expect("registration");
+    let outcome = runtime
+        .share_push_registration(&account.label)
+        .await
+        .expect("share");
+    push_ran_since(rested, "the token change wakes the Push job").await;
+    // Then let a repeat run show itself.
+    advance_held_clock(Duration::ZERO).await;
+    assert!(
+        gossip().is_some_and(|state| state.announce_owed_at_ms.is_some()),
+        "the token went out plain and owes an announce: {outcome:?} {:?}",
+        gossip()
+    );
+    assert_eq!(
+        push_runs() - rested,
+        1,
+        "the token change woke the Push job once"
+    );
+    // The wait above would also end at the next 15 s tick, through the
+    // watchdog: the worker must have woken the job first.
+    assert_eq!(
+        missed(),
+        0,
+        "the worker woke its Push job on the token change"
+    );
+    let mut samples = 0;
+    while gossip().is_some_and(|state| state.announce_owed_at_ms.is_some()) && samples < 4 {
+        step(&mut push_now_ms).await;
+        samples += 1;
+    }
+    assert!(
+        gossip().is_some_and(
+            |state| state.announce_owed_at_ms.is_none() && state.last_announced_at_ms.is_some()
+        ),
+        "the owed announce went out"
+    );
+    assert!(samples <= 2, "within 30 s, took {samples} samples");
+    assert!(
+        push_runs() - rested <= 1 + samples,
+        "the Push job runs once per 15 s sample, not in a loop: {}",
+        push_runs() - rested
+    );
+    assert_eq!(missed(), 0, "the worker woke its Push job itself");
+
+    // Owed timing that appears with no worker turn to see it: the tick's
+    // watchdog counts the miss and runs the Push job. The run that sent the
+    // announce may have re-armed its 15 s retry, which would run the job
+    // before the watchdog looks, so first let that fire. With the worker's
+    // own per-turn wake off, only the watchdog can then find the debt.
+    assert_eq!(
+        rest(&mut push_now_ms, 2).await,
+        2,
+        "the Push job holds no deadline"
+    );
+    push_override.update(|over| over.turn_wake = false);
+    let before_missed = push_runs();
+    app.record_group_push_announce_owed(&account.label, &group_hex, push_now_ms)
+        .expect("owed");
+    step(&mut push_now_ms).await;
+    assert_eq!(missed(), 1, "the watchdog found owed push timing");
+    push_ran_since(before_missed, "and ran the Push job").await;
+    runtime.shutdown().await;
+}
+
+/// An account whose KeyPackage cannot publish (no relays) owes session
+/// maintenance work with no stored time. It retries 15 s after its last
+/// run by the worker's clock, as the tick did, never back to back on each
+/// re-read of its due time (mdk#3265).
+#[tokio::test(flavor = "current_thread")]
+async fn owed_session_maintenance_retries_15_s_apart_not_back_to_back() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app = relayless_app_without_device_groups(dir.path());
+    app.account_home()
+        .create_account("alice")
+        .expect("create alice");
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.accounts().reconcile().await.expect("alice starts");
+    let count = |operation| startup_stage_snapshot(&runtime, operation).completed;
+    timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
+        while count(RuntimeOp::WorkerMaintenanceDue) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the first session maintenance run completes");
+    let runs = count(RuntimeOp::WorkerMaintenanceDue);
+    // The run's retry is due 15 s after it started, so no later than 15 s
+    // from here on the worker's clock.
+    let after_run = tokio::time::Instant::now();
+    // Ten seconds in one-second steps: past the re-read spacing each time,
+    // short of the 15 s retry.
+    for _ in 0..10 {
+        advance_held_clock(Duration::from_secs(1)).await;
+    }
+    assert_eq!(
+        count(RuntimeOp::WorkerMaintenanceDue),
+        runs,
+        "no run within 10 s"
+    );
+    // To 15 s and 1 ms: tokio rounds the retry's deadline up to its next
+    // millisecond (mdk#3462). The run then starts once real time crosses
+    // that boundary, so wait for it, then check it came within 1 s of the
+    // worker's clock: a retry later than that misses the 15 s cadence.
+    advance_held_clock(Duration::from_millis(5_001)).await;
+    timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
+        while count(RuntimeOp::WorkerMaintenanceDue) == runs {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the owed work retries");
+    let retried_after = after_run.elapsed();
+    assert!(
+        retried_after < Duration::from_secs(16),
+        "the owed work retries 15 s after its last run, not {retried_after:?}"
+    );
+    runtime.shutdown().await;
+}
+
+/// A group whose component recheck stays overdue, because each run returns
+/// before session maintenance checks it again, is owed work, retried 15 s
+/// after the last run. Reported as due now, it read as new work on every
+/// re-read, and maintenance ran about once a second (mdk#3265).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_overdue_component_recheck_runs_maintenance_at_most_once_per_15_s() {
+    let root = tempfile::tempdir().expect("tempdir");
+    AccountHome::open(root.path())
+        .create_account("alice")
+        .expect("create alice");
+    // Device groups off: their passes keep the 15 s retry owed, which
+    // would leave only the spin for the owed retry to hide.
+    let app = MarmotApp::with_relay_and_config(
+        root.path(),
+        "wss://relay.example",
+        crate::MarmotAppConfig::white_noise()
+            .with_allow_loopback_relay_endpoints(true)
+            .with_open_ranking_provider(None, Vec::new())
+            .with_device_groups(false),
+    )
+    .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let runtime = app.runtime();
+    runtime.reconcile_accounts().await.expect("alice starts");
+    runtime
+        .create_group("alice", "rechecked", &[], None)
+        .await
+        .expect("alice creates a group");
+    runtime
+        .accounts()
+        .overdue_component_recheck_for_test("alice")
+        .await
+        .expect("the recheck is held overdue");
+    let runs = || startup_stage_snapshot(&runtime, RuntimeOp::WorkerMaintenanceDue).completed;
+    let before = runs();
+    // Real time: the worker reads wall seconds from the system clock, so a
+    // held tokio clock cannot show a due time that moves with now. Within
+    // 5 s at most one run may come, the owed retry; a second is a spin.
+    let second_run = timeout(Duration::from_secs(5), async {
+        while runs() < before + 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(
+        second_run.is_err(),
+        "maintenance runs at most once per 15 s, not {} times within 5 s",
+        runs() - before
+    );
+    runtime.shutdown().await;
+}
+
+/// The worker re-reads when session maintenance next has work after a run
+/// and after a command that can change state, and not after a read
+/// (mdk#3265).
+#[tokio::test(flavor = "current_thread")]
+async fn session_maintenance_rereads_its_due_time_after_changes_only() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app = relayless_app_without_device_groups(dir.path());
+    app.account_home()
+        .create_account("alice")
+        .expect("create alice");
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.accounts().reconcile().await.expect("alice starts");
+    let count = |operation| startup_stage_snapshot(&runtime, operation).completed;
+    // Change-driven reads only: the watchdog's tick times its own read
+    // apart, as `WatchdogMaintenanceNextDue`, so a tick in any window below
+    // adds nothing here.
+    let reads = || count(RuntimeOp::WorkerMaintenanceNextDue);
+    // A re-read can wait on the read spacing's timer, which tokio rounds up
+    // to its next millisecond, so it lands once real time crosses that
+    // boundary, after however many yields (mdk#3462). Wait for it under the
+    // deadline rather than a fixed number of yields. A maintenance run is
+    // followed by a re-read of its own (the watchdog's real-time tick can
+    // start one), so the change's re-read must come before any run.
+    let reread_since = async |before: u64, what: &str| {
+        let runs = count(RuntimeOp::WorkerMaintenanceDue);
+        timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
+            while reads() == before && count(RuntimeOp::WorkerMaintenanceDue) == runs {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{what}"));
+        assert_eq!(
+            count(RuntimeOp::WorkerMaintenanceDue),
+            runs,
+            "{what}, before any maintenance run"
+        );
+    };
+    timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
+        while count(RuntimeOp::WorkerMaintenanceDue) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the first session maintenance run completes");
+    // The first read planned the run; the run is followed by another, once
+    // the read spacing has passed.
+    let planned = reads();
+    advance_held_clock(Duration::from_secs(2)).await;
+    reread_since(planned, "a run is followed by a re-read").await;
+    // Startup's last background turns (a route refresh, a checkpoint) can
+    // land late under load and re-read, as they should. Step until a quiet
+    // 2 s window shows the worker has settled.
+    let mut settled = reads();
+    let mut quiet = false;
+    for _ in 0..5 {
+        advance_held_clock(Duration::from_secs(2)).await;
+        if reads() == settled {
+            quiet = true;
+            break;
+        }
+        settled = reads();
+    }
+    assert!(quiet, "with nothing changing, the re-reads stop");
+
+    runtime
+        .key_package_maintenance_status("alice")
+        .await
+        .expect("status reads");
+    let policy = runtime
+        .periodic_maintenance_policy("alice")
+        .await
+        .expect("policy reads");
+    advance_held_clock(Duration::from_secs(2)).await;
+    assert_eq!(reads(), settled, "a read changes nothing");
+
+    runtime
+        .set_periodic_maintenance_policy("alice", policy)
+        .await
+        .expect("policy writes");
+    advance_held_clock(Duration::from_secs(2)).await;
+    reread_since(settled, "a state change is followed by a re-read").await;
+    runtime.shutdown().await;
+}
+
+/// Another account's activity runs none of this account's passes; its own
+/// does (mdk#2923).
+#[tokio::test(start_paused = true)]
+async fn another_accounts_wake_runs_no_pass_here() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app = MarmotApp::with_relays(dir.path(), vec![]);
+    app.account_home()
+        .create_account("alice")
+        .expect("create alice");
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.accounts().reconcile().await.expect("alice starts");
+    crate::worker_fences::worker_startup_finished(&runtime, "alice")
+        .await
+        .expect("alice finishes startup");
+
+    let count = |operation| startup_stage_snapshot(&runtime, operation).completed;
+    let passes = || {
+        (
+            count(RuntimeOp::WorkerAttachmentPass),
+            count(RuntimeOp::WorkerPresentationPass),
+        )
+    };
+    // A paused timer advances only once runnable work and spawn_blocking jobs
+    // have drained. Get past the first maintenance tick and its 1 s due-time
+    // re-read, then measure both wakes before the next 15 s tick or retry.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let before = passes();
+    assert!(count(RuntimeOp::WorkerMaintenance) > 0 && count(RuntimeOp::WorkerMaintenanceDue) > 0);
+    assert!(before.0 > 0 && before.1 > 0, "both startup passes ran");
+
+    app.presentation_signals.wake_account("bob");
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    assert_eq!(passes(), before, "bob's wake runs no pass for alice");
+
+    app.presentation_signals.wake_account("alice");
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    let after = passes();
+    assert!(
+        after.0 > before.0 && after.1 > before.1,
+        "alice's own wake runs both passes"
+    );
+    runtime.shutdown().await;
+}
+
+/// Work created without a wake is a missed wake: the next tick's watchdog
+/// counts it and runs the pass, so it waits at most one tick (mdk#2923 step
+/// B). Here an avatar request goes straight to storage, which wakes nothing.
+#[tokio::test(start_paused = true)]
+async fn work_created_without_a_wake_is_counted_and_run_by_the_watchdog() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app = MarmotApp::with_relays(dir.path(), vec![]);
+    app.account_home()
+        .create_account("alice")
+        .expect("create alice");
+    let runtime = MarmotAppRuntime::new(app.clone());
+    runtime.accounts().reconcile().await.expect("alice starts");
+    crate::worker_fences::worker_startup_finished(&runtime, "alice")
+        .await
+        .expect("alice finishes startup");
+
+    let count = |operation| startup_stage_snapshot(&runtime, operation).completed;
+    // A paused timer advances only once runnable work and spawn_blocking jobs
+    // have drained, so each sleep returns with the worker idle. Two ticks run
+    // out what startup left due: a local-submission deadline wakes the
+    // account, and its presentation pass sets the avatar pass due.
+    tokio::time::sleep(Duration::from_secs(31)).await;
+    let passes = count(RuntimeOp::WorkerAvatarPass);
+    assert!(count(RuntimeOp::WorkerMaintenance) >= 2 && passes > 0);
+    assert_eq!(count(RuntimeOp::WatchdogMissedWakeAvatarPass), 0);
+
+    app.account_storage("alice")
+        .expect("alice's storage")
+        .app_storage()
+        .request_avatar_acquisition(
+            "owner",
+            &crate::SelectedAvatar::RemoteImage {
+                url: "https://example.com/a.png".into(),
+                cache_key: "a".into(),
+            },
+            false,
+        )
+        .expect("request");
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    assert_eq!(
+        count(RuntimeOp::WorkerAvatarPass),
+        passes,
+        "nothing woke it"
+    );
+
+    tokio::time::sleep(Duration::from_secs(15)).await;
+    assert_eq!(
+        count(RuntimeOp::WatchdogMissedWakeAvatarPass),
+        1,
+        "the next tick's watchdog counts the miss"
+    );
+    assert!(
+        count(RuntimeOp::WorkerAvatarPass) > passes,
+        "and runs the pass"
+    );
+    runtime.shutdown().await;
+}
+
 /// What idle ticks do once a worker's startup housekeeping has settled
-/// (mdk#2923 §4): no writer transaction, no blocking-pool housekeeping
-/// batch, media sweep or upload promotion, while every tick still runs its
-/// phases and sets its passes due. That includes an offline account's
-/// replay flush, which repeated its writes every tick until mdk#3238.
+/// (mdk#2923 §4): no writer transaction on the app or session database, no blocking-pool housekeeping
+/// batch, media sweep or upload promotion, and no attachment or
+/// presentation pass, while every tick still runs its phases. That includes
+/// an offline account's replay flush, which repeated its writes every tick
+/// until mdk#3238.
 // Pauses the clock, which needs the current-thread runtime.
 #[tokio::test(flavor = "current_thread")]
 async fn idle_ticks_take_no_writer_and_spawn_no_housekeeping() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let app = MarmotApp::with_relays(dir.path(), vec![]);
+    let idle = idle_ticks_run_nothing(relayless_app_without_device_groups(dir.path())).await;
+    idle.runtime.shutdown().await;
+    assert_eq!(
+        idle.app_writes, 0,
+        "an idle tick takes no app-storage writer transaction"
+    );
+    assert_eq!(
+        idle.session_writes, 0,
+        "an idle tick takes no session-storage writer transaction"
+    );
+}
+
+/// The same with device groups on and backups off (mdk#2923, review C1): no
+/// recovery key is kept, so no backup pass or condemned-blob delete can run,
+/// and history dispatch runs once at startup, then stops. Before, an absent
+/// backup schedule counted as due at once and dispatch retried every 15 s.
+/// The tick's device-group upkeep writes nothing either (mdk#3479); a
+/// settled device group's is checked in
+/// `a_settled_device_groups_maintenance_takes_no_writer`.
+#[cfg(feature = "test-policy-overrides")]
+#[tokio::test(flavor = "current_thread")]
+async fn idle_ticks_with_device_groups_and_no_backups_stop_history_dispatch() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let app = MarmotApp::with_relays_and_config(
+        dir.path(),
+        vec![],
+        crate::MarmotAppConfig::white_noise()
+            .with_allow_loopback_relay_endpoints(true)
+            .with_open_ranking_provider(None, Vec::new())
+            .with_device_groups(true),
+    );
+    assert!(app.device_groups_enabled());
+    let idle = idle_ticks_run_nothing(app.clone()).await;
+    assert!(
+        idle.dispatched_at_startup > 0,
+        "history dispatch ran at startup, before it knew backups were off"
+    );
+    assert_eq!(
+        (idle.app_writes, idle.session_writes),
+        (0, 0),
+        "an idle tick with device groups on takes no app- or session-storage writer"
+    );
+
+    // Keeping a recovery key configures backups: the next worker turn sees
+    // the change and wakes history dispatch.
+    let count = |operation| startup_stage_snapshot(&idle.runtime, operation).completed;
+    let dispatched = count(RuntimeOp::WorkerMaintenanceHistoryDispatch);
+    app.account_storage("alice")
+        .expect("storage")
+        .app_storage()
+        .keep_recovery_key(&[7; 32])
+        .expect("keep key");
+    let ticks = count(RuntimeOp::WorkerMaintenance);
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(15)).await;
+    tokio::time::resume();
+    timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
+        while count(RuntimeOp::WorkerMaintenance) == ticks
+            || count(RuntimeOp::WorkerMaintenanceHistoryDispatch) == dispatched
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a kept recovery key wakes history dispatch");
+    assert_eq!(
+        count(RuntimeOp::WatchdogMissedWakeHistoryDispatch),
+        0,
+        "the worker woke it, not the watchdog"
+    );
+    idle.runtime.shutdown().await;
+}
+
+/// What [`idle_ticks_run_nothing`] saw: history dispatch runs before its
+/// three idle ticks, and the writer transactions those ticks took.
+struct IdleTicks {
+    runtime: MarmotAppRuntime,
+    // Read only by the device-groups variant, which needs the feature.
+    #[cfg_attr(not(feature = "test-policy-overrides"), allow(dead_code))]
+    dispatched_at_startup: u64,
+    app_writes: u64,
+    session_writes: u64,
+}
+
+/// [`MarmotApp::with_relays`]'s relayless app with device groups explicitly
+/// off: their passes keep session maintenance owed every 15 s, so tests of
+/// when maintenance runs without them say so (mdk#3265).
+fn relayless_app_without_device_groups(root: &std::path::Path) -> MarmotApp {
+    MarmotApp::with_relays_and_config(
+        root,
+        vec![],
+        crate::MarmotAppConfig::white_noise()
+            .with_allow_loopback_relay_endpoints(true)
+            .with_open_ranking_provider(None, Vec::new())
+            .with_device_groups(false),
+    )
+}
+
+/// Runs a fresh account's worker until its startup work settles, then checks
+/// three idle ticks run no job, spawn no housekeeping and miss no wake.
+async fn idle_ticks_run_nothing(app: MarmotApp) -> IdleTicks {
     app.account_home()
         .create_account("alice")
         .expect("create alice");
@@ -4039,19 +4407,24 @@ async fn idle_ticks_take_no_writer_and_spawn_no_housekeeping() {
         })
         .await
         .expect("an idle tick completes");
-        settle((attachment + 1, presentation + 1)).await;
+        // Idle ticks set no pass due (mdk#2923 step B): wait only for
+        // whatever is in flight.
+        settle((attachment, presentation)).await;
     };
-    // The first tick fires on entry and starts the startup housekeeping:
-    // let it, its passes and the blocking work they spawn all finish.
+    // The first tick fires on entry, and the worker runs every scheduled job
+    // once as it opens, session maintenance included (mdk#3265): let them,
+    // their passes and the blocking work they spawn all finish.
     timeout(ACCOUNT_OPEN_TEST_DEADLINE, async {
-        while count(RuntimeOp::WorkerMaintenance) == 0 {
+        while count(RuntimeOp::WorkerMaintenance) == 0
+            || count(RuntimeOp::WorkerMaintenanceDue) == 0
+        {
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("the first maintenance tick completes");
+    .expect("the first maintenance tick and session maintenance complete");
     settle((1, 1)).await;
-    const COUNTED: [RuntimeOp; 7] = [
+    const COUNTED: [RuntimeOp; 15] = [
         RuntimeOp::WorkerMaintenance,
         RuntimeOp::StorageWriteBegin,
         RuntimeOp::WorkerMaintenanceHousekeepingBatch,
@@ -4059,29 +4432,135 @@ async fn idle_ticks_take_no_writer_and_spawn_no_housekeeping() {
         RuntimeOp::WorkerUploadPromotion,
         RuntimeOp::WorkerAttachmentPass,
         RuntimeOp::WorkerPresentationPass,
+        RuntimeOp::StorageSessionWriteBegin,
+        RuntimeOp::WatchdogMissedWakeRecovery,
+        RuntimeOp::WatchdogMissedWakePostJoin,
+        RuntimeOp::WorkerMaintenancePostJoin,
+        RuntimeOp::WorkerMaintenanceRecovery,
+        RuntimeOp::WatchdogMissedWakeAttachmentPass,
+        RuntimeOp::WatchdogMissedWakeAvatarPass,
+        RuntimeOp::WatchdogMissedWakePresentationPass,
     ];
     let snapshot = || COUNTED.map(count);
-    // Settle one more tick, which may still finish startup work.
-    tick().await;
+    // Settle ticks until four in a row run no pass and no housekeeping:
+    // startup work can still be finishing. The attachment pass polls while
+    // its startup sweep or promotion runs, and those finish in real time, so
+    // under load the last poll can come a tick after them; session
+    // maintenance's first run wakes the passes too (mdk#3265); and each
+    // attachment pass wakes housekeeping.
+    let activity = || (passes(), count(RuntimeOp::WorkerMaintenanceCompaction));
+    let mut quiet = 0;
+    for _ in 0..20 {
+        let before = activity();
+        tick().await;
+        quiet = if activity() == before { quiet + 1 } else { 0 };
+        if quiet == 4 {
+            break;
+        }
+    }
+    assert_eq!(quiet, 4, "startup passes settle");
     let before = snapshot();
+    // Every job the tick used to run, and every watchdog counter. Session
+    // maintenance is checked on its own below: this account has no relays,
+    // so it owes a KeyPackage it cannot publish (mdk#3265).
+    let maintenance_before = count(RuntimeOp::WorkerMaintenanceDue);
+    let moved: Vec<RuntimeOp> = [
+        RuntimeOp::WorkerMaintenanceContentBackfill,
+        RuntimeOp::WorkerMaintenanceLegacyPromotion,
+        RuntimeOp::WorkerMaintenanceCompaction,
+        RuntimeOp::WorkerMaintenanceKeyPackageCatchUp,
+        RuntimeOp::WorkerMaintenancePush,
+        RuntimeOp::WorkerMaintenanceHistoryDispatch,
+    ]
+    .into_iter()
+    .chain(
+        RuntimeOp::ALL
+            .iter()
+            .copied()
+            .filter(|operation| operation.as_str().starts_with("watchdog_missed_wake_")),
+    )
+    .collect();
+    let account_id_hex = app
+        .account_home()
+        .account("alice")
+        .expect("alice")
+        .account_id_hex;
+    let housekeeping_runs = || {
+        account_worker::HOUSEKEEPING_RUNS
+            .lock()
+            .unwrap()
+            .get(&account_id_hex)
+            .cloned()
+            .unwrap_or_default()
+    };
+    let runs_before = housekeeping_runs().len();
+    let moved_before: Vec<u64> = moved.iter().map(|operation| count(*operation)).collect();
+    let dispatched_at_startup = count(RuntimeOp::WorkerMaintenanceHistoryDispatch);
     for _ in 0..3 {
         tick().await;
     }
     let after = snapshot();
     let delta = |index: usize| after[index] - before[index];
-    assert_eq!(delta(0), 3, "three idle ticks ran");
+    let moved_ran: Vec<(&str, u64)> = moved
+        .iter()
+        .zip(&moved_before)
+        .map(|(operation, before)| (operation.as_str(), count(*operation) - before))
+        .filter(|(_, ran)| *ran > 0)
+        .collect();
     assert_eq!(
-        delta(1),
-        0,
-        "an idle tick takes no app-storage writer transaction"
+        moved_ran,
+        Vec::<(&str, u64)>::new(),
+        "an idle tick runs none of the jobs it used to, and misses no wake; \
+         housekeeping runs in the window (trigger, held and real times): {:#?}",
+        &housekeeping_runs()[runs_before..]
+    );
+    assert_eq!(delta(0), 3, "three idle ticks ran");
+    // From the first tick on, warm-up included: no job missed a wake.
+    let missed_from_start: Vec<(&str, u64)> = RuntimeOp::ALL
+        .iter()
+        .copied()
+        .filter(|operation| operation.as_str().starts_with("watchdog_missed_wake_"))
+        .map(|operation| (operation.as_str(), count(operation)))
+        .filter(|(_, missed)| *missed > 0)
+        .collect();
+    assert_eq!(
+        missed_from_start,
+        Vec::<(&str, u64)>::new(),
+        "no missed wake from the first tick"
+    );
+    // Owed work with no stored time retries once per 15 s, as the tick did,
+    // never back to back (mdk#3265).
+    assert!(
+        count(RuntimeOp::WorkerMaintenanceDue) - maintenance_before <= 3,
+        "session maintenance retries at most once per 15 s"
     );
     assert_eq!(delta(2), 0, "nothing owed spawns no housekeeping batch");
+    assert_eq!(
+        (delta(8), delta(9)),
+        (0, 0),
+        "the watchdog found no missed wake"
+    );
+    assert_eq!(
+        [12, 13, 14].map(delta),
+        [0, 0, 0],
+        "the watchdog found no missed pass"
+    );
+    assert_eq!(delta(10), 0, "no post-join work, so post-join rests");
+    // With no relays the replay generation never authorizes, so recovery
+    // keeps its 15 s cadence; since mdk#3238 a repeat pass writes nothing.
+    assert_eq!(delta(11), 3, "recovery still runs once per tick offline");
     assert_eq!(delta(3), 0, "nothing deleted spawns no media sweep");
     assert_eq!(delta(4), 0, "no staged upload spawns no promotion");
-    // Each tick still sets its passes due (per-account wakes are step 2).
-    assert_eq!(delta(5), 3, "one attachment pass per tick");
-    assert_eq!(delta(6), 3, "one presentation pass per tick");
-    runtime.shutdown().await;
+    // The passes run on their own wakes and deadlines, and an idle account
+    // has none due (mdk#2923 step B).
+    assert_eq!(delta(5), 0, "an idle tick runs no attachment pass");
+    assert_eq!(delta(6), 0, "an idle tick runs no presentation pass");
+    IdleTicks {
+        runtime: runtime.clone(),
+        dispatched_at_startup,
+        app_writes: delta(1),
+        session_writes: delta(7),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4529,7 +5008,7 @@ async fn stuck_worker_reap_does_not_block_a_healthy_account() {
     let manager = runtime.accounts();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     let (shutdown, _shutdown_rx) = oneshot::channel();
-    let (commands, _receiver) = mpsc::channel(1);
+    let (commands, _receiver) = crate::runtime::test_worker_channel(1);
     manager.workers.lock().await.insert(
         alice.account_id_hex.clone(),
         ManagedAccountWorker {
@@ -4606,7 +5085,7 @@ async fn deactivation_waits_for_worker_abort_before_committing_sign_out() {
     let runtime = MarmotAppRuntime::new(app);
     let manager = runtime.accounts();
     let (shutdown, _shutdown_rx) = oneshot::channel();
-    let (commands, _commands_rx) = mpsc::channel(1);
+    let (commands, _commands_rx) = crate::runtime::test_worker_channel(1);
     manager.workers.lock().await.insert(
         alice.account_id_hex.clone(),
         ManagedAccountWorker {
@@ -4734,7 +5213,7 @@ fn transient_transport_catch_up_failure() -> AccountCatchUpFailure {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn catch_up_retries_only_the_worker_with_a_transient_transport_failure() {
-    let (flaky_tx, mut flaky_rx) = mpsc::channel(4);
+    let (flaky_tx, mut flaky_rx) = crate::runtime::test_worker_channel(4);
     let flaky = tokio::spawn(async move {
         let mut attempts = 0;
         while let Some(command) = flaky_rx.recv().await {
@@ -4754,7 +5233,7 @@ async fn catch_up_retries_only_the_worker_with_a_transient_transport_failure() {
         }
         attempts
     });
-    let (healthy_tx, mut healthy_rx) = mpsc::channel(4);
+    let (healthy_tx, mut healthy_rx) = crate::runtime::test_worker_channel(4);
     let healthy = tokio::spawn(async move {
         let Some(AccountWorkerCommand::CatchUp { respond }) = healthy_rx.recv().await else {
             panic!("expected catch-up command");
@@ -4777,7 +5256,7 @@ async fn catch_up_retries_only_the_worker_with_a_transient_transport_failure() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn catch_up_returns_after_transient_retry_budget_is_exhausted() {
-    let (worker_tx, mut worker_rx) = mpsc::channel(8);
+    let (worker_tx, mut worker_rx) = crate::runtime::test_worker_channel(8);
     let worker = tokio::spawn(async move {
         let mut attempts = 0;
         while let Some(command) = worker_rx.recv().await {
@@ -4807,7 +5286,7 @@ async fn catch_up_returns_after_transient_retry_budget_is_exhausted() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn catch_up_does_not_retry_a_closed_worker_response() {
-    let (worker_tx, mut worker_rx) = mpsc::channel(2);
+    let (worker_tx, mut worker_rx) = crate::runtime::test_worker_channel(2);
     let worker = tokio::spawn(async move {
         let Some(AccountWorkerCommand::CatchUp { respond }) = worker_rx.recv().await else {
             panic!("expected catch-up command");
@@ -4852,7 +5331,7 @@ async fn catch_up_error_from_ready_account_takes_precedence_over_sibling_backoff
     }
 
     let (shutdown, mut shutdown_rx) = oneshot::channel();
-    let (commands, mut receiver) = mpsc::channel(1);
+    let (commands, mut receiver) = crate::runtime::test_worker_channel(1);
     let handle = tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -5276,9 +5755,7 @@ fn recovery_preserves_persisted_authority_after_reopen() {
         let update =
             received_message_update_from_record("account", "alice", record, &HashMap::new())
                 .unwrap();
-        let RuntimeMessageUpdate::Message(received) = update else {
-            panic!("expected message")
-        };
+        let RuntimeMessageUpdate::Message(received) = update;
         assert_eq!(received.message.source_epoch, 7);
         assert_eq!(received.message.authority, authority);
     }

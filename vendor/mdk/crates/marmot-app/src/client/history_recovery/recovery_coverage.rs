@@ -43,25 +43,20 @@ type GenerationKey = (String, String, ReplaySourceGeneration);
 /// for replay, which its REQ will not deliver again.
 ///
 /// Debt that drives work (a unit's debt, its derived cursor, the capture
-/// fence) is the ledger's debt through [`LiveTails::owed_until`], read from
+/// fence) is the ledger's debt through its standing live tail, read from
 /// [`AppClient::live_tails`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct LiveTails(BTreeMap<(TransportReconciliationRoute, String), u64>);
 
-impl LiveTails {
-    /// The last second the ledger must prove on `relay` for `route` at
-    /// `now`: the second before a live tail starts there, else `now`.
-    pub(crate) fn owed_until(
-        &self,
-        route: &TransportReconciliationRoute,
-        relay: &str,
-        now: u64,
-    ) -> u64 {
+impl super::recovery_runner::LiveTailRead for LiveTails {
+    fn history_end(&self, route: &TransportReconciliationRoute, relay: &str) -> Option<u64> {
         self.0
             .get(&(route.clone(), relay.to_owned()))
-            .map_or(now, |since| since.saturating_sub(1).min(now))
+            .map(|since| since.saturating_sub(1))
     }
+}
 
+impl LiveTails {
     fn start(&mut self, route: &TransportReconciliationRoute, relay: &str, since: u64) {
         self.0
             .entry((route.clone(), relay.to_owned()))
@@ -469,6 +464,39 @@ struct CurrentRoute {
     goal_until: Option<u64>,
 }
 
+/// Each current route in `routing`, with the group it carries, its endpoints
+/// and a retained prior route's goal end: the inbox first, then each group
+/// route once, by its transport id, in routing order.
+fn current_routes(
+    routing: &crate::AppRoutingState,
+) -> impl Iterator<
+    Item = (
+        TransportReconciliationRoute,
+        Option<Vec<u8>>,
+        &[cgka_traits::TransportEndpoint],
+        Option<u64>,
+    ),
+> {
+    let mut seen = HashSet::new();
+    std::iter::once((
+        TransportReconciliationRoute::Inbox,
+        None,
+        routing.local_inbox_endpoints.as_slice(),
+        None,
+    ))
+    .chain(routing.group_routes.iter().filter_map(move |entry| {
+        let id = <[u8; 32]>::try_from(entry.transport_group_id.as_slice()).ok()?;
+        seen.insert(id).then(|| {
+            (
+                TransportReconciliationRoute::Group(id),
+                Some(entry.group_id.as_slice().to_vec()),
+                entry.endpoints.as_slice(),
+                entry.retained_since.map(crate::retained_route_goal_until),
+            )
+        })
+    }))
+}
+
 /// The ledger keys relays by one spelling: the adapter and the scope plans
 /// spell the same relay differently.
 fn relays(endpoints: &[String]) -> Vec<String> {
@@ -627,6 +655,21 @@ impl AppClient {
         Ok(())
     }
 
+    /// The account's current routes and the group each carries, as
+    /// [`Self::recovery_runner_routes`] lists them, without reading a group
+    /// record or the relays' admission: for reads that need only which route
+    /// carries which group. Both list routes through [`current_routes`].
+    pub(crate) fn current_route_groups(
+        &self,
+    ) -> Vec<(TransportReconciliationRoute, Option<Vec<u8>>)> {
+        // Borrowed: a rebuilt recovery answer reads the routes, and a copy
+        // of the whole routing would cost more than the read.
+        let routing = self.routing.read();
+        current_routes(&routing)
+            .map(|(route, group_id, _, _)| (route, group_id))
+            .collect()
+    }
+
     fn current_coverage_routes(&self) -> Vec<CurrentRoute> {
         let routing = self.routing.snapshot();
         let operated = &self.app.config.deployment.recovery_operated_relays;
@@ -648,27 +691,11 @@ impl AppClient {
                     goal_until,
                 }
             };
-        let mut routes = vec![current(
-            TransportReconciliationRoute::Inbox,
-            None,
-            &routing.local_inbox_endpoints,
-            None,
-        )];
-        let mut seen = HashSet::new();
-        for entry in &routing.group_routes {
-            let Ok(id) = <[u8; 32]>::try_from(entry.transport_group_id.as_slice()) else {
-                continue;
-            };
-            if seen.insert(id) {
-                routes.push(current(
-                    TransportReconciliationRoute::Group(id),
-                    Some(entry.group_id.as_slice().to_vec()),
-                    &entry.endpoints,
-                    entry.retained_since.map(crate::retained_route_goal_until),
-                ));
-            }
-        }
-        routes
+        current_routes(&routing)
+            .map(|(route, group_id, endpoints, goal_until)| {
+                current(route, group_id, endpoints, goal_until)
+            })
+            .collect()
     }
 
     /// The account's current routes as its recovery runner reads them, once
@@ -961,11 +988,15 @@ impl AppClient {
 
     /// Whether the group's local copy is Unrecoverable, which suspends its
     /// recovery (mdk#2660 section 6). A group whose record cannot be read is
-    /// not suspended.
+    /// not suspended; one not hydrated yet reads its stored record
+    /// ([`Self::unrecoverable_fact`]).
     pub(crate) fn group_unrecoverable(&self, group_id: &[u8]) -> bool {
-        self.runtime
-            .group_record(&cgka_traits::GroupId::new(group_id.to_vec()))
-            .is_ok_and(|group| group.unrecoverable)
+        let group_id = cgka_traits::GroupId::new(group_id.to_vec());
+        let record = self
+            .runtime
+            .group_record(&group_id)
+            .map_err(crate::AppError::from);
+        self.unrecoverable_fact(&group_id, record.as_ref()).value
     }
 
     fn coverage_storage(&self) -> Result<storage_sqlite::SqliteAccountStorage, AppError> {

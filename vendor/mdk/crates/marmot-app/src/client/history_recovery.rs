@@ -91,6 +91,10 @@ pub(crate) struct HistoryRecoveryState {
     /// Detector observations whose SQL write failed. At most one epoch per
     /// group; this buffer owns no dispatch, completion or retry policy.
     pub(crate) pending_recovery_arm_writes: HashMap<GroupId, u64>,
+    /// Advanced gaps awaiting reassessment, keyed to their observed old epoch.
+    pub(crate) pending_epoch_handoffs: HashMap<GroupId, u64>,
+    /// Coalesce local-only direct checks within one explicit runner pass.
+    pub(crate) direct_handoffs_checked: HashSet<GroupId>,
     /// Initial account open or release consumption requires a backfill reload.
     /// Keep this armed after a failed read even if the journal is already empty;
     /// the next synchronized receipt access retries on this same client.
@@ -148,6 +152,17 @@ impl HistoryRecovery {
         self.state.epoch_stall.clear_recovered_group(group_id);
     }
 
+    /// Whether a detector observation's SQL write failed and waits to be
+    /// retried, which keeps the recovery seam owed (mdk#2923).
+    pub(crate) fn has_buffered_epoch_gap_arms(&self) -> bool {
+        !self.state.pending_recovery_arm_writes.is_empty()
+    }
+
+    /// Whether a post-join collection is in progress (mdk#2923).
+    pub(crate) fn has_post_join_collections(&self) -> bool {
+        !self.state.runner_post_join.is_empty()
+    }
+
     /// Drop every post-join collection: frozen cursors and paused maintenance
     /// hold none.
     pub(crate) fn clear_post_join_collections(&mut self) {
@@ -167,6 +182,8 @@ impl HistoryRecovery {
             .retain(|event| &event.group_id != group_id);
         self.state.epoch_stall.clear_recovered_group(group_id);
         self.state.pending_recovery_arm_writes.remove(group_id);
+        self.state.pending_epoch_handoffs.remove(group_id);
+        self.state.direct_handoffs_checked.remove(group_id);
     }
 
     /// Forget a forgotten group's settled copy.

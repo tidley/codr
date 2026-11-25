@@ -3,28 +3,22 @@
 mod media_replies;
 
 use agent_control::{
-    AGENT_CONTROL_STREAM_STATUS_STARTED, AgentControlAccountSelection, AgentControlEnvelope,
-    AgentControlEvent, AgentControlInvitePolicy, AgentControlProfileLookupStatus,
-    AgentControlRequest, AgentControlResponse, AgentControlSendMaintenanceDisposition,
-    decode_frame, encode_frame, read_envelope, write_frame,
-};
-use cgka_traits::agent_text_stream::{
-    AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN, AGENT_TEXT_STREAM_RECORD_STATUS,
-    AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, AgentTextStreamTranscriptV1,
+    AgentControlAccountSelection, AgentControlEnvelope, AgentControlEvent,
+    AgentControlInvitePolicy, AgentControlProfileLookupStatus, AgentControlRequest,
+    AgentControlResponse, AgentControlSendMaintenanceDisposition, decode_frame, encode_frame,
+    read_envelope, write_frame,
 };
 use cgka_traits::app_event::{
-    MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_CHAT,
-    MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_EDIT, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
-    MARMOT_APP_EVENT_KIND_REACTION, MarmotAppEvent as MarmotInnerEvent, STREAM_PARENT_TAG,
-    STREAM_TAG,
+    MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_EDIT,
+    MARMOT_APP_EVENT_KIND_GROUP_SYSTEM, MARMOT_APP_EVENT_KIND_REACTION,
+    MarmotAppEvent as MarmotInnerEvent,
 };
 use cgka_traits::engine::{GroupEvent, GroupStateChange};
-use cgka_traits::{EpochId, GroupId, MessageId};
+use cgka_traits::{EpochId, GroupId};
 use marmot_account::AccountHome;
 use marmot_app::{
     AccountRelayListBootstrap, AccountSetupRequest, AppError, MarmotApp, MarmotAppEvent,
-    MarmotAppRuntime, ReceivedMessage, RuntimeAgentStreamMessage, RuntimeMessageReceived,
-    UserProfileMetadata,
+    MarmotAppRuntime, ReceivedMessage, RuntimeMessageReceived, UserProfileMetadata,
 };
 use nostr_relay_builder::MockRelay;
 use std::collections::HashSet;
@@ -398,10 +392,8 @@ pub(crate) fn test_config(
     config.dev_allow_any_invites = dev_allow_any_invites;
     config.debug_controls = debug_controls;
     config.media_allowed_roots = Vec::new();
-    // The white-box suite drives streams at loopback brokers and connects to an
-    // in-process `MockRelay` at loopback; production defaults keep both off (see
-    // `allow_insecure_local_broker` / `allow_loopback_relays`).
-    config.allow_insecure_local_broker = true;
+    // The white-box suite connects to an in-process `MockRelay` at loopback;
+    // production keeps this off (see `allow_loopback_relays`).
     config.allow_loopback_relays = true;
     config
 }
@@ -562,39 +554,6 @@ fn control_event_projects_imeta_tag_into_inbound_media_ref() {
     assert_eq!(attachment.locators.len(), 1);
     assert_eq!(attachment.locators[0].kind, "blossom-v1");
     assert_eq!(attachment.locators[0].value, locator_url);
-}
-
-#[tokio::test]
-async fn control_event_emits_stream_update_for_agent_stream_started() {
-    let dir = tempfile::tempdir().unwrap();
-    let runtime = MarmotAppRuntime::new(MarmotApp::with_relays(dir.path(), Vec::new()));
-    let agent_account_id_hex = "aa".repeat(32);
-    let stream_id_hex = "55".repeat(32);
-    let event = MarmotAppEvent::AgentStreamStarted(RuntimeAgentStreamMessage {
-        account_id_hex: agent_account_id_hex.clone(),
-        account_label: "agent".to_owned(),
-        message: received_message(
-            MARMOT_APP_EVENT_KIND_AGENT_STREAM_START,
-            "",
-            vec![vec![STREAM_TAG.to_owned(), stream_id_hex.clone()]],
-        ),
-    });
-
-    let Some(AgentControlEvent::StreamUpdate {
-        account_id_hex,
-        group_id_hex,
-        stream_id_hex: event_stream_id_hex,
-        status,
-    }) = control_event_from_runtime_event_with_runtime(&runtime, event, None, None).unwrap()
-    else {
-        panic!("expected agent stream start to become a stream update");
-    };
-
-    assert_eq!(account_id_hex, agent_account_id_hex);
-    assert_eq!(group_id_hex, "22".repeat(32));
-    assert_eq!(event_stream_id_hex, stream_id_hex);
-    assert_eq!(status, AGENT_CONTROL_STREAM_STATUS_STARTED);
-    runtime.shutdown().await;
 }
 
 #[tokio::test]
@@ -1069,157 +1028,6 @@ async fn invite_policy_retry_delay_starts_after_the_failed_attempt_returns() {
          (an attempt-start-anchored backoff would already have been in the past)"
     );
     handle.abort();
-}
-
-#[tokio::test]
-async fn stream_store_evicts_idle() {
-    use crate::stream_session::{ActiveStreamSession, StreamSessionStore};
-    use marmot_app::{AgentPublisherOptions, AgentPublisherRouting};
-    use std::time::Instant;
-
-    storage_sqlite::relax_storage_for_test_process();
-    let dir = tempfile::tempdir().unwrap();
-    let relay = MockRelay::run().await.unwrap();
-    let url = relay.url().await.to_string();
-    let runtime = MarmotApp::with_relay(dir.path(), url.clone()).runtime();
-    let account = runtime
-        .create_identity(
-            AccountSetupRequest {
-                default_relays: vec![crate::validation::endpoint(&url)],
-                bootstrap_relays: vec![crate::validation::endpoint(&url)],
-                ..Default::default()
-            }
-            .relay_options_only(),
-        )
-        .await
-        .unwrap();
-    let group = runtime
-        .create_group(&account.account.account_id_hex, "idle streams", &[], None)
-        .await
-        .unwrap()
-        .operation
-        .expect("fixture group is created");
-    let store = StreamSessionStore::default();
-    for (id, age) in [(0xaa, 3600), (0xbb, 0)] {
-        let publisher = runtime
-            .open_agent_publisher(
-                account.account.account_id_hex.clone(),
-                group.clone(),
-                vec![id; 32],
-                AgentPublisherOptions {
-                    candidates: Vec::new(),
-                    routing: AgentPublisherRouting::BestEffort,
-                    parent_message_id: None,
-                    chunk_bytes: 1024,
-                    server_cert_der: None,
-                    insecure_local: false,
-                },
-            )
-            .await
-            .unwrap();
-        store
-            .insert_new(
-                hex::encode([id; 32]),
-                ActiveStreamSession {
-                    publisher,
-                    stream_capability: [0x77; 32],
-                    last_activity: Instant::now() - Duration::from_secs(age),
-                },
-            )
-            .unwrap();
-    }
-    assert_eq!(store.sweep_idle(Duration::from_secs(300)).await, 1);
-    assert!(
-        store
-            .get_authorized(&"AA".repeat(32), &"77".repeat(32))
-            .is_err()
-    );
-    assert!(
-        store
-            .get_authorized(&"BB".repeat(32), &"77".repeat(32))
-            .is_ok()
-    );
-    let active = store
-        .remove_authorized(&"BB".repeat(32), &"77".repeat(32))
-        .unwrap();
-    active.publisher.cancel().await;
-    assert!(!active.publisher.is_idle_evictable());
-    runtime.shutdown_and_close().await.unwrap();
-}
-
-/// #366: a sealed transcript whose durable send failed is the only retry
-/// handle, so the idle sweeper must never evict it.
-#[tokio::test]
-async fn stream_store_sweep_spares_sealed_session() {
-    use crate::stream_session::{ActiveStreamSession, StreamSessionStore};
-    use marmot_app::{AgentPublisherOptions, AgentPublisherRouting};
-    use std::time::Instant;
-
-    storage_sqlite::relax_storage_for_test_process();
-    let dir = tempfile::tempdir().unwrap();
-    let relay = MockRelay::run().await.unwrap();
-    let url = relay.url().await.to_string();
-    let runtime = MarmotApp::with_relay(dir.path(), url.clone()).runtime();
-    let account = runtime
-        .create_identity(
-            AccountSetupRequest {
-                default_relays: vec![crate::validation::endpoint(&url)],
-                bootstrap_relays: vec![crate::validation::endpoint(&url)],
-                ..Default::default()
-            }
-            .relay_options_only(),
-        )
-        .await
-        .unwrap();
-    let group = runtime
-        .create_group(&account.account.account_id_hex, "sealed streams", &[], None)
-        .await
-        .unwrap()
-        .operation
-        .expect("fixture group is created");
-    let publisher = runtime
-        .open_agent_publisher(
-            account.account.account_id_hex.clone(),
-            group.clone(),
-            vec![0xcc; 32],
-            AgentPublisherOptions {
-                candidates: Vec::new(),
-                routing: AgentPublisherRouting::BestEffort,
-                parent_message_id: None,
-                chunk_bytes: 1024,
-                server_cert_der: None,
-                insecure_local: false,
-            },
-        )
-        .await
-        .unwrap();
-    // Dropping the group makes the durable final fail after sealing.
-    runtime
-        .delete_group_local(&account.account.account_id_hex, &group)
-        .await
-        .unwrap();
-    assert!(matches!(
-        publisher.finish(None).await,
-        Err(marmot_app::AppError::AgentStreamSendFailed(_))
-    ));
-    let store = StreamSessionStore::default();
-    store
-        .insert_new(
-            hex::encode([0xcc; 32]),
-            ActiveStreamSession {
-                publisher,
-                stream_capability: [0x77; 32],
-                last_activity: Instant::now() - Duration::from_secs(3600),
-            },
-        )
-        .unwrap();
-    assert_eq!(store.sweep_idle(Duration::from_secs(300)).await, 0);
-    let sealed = store
-        .remove_authorized(&"CC".repeat(32), &"77".repeat(32))
-        .unwrap();
-    assert!(!sealed.publisher.is_idle_evictable());
-    sealed.publisher.cancel().await;
-    runtime.shutdown_and_close().await.unwrap();
 }
 
 #[tokio::test]
@@ -2778,109 +2586,6 @@ fn invite_policy_defaults_to_allowlist_for_legacy_records_and_preserves_entries(
 }
 
 #[tokio::test]
-async fn stream_begin_reservations_do_not_serialize_unrelated_requests() {
-    use crate::stream_session::{StreamBeginReceipt, StreamBeginReservation, StreamSessionStore};
-
-    let store = StreamSessionStore::default();
-    let first_stream_id = hex::encode([0x11; 32]);
-    let second_stream_id = hex::encode([0x22; 32]);
-
-    let first_guard = match store
-        .reserve_stream_begin(
-            "request-a".to_owned(),
-            "fingerprint-a".to_owned(),
-            Some(first_stream_id.clone()),
-        )
-        .unwrap()
-    {
-        StreamBeginReservation::Leader { guard, .. } => guard,
-        _ => panic!("first request must lead its reservation"),
-    };
-
-    let mut follower = match store
-        .reserve_stream_begin(
-            "request-a".to_owned(),
-            "fingerprint-a".to_owned(),
-            Some(first_stream_id.clone()),
-        )
-        .unwrap()
-    {
-        StreamBeginReservation::Wait(completion) => completion,
-        _ => panic!("same-request retry must wait for the leader"),
-    };
-    assert!(matches!(
-        store.reserve_stream_begin(
-            "request-a".to_owned(),
-            "different-fingerprint".to_owned(),
-            Some(first_stream_id.clone()),
-        ),
-        Err(crate::ConnectorError::StreamBeginRequestConflict)
-    ));
-    assert!(matches!(
-        store.reserve_stream_begin(
-            "request-b".to_owned(),
-            "fingerprint-b".to_owned(),
-            Some(first_stream_id.clone()),
-        ),
-        Err(crate::ConnectorError::StreamIdInUse)
-    ));
-
-    // A distinct request and stream id becomes a leader immediately while A
-    // is still in flight. Its DNS/runtime work can therefore run concurrently.
-    let second_guard = match store
-        .reserve_stream_begin(
-            "request-b".to_owned(),
-            "fingerprint-b".to_owned(),
-            Some(second_stream_id),
-        )
-        .unwrap()
-    {
-        StreamBeginReservation::Leader { guard, .. } => guard,
-        _ => panic!("unrelated request must not wait behind request A"),
-    };
-    drop(second_guard);
-
-    // Cancelling/failing the leader releases its stream id and wakes followers
-    // so one can retry as the new leader.
-    drop(first_guard);
-    timeout(Duration::from_secs(1), follower.changed())
-        .await
-        .expect("cancelled leader must wake followers")
-        .expect("reservation watch remains valid through wakeup");
-
-    let retry_guard = match store
-        .reserve_stream_begin(
-            "request-a".to_owned(),
-            "fingerprint-a".to_owned(),
-            Some(first_stream_id.clone()),
-        )
-        .unwrap()
-    {
-        StreamBeginReservation::Leader { guard, .. } => guard,
-        _ => panic!("retry must lead after the cancelled reservation is released"),
-    };
-    let receipt = StreamBeginReceipt {
-        fingerprint: "fingerprint-a".to_owned(),
-        stream_id_hex: first_stream_id,
-        stream_capability: hex::encode([0x33; 32]),
-        start_message_id_hex: hex::encode([0x44; 32]),
-        quic_candidates: vec!["quic://broker.example:443".to_owned()],
-        policy_max_plaintext_frame_len: Some(1024),
-    };
-    retry_guard.complete(receipt.clone());
-    assert!(matches!(
-        store.reserve_stream_begin(
-            "request-a".to_owned(),
-            "fingerprint-a".to_owned(),
-            None,
-        ),
-        Ok(StreamBeginReservation::Completed(completed))
-            if completed.stream_id_hex == receipt.stream_id_hex
-                && completed.stream_capability == receipt.stream_capability
-    ));
-}
-
-#[tokio::test]
 async fn connector_policy_accepts_allowed_welcomer() {
     storage_sqlite::relax_storage_for_test_process();
     let agent_dir = tempfile::tempdir().unwrap();
@@ -4349,880 +4054,6 @@ async fn group_info_reads_current_chat_list_group_name_without_using_title() {
     );
 }
 
-#[tokio::test]
-async fn connector_socket_composes_and_finalizes_stream_without_quic_candidates() {
-    storage_sqlite::relax_storage_for_test_process();
-    let dir = tempfile::tempdir().unwrap();
-    let relay = MockRelay::run().await.unwrap();
-    let relay_url = relay.url().await.to_string();
-    let app = MarmotApp::with_relay(dir.path(), relay_url.clone());
-    let setup_runtime = MarmotAppRuntime::new(app);
-    let setup = AccountSetupRequest {
-        default_relays: vec![crate::validation::endpoint(&relay_url)],
-        bootstrap_relays: vec![crate::validation::endpoint(&relay_url)],
-        publish_initial_key_package: true,
-        ..AccountSetupRequest::default()
-    };
-    let agent = setup_runtime
-        .create_identity(setup.relay_options_only())
-        .await
-        .unwrap();
-    let human = setup_runtime.create_identity(setup).await.unwrap();
-    let group_id = setup_runtime
-        .create_group(
-            &agent.account.account_id_hex,
-            "agent stream",
-            std::slice::from_ref(&human.account.account_id_hex),
-            None,
-        )
-        .await
-        .unwrap()
-        .operation
-        .expect("fixture group is created");
-    setup_runtime.shutdown().await;
-
-    let group_id_hex = hex::encode(group_id.as_slice());
-    let stream_id_hex = hex::encode([0x77; 32]);
-    let parent_message_id_hex = hex::encode([0x88; 32]);
-    let socket = dir.path().join("dev").join("wn-agent.sock");
-    let connector = AgentConnector::open(test_config(
-        dir.path(),
-        socket.clone(),
-        vec![relay_url],
-        false,
-        false,
-    ))
-    .unwrap();
-    let listener = bind_connector_socket(&socket).unwrap();
-
-    let missing_begin_id = connector
-        .stream_begin_response(
-            None,
-            &agent.account.account_id_hex,
-            &group_id_hex,
-            Some(stream_id_hex.clone()),
-            Some(parent_message_id_hex.clone()),
-            Vec::new(),
-        )
-        .await;
-    assert!(matches!(
-        missing_begin_id,
-        Err(crate::ConnectorError::InvalidStreamBeginRequestId)
-    ));
-
-    let begin_request = AgentControlRequest::StreamBegin {
-        account_id_hex: agent.account.account_id_hex.clone(),
-        group_id_hex: group_id_hex.clone(),
-        stream_id_hex: Some(stream_id_hex.clone()),
-        parent_message_id_hex: Some(parent_message_id_hex.clone()),
-        quic_candidates: Vec::new(),
-    };
-    let begun = serve_control_request_once(
-        &connector,
-        &listener,
-        &socket,
-        "req-stream-begin",
-        begin_request.clone(),
-    )
-    .await;
-    let first_begun_payload = begun.payload.clone();
-
-    let retried_begin = serve_control_request_once(
-        &connector,
-        &listener,
-        &socket,
-        "req-stream-begin",
-        begin_request.clone(),
-    )
-    .await;
-    assert_eq!(
-        retried_begin.payload, first_begun_payload,
-        "an identical begin retry must return the original capability and receipt"
-    );
-
-    let conflicting_retry = serve_control_request_once(
-        &connector,
-        &listener,
-        &socket,
-        "req-stream-begin",
-        AgentControlRequest::StreamBegin {
-            account_id_hex: agent.account.account_id_hex.clone(),
-            group_id_hex: group_id_hex.clone(),
-            stream_id_hex: Some(stream_id_hex.clone()),
-            parent_message_id_hex: None,
-            quic_candidates: Vec::new(),
-        },
-    )
-    .await;
-    let AgentControlResponse::Error { code, .. } = conflicting_retry.payload else {
-        panic!("expected conflicting stream-begin retry error");
-    };
-    assert_eq!(code, "stream_begin_request_conflict");
-
-    let colliding_begin = serve_control_request_once(
-        &connector,
-        &listener,
-        &socket,
-        "req-stream-begin-collision",
-        begin_request,
-    )
-    .await;
-    let AgentControlResponse::Error { code, .. } = colliding_begin.payload else {
-        panic!("expected stream-id collision error");
-    };
-    assert_eq!(code, "stream_id_in_use");
-
-    let AgentControlResponse::StreamBegun {
-        stream_id_hex: begun_stream_id_hex,
-        stream_capability,
-        start_message_id_hex,
-        quic_candidates,
-        ..
-    } = begun.payload
-    else {
-        panic!("expected stream begun response");
-    };
-    assert_eq!(begun_stream_id_hex, stream_id_hex);
-    assert_eq!(stream_capability.len(), 64);
-    assert_eq!(hex::decode(&stream_capability).unwrap().len(), 32);
-    assert_eq!(stream_capability, stream_capability.to_ascii_lowercase());
-    assert!(quic_candidates.is_empty());
-    let stored = connector
-        .runtime
-        .messages_with_query(
-            &agent.account.account_id_hex,
-            crate::AppMessageQuery {
-                group_id_hex: Some(group_id_hex.clone()),
-                kinds: None,
-                limit: None,
-            },
-        )
-        .unwrap();
-    let start = stored
-        .iter()
-        .find(|message| message.message_id_hex == start_message_id_hex)
-        .expect("stream start must be in the local app projection");
-    assert_eq!(
-        stored
-            .iter()
-            .filter(|message| message.kind == MARMOT_APP_EVENT_KIND_AGENT_STREAM_START)
-            .count(),
-        1,
-        "begin retries and collisions must not publish another start event"
-    );
-    assert_eq!(start.kind, MARMOT_APP_EVENT_KIND_AGENT_STREAM_START);
-    assert_eq!(
-        start
-            .tags
-            .iter()
-            .find(|tag| tag.first().map(String::as_str) == Some(STREAM_PARENT_TAG))
-            .and_then(|tag| tag.get(1))
-            .map(String::as_str),
-        Some(parent_message_id_hex.as_str())
-    );
-
-    // Matching same-key preview requests may race after an ambiguous client
-    // timeout. Both callers receive Ack, while the compose transcript below
-    // proves the append was dispatched exactly once.
-    let first_append = connector.stream_record_response(
-        marmot_app::AgentPublisherRecord::Text,
-        &stream_id_hex,
-        &stream_capability,
-        "hello stream".to_owned(),
-        Some("preview-key".to_owned()),
-    );
-    let second_append = connector.stream_record_response(
-        marmot_app::AgentPublisherRecord::Text,
-        &stream_id_hex,
-        &stream_capability,
-        "hello stream".to_owned(),
-        Some("preview-key".to_owned()),
-    );
-    let (appended, replayed) = tokio::join!(first_append, second_append);
-    assert_eq!(appended.unwrap(), AgentControlResponse::Ack);
-    assert_eq!(replayed.unwrap(), AgentControlResponse::Ack);
-
-    let conflict = serve_control_request_once(
-        &connector,
-        &listener,
-        &socket,
-        "req-stream-append-conflict",
-        AgentControlRequest::StreamAppend {
-            stream_id_hex: stream_id_hex.clone(),
-            stream_capability: stream_capability.clone(),
-            append_text: "different".to_owned(),
-            idempotency_key: Some("preview-key".to_owned()),
-        },
-    )
-    .await;
-    let AgentControlResponse::Error { code, .. } = conflict.payload else {
-        panic!("expected preview idempotency conflict");
-    };
-    assert_eq!(code, "stream_preview_idempotency_conflict");
-
-    let status = serve_control_request_once(
-        &connector,
-        &listener,
-        &socket,
-        "req-stream-status",
-        AgentControlRequest::StreamStatus {
-            stream_id_hex: stream_id_hex.clone(),
-            stream_capability: stream_capability.clone(),
-            status: "thinking".to_owned(),
-            // The operation namespace isolates this from the append key above.
-            idempotency_key: Some("preview-key".to_owned()),
-        },
-    )
-    .await;
-    assert_eq!(status.payload, AgentControlResponse::Ack);
-
-    let transcript_hash_hex = expected_stream_transcript_hash(
-        &stream_id_hex,
-        &start_message_id_hex,
-        &[
-            (AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, "hello stream"),
-            (AGENT_TEXT_STREAM_RECORD_STATUS, "thinking"),
-        ],
-    );
-    let finalized = serve_control_request_once(
-        &connector,
-        &listener,
-        &socket,
-        "req-stream-finalize",
-        AgentControlRequest::StreamFinalize {
-            stream_id_hex: stream_id_hex.clone(),
-            stream_capability,
-            final_text: "hello stream".to_owned(),
-            transcript_hash_hex,
-            chunk_count: 2,
-            idempotency_key: None,
-        },
-    )
-    .await;
-    let AgentControlResponse::StreamFinalized {
-        stream_id_hex: finalized_stream_id_hex,
-        message_ids_hex,
-    } = finalized.payload
-    else {
-        panic!("expected stream finalized response");
-    };
-    assert_eq!(finalized_stream_id_hex, stream_id_hex);
-    assert_eq!(message_ids_hex.len(), 1);
-    assert!(!message_ids_hex[0].is_empty());
-}
-
-#[tokio::test]
-async fn preview_receipts_do_not_evict_durable_receipts_or_persist_on_restart() {
-    let temp = tempfile::tempdir().unwrap();
-    let home = temp.path();
-    let durable = crate::stream_session::SendIdempotencyStore::new(home);
-    let preview = crate::stream_session::SendIdempotencyStore::process_local_preview();
-    let durable_key = "durable-finalize-key".to_owned();
-    let durable_fingerprint = "durable-finalize-fingerprint".to_owned();
-    let durable_message_ids = vec!["ab".repeat(32)];
-
-    durable.record(
-        durable_key.clone(),
-        durable_fingerprint.clone(),
-        durable_message_ids.clone(),
-    );
-    let persisted = home.join("dev").join("send-idempotency.json");
-    timeout(Duration::from_secs(5), async {
-        loop {
-            if persisted
-                .is_file()
-                .then(|| std::fs::read_to_string(&persisted).ok())
-                .flatten()
-                .is_some_and(|raw| raw.contains(&durable_key))
-            {
-                break;
-            }
-            sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
-    let persisted_before = std::fs::read(&persisted).unwrap();
-
-    // Exceed the durable FIFO capacity with successful preview mutations.
-    // These must remain process-local and must not consume durable capacity.
-    for index in 0..=crate::stream_session::SEND_IDEMPOTENCY_CAPACITY {
-        let key = format!("stream_append:preview-{index}");
-        let fingerprint = format!("preview-fingerprint-{index}");
-        match preview.acquire_strict(&key, &fingerprint).await.unwrap() {
-            crate::stream_session::StrictIdempotencyAcquisition::Leader(reservation) => {
-                preview.record(key, fingerprint, Vec::new());
-                reservation.complete(Vec::new(), AgentControlSendMaintenanceDisposition::Ready);
-            }
-            crate::stream_session::StrictIdempotencyAcquisition::Completed(_) => {
-                panic!("fresh preview key unexpectedly replayed")
-            }
-            crate::stream_session::StrictIdempotencyAcquisition::Conflict => {
-                panic!("fresh preview key unexpectedly conflicted")
-            }
-        }
-    }
-    sleep(Duration::from_millis(100)).await;
-    assert_eq!(std::fs::read(&persisted).unwrap(), persisted_before);
-
-    match durable
-        .acquire(&durable_key, &durable_fingerprint)
-        .await
-        .unwrap()
-    {
-        crate::stream_session::SendIdempotencyAcquisition::Completed((ids, disposition)) => {
-            assert_eq!(ids, durable_message_ids);
-            assert_eq!(disposition, AgentControlSendMaintenanceDisposition::Ready);
-        }
-        crate::stream_session::SendIdempotencyAcquisition::Leader(_) => {
-            panic!("durable receipt was evicted by preview traffic")
-        }
-    }
-
-    // The durable receipt survives a process restart, while preview receipts
-    // intentionally do not because the associated active streams do not.
-    let reopened = crate::stream_session::SendIdempotencyStore::new(home);
-    match reopened
-        .acquire(&durable_key, &durable_fingerprint)
-        .await
-        .unwrap()
-    {
-        crate::stream_session::SendIdempotencyAcquisition::Completed((ids, disposition)) => {
-            assert_eq!(ids, durable_message_ids);
-            assert_eq!(disposition, AgentControlSendMaintenanceDisposition::Ready);
-        }
-        crate::stream_session::SendIdempotencyAcquisition::Leader(_) => {
-            panic!("durable receipt did not survive restart")
-        }
-    }
-    let reopened_preview = crate::stream_session::SendIdempotencyStore::process_local_preview();
-    match reopened_preview
-        .acquire_strict("stream_append:preview-0", "preview-fingerprint-0")
-        .await
-        .unwrap()
-    {
-        crate::stream_session::StrictIdempotencyAcquisition::Leader(_) => {}
-        crate::stream_session::StrictIdempotencyAcquisition::Completed(_) => {
-            panic!("preview receipt must not survive restart")
-        }
-        crate::stream_session::StrictIdempotencyAcquisition::Conflict => {
-            panic!("absent preview receipt unexpectedly conflicted")
-        }
-    }
-}
-
-/// Regression for #366: a finalize whose expectation does not match the
-/// composed transcript must not tear down the stream session. The compose
-/// task keeps running, further appends succeed, and a corrected finalize
-/// completes the stream.
-#[tokio::test]
-async fn connector_socket_finalize_mismatch_keeps_stream_session_retryable() {
-    storage_sqlite::relax_storage_for_test_process();
-    let dir = tempfile::tempdir().unwrap();
-    let relay = MockRelay::run().await.unwrap();
-    let relay_url = relay.url().await.to_string();
-    let app = MarmotApp::with_relay(dir.path(), relay_url.clone());
-    let setup_runtime = MarmotAppRuntime::new(app);
-    let setup = AccountSetupRequest {
-        default_relays: vec![crate::validation::endpoint(&relay_url)],
-        bootstrap_relays: vec![crate::validation::endpoint(&relay_url)],
-        publish_initial_key_package: true,
-        ..AccountSetupRequest::default()
-    };
-    let agent = setup_runtime
-        .create_identity(setup.relay_options_only())
-        .await
-        .unwrap();
-    let human = setup_runtime.create_identity(setup).await.unwrap();
-    let group_id = setup_runtime
-        .create_group(
-            &agent.account.account_id_hex,
-            "agent retryable finalize",
-            std::slice::from_ref(&human.account.account_id_hex),
-            None,
-        )
-        .await
-        .unwrap()
-        .operation
-        .expect("fixture group is created");
-    setup_runtime.shutdown().await;
-
-    let group_id_hex = hex::encode(group_id.as_slice());
-    let stream_id_hex = hex::encode([0x99; 32]);
-    let socket = dir.path().join("dev").join("wn-agent.sock");
-    let connector = AgentConnector::open(test_config(
-        dir.path(),
-        socket.clone(),
-        vec![relay_url],
-        false,
-        false,
-    ))
-    .unwrap();
-    let listener = bind_connector_socket(&socket).unwrap();
-
-    let begun = serve_control_request_once(
-        &connector,
-        &listener,
-        &socket,
-        "req-retry-begin",
-        AgentControlRequest::StreamBegin {
-            account_id_hex: agent.account.account_id_hex.clone(),
-            group_id_hex: group_id_hex.clone(),
-            stream_id_hex: Some(stream_id_hex.clone()),
-            parent_message_id_hex: None,
-            quic_candidates: vec!["quic://127.0.0.1:9".to_owned()],
-        },
-    )
-    .await;
-    let AgentControlResponse::StreamBegun {
-        stream_capability,
-        start_message_id_hex,
-        ..
-    } = begun.payload
-    else {
-        panic!("expected stream begun response");
-    };
-
-    let appended = serve_control_request_once(
-        &connector,
-        &listener,
-        &socket,
-        "req-retry-append",
-        AgentControlRequest::StreamAppend {
-            stream_id_hex: stream_id_hex.clone(),
-            stream_capability: stream_capability.clone(),
-            append_text: "hello stream".to_owned(),
-            idempotency_key: None,
-        },
-    )
-    .await;
-    assert_eq!(appended.payload, AgentControlResponse::Ack);
-
-    // Correct text and hash, wrong chunk count: the finalize must fail
-    // without tearing down the compose session.
-    let first_hash = expected_stream_transcript_hash(
-        &stream_id_hex,
-        &start_message_id_hex,
-        &[(AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, "hello stream")],
-    );
-    let mismatched = serve_control_request_once(
-        &connector,
-        &listener,
-        &socket,
-        "req-retry-finalize-mismatch",
-        AgentControlRequest::StreamFinalize {
-            stream_id_hex: stream_id_hex.clone(),
-            stream_capability: stream_capability.clone(),
-            final_text: "hello stream".to_owned(),
-            transcript_hash_hex: first_hash,
-            chunk_count: 7,
-            idempotency_key: None,
-        },
-    )
-    .await;
-    let AgentControlResponse::Error { code, .. } = mismatched.payload else {
-        panic!("expected finalize mismatch error");
-    };
-    assert_eq!(code, "stream_finalize_mismatch");
-
-    // The compose session must have survived the mismatch: a further append
-    // still succeeds.
-    let appended_again = serve_control_request_once(
-        &connector,
-        &listener,
-        &socket,
-        "req-retry-append-again",
-        AgentControlRequest::StreamAppend {
-            stream_id_hex: stream_id_hex.clone(),
-            stream_capability: stream_capability.clone(),
-            append_text: " again".to_owned(),
-            idempotency_key: None,
-        },
-    )
-    .await;
-    assert_eq!(appended_again.payload, AgentControlResponse::Ack);
-
-    // A corrected finalize over the full transcript succeeds.
-    let corrected_hash = expected_stream_transcript_hash(
-        &stream_id_hex,
-        &start_message_id_hex,
-        &[
-            (AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, "hello stream"),
-            (AGENT_TEXT_STREAM_RECORD_TEXT_DELTA, " again"),
-        ],
-    );
-    let finalized = serve_control_request_once(
-        &connector,
-        &listener,
-        &socket,
-        "req-retry-finalize",
-        AgentControlRequest::StreamFinalize {
-            stream_id_hex: stream_id_hex.clone(),
-            stream_capability,
-            final_text: "hello stream again".to_owned(),
-            transcript_hash_hex: corrected_hash,
-            chunk_count: 2,
-            idempotency_key: None,
-        },
-    )
-    .await;
-    let AgentControlResponse::StreamFinalized {
-        stream_id_hex: finalized_stream_id_hex,
-        message_ids_hex,
-    } = finalized.payload
-    else {
-        panic!("expected stream finalized response");
-    };
-    assert_eq!(finalized_stream_id_hex, stream_id_hex);
-    assert_eq!(message_ids_hex.len(), 1);
-    assert!(!message_ids_hex[0].is_empty());
-}
-
-// A lost control receipt must not publish another durable final.
-#[tokio::test]
-async fn connector_finish_reuses_receipt() {
-    use crate::error::ConnectorError;
-    use crate::validation::normalize_hex;
-
-    storage_sqlite::relax_storage_for_test_process();
-    let dir = tempfile::tempdir().unwrap();
-    let relay = MockRelay::run().await.unwrap();
-    let relay_url = relay.url().await.to_string();
-    let app = MarmotApp::with_relay(dir.path(), relay_url.clone());
-    let setup_runtime = MarmotAppRuntime::new(app);
-    let setup = AccountSetupRequest {
-        default_relays: vec![crate::validation::endpoint(&relay_url)],
-        bootstrap_relays: vec![crate::validation::endpoint(&relay_url)],
-        publish_initial_key_package: true,
-        ..AccountSetupRequest::default()
-    };
-    let agent = setup_runtime
-        .create_identity(setup.relay_options_only())
-        .await
-        .unwrap();
-    let human = setup_runtime.create_identity(setup).await.unwrap();
-    let group_id = setup_runtime
-        .create_group(
-            &agent.account.account_id_hex,
-            "agent durable finalize retry",
-            std::slice::from_ref(&human.account.account_id_hex),
-            None,
-        )
-        .await
-        .unwrap()
-        .operation
-        .expect("fixture group is created");
-    setup_runtime.shutdown().await;
-
-    let group_id_hex = hex::encode(group_id.as_slice());
-    let stream_id_hex = hex::encode([0x5a; 32]);
-    let socket = dir.path().join("dev").join("wn-agent.sock");
-    let connector = AgentConnector::open(test_config(
-        dir.path(),
-        socket.clone(),
-        vec![relay_url],
-        false,
-        false,
-    ))
-    .unwrap();
-    let listener = bind_connector_socket(&socket).unwrap();
-
-    // Begin (and start the runtime) so the durable finish below has a real
-    // account, group, and stream-start event to reference.
-    let begun = serve_control_request_once(
-        &connector,
-        &listener,
-        &socket,
-        "req-durable-begin",
-        AgentControlRequest::StreamBegin {
-            account_id_hex: agent.account.account_id_hex.clone(),
-            group_id_hex,
-            stream_id_hex: Some(stream_id_hex.clone()),
-            parent_message_id_hex: None,
-            quic_candidates: vec!["quic://127.0.0.1:9".to_owned()],
-        },
-    )
-    .await;
-    let AgentControlResponse::StreamBegun {
-        stream_capability, ..
-    } = begun.payload
-    else {
-        panic!("expected stream begun response");
-    };
-
-    // Model a successful publisher finish whose control response was lost.
-    // The retained publisher must return its receipt without a second send.
-    let stream_id_norm = normalize_hex(&stream_id_hex).unwrap();
-    let session = connector
-        .streams
-        .get_authorized(&stream_id_norm, &stream_capability)
-        .unwrap();
-    session
-        .publisher
-        .append(
-            marmot_app::AgentPublisherRecord::Text,
-            "frozen final".into(),
-        )
-        .await
-        .unwrap();
-    let original = session.publisher.finish(None).await.unwrap();
-    drop(session);
-    assert_eq!(connector.streams.sweep_idle(Duration::ZERO).await, 0);
-    // A retry that disagrees with the frozen transcript is rejected and leaves
-    // the session registered.
-    let mismatch = connector
-        .stream_finish_response(
-            &stream_id_hex,
-            &stream_capability,
-            "different final".to_owned(),
-            Some("frozen-finalize".to_owned()),
-        )
-        .await;
-    assert!(
-        matches!(
-            mismatch,
-            Err(ConnectorError::App(AppError::AgentStreamFinishMismatch))
-        ),
-        "a retry disagreeing with the frozen transcript must be rejected"
-    );
-    assert_eq!(mismatch.unwrap_err().code(), "stream_finalize_mismatch");
-    assert!(
-        connector
-            .streams
-            .get_authorized(&stream_id_norm, &stream_capability)
-            .is_ok(),
-        "a rejected retry must not drop the session"
-    );
-
-    // Matching concurrent retries reuse the publisher receipt.
-    let start = std::sync::Arc::new(tokio::sync::Barrier::new(2));
-    let first_start = std::sync::Arc::clone(&start);
-    let second_start = std::sync::Arc::clone(&start);
-    let first_finalize = async {
-        first_start.wait().await;
-        connector
-            .stream_finish_response(
-                &stream_id_hex,
-                &stream_capability,
-                "frozen final".to_owned(),
-                Some("frozen-finalize".to_owned()),
-            )
-            .await
-    };
-    let second_finalize = async {
-        second_start.wait().await;
-        connector
-            .stream_finish_response(
-                &stream_id_hex,
-                &stream_capability,
-                "frozen final".to_owned(),
-                Some("frozen-finalize".to_owned()),
-            )
-            .await
-    };
-    let (first_result, second_result) = tokio::join!(first_finalize, second_finalize);
-    let finalized =
-        first_result.expect("first frozen-transcript retry finalizes without the compose task");
-    let concurrent_retry =
-        second_result.expect("concurrent frozen-transcript retry reuses the leader result");
-    let AgentControlResponse::StreamFinalized {
-        message_ids_hex, ..
-    } = finalized
-    else {
-        panic!("expected stream finalized response");
-    };
-    assert_eq!(message_ids_hex, original.message_ids);
-    let AgentControlResponse::StreamFinalized {
-        message_ids_hex: concurrent_ids,
-        ..
-    } = concurrent_retry
-    else {
-        panic!("expected concurrent stream finalized response");
-    };
-    assert_eq!(
-        concurrent_ids, message_ids_hex,
-        "a concurrent stream finalize must reuse the leader message ids"
-    );
-    assert!(
-        connector
-            .streams
-            .get_authorized(&stream_id_norm, &stream_capability)
-            .is_err(),
-        "a successful durable finish must remove the session"
-    );
-
-    // A client retry after receiving a timeout from the successful durable
-    // publish path must return the original ids even though the stream session
-    // is gone. This is the post-success half of stream_finalize idempotency.
-    let retried_after_success = serve_control_request_once(
-        &connector,
-        &listener,
-        &socket,
-        "retry-finish",
-        AgentControlRequest::StreamFinish {
-            stream_id_hex: stream_id_hex.clone(),
-            stream_capability: stream_capability.clone(),
-            final_text: "frozen final".to_owned(),
-            idempotency_key: Some("frozen-finalize".to_owned()),
-        },
-    )
-    .await;
-    let AgentControlResponse::StreamFinalized {
-        message_ids_hex: retried_ids,
-        ..
-    } = retried_after_success.payload
-    else {
-        panic!("expected stream finalized response");
-    };
-    assert_eq!(retried_ids, message_ids_hex);
-
-    let wrong_capability = hex::encode([0x99; 32]);
-    let wrong_capability_retry = connector
-        .stream_finish_response(
-            &stream_id_hex,
-            &wrong_capability,
-            "frozen final".to_owned(),
-            Some("frozen-finalize".to_owned()),
-        )
-        .await;
-    assert!(
-        wrong_capability_retry.is_err(),
-        "a finalized idempotency receipt must remain bound to its capability"
-    );
-}
-
-#[tokio::test]
-async fn connector_socket_cancels_stream_session() {
-    storage_sqlite::relax_storage_for_test_process();
-    let dir = tempfile::tempdir().unwrap();
-    let relay = MockRelay::run().await.unwrap();
-    let relay_url = relay.url().await.to_string();
-    let app = MarmotApp::with_relay(dir.path(), relay_url.clone());
-    let setup_runtime = MarmotAppRuntime::new(app);
-    let setup = AccountSetupRequest {
-        default_relays: vec![crate::validation::endpoint(&relay_url)],
-        bootstrap_relays: vec![crate::validation::endpoint(&relay_url)],
-        publish_initial_key_package: true,
-        ..AccountSetupRequest::default()
-    };
-    let agent = setup_runtime
-        .create_identity(setup.relay_options_only())
-        .await
-        .unwrap();
-    let human = setup_runtime.create_identity(setup).await.unwrap();
-    let group_id = setup_runtime
-        .create_group(
-            &agent.account.account_id_hex,
-            "agent cancelled stream",
-            std::slice::from_ref(&human.account.account_id_hex),
-            None,
-        )
-        .await
-        .unwrap()
-        .operation
-        .expect("fixture group is created");
-    setup_runtime.shutdown().await;
-
-    let group_id_hex = hex::encode(group_id.as_slice());
-    let stream_id_hex = hex::encode([0x88; 32]);
-    let socket = dir.path().join("dev").join("wn-agent.sock");
-    let connector = AgentConnector::open(test_config(
-        dir.path(),
-        socket.clone(),
-        vec![relay_url],
-        false,
-        false,
-    ))
-    .unwrap();
-    let listener = bind_connector_socket(&socket).unwrap();
-
-    let begun = serve_control_request_once(
-        &connector,
-        &listener,
-        &socket,
-        "req-stream-begin-cancel",
-        AgentControlRequest::StreamBegin {
-            account_id_hex: agent.account.account_id_hex,
-            group_id_hex,
-            stream_id_hex: Some(stream_id_hex.clone()),
-            parent_message_id_hex: None,
-            quic_candidates: vec!["quic://127.0.0.1:9".to_owned()],
-        },
-    )
-    .await;
-    let AgentControlResponse::StreamBegun {
-        stream_capability, ..
-    } = begun.payload
-    else {
-        panic!("expected stream begun response");
-    };
-
-    let wrong_capability = hex::encode([0x99; 32]);
-    let denied_cancel = serve_control_request_once(
-        &connector,
-        &listener,
-        &socket,
-        "req-stream-cancel-denied",
-        AgentControlRequest::StreamCancel {
-            stream_id_hex: stream_id_hex.clone(),
-            stream_capability: wrong_capability,
-            reason: Some("unauthorized".to_owned()),
-        },
-    )
-    .await;
-    let AgentControlResponse::Error { code, .. } = denied_cancel.payload else {
-        panic!("expected denied cancel error");
-    };
-    assert_eq!(code, "stream_capability_denied");
-
-    let status = serve_control_request_once(
-        &connector,
-        &listener,
-        &socket,
-        "req-stream-status",
-        AgentControlRequest::StreamStatus {
-            stream_id_hex: stream_id_hex.clone(),
-            stream_capability: stream_capability.clone(),
-            status: "thinking".to_owned(),
-            idempotency_key: None,
-        },
-    )
-    .await;
-    assert_eq!(status.payload, AgentControlResponse::Ack);
-
-    let cancelled = serve_control_request_once(
-        &connector,
-        &listener,
-        &socket,
-        "req-stream-cancel",
-        AgentControlRequest::StreamCancel {
-            stream_id_hex: stream_id_hex.clone(),
-            stream_capability: stream_capability.clone(),
-            reason: Some("gateway_replaced_text".to_owned()),
-        },
-    )
-    .await;
-    assert_eq!(cancelled.payload, AgentControlResponse::Ack);
-
-    let append_after_cancel = serve_control_request_once(
-        &connector,
-        &listener,
-        &socket,
-        "req-stream-append-after-cancel",
-        AgentControlRequest::StreamAppend {
-            stream_id_hex,
-            stream_capability,
-            append_text: "late".to_owned(),
-            idempotency_key: None,
-        },
-    )
-    .await;
-    let AgentControlResponse::Error { code, .. } = append_after_cancel.payload else {
-        panic!("expected append-after-cancel error");
-    };
-    assert_eq!(code, "stream_capability_denied");
-}
-
 async fn connect_with_retry(socket: &Path) -> UnixStream {
     for _ in 0..100 {
         match UnixStream::connect(socket).await {
@@ -5315,20 +4146,6 @@ fn assert_allowlist(
             .map(|value| value.to_string())
             .collect::<Vec<_>>()
     );
-}
-
-fn expected_stream_transcript_hash(
-    stream_id_hex: &str,
-    start_message_id_hex: &str,
-    records: &[(u8, &str)],
-) -> String {
-    let stream_id = hex::decode(stream_id_hex).unwrap();
-    let start_event_id = MessageId::new(hex::decode(start_message_id_hex).unwrap());
-    let mut transcript = AgentTextStreamTranscriptV1::new(stream_id, start_event_id);
-    for (seq, (record_type, text)) in (1_u64..).zip(records.iter()) {
-        transcript.append(seq, *record_type, text.as_bytes());
-    }
-    hex::encode(transcript.hash())
 }
 
 struct ExistingPendingInviteSetup {
@@ -5487,47 +4304,6 @@ fn received_chat_record(
 }
 
 #[tokio::test]
-async fn inbound_message_event_from_record_projects_received_chat() {
-    let dir = tempfile::tempdir().unwrap();
-    let runtime = MarmotAppRuntime::new(MarmotApp::with_relays(dir.path(), Vec::new()));
-    // Regression for mdk#210: a missed inbound chat recovered from storage must
-    // project into exactly the same InboundMessage event the live path emits, so the
-    // consumer's existing handler delivers it to the agent.
-    let record = received_chat_record("aa", "bb", "cc", "hello agent");
-    let event = inbound_message_event_from_record_with_runtime(
-        &runtime,
-        "acct",
-        "acct",
-        record,
-        Some("acct"),
-        Some("bb"),
-    )
-    .unwrap()
-    .unwrap();
-    assert_eq!(
-        event,
-        AgentControlEvent::InboundMessage {
-            account_id_hex: "acct".to_owned(),
-            group_id_hex: "bb".to_owned(),
-            message: agent_control::AgentControlMessage {
-                message_id_hex: "aa".to_owned(),
-                sender: agent_control::AgentControlActor {
-                    account_id_hex: "cc".to_owned(),
-                    display_name: None,
-                    is_self: false,
-                },
-                text: "hello agent".to_owned(),
-                recorded_at: 100,
-                media: Vec::new(),
-            },
-            mentions_self: false,
-            reply_to: None,
-        }
-    );
-    runtime.shutdown().await;
-}
-
-#[tokio::test]
 async fn inbound_message_event_from_record_projects_group_system_row() {
     let dir = tempfile::tempdir().unwrap();
     let runtime = MarmotAppRuntime::new(MarmotApp::with_relays(dir.path(), Vec::new()));
@@ -5569,6 +4345,32 @@ async fn inbound_message_event_from_record_projects_group_system_row() {
         }
     );
     runtime.shutdown().await;
+}
+
+#[test]
+fn runtime_replay_dedup_key_covers_thread_messages_like_chat() {
+    // Live delivery records a thread message's row id so a later replay does
+    // not hand the agent the same message twice; other kind-1111 events stay
+    // outside the feed.
+    let update = |tags: Vec<Vec<String>>| {
+        MarmotAppEvent::MessageReceived(RuntimeMessageReceived {
+            account_id_hex: "aa".repeat(32),
+            account_label: "agent".to_owned(),
+            message: received_message(cgka_traits::NIP22_COMMENT_KIND, "in thread", tags),
+        })
+    };
+    let parent = vec![
+        vec!["e".to_owned(), "cc".repeat(32)],
+        vec!["k".to_owned(), "9".to_owned()],
+    ];
+    assert_eq!(
+        runtime_replay_dedup_key(&update(parent)),
+        Some("33".repeat(32))
+    );
+    assert_eq!(
+        runtime_replay_dedup_key(&update(vec![vec!["k".to_owned(), "9".to_owned()]])),
+        None
+    );
 }
 
 #[test]
@@ -5647,7 +4449,7 @@ fn inbound_message_event_detects_inline_nostr_mention() {
 #[test]
 fn inbound_message_event_does_not_scan_for_hex_mentions_past_the_cap() {
     let account = "aa".repeat(32);
-    let mut text = "x".repeat(AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize);
+    let mut text = "x".repeat(crate::event_projection::MAX_MENTION_PLAINTEXT_SCAN_BYTES);
     text.push_str(&format!(" nostr:{account}"));
 
     assert!(
@@ -5882,11 +4684,6 @@ async fn inbound_message_event_from_record_skips_non_inbound_and_own_and_filtere
     let self_authored = received_chat_record("aa", "bb", "acct", "loopback");
     assert!(project(self_authored, None, None).is_none());
 
-    // Agent stream markers are not part of the inbound durable-event feed.
-    let mut stream_start = received_chat_record("aa", "bb", "cc", "+1");
-    stream_start.kind = MARMOT_APP_EVENT_KIND_AGENT_STREAM_START;
-    assert!(project(stream_start, None, None).is_none());
-
     // A group-system row that was received as an app message, rather than synthesized locally,
     // is not treated as a durable GroupStateChanged replay event.
     let mut received_system = received_chat_record("aa", "bb", "cc", "{}");
@@ -5924,6 +4721,61 @@ fn delivered_inbound_cursor_dedups_and_evicts_oldest() {
     assert!(cursor.contains("d"));
 }
 
+/// Catch up until `ready` holds for the account's stored rows in the group,
+/// giving up after about two seconds. Returns whether it held.
+async fn catch_up_until(
+    connector: &AgentConnector,
+    account_id_hex: &str,
+    group_id_hex: &str,
+    ready: impl Fn(&[AppMessageRecord]) -> bool,
+) -> bool {
+    for _ in 0..40 {
+        connector.runtime.catch_up_accounts().await.unwrap();
+        let stored = connector
+            .runtime
+            .messages_with_query(
+                account_id_hex,
+                crate::AppMessageQuery {
+                    group_id_hex: Some(group_id_hex.to_owned()),
+                    kinds: None,
+                    limit: None,
+                },
+            )
+            .unwrap();
+        if ready(&stored) {
+            return true;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    false
+}
+
+/// Whether a stored delete (kind 5) names `target`.
+fn deletes(stored: &[AppMessageRecord], target: &str) -> bool {
+    stored.iter().any(|message| {
+        message.kind == MARMOT_APP_EVENT_KIND_DELETE
+            && message
+                .tags
+                .iter()
+                .any(|tag| tag.get(1).map(String::as_str) == Some(target))
+    })
+}
+
+/// Drain a lag replay the way the inbound stream does, one projection per row.
+fn replay_missed(
+    connector: &AgentConnector,
+    account_filter: Option<&str>,
+    group_filter: Option<&str>,
+    delivered: &mut DeliveredInboundCursor,
+) -> Result<Vec<AgentControlEvent>, crate::error::ConnectorError> {
+    let mut missed = connector.missed_inbound(account_filter, group_filter, delivered)?;
+    let mut events = Vec::new();
+    while let Some(event) = missed.next_event(connector, delivered)? {
+        events.push(event);
+    }
+    Ok(events)
+}
+
 #[tokio::test]
 async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
     storage_sqlite::relax_storage_for_test_process();
@@ -5959,8 +4811,12 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
         .unwrap()
         .operation
         .expect("fixture group is created");
+    // Shutdown cancels a Welcome wave still in flight, as a host's exit does
+    // (mdk#3466); the next start would retry it, after this test sends.
+    setup_runtime.drain_in_flight_work().await.unwrap();
     setup_runtime.shutdown().await;
     let group_id_hex = hex::encode(group_id.as_slice());
+    let agent_id = agent.account.account_id_hex.as_str();
 
     let connector = AgentConnector::open(test_config(
         dir.path(),
@@ -5991,49 +4847,53 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
     };
     let target_message_id_hex = message_ids_hex[0].clone();
     // Let the agent account observe the message so it lands in its storage projection.
-    for _ in 0..40 {
-        connector.runtime.catch_up_accounts().await.unwrap();
-        let stored = connector
-            .runtime
-            .messages_with_query(
-                &agent.account.account_id_hex,
-                crate::AppMessageQuery {
-                    group_id_hex: Some(group_id_hex.clone()),
-                    kinds: None,
-                    limit: None,
-                },
-            )
-            .unwrap();
-        if stored.iter().any(|m| m.plaintext == "missed while lagging") {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    assert!(
+        catch_up_until(&connector, agent_id, &group_id_hex, |stored| stored
+            .iter()
+            .any(|m| m.plaintext == "missed while lagging"),)
+        .await,
+        "the missed message did not arrive"
+    );
 
     // First replay surfaces the missed inbound message as an InboundMessage event.
     let mut delivered = DeliveredInboundCursor::new(crate::DELIVERED_INBOUND_CURSOR_CAPACITY);
-    let replayed = connector
-        .replay_missed_inbound(
-            Some(&agent.account.account_id_hex),
-            Some(&group_id_hex),
-            &mut delivered,
+    let replayed = replay_missed(
+        &connector,
+        Some(&agent.account.account_id_hex),
+        Some(&group_id_hex),
+        &mut delivered,
+    )
+    .unwrap();
+    // Replay emits exactly the InboundMessage the live path emits.
+    let stored_target = connector
+        .runtime
+        .message_by_id(
+            &agent.account.account_id_hex,
+            &group_id_hex,
+            &target_message_id_hex,
         )
-        .unwrap();
-    let recovered: Vec<_> = replayed
-        .iter()
-        .filter_map(|event| match event {
-            AgentControlEvent::InboundMessage { message, .. } => {
-                Some((message.text.clone(), message.sender.account_id_hex.clone()))
-            }
-            _ => None,
-        })
-        .collect();
+        .unwrap()
+        .expect("the agent stored the missed message");
+    let expected = AgentControlEvent::InboundMessage {
+        account_id_hex: agent.account.account_id_hex.clone(),
+        group_id_hex: group_id_hex.clone(),
+        message: agent_control::AgentControlMessage {
+            message_id_hex: target_message_id_hex.clone(),
+            sender: agent_control::AgentControlActor {
+                account_id_hex: human.account.account_id_hex.clone(),
+                display_name: None,
+                is_self: false,
+            },
+            text: "missed while lagging".to_owned(),
+            recorded_at: stored_target.recorded_at,
+            media: Vec::new(),
+        },
+        mentions_self: false,
+        reply_to: None,
+    };
     assert!(
-        recovered
-            .iter()
-            .any(|(text, sender)| text == "missed while lagging"
-                && sender == &human.account.account_id_hex),
-        "replay should recover the missed inbound message, got {recovered:?}"
+        replayed.contains(&expected),
+        "replay should recover the missed inbound message, got {replayed:?}"
     );
 
     // Exercise every durable mutation through the same production projection
@@ -6045,6 +4905,56 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
             &group_id,
             &target_message_id_hex,
             "edited while lagging",
+        )
+        .await
+        .unwrap();
+    // A thread message answering the agent is chat, as is its author's edit.
+    let thread_message_id_hex = connector
+        .runtime
+        .send_thread_message(
+            &human.account.account_id_hex,
+            &group_id,
+            &target_message_id_hex,
+            "in a thread".to_owned(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .unwrap()
+        .message_ids[0]
+        .clone();
+    connector
+        .runtime
+        .edit_message(
+            &human.account.account_id_hex,
+            &group_id,
+            &thread_message_id_hex,
+            "edited in a thread",
+        )
+        .await
+        .unwrap();
+    // A thread message deleted before the agent sees it must never reach the
+    // agent; only its deletion does.
+    let deleted_thread_message_id_hex = connector
+        .runtime
+        .send_thread_message(
+            &human.account.account_id_hex,
+            &group_id,
+            &target_message_id_hex,
+            "deleted in a thread".to_owned(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .unwrap()
+        .message_ids[0]
+        .clone();
+    connector
+        .runtime
+        .delete_message(
+            &human.account.account_id_hex,
+            &group_id,
+            &deleted_thread_message_id_hex,
         )
         .await
         .unwrap();
@@ -6069,38 +4979,22 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
         .await
         .unwrap();
 
-    for _ in 0..40 {
-        connector.runtime.catch_up_accounts().await.unwrap();
-        let stored = connector
-            .runtime
-            .messages_with_query(
-                &agent.account.account_id_hex,
-                crate::AppMessageQuery {
-                    group_id_hex: Some(group_id_hex.clone()),
-                    kinds: None,
-                    limit: None,
-                },
-            )
-            .unwrap();
-        if stored.iter().any(|message| {
-            message.kind == MARMOT_APP_EVENT_KIND_DELETE
-                && message
-                    .tags
-                    .iter()
-                    .any(|tag| tag.get(1) == Some(&expected_reaction_event_id_hex))
-        }) {
-            break;
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
+    assert!(
+        catch_up_until(&connector, agent_id, &group_id_hex, |stored| {
+            deletes(stored, &expected_reaction_event_id_hex)
+                && deletes(stored, &deleted_thread_message_id_hex)
+        },)
+        .await,
+        "the deletions did not arrive"
+    );
 
-    let mutation_replay = connector
-        .replay_missed_inbound(
-            Some(&agent.account.account_id_hex),
-            Some(&group_id_hex),
-            &mut delivered,
-        )
-        .unwrap();
+    let mutation_replay = replay_missed(
+        &connector,
+        Some(&agent.account.account_id_hex),
+        Some(&group_id_hex),
+        &mut delivered,
+    )
+    .unwrap();
     assert!(
         mutation_replay.iter().any(|event| matches!(
             event,
@@ -6111,6 +5005,45 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
             } if target == &target_message_id_hex && replacement_text == "edited while lagging"
         )),
         "accepted edit must replay through the production projector: {mutation_replay:?}"
+    );
+    assert!(
+        mutation_replay.iter().any(|event| matches!(
+            event,
+            AgentControlEvent::InboundMessage {
+                message,
+                reply_to: Some(parent),
+                ..
+            } if message.message_id_hex == thread_message_id_hex
+                && parent.message_id_hex == target_message_id_hex
+        )),
+        "a thread message reaches the agent as a reply to its parent: {mutation_replay:?}"
+    );
+    assert!(
+        mutation_replay.iter().any(|event| matches!(
+            event,
+            AgentControlEvent::MessageEdited {
+                target_message_id_hex: target,
+                replacement_text,
+                ..
+            } if target == &thread_message_id_hex && replacement_text == "edited in a thread"
+        )),
+        "a thread message's edit reaches the agent: {mutation_replay:?}"
+    );
+    assert!(
+        !mutation_replay.iter().any(|event| matches!(
+            event,
+            AgentControlEvent::InboundMessage { message, .. }
+                if message.message_id_hex == deleted_thread_message_id_hex
+        )),
+        "a message deleted before delivery must not reach the agent: {mutation_replay:?}"
+    );
+    assert!(
+        mutation_replay.iter().any(|event| matches!(
+            event,
+            AgentControlEvent::MessageDeleted { target_message_id_hex: target, .. }
+                if target == &deleted_thread_message_id_hex
+        )),
+        "the deletion itself still reaches the agent: {mutation_replay:?}"
     );
     assert!(
         mutation_replay.iter().any(|event| matches!(
@@ -6139,16 +5072,103 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
     );
 
     // A subsequent replay must not re-deliver either the message or mutations.
-    let replayed_again = connector
-        .replay_missed_inbound(
-            Some(&agent.account.account_id_hex),
-            Some(&group_id_hex),
-            &mut delivered,
-        )
-        .unwrap();
+    let replayed_again = replay_missed(
+        &connector,
+        Some(&agent.account.account_id_hex),
+        Some(&group_id_hex),
+        &mut delivered,
+    )
+    .unwrap();
     assert!(
         replayed_again.is_empty(),
         "subsequent replay must not duplicate delivered durable events: {replayed_again:?}"
+    );
+
+    // Replay projects each row only when it is about to be written, so a
+    // message deleted after replay began (while earlier frames were still
+    // going out to a slow reader) reaches the agent only as its deletion.
+    let thread_reply = |text: &str| {
+        let text = text.to_owned();
+        let runtime = &connector.runtime;
+        let human = &human.account.account_id_hex;
+        let group_id = &group_id;
+        let parent = &target_message_id_hex;
+        async move {
+            runtime
+                .send_thread_message(human, group_id, parent, text, Vec::new(), Vec::new())
+                .await
+                .unwrap()
+                .message_ids[0]
+                .clone()
+        }
+    };
+    let kept_id_hex = thread_reply("kept").await;
+    let late_deleted_id_hex = thread_reply("deleted mid-replay").await;
+    assert!(
+        catch_up_until(&connector, agent_id, &group_id_hex, |stored| {
+            [&kept_id_hex, &late_deleted_id_hex]
+                .iter()
+                .all(|id| stored.iter().any(|message| &&message.message_id_hex == id))
+        },)
+        .await,
+        "both replies did not arrive"
+    );
+    let mut missed = connector
+        .missed_inbound(
+            Some(&agent.account.account_id_hex),
+            Some(&group_id_hex),
+            &delivered,
+        )
+        .unwrap();
+    connector
+        .runtime
+        .delete_message(
+            &human.account.account_id_hex,
+            &group_id,
+            &late_deleted_id_hex,
+        )
+        .await
+        .unwrap();
+    assert!(
+        catch_up_until(&connector, agent_id, &group_id_hex, |_| {
+            connector
+                .runtime
+                .message_target(agent_id, &group_id_hex, &late_deleted_id_hex)
+                .unwrap()
+                .is_some_and(|target| target.deleted)
+        },)
+        .await,
+        "the mid-replay deletion did not arrive"
+    );
+    let mut in_flight = Vec::new();
+    while let Some(event) = missed.next_event(&connector, &mut delivered).unwrap() {
+        in_flight.push(event);
+    }
+    let inbound_ids: Vec<_> = in_flight
+        .iter()
+        .filter_map(|event| match event {
+            AgentControlEvent::InboundMessage { message, .. } => Some(&message.message_id_hex),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        inbound_ids.contains(&&kept_id_hex) && !inbound_ids.contains(&&late_deleted_id_hex),
+        "a message deleted mid-replay must not reach the agent: {in_flight:?}"
+    );
+    let after = replay_missed(
+        &connector,
+        Some(&agent.account.account_id_hex),
+        Some(&group_id_hex),
+        &mut delivered,
+    )
+    .unwrap();
+    assert!(
+        after.iter().any(|event| matches!(
+            event,
+            AgentControlEvent::MessageDeleted { target_message_id_hex: target, .. }
+                if target == &late_deleted_id_hex
+        )),
+        "the next replay delivers the deletion: {after:?}"
     );
 
     // Raw modifiers that the materialized timeline rejects must also stay out
@@ -6199,39 +5219,22 @@ async fn replay_missed_inbound_recovers_dropped_messages_and_dedups() {
         .await
         .unwrap();
 
-    for _ in 0..40 {
-        connector.runtime.catch_up_accounts().await.unwrap();
-        let stored = connector
-            .runtime
-            .messages_with_query(
-                &human.account.account_id_hex,
-                crate::AppMessageQuery {
-                    group_id_hex: Some(group_id_hex.clone()),
-                    kinds: None,
-                    limit: None,
-                },
-            )
-            .unwrap();
-        if stored.iter().any(|message| {
-            message.kind == MARMOT_APP_EVENT_KIND_DELETE
-                && message
-                    .tags
-                    .iter()
-                    .any(|tag| tag.get(1) == Some(&retained_reaction_id_hex))
-        }) {
-            break;
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
+    catch_up_until(
+        &connector,
+        &human.account.account_id_hex,
+        &group_id_hex,
+        |stored| deletes(stored, &retained_reaction_id_hex),
+    )
+    .await;
 
     let mut human_delivered = DeliveredInboundCursor::new(crate::DELIVERED_INBOUND_CURSOR_CAPACITY);
-    let rejected = connector
-        .replay_missed_inbound(
-            Some(&human.account.account_id_hex),
-            Some(&group_id_hex),
-            &mut human_delivered,
-        )
-        .unwrap();
+    let rejected = replay_missed(
+        &connector,
+        Some(&human.account.account_id_hex),
+        Some(&group_id_hex),
+        &mut human_delivered,
+    )
+    .unwrap();
     assert!(
         !rejected.iter().any(|event| matches!(
             event,
@@ -6372,33 +5375,57 @@ async fn concurrent_send_final_with_repeated_idempotency_key_sends_once() {
     assert_eq!(copies, 1, "a deduped retry must not re-post the message");
 }
 
+fn recorded_ids(
+    store: &crate::send_idempotency::SendIdempotencyStore,
+    key: &str,
+    fingerprint: &str,
+) -> Option<Vec<String>> {
+    store
+        .get_with_disposition(key, fingerprint)
+        .map(|(ids, _)| ids)
+}
+
+fn record_ready(
+    store: &crate::send_idempotency::SendIdempotencyStore,
+    key: String,
+    fingerprint: String,
+    message_ids: Vec<String>,
+) {
+    store.record_with_disposition(
+        key,
+        fingerprint,
+        message_ids,
+        AgentControlSendMaintenanceDisposition::Ready,
+    );
+}
+
 #[test]
 fn send_idempotency_store_returns_recorded_ids_for_a_key() {
-    use crate::stream_session::SendIdempotencyStore;
+    use crate::send_idempotency::SendIdempotencyStore;
 
     let dir = tempfile::tempdir().unwrap();
     let store = SendIdempotencyStore::new(dir.path());
     let fingerprint = "fp-k1".to_owned();
     assert_eq!(
-        store.get("k1", &fingerprint),
+        recorded_ids(&store, "k1", &fingerprint),
         None,
         "an unseen key has no cached ids"
     );
 
     let ids = vec!["aa".repeat(32), "bb".repeat(32)];
-    store.record("k1".to_owned(), fingerprint.clone(), ids.clone());
+    record_ready(&store, "k1".to_owned(), fingerprint.clone(), ids.clone());
     assert_eq!(
-        store.get("k1", &fingerprint),
+        recorded_ids(&store, "k1", &fingerprint),
         Some(ids),
         "a recorded key returns its message ids for a matching fingerprint"
     );
     assert_eq!(
-        store.get("k1", "fp-other"),
+        recorded_ids(&store, "k1", "fp-other"),
         None,
         "a recorded key with a non-matching fingerprint is a cache miss"
     );
     assert_eq!(
-        store.get("k2", &fingerprint),
+        recorded_ids(&store, "k2", &fingerprint),
         None,
         "an unrelated key stays absent"
     );
@@ -6421,7 +5448,7 @@ fn send_idempotency_store_returns_recorded_ids_for_a_key() {
 }
 
 async fn wait_for_idempotency_follower(
-    store: &crate::stream_session::SendIdempotencyStore,
+    store: &crate::send_idempotency::SendIdempotencyStore,
     key: &str,
     fingerprint: &str,
 ) {
@@ -6436,7 +5463,7 @@ async fn wait_for_idempotency_follower(
 
 #[tokio::test]
 async fn send_idempotency_store_same_request_waits_for_leader_result() {
-    use crate::stream_session::{SendIdempotencyAcquisition, SendIdempotencyStore};
+    use crate::send_idempotency::{SendIdempotencyAcquisition, SendIdempotencyStore};
 
     let dir = tempfile::tempdir().unwrap();
     let store = SendIdempotencyStore::new(dir.path());
@@ -6456,7 +5483,8 @@ async fn send_idempotency_store_same_request_waits_for_leader_result() {
     assert!(!follower.is_finished());
 
     let ids = vec!["aa".repeat(32)];
-    store.record(
+    record_ready(
+        &store,
         "same-key".to_owned(),
         "same-fingerprint".to_owned(),
         ids.clone(),
@@ -6477,7 +5505,7 @@ async fn send_idempotency_store_same_request_waits_for_leader_result() {
 
 #[tokio::test]
 async fn send_idempotency_store_failed_leader_leaves_request_retryable() {
-    use crate::stream_session::{SendIdempotencyAcquisition, SendIdempotencyStore};
+    use crate::send_idempotency::{SendIdempotencyAcquisition, SendIdempotencyStore};
 
     let dir = tempfile::tempdir().unwrap();
     let store = SendIdempotencyStore::new(dir.path());
@@ -6511,11 +5539,12 @@ async fn send_idempotency_store_failed_leader_leaves_request_retryable() {
 
 #[tokio::test]
 async fn concurrent_new_fingerprint_reuses_transient_leader_result() {
-    use crate::stream_session::{SendIdempotencyAcquisition, SendIdempotencyStore};
+    use crate::send_idempotency::{SendIdempotencyAcquisition, SendIdempotencyStore};
 
     let dir = tempfile::tempdir().unwrap();
     let store = SendIdempotencyStore::new(dir.path());
-    store.record(
+    record_ready(
+        &store,
         "shared-key".to_owned(),
         "first-fingerprint".to_owned(),
         vec!["aa".repeat(32)],
@@ -6542,13 +5571,14 @@ async fn concurrent_new_fingerprint_reuses_transient_leader_result() {
     assert!(!follower.is_finished());
 
     let ids = vec!["bb".repeat(32)];
-    store.record(
+    record_ready(
+        &store,
         "shared-key".to_owned(),
         "second-fingerprint".to_owned(),
         ids.clone(),
     );
     assert_eq!(
-        store.get("shared-key", "second-fingerprint"),
+        recorded_ids(&store, "shared-key", "second-fingerprint"),
         None,
         "the original durable key binding remains first-write-wins"
     );
@@ -6581,11 +5611,12 @@ async fn concurrent_new_fingerprint_reuses_transient_leader_result() {
 
 #[tokio::test]
 async fn send_idempotency_store_different_fingerprint_remains_a_cache_miss() {
-    use crate::stream_session::{SendIdempotencyAcquisition, SendIdempotencyStore};
+    use crate::send_idempotency::{SendIdempotencyAcquisition, SendIdempotencyStore};
 
     let dir = tempfile::tempdir().unwrap();
     let store = SendIdempotencyStore::new(dir.path());
-    store.record(
+    record_ready(
+        &store,
         "shared-key".to_owned(),
         "first-fingerprint".to_owned(),
         vec!["aa".repeat(32)],
@@ -6605,7 +5636,7 @@ async fn send_idempotency_store_different_fingerprint_remains_a_cache_miss() {
 
 #[test]
 fn send_idempotency_persist_preserves_existing_socket_directory_mode() {
-    use crate::stream_session::SendIdempotencyStore;
+    use crate::send_idempotency::SendIdempotencyStore;
     use std::os::unix::fs::PermissionsExt;
 
     let dir = tempfile::tempdir().unwrap();
@@ -6614,7 +5645,8 @@ fn send_idempotency_persist_preserves_existing_socket_directory_mode() {
     std::fs::set_permissions(&dev, std::fs::Permissions::from_mode(0o750)).unwrap();
 
     let store = SendIdempotencyStore::new(dir.path());
-    store.record(
+    record_ready(
+        &store,
         "key".to_owned(),
         "fingerprint".to_owned(),
         vec!["aa".repeat(32)],
@@ -6628,52 +5660,58 @@ fn send_idempotency_persist_preserves_existing_socket_directory_mode() {
 
 #[test]
 fn send_idempotency_store_keeps_first_recorded_ids_for_a_key() {
-    use crate::stream_session::SendIdempotencyStore;
+    use crate::send_idempotency::SendIdempotencyStore;
 
     let dir = tempfile::tempdir().unwrap();
     let store = SendIdempotencyStore::new(dir.path());
     let first = vec!["11".repeat(32)];
     let second = vec!["22".repeat(32)];
-    store.record("dup".to_owned(), "fp-first".to_owned(), first.clone());
+    record_ready(
+        &store,
+        "dup".to_owned(),
+        "fp-first".to_owned(),
+        first.clone(),
+    );
     // A repeat record (e.g. a racing duplicate) must not overwrite the original
     // committed entry: the first successful send for a key always wins, even if
     // the later record carries a different fingerprint.
-    store.record("dup".to_owned(), "fp-second".to_owned(), second);
-    assert_eq!(store.get("dup", "fp-first"), Some(first));
+    record_ready(&store, "dup".to_owned(), "fp-second".to_owned(), second);
+    assert_eq!(recorded_ids(&store, "dup", "fp-first"), Some(first));
 }
 
 #[test]
 fn send_idempotency_store_evicts_oldest_keys_past_capacity() {
-    use crate::stream_session::SendIdempotencyStore;
+    use crate::send_idempotency::SendIdempotencyStore;
 
     // Cap is 1024; fill past it and assert the oldest key is evicted FIFO while
     // the newest remain. This bounds memory for a long-lived connector.
     let dir = tempfile::tempdir().unwrap();
     let store = SendIdempotencyStore::new(dir.path());
     for n in 0..1100u32 {
-        store.record(
+        record_ready(
+            &store,
             format!("key-{n}"),
             format!("fp-{n}"),
             vec![format!("{n:064x}")],
         );
     }
     assert_eq!(
-        store.get("key-0", "fp-0"),
+        recorded_ids(&store, "key-0", "fp-0"),
         None,
         "oldest key must be evicted"
     );
     assert_eq!(
-        store.get("key-75", "fp-75"),
+        recorded_ids(&store, "key-75", "fp-75"),
         None,
         "early keys must be evicted"
     );
     assert_eq!(
-        store.get("key-1099", "fp-1099"),
+        recorded_ids(&store, "key-1099", "fp-1099"),
         Some(vec![format!("{:064x}", 1099)]),
         "the newest key must still be cached"
     );
     assert_eq!(
-        store.get("key-200", "fp-200"),
+        recorded_ids(&store, "key-200", "fp-200"),
         Some(vec![format!("{:064x}", 200)]),
         "a key within the retained window must still be cached"
     );
@@ -6682,23 +5720,29 @@ fn send_idempotency_store_evicts_oldest_keys_past_capacity() {
 #[test]
 fn send_idempotency_store_survives_connector_restart() {
     use crate::messaging::send_final_fingerprint;
-    use crate::stream_session::SendIdempotencyStore;
+    use crate::send_idempotency::SendIdempotencyStore;
 
     let dir = tempfile::tempdir().unwrap();
     let fingerprint = send_final_fingerprint("aa", "bb", "hello", Some("cc"));
     let ids = vec!["aa".repeat(32)];
     {
         let store = SendIdempotencyStore::new(dir.path());
-        store.record("retry-key".to_owned(), fingerprint.clone(), ids.clone());
+        record_ready(
+            &store,
+            "retry-key".to_owned(),
+            fingerprint.clone(),
+            ids.clone(),
+        );
     }
     let reloaded = SendIdempotencyStore::new(dir.path());
     assert_eq!(
-        reloaded.get("retry-key", &fingerprint),
+        recorded_ids(&reloaded, "retry-key", &fingerprint),
         Some(ids),
         "a persisted idempotency record must survive restart"
     );
     assert_eq!(
-        reloaded.get(
+        recorded_ids(
+            &reloaded,
             "retry-key",
             &send_final_fingerprint("aa", "bb", "hello", None)
         ),
@@ -6709,13 +5753,14 @@ fn send_idempotency_store_survives_connector_restart() {
 
 #[test]
 fn send_idempotency_store_persists_fifo_eviction() {
-    use crate::stream_session::SendIdempotencyStore;
+    use crate::send_idempotency::SendIdempotencyStore;
 
     let dir = tempfile::tempdir().unwrap();
     {
         let store = SendIdempotencyStore::new(dir.path());
         for n in 0..1100u32 {
-            store.record(
+            record_ready(
+                &store,
                 format!("key-{n}"),
                 format!("fp-{n}"),
                 vec![format!("{n:064x}")],
@@ -6724,12 +5769,12 @@ fn send_idempotency_store_persists_fifo_eviction() {
     }
     let reloaded = SendIdempotencyStore::new(dir.path());
     assert_eq!(
-        reloaded.get("key-0", "fp-0"),
+        recorded_ids(&reloaded, "key-0", "fp-0"),
         None,
         "oldest key must stay evicted"
     );
     assert_eq!(
-        reloaded.get("key-1099", "fp-1099"),
+        recorded_ids(&reloaded, "key-1099", "fp-1099"),
         Some(vec![format!("{:064x}", 1099)]),
         "newest retained key must reload from disk"
     );
@@ -6737,7 +5782,7 @@ fn send_idempotency_store_persists_fifo_eviction() {
 
 #[test]
 fn send_idempotency_store_ignores_corrupt_on_disk_file() {
-    use crate::stream_session::SendIdempotencyStore;
+    use crate::send_idempotency::SendIdempotencyStore;
 
     let dir = tempfile::tempdir().unwrap();
     let store = SendIdempotencyStore::new(dir.path());
@@ -6745,21 +5790,22 @@ fn send_idempotency_store_ignores_corrupt_on_disk_file() {
     std::fs::write(store.file_path(), b"{not valid json").unwrap();
 
     let reloaded = SendIdempotencyStore::new(dir.path());
-    assert_eq!(reloaded.get("missing", "fp-missing"), None);
-    reloaded.record(
+    assert_eq!(recorded_ids(&reloaded, "missing", "fp-missing"), None);
+    record_ready(
+        &reloaded,
         "fresh".to_owned(),
         "fp-fresh".to_owned(),
         vec!["cc".repeat(32)],
     );
     assert_eq!(
-        reloaded.get("fresh", "fp-fresh"),
+        recorded_ids(&reloaded, "fresh", "fp-fresh"),
         Some(vec!["cc".repeat(32)])
     );
 }
 
 #[test]
 fn send_idempotency_store_atomic_write_replaces_stale_temp_file() {
-    use crate::stream_session::SendIdempotencyStore;
+    use crate::send_idempotency::SendIdempotencyStore;
 
     let dir = tempfile::tempdir().unwrap();
     let store = SendIdempotencyStore::new(dir.path());
@@ -6767,7 +5813,12 @@ fn send_idempotency_store_atomic_write_replaces_stale_temp_file() {
     std::fs::create_dir_all(store.file_path().parent().unwrap()).unwrap();
     std::fs::write(&temp_path, b"partial write from crashed writer").unwrap();
 
-    store.record("k1".to_owned(), "fp-k1".to_owned(), vec!["aa".repeat(32)]);
+    record_ready(
+        &store,
+        "k1".to_owned(),
+        "fp-k1".to_owned(),
+        vec!["aa".repeat(32)],
+    );
 
     assert!(!temp_path.exists());
     assert!(store.file_path().exists());
@@ -6776,7 +5827,10 @@ fn send_idempotency_store_atomic_write_replaces_stale_temp_file() {
         0o600
     );
     let reloaded = SendIdempotencyStore::new(dir.path());
-    assert_eq!(reloaded.get("k1", "fp-k1"), Some(vec!["aa".repeat(32)]));
+    assert_eq!(
+        recorded_ids(&reloaded, "k1", "fp-k1"),
+        Some(vec!["aa".repeat(32)])
+    );
 }
 
 #[test]

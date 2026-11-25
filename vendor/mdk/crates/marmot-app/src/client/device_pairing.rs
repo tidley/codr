@@ -17,15 +17,13 @@
 //! - Holding the account key never authenticates a device: only the code
 //!   compared on both screens does.
 //!
-//! Pairing is unreleased: without `unreleased-device-pairing` every call is
-//! refused, and with it nothing runs unless `dev_device_groups` is on.
+//! Nothing runs unless the host turns device groups on
+//! ([`crate::MarmotAppConfig::device_groups`]).
 
 use super::AppClient;
 use crate::AppError;
 
-#[cfg(feature = "unreleased-device-pairing")]
 mod live;
-#[cfg(feature = "unreleased-device-pairing")]
 pub(crate) use live::{DevicePairing, PairingInbox};
 
 /// One emoji of the code.
@@ -192,6 +190,17 @@ pub struct DeviceGroupMoveView {
     pub overridden_rejection_slots: Vec<String>,
 }
 
+/// Progress of one approved link. On the new device, remaining counts
+/// expected chats it has yet to join. On its approver it counts missing Adds.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct LinkChatProgress {
+    /// The newly linked device's slot, including on that device itself.
+    pub slot_id_hex: String,
+    pub on_new_device: bool,
+    pub total: u32,
+    pub remaining: u32,
+}
+
 /// Linking as this device shows it: its own new-device session, if any, and
 /// the prompts for sign-ins it can link.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -206,6 +215,8 @@ pub struct DeviceLinkSnapshot {
     /// heard from it. Offer [`DeviceLinkOp::ResetForRepair`] followed by
     /// fresh pairing.
     pub device_group_stalled: bool,
+    /// Current, approver-scoped inventories. An absent entry means unavailable.
+    pub chat_progress: Vec<LinkChatProgress>,
 }
 
 impl DeviceLinkSnapshot {
@@ -254,15 +265,7 @@ impl AppClient {
         &mut self,
         op: DeviceLinkOp,
     ) -> Result<DeviceLinkSnapshot, AppError> {
-        #[cfg(feature = "unreleased-device-pairing")]
-        {
-            self.device_link_live(op).await
-        }
-        #[cfg(not(feature = "unreleased-device-pairing"))]
-        {
-            let _ = op;
-            Err(AppError::DeviceGroupRefused("pairing_unsupported"))
-        }
+        self.device_link_live(op).await
     }
 
     /// Move linking on: read the pairing messages the Welcome peeler split
@@ -273,7 +276,6 @@ impl AppClient {
     pub(crate) async fn drive_device_pairing(&mut self) {
         // A device signing out sends only what its sign-out has left
         // (mdk#2628 D67).
-        #[cfg(feature = "unreleased-device-pairing")]
         if !self.signing_out() {
             self.drive_device_pairing_live().await;
         }
@@ -288,7 +290,6 @@ impl AppClient {
         &mut self,
         effects: &marmot_session::AccountDeviceEffects,
     ) {
-        #[cfg(feature = "unreleased-device-pairing")]
         if self.app.device_groups_enabled()
             && !self.device_unlinked
             && effects.events.iter().any(|event| {
@@ -306,15 +307,12 @@ impl AppClient {
                 "could not note this device's removal from its device group; retrying"
             );
         }
-        #[cfg(not(feature = "unreleased-device-pairing"))]
-        let _ = effects;
     }
 
     /// Note, as a client opens, a removal from the device group that an
     /// earlier run applied but ended before noting, so the client is stopped
     /// before it sends anything (D67). Never while device groups are off.
     pub(crate) fn note_stored_device_group_removal(&mut self) {
-        #[cfg(feature = "unreleased-device-pairing")]
         if self.app.device_groups_enabled()
             && let Err(error) = self.note_device_group_removal_live()
         {
@@ -334,7 +332,6 @@ impl AppClient {
     /// anything goes out, and as it stops an unlinked account. Never while
     /// device groups are off.
     pub(crate) async fn follow_device_group_removal(&mut self) {
-        #[cfg(feature = "unreleased-device-pairing")]
         if self.app.device_groups_enabled()
             && let Err(error) = self.follow_device_group_removal_live().await
         {
@@ -348,10 +345,8 @@ impl AppClient {
     }
 
     /// Whether to announce `DeviceLinkChanged`, clearing the flag. Never
-    /// without pairing, or while device groups are off.
+    /// while device groups are off.
     pub(crate) fn take_device_link_changed(&mut self) -> bool {
-        std::mem::take(&mut self.device_link_changed)
-            && cfg!(feature = "unreleased-device-pairing")
-            && self.app.device_groups_enabled()
+        std::mem::take(&mut self.device_link_changed) && self.app.device_groups_enabled()
     }
 }

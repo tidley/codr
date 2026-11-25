@@ -5,11 +5,9 @@ session storage, the Nostr MLS peeler, the Nostr transport adapter, and relay-ba
 result as `MarmotApp` / `MarmotAppRuntime`. It sits below presentation layers (`wn`, the UniFFI and C bindings) and above
 the generic account, session, and engine crates. Read this if you are building a host app or binding on top of MDK.
 
-The default-off `dev-device-groups` capability permits the adopted device roster independently of policy-test timing.
-The app still requires runtime intent; a dev `wn`/`wnd` build supplies it. Ordinary release builds keep it off.
-An account that holds or is joining a device group opens only with both: otherwise its session fails with
+Device groups are on by default; a host turns them off with `MarmotAppConfig::with_device_groups(false)`. An account that holds or is joining a device group opens only with them on: otherwise its session fails with
 `AppError::ExperimentalDeviceGroupsRequired` before anything of it is read, sent or subscribed (mdk#3012).
-See [dev device linking](../cli/README.md#device-linking-dev-builds).
+See [device linking](../cli/README.md#device-linking).
 
 ## Contents
 
@@ -36,8 +34,8 @@ See [dev device linking](../cli/README.md#device-linking-dev-builds).
 The opt-in native startup recorder distinguishes task dispatch, account/key lookup, store-opening waits, SQLCipher phases, schema inspection and each migration transaction. `set_startup_diagnostics_enabled` and `startup_diagnostics_snapshot` change only bounded process-local diagnostic memory. Snapshots use their own short lock and remain readable while an account open is blocked; they do not open storage or query the keystore. Successful cached attachment reads and account-store lookups omit history events so ordinary reads preserve first-open evidence. An attachment read shares one active scope across queueing, account opening and result delivery; cache/admission waits remain visible, and misses, failures or unwinds retain evidence. Dropping its host future leaves running native work observable until the worker exits. Normal construction leaves capture disabled. Host exports must be explicitly requested and serialized within a separate size bound.
 
 
-`MarmotAppRuntime` owns restored signing accounts, a shared relay plane, live per-account workers, runtime event hubs,
-and the shared agent stream watch manager. The relay plane also owns shared directory discovery fetches for relay lists,
+`MarmotAppRuntime` owns restored signing accounts, a shared relay plane, live per-account workers, and runtime event
+hubs. The relay plane also owns shared directory discovery fetches for relay lists,
 profiles, follow lists, and KeyPackages, including endpoint safety and in-flight coalescing. The daemon path is
 runtime-owned subscriptions plus typed events; explicit catch-up remains available for repair and tests.
 
@@ -167,8 +165,7 @@ resolved by the proxy. HTTP clients still resolve and validate destinations loca
 SOCKS5 while retaining the original HTTP Host header and TLS identity. The proxy is an explicitly trusted egress.
 
 `ALL_PROXY` cannot replace this policy and `NO_PROXY` cannot bypass it. Invalid configuration, connection failure,
-and authentication rejection do not fall back to direct connections. QUIC agent preview publishing and watching
-are unavailable with SOCKS5 enabled because this TCP proxy path cannot carry QUIC.
+and authentication rejection do not fall back to direct connections.
 
 ## Local storage
 
@@ -262,6 +259,20 @@ event, pre-cache direct follows, and cache profile metadata for those likely con
 directory subscriptions for local accounts and known users so profile, follow-list, relay-list, and KeyPackage updates
 keep warming the cache.
 
+**Direct-follow availability.** `follow_availability_page(account_ref, after, limit)` reads a keyset-paged projection
+of the selected account's direct cached follows without networking. `ready` records a selected current compatible
+KeyPackage and its `fresh_until` deadline (the earlier of MLS expiry and publication freshness), not proof that a
+particular client is installed. `unknown` covers missing, stale,
+incomplete, malformed, replaced, and expired results. A completed clean, deleted, or obsolete miss is `not_found` for 15
+minutes, with check and expiry timestamps plus network provenance.
+
+`refresh_follow_availability` processes at most 100 follows with four concurrent target lookups, a 10-second target
+deadline, and a five-minute target-processing budget. Results persist per target and remain readable while the refresh runs.
+Poll `follow_availability_status` for aggregate progress and call `cancel_follow_availability` with
+the observed operation id to stop it without cancelling a newer operation. Completed refreshes have a 60-second
+cadence. Pages contain at most 100 rows and always join the current follow list, so account switches and unfollows do
+not expose another account's projection.
+
 **Profile sanitization.** Incoming kind `0` strings are sanitized in `nostr-directory`'s `src/records.rs` before they
 are cached:
 
@@ -313,6 +324,13 @@ pub async fn start_direct_conversation(
     account_ref: &str,
     peer_account_id: &str,
 ) -> Result<GroupId, AppError>
+
+pub async fn start_direct_conversation_with_options(
+    &self,
+    account_ref: &str,
+    peer_account_id: &str,
+    options: DirectConversationOptions,
+) -> Result<GroupId, AppError>
 ```
 
 `MarmotAppRuntime::start_direct_conversation` accepts a hex or npub peer identity. The account worker serializes the
@@ -328,6 +346,14 @@ returns an error rather than creating another group. Removed and disbanded copie
 starts on the same account return one local group. Simultaneous starts by different accounts can create two groups, each
 with both accounts as founding admins.
 
+`start_direct_conversation_with_options` takes founding options for a new group. A nonzero
+`DirectConversationOptions::disappearing_message_secs` is written into the founding MLS state and Welcome, as
+`AppCreateGroupOptions` does for generic creation, so the recipient joins with that duration and no retention commit
+follows. Options apply only when the call creates the group: reuse, retry, and same-account concurrent starts return the
+existing group with its founding duration and roles, whatever duration they propose. A nonzero duration requires the
+peer's KeyPackages to support message retention; without it the start fails and nothing is created.
+`start_direct_conversation` is the same call with default options, which leave disappearing messages disabled.
+
 There is no immutable cross-client DM provenance, so MDK cannot prove legacy groups eligible for automatic admin repair.
 Legacy and generic groups retain their authoritative roles, including unnamed two-member groups. Clients using generic
 creator-only creation remain interoperable: recipients accept the founding admin set through the Welcome, but cannot
@@ -335,7 +361,9 @@ self-promote if they are not admins. Those clients must adopt the explicit start
 
 **Experimental shared invitation decisions.** With device groups enabled, updated clients share Accept/Decline for
 one authenticated admission generation and its automatic sibling Adds (mdk#2628 D96). A separate external Add batch
-or admission fork can prompt again; older unidentified invites stay local-only. Higher version wins, with decline
+or admission fork can prompt again; older unidentified invites stay local-only. A sibling Add forwards how the adding
+device holds the chat: its original inviter, and for an unidentified copy whether it is confirmed, so the new device
+shows it confirmed or as an invitation from that inviter (mdk#3546). Higher version wins, with decline
 winning an equal version. Acceptance preserves membership, block/rejoin checks and explicit archive intent. Decline
 records durable work for this matching local leaf's ordinary Leave; a later accept never cancels an already-requested
 Leave or joins a device. `published = 0` with `CompletionUnknown` reports pending work, not completed departure by
@@ -410,7 +438,7 @@ targets.
 **Leaving.** An admin account's Leave, including declining a pending invitation that made it an admin, is refused with
 `AdminCannotSelfRemove` before anything is written or sent; the host demotes it first (`self_demote_admin`) and then
 leaves, and a last admin first makes another member an admin. `requires_self_demote_before_leave` says so. With
-experimental device groups on (`MarmotApp::admin_leave_steps_down`), User Leave instead records the leave and lets the
+device groups on (the default; `MarmotApp::admin_leave_steps_down`), User Leave instead records the leave and lets the
 engine step this account down when another active administrator account remains, then request its own leaf's SelfRemove;
 the call returns before the step-down is published. The last active administrator account is refused on all its devices
 before a choice or departure is published (mdk#3014 keeps that automatic step-down off elsewhere). Queued work is
@@ -507,6 +535,31 @@ Encrypted group images differ: no endpoint is stored in group state, so upload a
 deployment's `group_image_endpoint`. Clients configured with different values therefore look for group images in
 different places; re-setting the group image republishes it to the current endpoint.
 
+### Attachment derivative eviction
+
+`MarmotAppRuntime::attachment_removals(account_ref, cursor, limit)` reads
+historical body removals without starting acquisition, a worker, or network
+activity. Each record identifies the group, message, original source message,
+and attachment index, with a `CleanedBySetting`, `Removed`,
+`CompletedUnretained`, or `Unavailable` state. Expiry records follow native
+cleanup; attachment reads still enforce the deadline immediately.
+
+Keep one cursor per account-device store. Pages contain at most `limit`
+records (`1..=256`), and the journal retains the latest 4,096 records.
+
+1. Read with your saved cursor, or `None` on first use.
+2. If `reset_required`, keep the returned cursor while reconciling every
+   derivative against fresh native attachment state. Save that cursor after
+   reconciliation, then read from it to catch concurrent removals.
+3. Otherwise, evict each listed derivative before saving `next_cursor`.
+   Repeat while `has_more`.
+
+Evictions must be idempotent. A record describes a past loss, so a body may
+have been downloaded again by the time you apply it. Never use the journal
+to authorize a derivative read; retain the fresh native-state check.
+An interrupted eviction can replay its page. A cursor from another store,
+a store reset, or trimmed history requires full reconciliation.
+
 ## Custom emoji sets
 
 `MarmotApp` reads NIP-51 emoji sets (kind 30030) so a host can offer opt-in custom emoji. Every network step is a
@@ -514,7 +567,7 @@ separate call the host makes after a user action:
 
 | Call | Network | What it reaches |
 | --- | --- | --- |
-| `sync_emoji_sets`, `fetch_emoji_set`, `user_emoji_list` | Relays, text only | The sticker discovery relays (account relays), plus up to 8 relay hints from a pasted `naddr` |
+| `sync_emoji_sets`, `fetch_emoji_set`, `user_emoji_list` | Relays, text only | Sets: the account relays and the runtime's configured relays (the sticker pack read relays), plus up to 8 relay hints from a pasted `naddr`. The account's own kind-10030 list: the account relays only |
 | `fetch_emoji_set_asset`, `fetch_emoji_set_cover` | One image host | The host the set's author chose for that emoji or the cover; nothing is stored |
 | `install_emoji_set` | Every image host in the set | Downloads each emoji once and stores the bytes |
 | `emoji_sets`, `emoji_set`, `installed_custom_emoji`, `read_installed_custom_emoji`, `uninstall_emoji_set` | None | Local storage only, read on the blocking pool |
@@ -548,7 +601,8 @@ Limits:
 | Stored bytes | 32 MiB per set, 128 MiB in all |
 
 Invalid, duplicate, failed and over-cap entries are dropped and reported in `skipped`; a set fails only when no entry
-is usable. Shortcode collisions between installed sets are flagged on each `installed_custom_emoji` row and left to
+is usable. Reinstalling the installed version keeps each verified image whose refresh fails or does not fit: that
+entry stays installed, counts in `installed_count` and is not in `skipped`. Shortcode collisions between installed sets are flagged on each `installed_custom_emoji` row and left to
 the host.
 
 ## Application-owned group state
@@ -628,8 +682,7 @@ Welcomes travel privately through the device group, independently of the other a
 `MarmotAppRuntime::linked_devices(account_ref)` lists this account's own devices as `LinkedDevice`s, from the roster of
 the device group this device trusts (mdk#2628): this device first (`is_this_device`), then by `linked_at`. Each carries
 its KeyPackage slot (`slot_id_hex`, the handle device actions take), label, client and platform, who linked it, its
-`LinkedDeviceStatus` and its settings. It is empty until this device trusts a device group, or while explicit
-device-group capability and runtime intent are absent. The device group's own events never reach hosts; `MarmotAppEvent::LinkedDevicesChanged`
+`LinkedDeviceStatus` and its settings. It is empty until this device trusts a device group, or while the host keeps device groups off. The device group's own events never reach hosts; `MarmotAppEvent::LinkedDevicesChanged`
 says to re-read. It also fires once each time the account's worker opens or reconnects, so it may fire with no visible
 change.
 
@@ -650,10 +703,13 @@ changes any linked device's supplied settings, this device included. Each settin
 from the current roster on the account worker, so changing one toggle does not restore another from a stale screen.
 A patch that still matches after earlier-edit recovery sends no new edit. Enabling **Add to all my chats** permits
 eligible direct post-link Adds while that flow is still adding, and gap filling under its conditions; turning it off
-does not leave joined chats. The approving device's direct post-link pass sends no gap-fill claim (kind 458). With
-three or more devices, it can race another sibling's gap filling and cause extra Add attempts, private-KeyPackage
-consumption, or Commits and convergence passes; selected-parent presence checks and ordinary branch selection still
-apply. **Bring chat history** applies to future sibling Adds and transfers still owed; enabling
+does not leave joined chats. The approving device's direct post-link pass sends no gap-fill claim (kind 458), so
+other devices leave a newly linked device to it, in the chats it is in, while it is active: for up to a week after
+the link, until two hours pass without a heartbeat from the approver. The approver does not add the device to a chat
+another device holds a live claim for. This prevents competing Adds in the usual case only: a claim that arrives late
+at the hand-off, or a device running a version before this rule, which gap-fills at once, can still race the
+approver; selected-parent presence checks and ordinary branch selection still apply.
+**Bring chat history** applies to future sibling Adds and transfers still owed; enabling
 it does not backfill chats already joined or recreate a transfer discarded while it was off. **Keep while inactive**
 stops automatic removal of an `Inactive` device; it does not stop the mark, explicit removal or sign-out. The devices
 mark and remove inactive siblings themselves; see the [shared linked-devices contract](../marmot-uniffi/README.md#linked-devices).
@@ -666,7 +722,7 @@ A rename and a settings change share one recovery record. Before accepting anoth
 tries the existing recovery of an earlier lost edit and re-reads the roster. Retry `device_group_busy` only while it
 remains unsettled. A successful no-op never leaves an opposite lost intention to apply later. A competing user edit
 of that device wins as a whole, even if it changed a different toggle. Refresh the displayed label and flags on
-`LinkedDevicesChanged`. These commands remain behind the device-group development gate. Custom clients writing post-link settings must adopt
+`LinkedDevicesChanged`. These commands are refused only while the host keeps device groups off. Custom clients writing post-link settings must adopt
 this user-edit marker rule before using the feature; earlier draft writers must update first.
 
 When another of the account's devices removes this one, the account stops on this device once it reads the removal, and
@@ -702,6 +758,7 @@ removal and have the required tagged leaves. `groups_left_to_siblings` records a
 completed. Outside admin chats, `groups_left` counts successful local leave calls, not confirmed membership removal. The call still attempts
 local account deletion when remote departure fails: show the chats in `group_leave_failures` and check
 `local_cleanup.completed` separately. Completed local cleanup does not prove this device left every chat.
+A queued member Leave appears in `group_leave_failures`.
 
 An account that cannot run a worker here (signed out, lacking its registered external signer, or excluded by
 onboarding's worker gate) signs out on its own immediately. Unfinished onboarding that runs setup traffic but still
@@ -727,7 +784,7 @@ It shows facts only: a chat with nothing to bring sends nothing, so no chat wait
 after a week leaves nothing. A delivery for a chat this device does not hold yet appears once it joins.
 `MarmotAppEvent::ChatHistoryImportsChanged` fires whenever that answer changes, as rows are pruned or a source device
 is renamed too, and once each time the account's worker opens or reconnects. Everything here is empty and silent unless
-`dev_device_groups` is on.
+`device_groups` is on.
 
 ### Recovery words
 
@@ -764,8 +821,7 @@ worker stop/replacement returns `TransportClosed`. Once queued, this caller's wa
 bounds its OS execution opportunity. Manual restore and
 supported lower-level `AppClient` APIs remain independent.
 
-Backup setup and manual restore require `dev_device_groups` (off by default) and a build with experimental
-device-group support; unsupported setup/restore returns `DeviceGroupRefused("roster_unsupported")`.
+Backup setup and manual restore require `device_groups` (on by default); unsupported setup/restore returns `DeviceGroupRefused("roster_unsupported")`.
 The runtime-wide fact report remains local, and the due-pass wait returns `NotStarted` when device groups are disabled.
 
 ### Manual backup history restore
@@ -802,7 +858,7 @@ stays. Already-running bounded crypto work may finish off the worker; it owns no
 cancelled result, and drops its keys with that work. Closing a watch only stops observing. No secret-backed job or
 cursor is persisted or resumed: a later explicit
 attempt supplies words again. Core Rust operation handles and methods are available here; complete UniFFI/C controls,
-provenance DTOs and operation-token codecs remain separate work. Restore uses the same experimental device-group gate
+provenance DTOs and operation-token codecs remain separate work. Restore uses the same device-group gate
 as the writer.
 
 ### Overdue KeyPackage refresh
@@ -814,8 +870,8 @@ publish is still unannounced, and the slot's newest publication by this device i
 days, so tell the user. A routine refresh announces and publishes in one maintenance pass and never shows; one that is
 announced but failing at the relays doesn't count. The client recomputes the answer after each maintenance pass, and
 `MarmotAppEvent::KeyPackageRefreshOverdueChanged` says to re-read. Like `LinkedDevicesChanged`, it also fires once each
-time the account's worker opens or reconnects. It is false, and the event silent, without explicit device-group
-capability and runtime intent.
+time the account's worker opens or reconnects. It is false, and the event silent, unless the host
+turns device groups on.
 
 ## Unrecognized sign-ins
 
@@ -852,14 +908,20 @@ already in the first roster this device trusts count as seen, and a rejected sig
 a device. `dismiss_compromise_warning` marks everything it gathers as seen, on this device only; a rejection that
 branch selection drops and restores stays seen. `CompromiseWarningReason` gains reasons in later releases; show one the
 host does not know as a generic one. `MarmotAppEvent::CompromiseWarningChanged` says to re-read, and also fires once
-each time the account's worker opens. All of it is empty and silent without explicit device-group capability and
-runtime intent.
+each time the account's worker opens. All of it is empty and silent unless the host turns device
+groups on.
 
 ## Linking a new device
 
-Device linking (mdk#2628) runs through the account runtime. It requires the `unreleased-device-pairing` feature,
-explicit device-group build capability (`dev-device-groups`, or policy-test builds), and the per-client
-`dev_device_groups` runtime intent; every call is refused otherwise. Each call returns a `DeviceLinkSnapshot`: the new device's own
+After pairing reaches `Linked`, read `chat_progress` on each `DeviceLinkChanged`. Each entry identifies the new device by
+`slot_id_hex`. On the approver, `remaining` counts eligible chats that still need an Add. On the new device,
+`on_new_device` is true and `remaining` counts expected chats that have yet to join locally. Show the joining banner while
+that count is positive. Zero means complete for the reported `total`. The total can change as the approver's chats change.
+An absent entry means progress is unavailable, including before a complete report arrives, with older peers, after opt-out,
+or when the direct-add window expires. History import and chats known only to other siblings have their own lifecycles.
+
+Device linking (mdk#2628) runs through the account runtime. It requires the per-client `device_groups` switch
+(on by default); every call is refused otherwise. Each call returns a `DeviceLinkSnapshot`: the new device's own
 link (`new_device`) and the prompts for sign-ins this device can link (`prompts`).
 
 - On the new device, `start_device_link` asks a device already signed in to link this one. Its state goes from

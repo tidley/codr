@@ -6,8 +6,8 @@
 //! Every read the worker still answers goes down the account's real lane, in
 //! one FIFO, while a barrier or a held relay publish keeps the worker inside
 //! the unit. The unit's `read_queue_behind_<unit>` series must count each of
-//! them. The reads that answer from A, the published read state (PRs 3 and
-//! 4), go through their host wrappers instead: each must answer while the
+//! them. The reads that answer from A, the published read state (PRs 3, 4
+//! and 8), go through their host wrappers instead: each must answer while the
 //! unit is still held, and none may count in a queue series.
 
 use futures::future::{BoxFuture, join_all};
@@ -110,10 +110,6 @@ fn host_reads(
             store_epoch: Vec::new(),
             observer: None,
         }
-        Waits PreparedGroupImageStatus { upload_id: "probe".into() }
-        Waits PreparedGroupImages {}
-        Waits StartedFresh {}
-        Waits ChatHistoryImports {}
         Waits HistoryImportProvenance { group_id: group_id(), event_id: "00".repeat(32) }
         Waits PendingWelcomeDeliveries {}
         Waits AccountDevicesActivation { group_id: group_id() }
@@ -144,13 +140,10 @@ fn host_reads(
                 thumbhash: None,
             },
         }
-        Waits HistoryNotices {}
-        Waits GroupRecoveryStatus { group_id: group_id() }
-        Waits AccountRecoveryStatus {}
     }
 }
 
-/// The reads that answer from A (mdk#3273 PRs 3 and 4), each through its
+/// The reads that answer from A (mdk#3273 PRs 3, 4, 5 and 8), each through its
 /// host wrapper while `behind` holds the worker: every one answers before the
 /// unit ends, and none queues on the worker, so neither its class's series
 /// nor the unit's counts it. The group reads find their group hydrated, so
@@ -165,9 +158,12 @@ async fn reads_from_published_state(
     let queued = || {
         [
             behind,
+            RuntimeOp::ReadQueueR1,
+            RuntimeOp::ReadQueueR2,
             RuntimeOp::ReadQueueR3,
             RuntimeOp::ReadQueueR4,
             RuntimeOp::ReadQueueR7,
+            RuntimeOp::ReadQueueR9,
         ]
         .map(|operation| sample(telemetry, operation).started)
     };
@@ -260,7 +256,101 @@ async fn reads_from_published_state(
         ),
         Err(AppError::InvalidAppComponent(_))
     ));
+    answers!(
+        "prepared_group_images",
+        accounts.prepared_group_images(account)
+    )
+    .unwrap();
+    assert!(matches!(
+        answers!(
+            "prepared_group_image_status",
+            accounts.prepared_group_image_status(account, "probe".into())
+        ),
+        Err(AppError::InvalidEncryptedMedia(message))
+            if message == "prepared group image upload was not found"
+    ));
+    answers!("started_fresh", accounts.started_fresh(account)).unwrap();
+    answers!(
+        "chat_history_imports",
+        accounts.chat_history_imports(account)
+    )
+    .unwrap();
+    answers!("history_notices", accounts.history_notices(account)).unwrap();
+    answers!(
+        "account_recovery_status",
+        accounts.account_recovery_status(account)
+    )
+    .unwrap();
+    answers!(
+        "group_recovery_status",
+        accounts.group_recovery_status(account, group)
+    )
+    .unwrap();
     assert_eq!(queued(), before, "a read of A queued on the worker");
+}
+
+/// `GroupRecoveryStatus` answers from A only for a group in the version's
+/// mirror (mdk#3273 PR 8, decision 1). A locally deleted group keeps its
+/// MLS state outside the mirror, and an unknown id is in neither: both go to
+/// the worker's command, which answers them as before A: a status for the
+/// deleted group, and for the unknown id the engine's failure to find its
+/// record. A mirror group's read never queues on the worker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_recovery_status_outside_the_mirror_is_answered_by_the_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .create_account("alice")
+        .unwrap();
+    let app = MarmotApp::with_relay(dir.path(), "wss://relay.example")
+        .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
+    let mut client = app.client("alice").await.unwrap();
+    let mut groups = Vec::new();
+    for name in ["kept", "deleted"] {
+        let created = client.create_group(name, &[]).await.unwrap();
+        groups.push(created.operation.expect("eligible fixture members"));
+    }
+    drop(client);
+    let [kept, deleted] = <[GroupId; 2]>::try_from(groups).unwrap();
+    let runtime = crate::MarmotAppRuntime::new(app.clone());
+    let telemetry = runtime.shared_services().observer.performance().clone();
+    runtime.reconcile_accounts().await.unwrap();
+    crate::worker_fences::worker_startup_finished(&runtime, "alice")
+        .await
+        .unwrap();
+    assert!(runtime.delete_group_local("alice", &deleted).await.unwrap());
+    let queued = || sample(&telemetry, RuntimeOp::ReadQueueR9).started;
+    let before = queued();
+
+    let status = runtime.group_recovery_status("alice", &kept).await.unwrap();
+    assert_eq!(status.group_id_hex, hex::encode(kept.as_slice()));
+    assert_eq!(
+        queued(),
+        before,
+        "a mirror group's read queued on the worker"
+    );
+
+    let status = runtime
+        .group_recovery_status("alice", &deleted)
+        .await
+        .unwrap();
+    assert_eq!(status.group_id_hex, hex::encode(deleted.as_slice()));
+    assert_eq!(queued(), before + 1, "the worker answers a deleted group");
+
+    let unknown = runtime
+        .group_recovery_status("alice", &GroupId::new(vec![0xa5; 16]))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            unknown.as_engine_error(),
+            Some(cgka_traits::error::EngineError::Storage(
+                cgka_traits::StorageError::NotFound
+            ))
+        ),
+        "{unknown:?}"
+    );
+    assert_eq!(queued(), before + 2, "the worker answers an unknown id");
+    runtime.shutdown_and_close().await.unwrap();
 }
 
 /// A member read whose profile load fails answers that failure on the
@@ -470,13 +560,23 @@ async fn host_reads_wait_behind_held_worker_units() {
         .await
         .expect("the explicit catch-up reaches its hold");
     // A host read through its public wrapper records its class, and the
-    // unit it waits behind once that ends: the fresh-start flag still waits
+    // unit it waits behind once that ends: an exporter secret, which stays
     // on the worker.
-    let class_before = sample(&telemetry, RuntimeOp::ReadQueueR2);
+    let class_before = sample(&telemetry, RuntimeOp::ReadQueueR5);
     let unit_before = sample(&telemetry, RuntimeOp::ReadQueueBehindCatchUp);
     let wrapped = tokio::spawn({
-        let runtime = runtime.clone();
-        async move { runtime.started_fresh("alice").await }
+        let accounts = runtime.accounts();
+        let group = group.clone();
+        async move {
+            accounts
+                .exporter_secret(
+                    "alice",
+                    &group,
+                    cgka_traits::app_components::GROUP_ENCRYPTED_MEDIA_EXPORTER_CACHE_KEY,
+                    32,
+                )
+                .await
+        }
     });
     timeout(SETTLE, async {
         while sample(&telemetry, RuntimeOp::ReadQueueBehindCatchUp).in_flight
@@ -505,7 +605,7 @@ async fn host_reads_wait_behind_held_worker_units() {
         .unwrap()
         .unwrap();
     timeout(SETTLE, wrapped).await.unwrap().unwrap().unwrap();
-    let class_after = sample(&telemetry, RuntimeOp::ReadQueueR2);
+    let class_after = sample(&telemetry, RuntimeOp::ReadQueueR5);
     assert_eq!(class_after.successes - class_before.successes, 1);
     // The unit's series counts it with the probes.
     held.all_answered(&telemetry).await;
@@ -629,6 +729,12 @@ async fn host_reads_wait_behind_a_held_convergence_pass() {
         .unwrap()
         .operation
         .expect("eligible fixture members");
+    // The create's Welcome wave runs beside the worker (mdk#3466): Bob must
+    // hold the group before its commit reaches him.
+    timeout(Duration::from_secs(10), runtime.drain_in_flight_work())
+        .await
+        .expect("the create's Welcome wave settles")
+        .unwrap();
     runtime.catch_up_accounts().await.unwrap();
     runtime
         .update_group_profile("alice", &group, Some("changed".into()), None)

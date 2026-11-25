@@ -14,7 +14,13 @@
 //! typed value the build returns with the answers, recording what they were
 //! read at and how long they hold (`KeyPackagesValidity`, `EntryValidity`).
 //! The list is keyed on its own write count, which only its inputs move, so a
-//! send keeps it.
+//! send keeps it. The account's recovery answer (R9, mdk#3273 PR 8) is reused
+//! too: its read while the recovery-notice write count, the routing version
+//! and the runner's survey hold, and the status built from it while every
+//! group it asked a fact of holds its change stamp ([`RecoveryAnswer`]).
+//! Each group's recovery status is part of its entry, rebuilt when the
+//! group's notices in the account's read change as well as when its
+//! generation moves.
 //! Reuse checks that value alone, so every input of a reused answer must be
 //! either a write those counts see or a field of its validity. App components
 //! are reused while the group's hydrated generation holds. A publish whose
@@ -51,16 +57,22 @@ use cgka_traits::{
     GroupMaintenanceStatus, KeyPackageLifecycleState, PeriodicMaintenancePolicy, StorageError,
     Timestamp,
 };
-use marmot_session::{GroupChangeGeneration, GroupMaintenanceRows, WallClockWindow};
+use marmot_session::{ChangeStamp, GroupChangeGeneration, GroupMaintenanceRows, WallClockWindow};
 use storage_sqlite::{SelfMembership, StoredGroupStanding};
 use tokio::sync::watch;
 
 use super::AppClient;
+use super::history_recovery::history_notices::reuse::RecoveryAnswer;
+use super::history_recovery::history_notices::{
+    Fact, GroupFacts, GroupNotices, LiveFacts, RecoveryRead,
+};
+use super::invite_recovery::InvitationRows;
 use crate::groups::AppGroupRosterSession;
 use crate::{
-    AppError, AppGroupMemberIds, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord,
-    AppPreparedGroupImageUpload, AppPreparedGroupImageUploadState, AppQuarantinedGroup,
-    BackupRestoreStatus, BackupRestoreWatch, ChatHistoryImport, GroupCommitDelivery,
+    AccountRecoveryStatus, AppError, AppGroupMemberIds, AppGroupMemberRecord, AppGroupMlsState,
+    AppGroupRecord, AppPreparedGroupImageUpload, AppPreparedGroupImageUploadState,
+    AppQuarantinedGroup, BackupRestoreStatus, BackupRestoreWatch, ChatHistoryImport,
+    GroupCommitDelivery, GroupRecoveryStatus, HistoryNotice,
 };
 
 const TRACE_TARGET: &str = "marmot_app::read_state";
@@ -123,13 +135,18 @@ pub(crate) struct AccountAnswers {
     /// A receiver of the client's backup-restore progress channel, which
     /// `WatchBackupRestore` hands out a copy of.
     pub(crate) backup_restore_updates: watch::Receiver<BackupRestoreStatus>,
-    /// With the in-flight upload overlay applied.
-    #[cfg_attr(not(test), allow(dead_code))] // Account reads answer from A (mdk#3273 PR 5).
+    /// With the in-flight upload overlay applied: the worker's set as it
+    /// stood at the publish, which only the worker changes.
     pub(crate) prepared_group_images: ReadAnswer<Vec<AppPreparedGroupImageUpload>>,
-    #[cfg_attr(not(test), allow(dead_code))] // Account reads answer from A (mdk#3273 PR 5).
+    /// The listed uploads whose record the worker's status read fails to read
+    /// (a column only it decodes holds another type), from the list's own
+    /// statement: their status goes to the worker. Empty when the list failed.
+    pub(crate) prepared_group_image_records_unread: HashSet<String>,
     pub(crate) started_fresh: ReadAnswer<bool>,
-    #[cfg_attr(not(test), allow(dead_code))] // Account reads answer from A (mdk#3273 PR 5).
     pub(crate) chat_history_imports: ReadAnswer<Vec<ChatHistoryImport>>,
+    /// The account's recovery status, whose notices `HistoryNotices` lists
+    /// (mdk#3273 PR 8). Shared with the publisher's kept answer.
+    pub(crate) recovery_status: ReadAnswer<Arc<AccountRecoveryStatus>>,
 }
 
 impl AccountAnswers {
@@ -145,8 +162,10 @@ impl AccountAnswers {
             backup_restore_status,
             backup_restore_updates,
             prepared_group_images,
+            prepared_group_image_records_unread,
             started_fresh,
             chat_history_imports,
+            recovery_status,
         } = self;
         *quarantined_groups == other.quarantined_groups
             && same_answer(
@@ -179,12 +198,16 @@ impl AccountAnswers {
                 &other.prepared_group_images,
                 PartialEq::eq,
             )
+            && *prepared_group_image_records_unread == other.prepared_group_image_records_unread
             && same_answer(started_fresh, &other.started_fresh, PartialEq::eq)
             && same_answer(
                 chat_history_imports,
                 &other.chat_history_imports,
                 PartialEq::eq,
             )
+            && same_answer(recovery_status, &other.recovery_status, |ours, theirs| {
+                Arc::ptr_eq(ours, theirs) || ours == theirs
+            })
     }
 }
 
@@ -231,6 +254,9 @@ pub(crate) struct GroupAnswers {
     pub(crate) maintenance_status: ReadAnswer<GroupMaintenanceStatus>,
     /// Every app-owned component the group holds, in id order.
     pub(crate) app_components: ReadAnswer<Vec<(AppComponentId, Vec<u8>)>>,
+    /// `GroupRecoveryStatus`, from the publish's recovery read (mdk#3273
+    /// PR 8).
+    pub(crate) recovery_status: ReadAnswer<GroupRecoveryStatus>,
 }
 
 impl GroupAnswers {
@@ -250,6 +276,7 @@ impl GroupAnswers {
             commit_delivery,
             maintenance_status,
             app_components,
+            recovery_status,
         } = self;
         *record == other.record
             && *host_may_see == other.host_may_see
@@ -262,6 +289,7 @@ impl GroupAnswers {
             && same_answer(commit_delivery, &other.commit_delivery, PartialEq::eq)
             && same_answer(maintenance_status, &other.maintenance_status, PartialEq::eq)
             && same_answer(app_components, &other.app_components, PartialEq::eq)
+            && same_answer(recovery_status, &other.recovery_status, PartialEq::eq)
     }
 }
 
@@ -517,26 +545,6 @@ impl ReadState {
     ) -> Result<Vec<(GroupId, CommittedMembers)>, AppError> {
         Ok(storage.trusted_roster_members(&self.trusted_rosters())?)
     }
-
-    /// `PreparedGroupImageStatus`.
-    #[cfg_attr(not(test), allow(dead_code))] // Account reads answer from A (mdk#3273 PR 5).
-    pub(crate) fn prepared_group_image_status(
-        &self,
-        upload_id: &str,
-    ) -> ReadAnswer<AppPreparedGroupImageUpload> {
-        self.account
-            .prepared_group_images
-            .as_ref()
-            .map_err(Arc::clone)?
-            .iter()
-            .find(|status| status.upload_id == upload_id)
-            .cloned()
-            .ok_or_else(|| {
-                Arc::new(AppError::InvalidEncryptedMedia(
-                    "prepared group image upload was not found".into(),
-                ))
-            })
-    }
 }
 
 /// The account reads that answer from A (mdk#3273 PR 3), from this version
@@ -569,13 +577,102 @@ impl ReadState {
         self.account.backup_restore_status.clone()
     }
 
-    /// `WatchBackupRestore`: a receiver of the client's progress channel
-    /// that has seen the status published here, as subscribing at this
-    /// publish gave. A change sent since then is still news to it.
+    /// `WatchBackupRestore`: a watch of the client's progress channel that
+    /// has seen the status published here, even before the channel
+    /// announces it. A change sent since then is still news to it.
     pub(crate) fn watch_backup_restore(&self) -> BackupRestoreWatch {
         BackupRestoreWatch {
             receiver: self.account.backup_restore_updates.clone(),
+            seen: self.account.backup_restore_status.clone(),
         }
+    }
+}
+
+/// The prepared group image reads (R1) and the account's device-group
+/// history reads (R2), from this version alone (mdk#3273 PR 5).
+impl ReadState {
+    /// `PreparedGroupImages`, with the in-flight overlay applied.
+    pub(crate) fn prepared_group_images(&self) -> ReadAnswer<Vec<AppPreparedGroupImageUpload>> {
+        self.account.prepared_group_images.clone()
+    }
+
+    /// `PreparedGroupImageStatus`: the listed upload's status, or today's
+    /// not-found failure for an id the list does not hold. Both storage
+    /// reads decode the same status columns, so where both succeed they
+    /// agree. `None` while the list failed, or for an upload whose record
+    /// the worker's read fails on a column the list does not decode: this
+    /// version then holds no answer for it, which the worker's read of that
+    /// one row gives, since another row's failure does not fail it.
+    pub(crate) fn prepared_group_image_status(
+        &self,
+        upload_id: &str,
+    ) -> Option<ReadAnswer<AppPreparedGroupImageUpload>> {
+        let statuses = self.account.prepared_group_images.as_ref().ok()?;
+        if self
+            .account
+            .prepared_group_image_records_unread
+            .contains(upload_id)
+        {
+            return None;
+        }
+        Some(
+            statuses
+                .iter()
+                .find(|status| status.upload_id == upload_id)
+                .cloned()
+                .ok_or_else(|| {
+                    Arc::new(AppError::InvalidEncryptedMedia(
+                        "prepared group image upload was not found".into(),
+                    ))
+                }),
+        )
+    }
+
+    /// `StartedFresh`.
+    pub(crate) fn started_fresh(&self) -> ReadAnswer<bool> {
+        self.account.started_fresh.clone()
+    }
+
+    /// `ChatHistoryImports`.
+    pub(crate) fn chat_history_imports(&self) -> ReadAnswer<Vec<ChatHistoryImport>> {
+        self.account.chat_history_imports.clone()
+    }
+}
+
+/// The account's recovery reads (R9, mdk#3273 PR 8), from this version
+/// alone.
+impl ReadState {
+    /// `HistoryNotices`: the recovery status's notices, which today's read
+    /// computes from the same read, so it gives the same success and the
+    /// same failure.
+    pub(crate) fn history_notices(&self) -> ReadAnswer<Vec<HistoryNotice>> {
+        Ok(self
+            .account
+            .recovery_status
+            .as_ref()
+            .map_err(Arc::clone)?
+            .notices
+            .clone())
+    }
+
+    /// `AccountRecoveryStatus`.
+    pub(crate) fn account_recovery_status(&self) -> ReadAnswer<AccountRecoveryStatus> {
+        Ok(AccountRecoveryStatus::clone(
+            self.account.recovery_status.as_ref().map_err(Arc::clone)?,
+        ))
+    }
+
+    /// `GroupRecoveryStatus` of a group in the mirror. `None` for any other
+    /// id, which the worker answers as it did before A: today's read
+    /// answers a locally deleted group, outside the mirror, from its kept
+    /// MLS state (mdk#3273 decision 1).
+    pub(crate) fn group_recovery_status(
+        &self,
+        group_id: &GroupId,
+    ) -> Option<ReadAnswer<GroupRecoveryStatus>> {
+        self.groups
+            .get(group_id)
+            .map(|group| group.recovery_status.clone())
     }
 }
 
@@ -590,10 +687,14 @@ pub(crate) fn reissue<T>(answer: ReadAnswer<T>) -> Option<Result<T, AppError>> {
 
 /// An exact copy of `error`, for the failures the moved reads give whose
 /// payloads can be copied: an unknown group in the mirror or the engine, a
-/// group not hydrated yet, and a storage failure, from the app or the engine.
-/// An engine failure keeps its wrapping, whether the account or its session
-/// raised it. Any other failure (SQLite, I/O, JSON, the rest of the engine's)
-/// has no copy, so it is never rebuilt into a different error.
+/// group not hydrated yet, a storage failure, from the app or the engine,
+/// a KeyPackage outside its lifetime (a group's recovery status judges
+/// its reinvites' KeyPackages), and an encrypted-media failure, whose payload
+/// is its message (a prepared group image upload the list does not hold).
+/// An engine failure keeps its wrapping, whether
+/// the app's session, the account or the account's session raised it. Any
+/// other failure (SQLite, I/O, JSON, the rest of the engine's) has no copy,
+/// so it is never rebuilt into a different error.
 pub(crate) fn reissue_error(error: &AppError) -> Option<AppError> {
     use marmot_session::{AccountError, SessionError};
     fn copy_engine(engine: &EngineError) -> Option<EngineError> {
@@ -603,12 +704,25 @@ pub(crate) fn reissue_error(error: &AppError) -> Option<AppError> {
                 Some(EngineError::GroupNotHydrated(group.clone()))
             }
             EngineError::Storage(storage) => Some(EngineError::Storage(storage.clone())),
+            EngineError::InvalidKeyPackageLifetime {
+                not_before,
+                not_after,
+            } => Some(EngineError::InvalidKeyPackageLifetime {
+                not_before: *not_before,
+                not_after: *not_after,
+            }),
             _ => None,
         }
     }
     match error {
         AppError::UnknownGroup(group) => Some(AppError::UnknownGroup(group.clone())),
         AppError::Storage(storage) => Some(AppError::Storage(storage.clone())),
+        AppError::InvalidEncryptedMedia(message) => {
+            Some(AppError::InvalidEncryptedMedia(message.clone()))
+        }
+        AppError::Session(SessionError::Engine(engine)) => {
+            copy_engine(engine).map(|engine| AppError::Session(SessionError::Engine(engine)))
+        }
         AppError::Account(AccountError::Engine(engine)) => {
             copy_engine(engine).map(|engine| AppError::Account(AccountError::Engine(engine)))
         }
@@ -660,8 +774,10 @@ fn empty_account_answers() -> AccountAnswers {
         backup_restore_status: BackupRestoreStatus::default(),
         backup_restore_updates: watch::channel(BackupRestoreStatus::default()).1,
         prepared_group_images: Ok(Vec::new()),
+        prepared_group_image_records_unread: HashSet::new(),
         started_fresh: Ok(false),
         chat_history_imports: Ok(Vec::new()),
+        recovery_status: Ok(Arc::default()),
     }
 }
 
@@ -778,6 +894,17 @@ struct EntryValidity {
     /// The wall-clock window the commit-delivery answer holds in: from the
     /// clock reading it was computed at until a delivery deadline passes.
     window: WallClockWindow,
+    /// The system-clock window the recovery status's KeyPackage lifetimes
+    /// leave it in: a retained reinvite's KeyPackage past its `not_after`
+    /// fails the status, with no write.
+    key_packages: WallClockWindow,
+    /// The group's notices in the recovery read its recovery status was
+    /// built from, `None` when that read failed: a park, a dismissal or a
+    /// route gone moves them and no write of the group (mdk#3273 PR 8).
+    notices: Option<GroupNotices>,
+    /// The group's facts the account's recovery status takes from the
+    /// entry: both read only what the generation counts.
+    recovery_facts: OwnFacts,
     /// False when a read failed on something other than a fact about the
     /// group ([`settled_failure`]), whether its answer keeps the failure or
     /// swallows it (the device-group check, which hides the group). Such a
@@ -787,21 +914,30 @@ struct EntryValidity {
 
 impl EntryValidity {
     /// Whether an entry built at `self` still holds for a group now at
-    /// `generation`, `record` and `maintenance_paused`, at `now`. A clock
-    /// moved back before the reading the commit-delivery answer was computed
-    /// at can bring an expired bound back into force.
+    /// `generation`, `record` and `maintenance_paused`, at `now` on the
+    /// account's wall clock and `system_now` on the system clock. A clock
+    /// moved back before the reading an answer was computed at can bring an
+    /// expired bound back into force.
     fn holds(
         &self,
         generation: &GroupChangeGeneration,
         record: &AppGroupRecord,
         maintenance_paused: bool,
         now: Timestamp,
+        system_now: Timestamp,
     ) -> bool {
         self.reusable
             && generation.state.unchanged_since(&self.generation.state)
             && *record == self.record
             && maintenance_paused == self.maintenance_paused
             && self.window.contains(now)
+            && self.key_packages.contains(system_now)
+    }
+
+    /// Whether the entry's recovery status still holds for the group's
+    /// notices in this publish's recovery read, `None` when it failed.
+    fn notices_hold(&self, notices: Option<&GroupNotices>) -> bool {
+        self.notices.as_ref() == notices
     }
 
     /// Whether the entry's app components still hold for a group now at
@@ -817,8 +953,9 @@ impl EntryValidity {
 /// Whether a failed answer is a fact about the group that only a move of the
 /// entry's inputs can change: the engine does not know the group, or has not
 /// hydrated it yet. Any other failure, a busy or failing database above all,
-/// can clear without a write.
-fn settled_failure(error: &AppError) -> bool {
+/// can clear without a write. The account's recovery answer judges the
+/// group facts it uses by the same rule.
+pub(crate) fn settled_failure(error: &AppError) -> bool {
     use cgka_traits::error::EngineError;
     matches!(error, AppError::UnknownGroup(_))
         || matches!(
@@ -833,6 +970,83 @@ fn settled<T>(answer: &Result<T, impl std::ops::Deref<Target = AppError>>) -> bo
         .as_ref()
         .err()
         .is_none_or(|error| settled_failure(error))
+}
+
+/// One group's recovery facts as its entry read them: whether the host may
+/// see it (the device-group check, a failure hiding it) and whether its copy
+/// is Unrecoverable (the engine record, a failure reading as recoverable),
+/// each with whether its check settled.
+#[derive(Clone, Copy)]
+struct OwnFacts {
+    host_may_see: Fact,
+    unrecoverable: Fact,
+}
+
+/// An entry's own status asks facts of its own group only.
+impl GroupFacts for OwnFacts {
+    fn host_may_see(&self, _: &[u8]) -> Fact {
+        self.host_may_see
+    }
+
+    fn unrecoverable(&self, _: &[u8]) -> Fact {
+        self.unrecoverable
+    }
+
+    fn stamp(&self, _: &[u8]) -> Option<ChangeStamp> {
+        None
+    }
+}
+
+/// The account recovery status's group facts, from each mirror group's entry
+/// in this publish, at the generation the entry was built at. A group
+/// outside the mirror has no entry: its facts are read live, at no stamp, so
+/// a status that used them is never kept (mdk#3273 decision 3, condition 2).
+struct EntryFacts<'a> {
+    client: &'a AppClient,
+    entries: &'a HashMap<GroupId, EntryValidity>,
+}
+
+impl EntryFacts<'_> {
+    fn entry(&self, group_id: &[u8]) -> Option<&EntryValidity> {
+        self.entries.get(&GroupId::new(group_id.to_vec()))
+    }
+}
+
+impl GroupFacts for EntryFacts<'_> {
+    fn host_may_see(&self, group_id: &[u8]) -> Fact {
+        self.entry(group_id).map_or_else(
+            || LiveFacts(self.client).host_may_see(group_id),
+            |entry| entry.recovery_facts.host_may_see,
+        )
+    }
+
+    fn unrecoverable(&self, group_id: &[u8]) -> Fact {
+        self.entry(group_id).map_or_else(
+            || LiveFacts(self.client).unrecoverable(group_id),
+            |entry| entry.recovery_facts.unrecoverable,
+        )
+    }
+
+    fn stamp(&self, group_id: &[u8]) -> Option<ChangeStamp> {
+        self.entry(group_id)
+            .map(|entry| entry.generation.state.clone())
+    }
+}
+
+/// A publish's recovery read: the kept answer's while it holds, else a
+/// fresh one.
+enum PublishRecoveryRead {
+    Kept(RecoveryAnswer),
+    Fresh(Result<RecoveryRead, Arc<AppError>>),
+}
+
+impl PublishRecoveryRead {
+    fn read(&self) -> Result<&RecoveryRead, &Arc<AppError>> {
+        match self {
+            Self::Kept(answer) => answer.read(),
+            Self::Fresh(read) => read.as_ref(),
+        }
+    }
 }
 
 /// What the owned KeyPackage list was read at and how long it holds. The
@@ -927,7 +1141,7 @@ fn key_package_answer(
 
 /// Seconds since the Unix epoch on the system clock, which OpenMLS checks
 /// KeyPackage lifetimes against.
-fn system_clock_now() -> Timestamp {
+pub(crate) fn system_clock_now() -> Timestamp {
     Timestamp(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -949,9 +1163,14 @@ pub(crate) struct ReadStatePublisher {
     /// The owned KeyPackage list the last publish read or reused.
     key_packages: Option<(ReadAnswer<Vec<KeyPackage>>, KeyPackagesValidity)>,
     entries: HashMap<GroupId, EntryValidity>,
+    /// The account's recovery answer the last publish read or kept.
+    recovery: Option<RecoveryAnswer>,
     /// The earliest commit-delivery bound among `entries`, on the account's
     /// wall clock.
     groups_valid_until: Option<Timestamp>,
+    /// The earliest KeyPackage bound among `entries`' recovery statuses, on
+    /// the system clock.
+    groups_key_packages_until: Option<Timestamp>,
     /// Whether any account handle the publish reads was still open when the
     /// last publish began: the oracle's window for a terminal close.
     #[cfg(any(test, feature = "test-support"))]
@@ -972,17 +1191,20 @@ pub(crate) struct ReadStatePublisher {
 
 impl ReadStatePublisher {
     /// How long until an answer in the published version can change with no
-    /// write, each bound measured on its own clock: KeyPackage lifetimes on
-    /// the system clock, commit-delivery bounds on the account's wall clock.
+    /// write, each bound measured on its own clock: KeyPackage lifetimes (the
+    /// owned list's and the recovery statuses') on the system clock,
+    /// commit-delivery bounds on the account's wall clock.
     /// Never under a second, the clocks' resolution, so a bound the clock
     /// does not show as passed yet is waited for rather than spun on.
     fn deadline(&self, wall_now: Timestamp, system_now: Timestamp) -> Option<Duration> {
         let remaining = |until: Timestamp, now: Timestamp| until.0.saturating_sub(now.0);
-        let key_packages = self
-            .key_packages
-            .as_ref()
-            .and_then(|(_, validity)| validity.window.until)
-            .map(|until| remaining(until, system_now));
+        let key_packages = earliest(
+            self.key_packages
+                .as_ref()
+                .and_then(|(_, validity)| validity.window.until),
+            self.groups_key_packages_until,
+        )
+        .map(|until| remaining(until, system_now));
         let groups = self
             .groups_valid_until
             .map(|until| remaining(until, wall_now));
@@ -1000,7 +1222,9 @@ impl ReadStatePublisher {
             uploads_in_flight,
             key_packages: None,
             entries: HashMap::new(),
+            recovery: None,
             groups_valid_until: None,
+            groups_key_packages_until: None,
             #[cfg(any(test, feature = "test-support"))]
             storage_open_at_publish: true,
             #[cfg(any(test, feature = "test-support"))]
@@ -1016,6 +1240,7 @@ impl ReadStatePublisher {
     fn forget_inputs(&mut self) {
         self.key_packages = None;
         self.entries.clear();
+        self.recovery = None;
         #[cfg(any(test, feature = "test-support"))]
         {
             self.key_package_inputs = None;
@@ -1057,11 +1282,15 @@ impl ReadStatePublisher {
         let uploads_in_flight = self.uploads_in_flight();
         let maintenance_paused = client.runtime.maintenance_is_paused();
         let now = client.runtime.wall_clock_now();
+        // Read before every recovery status's KeyPackage check, so a check on
+        // the other side of a bound shows as a moved clock.
+        let system_now = system_clock_now();
 
         // Read before the build, so a write that lands during it ends the
         // reuse at the next publish.
         let key_package_writes = (!client.engine_storage.is_closed())
             .then(|| client.engine_storage.key_package_write_count());
+        let recovery_inputs = client.recovery_inputs();
         let profile = client.runtime.new_protocol_profile();
         let (key_packages, key_package_validity, key_packages_reused) =
             match self.key_packages.take() {
@@ -1089,20 +1318,22 @@ impl ReadStatePublisher {
         {
             self.key_packages_reused = key_packages_reused;
         }
-        let account = account_answers(
-            client,
-            maintenance_paused,
-            uploads_in_flight.as_ref(),
-            key_packages.clone(),
-        );
+        let durably_owned_key_packages = key_packages.clone();
         let key_packages_valid_until = key_package_validity.window.until;
         self.key_packages = Some((key_packages, key_package_validity));
-        let account_changed = !account.same_as(&current.account);
-        let account = if account_changed {
-            Arc::new(account)
-        } else {
-            Arc::clone(&current.account)
+
+        // The account's recovery read, kept while it holds. Every group's
+        // recovery status below is built from it, and the account status
+        // after them from the facts their entries hold.
+        let recovery_read = match self.recovery.take() {
+            Some(answer) if answer.read_holds(&recovery_inputs) => {
+                PublishRecoveryRead::Kept(answer)
+            }
+            _ => PublishRecoveryRead::Fresh(client.read_recovery().map_err(Arc::new)),
         };
+        // A kept read is the one every entry carried over was last checked
+        // against, so their notices in it hold.
+        let recovery_read_kept = matches!(recovery_read, PublishRecoveryRead::Kept(_));
 
         // Borrowed: only a rebuilt entry copies its record (mdk#3273 PR 3
         // measured the copy at two fifths of an unchanged publish).
@@ -1124,9 +1355,11 @@ impl ReadStatePublisher {
         let mut rebuilt = 0usize;
         let mut changed = 0usize;
         let mut groups_valid_until = None;
+        let mut groups_key_packages_until = None;
         // Loaded once, for the first entry rebuilt. A failed load leaves each
         // entry to the per-group reads, so its errors are theirs.
         let mut maintenance_rows = None;
+        let mut invitation_rows = None;
         let mut earlier_entries = std::mem::take(&mut self.entries);
         for ((group_id, record), generation) in mirror.into_iter().zip(generations) {
             let earlier = earlier_entries
@@ -1134,7 +1367,14 @@ impl ReadStatePublisher {
                 .zip(current.groups.get(&group_id));
             let (answers, validity) = match earlier {
                 Some((validity, answers))
-                    if validity.holds(&generation, record, maintenance_paused, now) =>
+                    if validity.holds(&generation, record, maintenance_paused, now, system_now)
+                        && (recovery_read_kept
+                            || validity.notices_hold(
+                                recovery_read
+                                    .read()
+                                    .ok()
+                                    .map(|read| read.group_notices(&group_id)),
+                            )) =>
                 {
                     (Arc::clone(answers), validity)
                 }
@@ -1142,6 +1382,10 @@ impl ReadStatePublisher {
                     rebuilt += 1;
                     let rows = maintenance_rows
                         .get_or_insert_with(|| client.runtime.group_maintenance_rows())
+                        .as_ref()
+                        .ok();
+                    let invitations = invitation_rows
+                        .get_or_insert_with(|| client.invitation_rows())
                         .as_ref()
                         .ok();
                     let (answers, validity) = group_entry(
@@ -1154,6 +1398,9 @@ impl ReadStatePublisher {
                             .as_ref()
                             .map(|(validity, answers)| (validity, *answers)),
                         rows,
+                        invitations,
+                        recovery_read.read(),
+                        system_now,
                     );
                     // A rebuild whose answers are the published ones keeps
                     // them, and so does not by itself move the version.
@@ -1169,6 +1416,8 @@ impl ReadStatePublisher {
                 }
             };
             groups_valid_until = earliest(groups_valid_until, validity.window.until);
+            groups_key_packages_until =
+                earliest(groups_key_packages_until, validity.key_packages.until);
             entries.insert(group_id.clone(), validity);
             groups.insert(group_id, answers);
         }
@@ -1176,9 +1425,43 @@ impl ReadStatePublisher {
             .groups
             .keys()
             .any(|group_id| !groups.contains_key(group_id));
+
+        let facts = EntryFacts {
+            client,
+            entries: &entries,
+        };
+        let (recovery, recovery_status_kept) = match recovery_read {
+            PublishRecoveryRead::Kept(answer)
+                if answer.status_holds(&|group_id: &[u8]| facts.stamp(group_id)) =>
+            {
+                (answer, true)
+            }
+            PublishRecoveryRead::Kept(answer) => (answer.refresh(&facts), false),
+            PublishRecoveryRead::Fresh(read) => {
+                (RecoveryAnswer::build(recovery_inputs, read, &facts), false)
+            }
+        };
+        let account = account_answers(
+            client,
+            maintenance_paused,
+            uploads_in_flight.as_ref(),
+            durably_owned_key_packages,
+            recovery.status().clone(),
+        );
+        self.recovery = Some(recovery);
+        let account_changed = !account.same_as(&current.account);
+        let account = if account_changed {
+            Arc::new(account)
+        } else {
+            Arc::clone(&current.account)
+        };
         self.entries = entries;
         self.groups_valid_until = groups_valid_until;
-        let valid_until = earliest(key_packages_valid_until, groups_valid_until);
+        self.groups_key_packages_until = groups_key_packages_until;
+        let valid_until = earliest(
+            earliest(key_packages_valid_until, groups_valid_until),
+            groups_key_packages_until,
+        );
         // Version 0 is the channel's empty state, never a publish.
         let first = current.version == 0;
         if !first
@@ -1211,6 +1494,8 @@ impl ReadStatePublisher {
             version,
             account_changed,
             key_packages_reused,
+            recovery_read_kept,
+            recovery_status_kept,
             groups = group_count,
             groups_rebuilt = rebuilt,
             groups_changed = changed,
@@ -1226,13 +1511,22 @@ fn arc_err<T>(result: Result<T, AppError>) -> ReadAnswer<T> {
 }
 
 /// The account answers, by today's read code, around the owned KeyPackage
-/// list the caller read or reused.
+/// list and the recovery status the caller read or kept.
 fn account_answers(
     client: &AppClient,
     maintenance_paused: bool,
     uploads_in_flight: Option<&HashSet<String>>,
     durably_owned_key_packages: ReadAnswer<Vec<KeyPackage>>,
+    recovery_status: ReadAnswer<Arc<AccountRecoveryStatus>>,
 ) -> AccountAnswers {
+    let (prepared_group_images, prepared_group_image_records_unread) =
+        match client.prepared_initial_group_images_with_record_check() {
+            Ok((statuses, unread)) => (
+                Ok(with_uploads_in_flight(statuses, uploads_in_flight)),
+                unread,
+            ),
+            Err(error) => (Err(Arc::new(error)), HashSet::new()),
+        };
     AccountAnswers {
         quarantined_groups: client.quarantined_groups(),
         key_package_maintenance_status: arc_err(client.key_package_maintenance_status()),
@@ -1241,13 +1535,11 @@ fn account_answers(
         maintenance_paused,
         backup_restore_status: client.backup_restore_status(),
         backup_restore_updates: client.watch_backup_restore().receiver,
-        prepared_group_images: arc_err(
-            client
-                .prepared_initial_group_images()
-                .map(|statuses| with_uploads_in_flight(statuses, uploads_in_flight)),
-        ),
+        prepared_group_images,
+        prepared_group_image_records_unread,
         started_fresh: arc_err(client.started_fresh()),
         chat_history_imports: arc_err(client.chat_history_imports()),
+        recovery_status,
     }
 }
 
@@ -1267,7 +1559,9 @@ pub(crate) fn with_uploads_in_flight(
 
 /// One mirror group's answers, by today's read code past its mirror gate,
 /// with what they were read at. `earlier` is the entry this one replaces,
-/// whose app components are kept while they hold.
+/// whose app components are kept while they hold; `recovery` is the
+/// publish's recovery read.
+#[allow(clippy::too_many_arguments)]
 fn group_entry(
     client: &AppClient,
     group_id: &GroupId,
@@ -1276,6 +1570,9 @@ fn group_entry(
     maintenance_paused: bool,
     earlier: Option<(&EntryValidity, &Arc<GroupAnswers>)>,
     maintenance_rows: Option<&GroupMaintenanceRows>,
+    invitation_rows: Option<&InvitationRows>,
+    recovery: Result<&RecoveryRead, &Arc<AppError>>,
+    system_now: Timestamp,
 ) -> (GroupAnswers, EntryValidity) {
     let app_components = match earlier {
         Some((validity, answers)) if validity.components_hold(&generation) => {
@@ -1289,6 +1586,37 @@ fn group_entry(
     // `host_may_see_group`, which hides the group when the check fails,
     // keeping whether it did: the entry is then not reusable.
     let device_group = client.is_device_group(group_id);
+    // The engine record gives whether the group's copy is Unrecoverable (a
+    // group not hydrated yet reads its stored record) and its recovery
+    // status, which reads it once, as `group_recovery_status`.
+    let engine_record = client
+        .runtime
+        .group_record(group_id)
+        .map_err(AppError::from);
+    let recovery_facts = OwnFacts {
+        host_may_see: Fact {
+            value: matches!(device_group, Ok(false)),
+            settled: device_group.is_ok(),
+        },
+        unrecoverable: client.unrecoverable_fact(group_id, engine_record.as_ref()),
+    };
+    // The recovery read fails first, then the record, as today's read. A
+    // failed status depends on no clock reading, and is never reused.
+    let (recovery_status, recovery_inputs) = match (recovery, engine_record) {
+        (Err(error), _) => (Err(Arc::clone(error)), None),
+        (Ok(_), Err(error)) => (Err(Arc::new(error)), None),
+        (Ok(read), Ok(group)) => match client.group_recovery_status_in(
+            group_id,
+            &group,
+            read,
+            &recovery_facts,
+            invitation_rows,
+            system_now,
+        ) {
+            Ok((status, inputs)) => (Ok(status), Some(inputs)),
+            Err(error) => (Err(Arc::new(error)), None),
+        },
+    };
     // A failed read depends on no clock reading, and is never reused.
     let (commit_delivery, window) =
         match client.group_commit_delivery_until(group_id, maintenance_rows) {
@@ -1320,21 +1648,32 @@ fn group_entry(
             .maintenance_status_in(group_id, maintenance_rows)
             .map_err(|error| Arc::new(AppError::from(error))),
         app_components,
+        recovery_status,
         record: record.clone(),
     };
     let reusable = device_group.is_ok()
+        && recovery_facts.unrecoverable.settled
         && settled(&answers.roster_revision)
         && settled(&answers.members)
         && settled(&answers.standing)
         && settled(&answers.mls_state)
         && settled(&answers.commit_delivery)
         && settled(&answers.maintenance_status)
-        && settled(&answers.app_components);
+        && settled(&answers.app_components)
+        && settled(&answers.recovery_status)
+        && recovery_inputs
+            .as_ref()
+            .is_none_or(|inputs| inputs.reusable);
     let validity = EntryValidity {
         generation,
         record,
         maintenance_paused,
         window,
+        key_packages: recovery_inputs.map_or(WallClockWindow::ALWAYS, |inputs| inputs.key_packages),
+        notices: recovery
+            .ok()
+            .map(|read| read.group_notices(group_id).clone()),
+        recovery_facts,
         reusable,
     };
     (answers, validity)
@@ -1388,6 +1727,14 @@ impl AppClient {
         // the clock has reached none of their lifetime bounds.
         #[cfg(any(test, feature = "test-support"))]
         if oracle::enabled() {
+            // The recovery answers, kept or rebuilt, at every publish
+            // (mdk#3273 decision 3).
+            oracle::recovery(
+                self,
+                &publisher.current(),
+                publisher.recovery.as_ref(),
+                publisher.storage_open_at_publish,
+            );
             let read_afresh = if _changed {
                 oracle::note_check();
                 oracle::check(
@@ -1421,7 +1768,9 @@ impl AppClient {
     /// Continue publishing A on a client that replaced the one `slot` was
     /// taken from. Every answer rebuilds at the next publish: the new
     /// client's write counts start over, so no stamp taken on the old one
-    /// may be compared with them.
+    /// may be compared with them. The worker resumes A only on a client
+    /// whose deferred hydration it has drained, so A never shows a group a
+    /// reopen only seeded.
     pub(crate) fn resume_read_state(&mut self, slot: Option<Box<ReadStateSlot>>) {
         if let Some(slot) = slot {
             slot.lock()
@@ -1451,6 +1800,20 @@ impl AppClient {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .key_packages_reused
         })
+    }
+
+    /// The account recovery status this client's last publish read or kept:
+    /// the same `Arc` while the answer is kept.
+    #[cfg(test)]
+    pub(crate) fn read_state_recovery_status(
+        &self,
+    ) -> Option<ReadAnswer<Arc<AccountRecoveryStatus>>> {
+        let slot = self.read_state.as_ref()?;
+        let publisher = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        publisher
+            .recovery
+            .as_ref()
+            .map(|answer| answer.status().clone())
     }
 
     /// A receiver of every version this client publishes, if it publishes:
@@ -1568,6 +1931,51 @@ pub(crate) mod oracle {
             equal || across_close,
             "read state differs from the live read for {name}: published {published:?}, live {live:?}"
         );
+    }
+
+    /// The recovery answers against the live reads, at every publish,
+    /// changed or not (mdk#3273 decision 3, condition 1): the account status
+    /// as `answer` holds it, under decision 2's window for a survey that
+    /// landed since its read, and every mirror group's status, strictly.
+    /// A closed-storage failure on either side inside the close window is
+    /// let through, as [`same`] lets it.
+    pub(crate) fn recovery(
+        client: &AppClient,
+        state: &ReadState,
+        answer: Option<&RecoveryAnswer>,
+        storage_open_at_publish: bool,
+    ) {
+        let window = Window {
+            storage_open_at_publish,
+            storage_closed: &client.app.storage_closed,
+        };
+        if let Some(answer) = answer {
+            let published = &state.account.recovery_status;
+            assert!(
+                same_answer(published, answer.status(), |ours, theirs| ours == theirs),
+                "the published recovery status is not the kept answer's"
+            );
+            let live = client.account_recovery_status();
+            let across_close = window.closed_inside()
+                && (published.as_ref().err().is_some_and(|error| closed(error))
+                    || live.as_ref().err().is_some_and(closed));
+            if let Some(field) = answer.differs_from_live(published, &live)
+                && !across_close
+            {
+                panic!(
+                    "read state differs from the live read for the account recovery status \
+                     ({field}): published {published:?}, live {live:?}"
+                );
+            }
+        }
+        for (group_id, group) in state.groups.iter() {
+            same(
+                window,
+                "group recovery status",
+                &group.recovery_status,
+                &client.group_recovery_status(group_id),
+            );
+        }
     }
 
     /// A group id no account holds.
@@ -1812,12 +2220,26 @@ pub(crate) mod oracle {
                         .pop()
                         .expect("one status in, one out")
                 });
-            same(
-                window,
-                "prepared group image status",
-                &state.prepared_group_image_status(upload_id),
-                &live,
-            );
+            // A version whose list failed, or whose list holds the upload
+            // with a record that does not read, sends the read to the
+            // worker, whose single read is the live one.
+            let unread = state
+                .account
+                .prepared_group_image_records_unread
+                .contains(upload_id);
+            match state.prepared_group_image_status(upload_id) {
+                Some(published) => {
+                    same(window, "prepared group image status", &published, &live);
+                }
+                None if unread => assert!(
+                    live.is_err(),
+                    "a record the version marks unread reads: {live:?}"
+                ),
+                None => assert!(
+                    state.account.prepared_group_images.is_err(),
+                    "a version with a list answers every upload id"
+                ),
+            }
         }
         same(
             window,
@@ -2158,6 +2580,226 @@ mod tests {
             publisher.deadline(Timestamp(0), Timestamp(50_010)),
             Some(Duration::from_secs(20))
         );
+        // A recovery status's KeyPackage bound is on the system clock too.
+        publisher.groups_key_packages_until = Some(Timestamp(50_015));
+        assert_eq!(
+            publisher.deadline(Timestamp(50_014), Timestamp(50_010)),
+            Some(Duration::from_secs(5))
+        );
+    }
+
+    /// A group entry holds only while the system clock is inside the window
+    /// its recovery status's reinvite KeyPackages leave it in: from the
+    /// reading they were judged at until the first `not_after`, exclusive.
+    /// Nothing else about the group moves here, so the window alone decides
+    /// (mdk#3273 PR 8).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_entry_holds_only_inside_its_key_package_window() {
+        let dir = tempfile::tempdir().unwrap();
+        marmot_account::AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(std::sync::Arc::new(
+                crate::tests::ScriptedPushRelayClient::default(),
+            ));
+        let mut client = app.client("alice").await.unwrap();
+        let group = client
+            .create_group("windowed", &[])
+            .await
+            .unwrap()
+            .operation
+            .unwrap();
+        let record = client
+            .state
+            .groups
+            .iter()
+            .find(|record| record.group_id_hex == hex::encode(group.as_slice()))
+            .unwrap()
+            .clone();
+        let generation = client
+            .runtime
+            .group_change_generations(std::iter::once(&group))
+            .remove(0);
+        let settled = |value| Fact {
+            value,
+            settled: true,
+        };
+        let validity = EntryValidity {
+            generation: generation.clone(),
+            record: record.clone(),
+            maintenance_paused: false,
+            window: WallClockWindow::ALWAYS,
+            key_packages: WallClockWindow {
+                from: Timestamp(1_000),
+                until: Some(Timestamp(2_000)),
+            },
+            notices: None,
+            recovery_facts: OwnFacts {
+                host_may_see: settled(true),
+                unrecoverable: settled(false),
+            },
+            reusable: true,
+        };
+        let holds_at = |system_now| {
+            validity.holds(
+                &generation,
+                &record,
+                false,
+                Timestamp(0),
+                Timestamp(system_now),
+            )
+        };
+        assert!(holds_at(1_000));
+        assert!(holds_at(1_999), "just before not_after");
+        assert!(!holds_at(2_000), "at not_after");
+        assert!(
+            !holds_at(999),
+            "a system clock moved back before the reading"
+        );
+    }
+
+    /// A publish judges a kept group entry's KeyPackage window against the
+    /// system-clock reading it took, and rebuilds the group's answers once
+    /// that reading is past the window (mdk#3273 PR 8). The window is planted
+    /// to end no later than that reading and to hold every other time the
+    /// publish has at hand: the account's wall clock, an hour back; the owned
+    /// KeyPackage list's judged reading, two hours back; and the window's
+    /// own start. The published answers carry a marker no rebuild gives, so
+    /// they stay only while the entry is kept. Readings are whole seconds,
+    /// so this says nothing of a system reading kept from an earlier publish
+    /// in the same second.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_publish_rebuilds_an_entry_once_its_key_package_window_ends() {
+        use cgka_traits::engine::SendIntent;
+        use cgka_traits::storage::{
+            OutboundIntentStorage as _, OwnCommitBaseline, OwnCommitIntent, ReinviteRetry,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        marmot_account::AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let app = crate::MarmotApp::with_relay(dir.path(), "wss://relay.example")
+            .with_test_relay_client(std::sync::Arc::new(
+                crate::tests::ScriptedPushRelayClient::default(),
+            ));
+        let mut client = app.client("alice").await.unwrap();
+        client.publish_key_package().await.unwrap();
+        let group = client
+            .create_group("windowed", &[])
+            .await
+            .unwrap()
+            .operation
+            .unwrap();
+        // A retained reinvite of Alice's own live KeyPackage, which the
+        // group's recovery status judges against the system clock.
+        let key_package = client.durably_owned_key_packages().unwrap().remove(0);
+        app.account_storage("alice")
+            .unwrap()
+            .put_own_commit_intent(&OwnCommitIntent {
+                commit_id: cgka_traits::MessageId::new(vec![0xc1; 32]),
+                group_id: group.clone(),
+                source_epoch: cgka_traits::EpochId(0),
+                intent: SendIntent::Invite {
+                    group_id: group.clone(),
+                    key_packages: vec![key_package],
+                    initial_admins: vec![],
+                },
+                baseline: OwnCommitBaseline::None,
+                reinvite: Some(ReinviteRetry::default()),
+                reissue_attempts: 0,
+                created_at_ms: 0,
+            })
+            .unwrap();
+        // The account's wall clock, an hour behind the system clock from
+        // the first publish on, so the entry's wall-clock window holds it.
+        struct BehindClock(u64);
+        impl marmot_session::WallClock for BehindClock {
+            fn now(&self) -> Timestamp {
+                Timestamp(self.0)
+            }
+            fn now_ms(&self) -> u64 {
+                self.0 * 1_000
+            }
+        }
+        client.runtime = client.runtime.with_maintenance_sources(
+            Arc::new(BehindClock(system_clock_now().0 - 3_600)),
+            Arc::new(marmot_session::SystemMonotonicClock::default()),
+            Arc::new(marmot_session::OsMaintenanceRandom),
+        );
+
+        let (sender, _reader) = read_state_channel();
+        let mut publisher = ReadStatePublisher::new(sender, UploadsInFlight::default());
+        assert!(publisher.publish(&client));
+        let window = publisher.entries[&group].key_packages;
+        assert!(
+            window.until.is_some_and(|until| until > system_clock_now()),
+            "the live reinvite bounds the entry: {window:?}"
+        );
+        assert!(publisher.current().groups[&group].recovery_status.is_ok());
+
+        let mut marked = None;
+        publisher.sender.send_modify(|state| {
+            let published = &state.groups[&group];
+            let answers = Arc::new(GroupAnswers {
+                record: published.record.clone(),
+                host_may_see: published.host_may_see,
+                awaits_hydration: published.awaits_hydration,
+                serves_reads: published.serves_reads,
+                roster_revision: published.roster_revision.clone(),
+                members: published.members.clone(),
+                standing: published.standing.clone(),
+                mls_state: published.mls_state.clone(),
+                commit_delivery: published.commit_delivery.clone(),
+                maintenance_status: published.maintenance_status.clone(),
+                app_components: published.app_components.clone(),
+                recovery_status: Err(Arc::new(AppError::UnknownGroup("marker".to_owned()))),
+            });
+            let mut groups = HashMap::clone(&state.groups);
+            groups.insert(group.clone(), Arc::clone(&answers));
+            marked = Some(answers);
+            *state = Arc::new(ReadState {
+                version: state.version,
+                valid_until: state.valid_until,
+                account: Arc::clone(&state.account),
+                groups: Arc::new(groups),
+            });
+        });
+        let marked = marked.unwrap();
+        let keeps_marker = |publisher: &ReadStatePublisher| {
+            Arc::ptr_eq(&publisher.current().groups[&group], &marked)
+        };
+
+        publisher.publish(&client);
+        assert!(
+            keeps_marker(&publisher),
+            "an entry inside its window is kept"
+        );
+
+        // The window ends at or before the reading the next publish takes,
+        // and holds every earlier time: the owned list's judged reading is
+        // moved two hours back, where the list still holds.
+        let reading = system_clock_now();
+        publisher.entries.get_mut(&group).unwrap().key_packages = WallClockWindow {
+            from: Timestamp(0),
+            until: Some(reading),
+        };
+        publisher.key_packages.as_mut().unwrap().1.window.from = Timestamp(reading.0 - 7_200);
+        assert!(publisher.publish(&client));
+        assert!(
+            publisher.key_packages_reused,
+            "the owned list is kept with its earlier reading"
+        );
+        assert!(
+            !keeps_marker(&publisher),
+            "an entry past its window is rebuilt"
+        );
+        assert!(publisher.current().groups[&group].recovery_status.is_ok());
+        assert_eq!(
+            publisher.entries[&group].key_packages.until, window.until,
+            "the rebuilt entry is bounded by the live KeyPackage again"
+        );
     }
 
     /// Before the worker's first publish a read is sent to the worker; once
@@ -2228,6 +2870,38 @@ mod tests {
         let mut watch = state.watch_backup_restore();
         assert!(watch.receiver.has_changed().unwrap());
         assert_eq!(watch.changed().await.unwrap(), later);
+
+        // A version is published before the channel announces its status.
+        // A watch handed out from it in between has seen that status: it
+        // shows it, and its announcement is no news. Only a later one is.
+        use futures::FutureExt as _;
+        let announced = BackupRestoreStatus {
+            phase: crate::BackupRestorePhase::Cancelled,
+            revision: 3,
+            ..Default::default()
+        };
+        let state = ReadState {
+            version: 2,
+            valid_until: None,
+            account: Arc::new(AccountAnswers {
+                backup_restore_status: announced.clone(),
+                backup_restore_updates: updates.subscribe(),
+                ..empty_account_answers()
+            }),
+            groups: Arc::default(),
+        };
+        let mut watch = state.watch_backup_restore();
+        assert_eq!(watch.snapshot(), announced);
+        updates.send_replace(announced.clone());
+        assert!(watch.changed().now_or_never().is_none());
+        assert_eq!(watch.snapshot(), announced);
+        let next = BackupRestoreStatus {
+            phase: crate::BackupRestorePhase::Discovering,
+            revision: 4,
+            ..Default::default()
+        };
+        updates.send_replace(next.clone());
+        assert_eq!(watch.changed().await.unwrap(), next);
     }
 
     /// A read whose groups come from stored rows waits for a version that

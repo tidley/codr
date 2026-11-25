@@ -147,7 +147,11 @@ fn normalize_cursor(
 }
 
 fn timeline_media(record: &TimelineMessageRecord, include: bool) -> Vec<AgentControlMediaRef> {
-    if !include || record.deleted || record.invalidation_status.is_some() || record.kind != 9 {
+    if !include
+        || record.deleted
+        || record.invalidation_status.is_some()
+        || !cgka_traits::is_chat_message(record.kind, &record.tags)
+    {
         return Vec::new();
     }
     media_refs_from_tags(&record.tags, record.source_epoch.unwrap_or_default())
@@ -270,8 +274,8 @@ mod tests {
             received_at: 43,
             reply_to_message_id_hex: Some("55".repeat(32)),
             reply_preview: None,
+            thread: None,
             media: None,
-            agent_text_stream: None,
             reactions: TimelineReactionSummary {
                 by_emoji: Default::default(),
                 user_reactions: vec![TimelineUserReaction {
@@ -331,6 +335,15 @@ mod tests {
         assert_eq!(media.len(), 1);
         assert_eq!(media[0].source_epoch, 7);
         assert_eq!(media[0].plaintext_sha256, "ab".repeat(32));
+        stored.kind = 1111;
+        // Only a parented comment is chat upstream. Numeric `k` or a body quote
+        // alone must not expose full media references through this extension.
+        assert!(timeline_media(&stored, true).is_empty());
+        stored.tags.push(vec!["k".into(), "9".into()]);
+        stored.tags.push(vec!["q".into(), "quote".into()]);
+        assert!(timeline_media(&stored, true).is_empty());
+        stored.tags.push(vec!["e".into(), "parent".into()]);
+        assert_eq!(timeline_media(&stored, true).len(), 1);
         stored.deleted = true;
         assert!(timeline_media(&stored, true).is_empty());
         stored.deleted = false;

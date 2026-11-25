@@ -110,6 +110,15 @@ impl PairingInbox {
         }
     }
 
+    /// Whether a pairing message waits to be read (mdk#3265).
+    fn holds_messages(&self) -> bool {
+        !self
+            .queue
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_empty()
+    }
+
     fn take(&self) -> Vec<InboundPairingMessage> {
         self.queue
             .lock()
@@ -153,14 +162,36 @@ pub(crate) struct DevicePairing {
     /// link before its first commit there landed: its user is told linking
     /// failed until it starts another link.
     removed_after_join: bool,
+    /// The trusted device group's roster may have changed since the last
+    /// drive: a failed link this device approved may still be listed there,
+    /// to be taken out (mdk#3265).
+    pub(crate) roster_changed: bool,
 }
 
 impl DevicePairing {
     pub(crate) fn new(inbox: Option<PairingInbox>) -> Self {
         Self {
             inbox,
+            // A failed link this device approved may still be listed: the
+            // first drive after open reads the roster (mdk#3265).
+            roster_changed: true,
             ..Self::default()
         }
+    }
+
+    /// Whether linking holds anything in memory that its timers still run:
+    /// a link this device is making, a prompt, an outbound message, or a
+    /// settlement window (mdk#2923).
+    pub(crate) fn has_state(&self) -> bool {
+        self.new_device.is_some()
+            || !self.prompts.is_empty()
+            || !self.outbox.is_empty()
+            || !self.quiet_since.is_empty()
+            || self
+                .inbox
+                .as_ref()
+                .is_some_and(PairingInbox::holds_messages)
+            || self.roster_changed
     }
 
     fn send(&mut self, message: PairingMessage, now: u64) {
@@ -436,6 +467,8 @@ impl AppClient {
         if self.device_unlinked {
             return;
         }
+        // This drive reads the roster as it now stands (mdk#3265).
+        self.device_pairing.roster_changed = false;
         let messages = self
             .device_pairing
             .inbox
@@ -1545,11 +1578,14 @@ impl AppClient {
     /// it is gone.
     async fn decide_device_links(&mut self, now: u64) {
         let window = Duration::from_millis(self.app.settlement_quiescence_ms());
+        // A failed read leaves the links to the next drive, 15 s on.
         let Ok(storage) = self.app.account_storage(&self.state.label) else {
+            self.device_pairing.roster_changed = true;
             return;
         };
         let storage = storage.app_storage();
         let (Ok(links), Ok(own_slot)) = (storage.device_links(), self.own_slot()) else {
+            self.device_pairing.roster_changed = true;
             return;
         };
         let mut pending = Vec::new();
@@ -1732,18 +1768,25 @@ impl AppClient {
                     Some(EngineError::LinkDeviceUnsettled { .. })
                 ) =>
             {
+                // What settles it need not change the roster: read it again
+                // on the next drive, 15 s on.
+                self.device_pairing.roster_changed = true;
                 tracing::debug!(
                     target: TARGET,
                     method = "unlink_failed_device",
                     "the device group is unsettled; the removal waits"
                 );
             }
-            Err(error) => tracing::warn!(
-                target: TARGET,
-                method = "unlink_failed_device",
-                error_kind = error.privacy_safe_kind(),
-                "could not remove a device whose link failed; retrying"
-            ),
+            Err(error) => {
+                // The next drive reads the roster again, 15 s on.
+                self.device_pairing.roster_changed = true;
+                tracing::warn!(
+                    target: TARGET,
+                    method = "unlink_failed_device",
+                    error_kind = error.privacy_safe_kind(),
+                    "could not remove a device whose link failed; retrying"
+                );
+            }
         }
     }
 
@@ -1839,7 +1882,7 @@ impl AppClient {
 
     /// Test hook: date every prompt's request `secs` earlier, as a code
     /// comparison that took that long would.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "test-policy-overrides"))]
     pub(crate) fn backdate_link_requests(&mut self, secs: u64) {
         for prompt in &mut self.device_pairing.prompts {
             prompt.requested_at = prompt.requested_at.saturating_sub(secs);
@@ -2172,6 +2215,7 @@ impl AppClient {
             prompts,
             moves: self.device_group_move_views()?,
             device_group_stalled: self.device_group_stalled()?,
+            chat_progress: self.link_chat_progress_views(now)?,
         })
     }
 }

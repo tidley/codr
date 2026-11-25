@@ -1,6 +1,6 @@
 # Combined codr daemon
 
-The unpublished 0.12.2 release candidate hosts the bridge and MDK 0.17.0 messaging runtime in one process.
+The issue #31 working source hosts the bridge and stable MDK 0.19.0 messaging runtime in one process.
 It does not spawn `wn-agent`. MDK keeps ownership of keys, account storage,
 cryptography, relay transport, and invitations. The existing private
 `marmot.agent-control.v2` socket remains available to local setup tools.
@@ -12,7 +12,7 @@ This does not authorize opening older or incompatible account storage.
 The repository pins Rust 1.97.1 with `llvm-tools-preview`, matching the MDK build
 cohort. The LLVM tools are required by optimized native Linux Markdown builds.
 
-MDK 0.17's native Markdown parser also requires Odin `dev-2026-10` at
+MDK 0.19's native Markdown parser also requires Odin `dev-2026-10` at
 `84bc3fc2100b0f7880a3af37f71bccdcda41c6f9`. Run
 `bash scripts/install-odin.sh /absolute/path/to/odin`, then put that directory
 on `PATH` before invoking Cargo. The installer verifies upstream archive hashes;
@@ -48,25 +48,35 @@ PR #29 now provisions it in the Linux packaging container without skipping gates
 Both old tags remain immutable; fresh four-platform 0.12.2 package qualification
 remains pending. See the [release handoff](releases/0.12.2-readiness.md).
 
-## MDK 0.17 storage boundary
+<a id="mdk-017-storage-boundary"></a>
 
-The current source declares `storage_cohort = "mdk-0.17"`, replacing the previous
-`mdk-0.14` cohort. Normal whole-binary updates reject that mismatch. Do not bypass
+## MDK 0.19 storage boundary
+
+The issue #31 source declares `storage_cohort = "mdk-0.19"`, replacing the
+source base's `mdk-0.17` cohort. This does not establish the installed cohort.
+Normal whole-binary updates reject a cohort mismatch. Do not bypass
 the gate: migration requires separate owner approval and a private, verified cold
-backup of the complete account home and credentials. MDK 0.17 upgrades account
-databases to schema 207; downgrade is unsupported. Review the upstream
-[0.17 integration guide](https://github.com/marmot-protocol/mdk/blob/v0.17.0/docs/integration/0.17.0.md)
-and its linked earlier guides before planning a 0.14-to-0.17 migration.
+backup of the account home and credentials, excluding plaintext `accounts/*/handoff/`
+leases. MDK 0.18 moves account schema 207 to 216, shared schema 4 to 5, and
+directory cache 2 to 3; 0.19 then moves accounts to schema 218. Downgrade is
+unsupported. Review both upstream
+[0.18](https://github.com/marmot-protocol/mdk/blob/v0.19.0/docs/integration/0.18.0.md)
+and [0.19](https://github.com/marmot-protocol/mdk/blob/v0.19.0/docs/integration/0.19.0.md)
+integration guides and the [local handoff](MDK-0.19.md). Earlier installed cohorts
+also need the intervening integration guides, not a claim of direct compatibility.
 
-That jump also includes 0.16's shared-database schema 3-to-4 migration and v5
+An upgrade from 0.14 also includes 0.16's shared-database schema 3-to-4 migration and v5
 audit-cursor upgrade. Back up the complete home, not only `session.sqlite`.
 New groups can require the account-devices component when every founder supports
 it; clients older than 0.15 cannot later join those groups. Existing groups are
-not automatically opted in. Verify phone interoperability before any live rollout.
+not automatically opted in. Device groups are on by default in 0.18/0.19; Codr
+does not add a linking workflow. 0.19 removes stream tables and kind-1200 timeline
+rows, but preserves retained events and durable kind-9 finals. Verify phone
+interoperability before any live rollout.
 
 The legacy automatic external-to-combined handover remains restricted to 0.14.
 The following 0.9/0.10 procedures describe that historical compatible cohort;
-they do not authorize opening a 0.14 account with the new 0.17 runtime.
+they do not authorize opening an older account with the new 0.19 runtime.
 
 ## Chat-only upgrade from 0.9
 

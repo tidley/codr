@@ -589,6 +589,15 @@ async fn siblings_exchange_small_state_through_the_device_group() {
         laptop_storage().unsent_invitation_decisions().unwrap(),
         [decision]
     );
+    // The answer it carried goes out again on the worker's next turn, as the
+    // answer first did, not at the next maintenance pass (mdk#3566).
+    assert!(devices.phone.drive_changed_invitation_decisions().await);
+    assert!(
+        phone_storage()
+            .unsent_invitation_decisions()
+            .unwrap()
+            .is_empty()
+    );
 
     // A withdrawn request owes a new one, on both.
     devices
@@ -645,6 +654,24 @@ async fn siblings_exchange_small_state_through_the_device_group() {
         .unwrap();
     assert_eq!(phone.unsent_small_state_items().unwrap().len(), 401);
     assert!(phone.small_state_schedule().unwrap().unwrap().request_owed);
+
+    // A withdrawn commit owes every item again, and its answer goes out on
+    // the next turn: an update sent on the commit's branch is parked with
+    // that branch, never withdrawn on its own (mdk#3594).
+    settle();
+    devices
+        .phone
+        .observe_device_group_event(&cgka_traits::engine::GroupEvent::GroupStateInvalidated {
+            group_id: group.clone(),
+            epoch: cgka_traits::EpochId(0),
+            invalidated_commit_id: MessageId::new(vec![0x66; 32]),
+            reason: cgka_traits::engine::GroupStateInvalidationReason::SupersededByBranchSelection,
+        })
+        .unwrap();
+    assert_eq!(phone.unsent_small_state_items().unwrap().len(), 401);
+    assert_eq!(phone.unsent_invitation_decisions().unwrap().len(), 1);
+    assert!(devices.phone.drive_changed_invitation_decisions().await);
+    assert!(phone.unsent_invitation_decisions().unwrap().is_empty());
 }
 
 /// An update that reaches no relay leaves its items owed, and the next pass

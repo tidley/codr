@@ -23,10 +23,13 @@ The current setup code uses **👾** as the public name and display name when it
 
 ## Install
 
-The unpublished 0.12.2 release candidate retains the MDK 0.17.0 update. Its account-storage migration
-is not an automatic update from the released 0.14 cohort. Keep the running
+Issue [#31](https://github.com/tidley/codr/issues/31) prepares a local source upgrade
+to stable MDK 0.19.0, without changing Codr's version or release channel. Its account-storage migration
+is not an automatic update from the 0.14 or 0.17 cohorts. Keep the running
 installation unchanged until a separately approved, backed-up migration; see the
-[combined-runtime storage boundary](docs/COMBINED.md#mdk-017-storage-boundary).
+[combined-runtime storage boundary](docs/COMBINED.md#mdk-019-storage-boundary)
+and [qualification/local-handover limits](docs/MDK-0.19.md). Source changes are
+not an installed update or migration approval.
 
 **0.11.2 targets existing accounts.** Fresh accounts use the
 supported 0.9.0 setup below, then the owner-confirmed chat handover. See the

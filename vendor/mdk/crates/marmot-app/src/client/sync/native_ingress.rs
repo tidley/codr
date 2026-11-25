@@ -80,8 +80,16 @@ impl AppClient {
     /// Examine at most four frames (including receipt skips) per turn, buffering its committed
     /// summary before an acknowledgement can suspend. Dropping this future
     /// returns its unacknowledged suffix in the original per-group order.
-    pub(crate) async fn admit_native_turn(&mut self) -> Result<bool, AppError> {
+    ///
+    /// On an account worker, `unit` is its gauge: from the turn's first ready
+    /// frame to the turn's end the worker is in a delivery unit. A turn with
+    /// no ready frame starts none.
+    pub(crate) async fn admit_native_turn(
+        &mut self,
+        unit: Option<&crate::runtime::account_worker::WorkerUnitGauge>,
+    ) -> Result<bool, AppError> {
         let mut progressed = false;
+        let mut _delivery_unit = None;
         let mut inventory = super::InventoryBatch::default();
         for _ in 0..MAX_NATIVE_ADMISSION_PER_TURN {
             // An unlinked account admits nothing more (mdk#2628 D67).
@@ -90,6 +98,10 @@ impl AppClient {
             {
                 break;
             }
+            if !progressed {
+                _delivery_unit = unit
+                    .and_then(|unit| unit.time(crate::runtime::account_worker::UnitKind::Delivery));
+            }
             #[cfg(feature = "test-policy-overrides")]
             if self
                 .app
@@ -97,14 +109,14 @@ impl AppClient {
                 .dev_fail_sync_before_delivery
                 .is_some_and(|limit| self.native_sync_deliveries >= limit)
             {
-                let id = self
+                let delivery = self
                     .recovery_owner
                     .native_batch
                     .as_ref()
                     .and_then(|batch| batch.delivery())
-                    .map(|delivery| hex::encode(delivery.message.id.as_slice()))
+                    .cloned()
                     .expect("the selected native batch is ready");
-                if !self.transport_receipts()?.contains(&id) {
+                if !self.transport_receipts()?.skips(&delivery)? {
                     return Err(AppError::BlockingTask(
                         "injected catch-up delivery failure".to_owned(),
                     ));

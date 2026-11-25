@@ -1833,7 +1833,6 @@ pub(crate) fn notification_update_from_event_cached(
         }
         MarmotAppEvent::GroupStateUpdated { .. }
         | MarmotAppEvent::ProjectionUpdated(_)
-        | MarmotAppEvent::AgentStreamStarted(_)
         | MarmotAppEvent::WelcomeDeliveryPending { .. }
         | MarmotAppEvent::EpochStallEscalated { .. }
         | MarmotAppEvent::GroupChangeSuperseded { .. }
@@ -2092,10 +2091,11 @@ fn notification_update_from_classified_group_state(
     }))
 }
 
-/// Classify every notification-eligible wire kind. Returning `None` for
+/// Classify every notification-eligible wire event. Returning `None` for
 /// unknown kinds keeps notification eligibility and channel routing coupled:
 /// adding a kind cannot silently fall through to the audible standard channel.
-fn notification_traffic_for_kind(kind: u64) -> Option<NotificationTrafficClass> {
+/// A thread message notifies like chat; other kind-1111 events are custom.
+fn notification_traffic(kind: u64, tags: &[Vec<String>]) -> Option<NotificationTrafficClass> {
     match kind {
         MARMOT_APP_EVENT_KIND_AGENT_ACTIVITY | MARMOT_APP_EVENT_KIND_AGENT_OPERATION => {
             Some(NotificationTrafficClass::AgentActivity)
@@ -2103,6 +2103,9 @@ fn notification_traffic_for_kind(kind: u64) -> Option<NotificationTrafficClass> 
         MARMOT_APP_EVENT_KIND_CHAT
         | MARMOT_APP_EVENT_KIND_REACTION
         | MARMOT_APP_EVENT_KIND_POLL => Some(NotificationTrafficClass::Standard),
+        _ if cgka_traits::thread_message_parent(kind, tags).is_some() => {
+            Some(NotificationTrafficClass::Standard)
+        }
         _ => None,
     }
 }
@@ -2111,7 +2114,7 @@ fn notification_traffic_for_kind(kind: u64) -> Option<NotificationTrafficClass> 
 pub(crate) fn notification_event_notifies(event: &MarmotAppEvent) -> bool {
     match event {
         MarmotAppEvent::MessageReceived(message) => {
-            notification_traffic_for_kind(message.message.kind).is_some()
+            notification_traffic(message.message.kind, &message.message.tags).is_some()
         }
         MarmotAppEvent::GroupJoined { .. } => true,
         MarmotAppEvent::GroupEvent(event) => {
@@ -2131,7 +2134,7 @@ fn notification_update_from_message(
     resolver: &mut NotificationResolver,
     event: &RuntimeMessageReceived,
 ) -> Result<Option<NotificationUpdate>, AppError> {
-    let Some(traffic_class) = notification_traffic_for_kind(event.message.kind) else {
+    let Some(traffic_class) = notification_traffic(event.message.kind, &event.message.tags) else {
         return Ok(None);
     };
     let storage = app.account_storage(&event.account_label)?.app_storage();
@@ -2228,6 +2231,14 @@ fn notification_update_from_group_join(
     }
     let group_id_hex = hex::encode(group_id.as_slice());
     let group = resolver.group(app, account_label, &group_id_hex)?;
+    // A join already confirmed, such as a chat this account holds reaching a
+    // newly linked device, is no invitation (mdk#3546).
+    if group
+        .as_ref()
+        .is_some_and(|group| !group.pending_confirmation)
+    {
+        return Ok(None);
+    }
     let receiver = resolver.user(app, account_id_hex)?;
     let sender_id = group
         .as_ref()
@@ -2309,7 +2320,7 @@ fn message_mentions_account(message: &ReceivedMessage, account_id_hex: &str) -> 
 }
 
 /// Pure mention predicate over a timeline message's raw fields. A message
-/// mentions `account_id_hex` when it is a kind-9 chat that either carries a
+/// mentions `account_id_hex` when it is a kind-9 chat or a thread message that either carries a
 /// NIP-27 pubkey-reference (`p`) tag resolving to the account, or an inline
 /// nostr pubkey entity referencing it (a bare `@npub1…` handle or an explicit
 /// `nostr:` URI). Shared with the chat-list unread projection so the @-badge
@@ -2322,7 +2333,7 @@ pub(crate) fn message_text_mentions_account(
     tags: &[Vec<String>],
     account_id_hex: &str,
 ) -> bool {
-    if kind != MARMOT_APP_EVENT_KIND_CHAT || account_id_hex.is_empty() {
+    if !cgka_traits::is_chat_message(kind, tags) || account_id_hex.is_empty() {
         return false;
     }
     if tags.iter().any(|tag| {

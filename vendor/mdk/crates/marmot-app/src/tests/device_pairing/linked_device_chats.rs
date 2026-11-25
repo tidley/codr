@@ -206,23 +206,24 @@ async fn hold_key_packages(
     // number of maintenance passes settles every replay slice (mdk#2861).
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
-            deliver_new(&mut phone.client, relay, &mut phone.cursor).await;
-            phone.client.sibling_key_package_upkeep(&[]).await;
-            deliver_new(&mut laptop.client, relay, &mut laptop.cursor).await;
-            laptop.client.run_due_maintenance().await.unwrap();
+            boxed(|| deliver_new(&mut phone.client, relay, &mut phone.cursor)).await;
+            boxed(|| phone.client.sibling_key_package_upkeep(&[])).await;
+            boxed(|| deliver_new(&mut laptop.client, relay, &mut laptop.cursor)).await;
+            boxed(|| laptop.client.run_due_maintenance()).await.unwrap();
             for client in [&mut phone.client, &mut laptop.client] {
                 for group in client.take_pending_convergence_groups() {
-                    client
-                        .advance_convergence_with_projection_progress_and_yield(
+                    boxed(|| {
+                        client.advance_convergence_with_projection_progress_and_yield(
                             &group,
                             None,
                             std::future::pending(),
                         )
-                        .await
-                        .unwrap();
+                    })
+                    .await
+                    .unwrap();
                 }
             }
-            deliver_new(&mut phone.client, relay, &mut phone.cursor).await;
+            boxed(|| deliver_new(&mut phone.client, relay, &mut phone.cursor)).await;
             if held_from(phone, laptop) > 0 {
                 break;
             }
@@ -300,6 +301,213 @@ async fn the_approving_device_adds_a_new_device_to_its_chats() {
     assert_eq!(phone.client.chats_closed_to_linked_devices().unwrap(), 0);
 }
 
+/// A chat reaches a newly linked laptop as it stands on the phone that adds
+/// it (mdk#3546): one the phone founded or accepted arrives confirmed, and
+/// an invitation still unanswered there arrives pending, from the account
+/// that sent it rather than from Alice herself. Chats from before invitation
+/// generations (no admission, which stay local-only) take that state from
+/// the sibling Welcome. An identified invitation settles through its
+/// generation's shared decision, which the phone records first if it
+/// accepted without one, as with device groups off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_linked_device_gets_each_chat_as_the_adding_device_holds_it() {
+    forwarded_invitation_case(false).await;
+}
+
+/// The laptop's own block of the inviter still governs how an accepted chat
+/// it gets from the phone is shown, as it governs a shared acceptance: each
+/// stays a pending invitation, which the block hides.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_linked_devices_block_holds_a_forwarded_acceptance() {
+    forwarded_invitation_case(true).await;
+}
+
+async fn forwarded_invitation_case(laptop_blocks_bob: bool) {
+    let (relay, [mut phone]) = alice_devices::<1>().await;
+    let alice = phone
+        .app
+        .account_home()
+        .account("alice")
+        .unwrap()
+        .account_id_hex;
+    let bob_dir = tempfile::tempdir().unwrap();
+    let bob_id = AccountHome::open(bob_dir.path())
+        .create_account("bob")
+        .unwrap()
+        .account_id_hex;
+    let bob_app = crate::tests::canonical_membership::app_at(&bob_dir, relay.clone());
+    remember_test_member_inbox(&bob_app, &alice, "wss://relay.example");
+    let mut bob = bob_app.client("bob").await.unwrap();
+    let mut invite = async |name: &str| {
+        bob.create_group(name, &[&alice])
+            .await
+            .unwrap()
+            .operation
+            .expect("eligible fixture members")
+    };
+    let accepted_legacy = invite("accepted, legacy").await;
+    let unanswered_legacy = invite("unanswered, legacy").await;
+    let accepted_unrecorded = invite("accepted, no decision").await;
+    let rebuilt = invite("unanswered, rebuilt").await;
+    let unanswered = invite("unanswered").await;
+    deliver_new(&mut phone.client, &relay, &mut phone.cursor).await;
+    phone.client.sync().await.unwrap();
+    for chat in [&accepted_legacy, &accepted_unrecorded] {
+        phone.client.accept_group_invite(chat).unwrap();
+    }
+    let founded_legacy = chats(&mut phone, 1).await.remove(0);
+    // Copies installed before invitation generations have no admission and
+    // so no decision; migration 0170 seeded none. A copy accepted while
+    // device groups were off has its admission but no decision.
+    let db = account_database(&phone.app);
+    for chat in [&founded_legacy, &accepted_legacy, &unanswered_legacy] {
+        db.execute(
+            "DELETE FROM cgka_invitation_admissions WHERE group_id = ?1",
+            [chat.as_slice()],
+        )
+        .unwrap();
+    }
+    for chat in [&founded_legacy, &accepted_legacy, &accepted_unrecorded] {
+        db.execute(
+            "DELETE FROM invitation_decisions WHERE group_id_hex = ?1",
+            [hex::encode(chat.as_slice())],
+        )
+        .unwrap();
+    }
+    // A row rebuilt after a local deletion is unconfirmed by default and
+    // carries no Welcome; that is no acceptance to share.
+    db.execute(
+        "UPDATE account_groups SET pending_confirmation = 0, welcomer_account_id_hex = NULL,
+             via_welcome_message_id_hex = NULL WHERE group_id_hex = ?1",
+        [hex::encode(rebuilt.as_slice())],
+    )
+    .unwrap();
+    drop(db);
+    let mut phone = reopen(phone).await;
+
+    // The laptop signs in only now, so none of Bob's invitations reached it.
+    let mut laptop = another_alice_device(&relay, &phone).await;
+    if laptop_blocks_bob {
+        laptop
+            .app
+            .set_user_blocked("alice", &bob_id, true)
+            .await
+            .unwrap();
+    }
+    link(&relay, &mut phone, &mut laptop, "Laptop").await;
+    // The decision the phone records for `accepted_unrecorded` reaches the
+    // laptop ahead of its Welcome, so the copy is never an invitation there.
+    let mut seen = false;
+    for _ in 0..6 {
+        passes(&relay, &mut [&mut phone, &mut laptop], 1).await;
+        if !seen && let Some(group) = laptop.client.state_group_record(&accepted_unrecorded) {
+            seen = true;
+            assert_eq!(group.pending_confirmation, laptop_blocks_bob);
+        }
+    }
+    assert!(seen);
+
+    let invitation = |chat: &GroupId| {
+        let group = laptop
+            .client
+            .state_group_record(chat)
+            .expect("the laptop joined from the phone's sibling Welcome");
+        (group.pending_confirmation, group.welcomer_account_id_hex)
+    };
+    assert!(!invitation(&founded_legacy).0);
+    let from_bob = |pending| (pending, Some(bob_id.clone()));
+    assert_eq!(invitation(&accepted_legacy), from_bob(laptop_blocks_bob));
+    assert_eq!(
+        invitation(&accepted_unrecorded),
+        from_bob(laptop_blocks_bob)
+    );
+    assert_eq!(invitation(&unanswered_legacy), from_bob(true));
+    assert!(invitation(&rebuilt).0);
+    let phone_store = phone.app.account_storage("alice").unwrap();
+    let generation = {
+        use cgka_traits::storage::GroupStorage as _;
+        phone_store
+            .invitation_admission(&rebuilt)
+            .unwrap()
+            .unwrap()
+            .generation
+    };
+    assert_eq!(
+        phone_store
+            .app_storage()
+            .invitation_decision(&hex::encode(rebuilt.as_slice()), &generation)
+            .unwrap(),
+        None,
+        "a rebuilt row records no acceptance"
+    );
+    assert_eq!(invitation(&unanswered), from_bob(true));
+}
+
+/// A chat the phone accepted with device groups off holds no decision. The
+/// scan that records its acceptance adds no device to that chat, not even a
+/// second new device that would otherwise find the decision stored and get
+/// its Welcome before the decision is sent (mdk#3546); a later pass adds
+/// both, and both see the chat confirmed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_recorded_acceptance_holds_every_new_device_until_it_is_sent() {
+    let (relay, [mut phone]) = alice_devices::<1>().await;
+    let alice = phone
+        .app
+        .account_home()
+        .account("alice")
+        .unwrap()
+        .account_id_hex;
+    let bob_dir = tempfile::tempdir().unwrap();
+    AccountHome::open(bob_dir.path())
+        .create_account("bob")
+        .unwrap();
+    let bob_app = crate::tests::canonical_membership::app_at(&bob_dir, relay.clone());
+    remember_test_member_inbox(&bob_app, &alice, "wss://relay.example");
+    let mut bob = bob_app.client("bob").await.unwrap();
+    let chat = bob
+        .create_group("accepted, no decision", &[&alice])
+        .await
+        .unwrap()
+        .operation
+        .expect("eligible fixture members");
+    deliver_new(&mut phone.client, &relay, &mut phone.cursor).await;
+    phone.client.sync().await.unwrap();
+    phone.client.accept_group_invite(&chat).unwrap();
+    account_database(&phone.app)
+        .execute(
+            "DELETE FROM invitation_decisions WHERE group_id_hex = ?1",
+            [hex::encode(chat.as_slice())],
+        )
+        .unwrap();
+    // The laptop and tablet sign in only now, so Bob's invitation reached
+    // neither.
+    let mut laptop = another_alice_device(&relay, &phone).await;
+    let mut tablet = another_alice_device(&relay, &phone).await;
+    link(&relay, &mut phone, &mut laptop, "Laptop").await;
+    link(&relay, &mut phone, &mut tablet, "Tablet").await;
+    hold_key_packages(&relay, &mut phone, &mut laptop).await;
+    hold_key_packages(&relay, &mut phone, &mut tablet).await;
+    phone
+        .client
+        .add_linked_devices_to_chats(&[], &mut Default::default())
+        .await;
+    assert_eq!(
+        (taken_from(&phone, &laptop), taken_from(&phone, &tablet)),
+        (0, 0)
+    );
+
+    passes(&relay, &mut [&mut phone, &mut laptop, &mut tablet], 4).await;
+    for device in [&laptop, &tablet] {
+        assert!(
+            !device
+                .client
+                .state_group_record(&chat)
+                .expect("added once the acceptance was sent")
+                .pending_confirmation
+        );
+    }
+}
+
 /// A real linked sender rebroadcasts a retained winning choice. It need not
 /// have this ordinary chat installed to authenticate its account's choice.
 async fn receive_account_choice(
@@ -328,16 +536,27 @@ async fn receive_account_choice(
         crate::small_state::encode_invitation_decision_updates(std::slice::from_ref(&decision)),
     )
     .unwrap();
-    assert!(source.client.send_device_group_message(
-        &group, crate::small_state::KIND_SMALL_STATE_UPDATE, content,
-    ).await.unwrap());
+    assert!(
+        boxed(|| source.client.send_device_group_message(
+            &group,
+            crate::small_state::KIND_SMALL_STATE_UPDATE,
+            content,
+        ))
+        .await
+        .unwrap()
+    );
     // Direct clients have no worker. Await the real authenticated winner,
     // not a fixed count of convergence passes.
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
-            converge_device_group(&mut source.client, relay, &mut source.cursor, &group, 1).await;
-            converge_device_group(&mut receiver.client, relay, &mut receiver.cursor, &group, 1)
-                .await;
+            boxed(|| {
+                converge_device_group(&mut source.client, relay, &mut source.cursor, &group, 1)
+            })
+            .await;
+            boxed(|| {
+                converge_device_group(&mut receiver.client, relay, &mut receiver.cursor, &group, 1)
+            })
+            .await;
             if store
                 .app_storage()
                 .invitation_decision(&decision.group_id_hex, &generation)
@@ -960,7 +1179,7 @@ async fn a_deferred_worker_attributes_an_accepted_sibling_departure() {
         MarmotAppConfig::white_noise()
             .with_dev_settlement_quiescence_ms(0)
             .with_dev_scheduled_convergence_delay_ms(0)
-            .with_dev_device_groups(true),
+            .with_device_groups(true),
     )
     .with_test_relay_client(relay.clone());
     let runtime = MarmotAppRuntime::new(reopened.clone());
@@ -1349,39 +1568,58 @@ async fn invitation_work_preserves_a_pending_chat_projection() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_declined_generation_holds_automatic_adds_until_a_later_accept() {
     use cgka_traits::storage::{GroupStorage as _, LeaveRequestStorage as _};
-    async fn exchange_decision(
+    fn exchange_decision(
         relay: &ScriptedPushRelayClient,
         source: &mut Device,
         receiver: &mut Device,
         group: &GroupId,
         chat: &GroupId,
         expected: ([u8; 32], u64, bool),
-    ) {
-        let (generation, version, declined) = expected;
-        // Direct clients have no worker to advance scheduled convergence.
-        // Await the real replicated value, not a fixed number of passes.
-        tokio::time::timeout(Duration::from_secs(30), async {
-            loop {
-                source.client.drive_small_state().await;
-                converge_device_group(&mut source.client, relay, &mut source.cursor, group, 1)
+    ) -> impl Future<Output = ()> {
+        boxed(move || async move {
+            let (generation, version, declined) = expected;
+            // Direct clients have no worker to advance scheduled convergence.
+            // Await the real replicated value, not a fixed number of passes.
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    boxed(|| source.client.drive_small_state()).await;
+                    boxed(|| {
+                        converge_device_group(
+                            &mut source.client,
+                            relay,
+                            &mut source.cursor,
+                            group,
+                            1,
+                        )
+                    })
                     .await;
-                converge_device_group(&mut receiver.client, relay, &mut receiver.cursor, group, 1)
+                    boxed(|| {
+                        converge_device_group(
+                            &mut receiver.client,
+                            relay,
+                            &mut receiver.cursor,
+                            group,
+                            1,
+                        )
+                    })
                     .await;
-                let held = receiver
-                    .app
-                    .account_storage("alice")
-                    .unwrap()
-                    .app_storage()
-                    .invitation_decision(&hex::encode(chat.as_slice()), &generation)
-                    .unwrap();
-                if held.is_some_and(|held| held.version == version && held.declined == declined) {
-                    break;
+                    let held = receiver
+                        .app
+                        .account_storage("alice")
+                        .unwrap()
+                        .app_storage()
+                        .invitation_decision(&hex::encode(chat.as_slice()), &generation)
+                        .unwrap();
+                    if held.is_some_and(|held| held.version == version && held.declined == declined)
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
                 }
-                tokio::task::yield_now().await;
-            }
+            })
+            .await
+            .expect("the authenticated decision reaches its sibling");
         })
-        .await
-        .expect("the authenticated decision reaches its sibling");
     }
     let (relay, [first, second, mut laptop]) = alice_devices::<3>().await;
     let (mut tablet, mut phone) = if first.slot_hex() < second.slot_hex() {
@@ -1391,9 +1629,9 @@ async fn a_declined_generation_holds_automatic_adds_until_a_later_accept() {
     };
     let group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
     link(&relay, &mut phone, &mut tablet, "Tablet").await;
-    hold_key_packages(&relay, &mut phone, &mut laptop).await;
-    hold_key_packages(&relay, &mut phone, &mut tablet).await;
-    phone.client.sibling_key_package_upkeep(&[]).await;
+    boxed(|| hold_key_packages(&relay, &mut phone, &mut laptop)).await;
+    boxed(|| hold_key_packages(&relay, &mut phone, &mut tablet)).await;
+    boxed(|| phone.client.sibling_key_package_upkeep(&[])).await;
     let store = phone.app.account_storage("alice").unwrap();
     let stock = store.app_storage();
     let laptop_slot: [u8; 32] = hex::decode(laptop.slot_hex()).unwrap().try_into().unwrap();
@@ -1420,31 +1658,33 @@ async fn a_declined_generation_holds_automatic_adds_until_a_later_accept() {
         .unwrap()
         .account_id_hex;
     remember_test_member_inbox(&bob_app, &alice, "wss://relay.example");
-    let mut bob = bob_app.client("bob").await.unwrap();
+    let mut bob = boxed(|| bob_app.client("bob")).await.unwrap();
     let mut invitations = Vec::new();
-    for name in ["direct declined invitation", "gap declined invitation"] {
-        let chat = bob
-            .create_group(name, &[])
+    for name in [
+        "direct declined invitation",
+        "gap declined invitation",
+        "claimed declined invitation",
+    ] {
+        let chat = boxed(|| bob.create_group(name, &[]))
             .await
             .unwrap()
             .operation
             .expect("eligible fixture members");
         let phone_key = published_key_package(&mut phone.client, &relay).await;
         let tablet_key = published_key_package(&mut tablet.client, &relay).await;
-        let effects = bob
-            .runtime
-            .send(SendIntent::Invite {
-                group_id: chat.clone(),
-                key_packages: vec![phone_key, tablet_key],
-                initial_admins: vec![MemberId::new(hex::decode(&alice).unwrap())],
-            })
+        let invite = SendIntent::Invite {
+            group_id: chat.clone(),
+            key_packages: vec![phone_key, tablet_key],
+            initial_admins: vec![MemberId::new(hex::decode(&alice).unwrap())],
+        };
+        let effects = boxed(|| bob.runtime.send(invite)).await.unwrap();
+        boxed(|| bob.observe_drained_session_events(&effects))
             .await
             .unwrap();
-        bob.observe_drained_session_events(&effects).await.unwrap();
-        deliver_new(&mut phone.client, &relay, &mut phone.cursor).await;
-        phone.client.sync().await.unwrap();
-        deliver_new(&mut tablet.client, &relay, &mut tablet.cursor).await;
-        tablet.client.sync().await.unwrap();
+        boxed(|| deliver_new(&mut phone.client, &relay, &mut phone.cursor)).await;
+        boxed(|| phone.client.sync()).await.unwrap();
+        boxed(|| deliver_new(&mut tablet.client, &relay, &mut tablet.cursor)).await;
+        boxed(|| tablet.client.sync()).await.unwrap();
         assert!(
             phone
                 .client
@@ -1463,32 +1703,31 @@ async fn a_declined_generation_holds_automatic_adds_until_a_later_accept() {
             "the pending admin chat otherwise admits same-account Adds"
         );
         bob.self_demote_admin(&chat).await.unwrap();
-        deliver_new(&mut phone.client, &relay, &mut phone.cursor).await;
-        deliver_new(&mut tablet.client, &relay, &mut tablet.cursor).await;
-        receive_account_choice(&relay, &mut tablet, &mut phone, &chat, 1, true).await;
+        boxed(|| deliver_new(&mut phone.client, &relay, &mut phone.cursor)).await;
+        boxed(|| deliver_new(&mut tablet.client, &relay, &mut tablet.cursor)).await;
+        boxed(|| receive_account_choice(&relay, &mut tablet, &mut phone, &chat, 1, true)).await;
         assert!(store.leave_request(&chat).unwrap().is_none());
         assert!(phone.client.group_quiet(&chat).unwrap());
         invitations.push(chat);
     }
-    let [direct, gap] = <[_; 2]>::try_from(invitations).unwrap();
+    let [direct, gap, claimed] = <[_; 3]>::try_from(invitations).unwrap();
     // Tablet has not learned the decline yet. Its real authenticated lower
     // claim is advisory and must survive Phone's later semantic hold.
     let claim = format!(
         "{{\"v\":1,\"from\":\"{}\",\"to\":\"{}\",\"chat\":\"{}\"}}",
         tablet.slot_hex(),
         laptop.slot_hex(),
-        hex::encode(direct.as_slice())
+        hex::encode(claimed.as_slice())
     );
     assert!(
-        tablet
-            .client
-            .send_device_group_message(&group, 458, claim)
+        boxed(|| tablet.client.send_device_group_message(&group, 458, claim))
             .await
             .unwrap()
     );
-    converge_device_group(&mut tablet.client, &relay, &mut tablet.cursor, &group, 1).await;
-    converge_device_group(&mut phone.client, &relay, &mut phone.cursor, &group, 1).await;
-    for chat in [&direct, &gap] {
+    boxed(|| converge_device_group(&mut tablet.client, &relay, &mut tablet.cursor, &group, 1))
+        .await;
+    boxed(|| converge_device_group(&mut phone.client, &relay, &mut phone.cursor, &group, 1)).await;
+    for chat in [&direct, &gap, &claimed] {
         let generation = store
             .invitation_admission(chat)
             .unwrap()
@@ -1550,14 +1789,18 @@ async fn a_declined_generation_holds_automatic_adds_until_a_later_accept() {
     }
     let held = held_from(&phone, &laptop);
     let tablet_taken = taken_from(&phone, &tablet);
-    phone
-        .client
-        .add_linked_devices_to_chats(&[], &mut Default::default())
-        .await;
-    phone
-        .client
-        .fill_sibling_chat_gaps(&[], 10, &mut Default::default())
-        .await;
+    let mut selection = Default::default();
+    boxed(|| {
+        phone
+            .client
+            .add_linked_devices_to_chats(&[], &mut selection)
+    })
+    .await;
+    let mut selection = Default::default();
+    // The direct scan may publish its updated inventory. A subsequent gap
+    // pass must publish no claim for either declined chat.
+    let before = relay.published_event_ids().len();
+    boxed(|| phone.client.fill_sibling_chat_gaps(&[], 10, &mut selection)).await;
     assert_eq!(
         taken_from(&phone, &laptop),
         0,
@@ -1567,7 +1810,7 @@ async fn a_declined_generation_holds_automatic_adds_until_a_later_accept() {
     assert_eq!(
         relay.published_event_ids().len(),
         before,
-        "no new Add or claim on the automatic Add paths"
+        "no new Add or claim on the gap-filling path"
     );
     assert_eq!(held_from(&phone, &laptop), held);
     assert_eq!(taken_from(&phone, &laptop), 0);
@@ -1578,11 +1821,13 @@ async fn a_declined_generation_holds_automatic_adds_until_a_later_accept() {
         .received_private_key_packages_from(&laptop.slot_hex(), crate::unix_now_seconds())
         .unwrap()
         .remove(0);
-    phone
-        .client
-        .add_sibling_to_chat(&direct, &laptop_slot, candidate)
-        .await
-        .unwrap();
+    boxed(|| {
+        phone
+            .client
+            .add_sibling_to_chat(&direct, &laptop_slot, candidate)
+    })
+    .await
+    .unwrap();
     assert_eq!(
         held_from(&phone, &laptop),
         held,
@@ -1630,11 +1875,13 @@ async fn a_declined_generation_holds_automatic_adds_until_a_later_accept() {
         ]))
         .unwrap();
     assert!(
-        tablet
-            .client
-            .send_device_group_message(&group, crate::small_state::KIND_SMALL_STATE_UPDATE, content)
-            .await
-            .unwrap()
+        boxed(|| tablet.client.send_device_group_message(
+            &group,
+            crate::small_state::KIND_SMALL_STATE_UPDATE,
+            content
+        ))
+        .await
+        .unwrap()
     );
     exchange_decision(
         &relay,
@@ -1654,34 +1901,52 @@ async fn a_declined_generation_holds_automatic_adds_until_a_later_accept() {
         phone.client.group_quiet(&group).unwrap(),
         "the device group is ready for an automatic Add"
     );
+    tablet.client.accept_group_invite(&claimed).unwrap();
+    let generation = store
+        .invitation_admission(&claimed)
+        .unwrap()
+        .unwrap()
+        .generation;
+    exchange_decision(
+        &relay,
+        &mut tablet,
+        &mut phone,
+        &group,
+        &claimed,
+        (generation, 2, false),
+    )
+    .await;
+    phone.client.drive_invitation_decisions().await;
+    // The approver's direct flow adds the laptop to the accepted chat
+    // despite the unrelated Decline. It leaves the claimed chat to the
+    // tablet's live claim (mdk#3537).
+    let mut selection = Default::default();
+    boxed(|| {
+        phone
+            .client
+            .add_linked_devices_to_chats(&[], &mut selection)
+    })
+    .await;
+    assert_eq!(taken_from(&phone, &laptop), 1);
+    assert_eq!(leaves_of(&phone, &laptop, &direct, &group), 1);
+    assert_eq!(leaves_of(&phone, &laptop, &claimed, &group), 0);
+    assert_eq!(leaves_of(&phone, &laptop, &gap, &group), 0);
     let before = relay.published_event_ids().len();
-    phone
-        .client
-        .fill_sibling_chat_gaps(&[], 10, &mut Default::default())
-        .await;
+    let mut selection = Default::default();
+    boxed(|| phone.client.fill_sibling_chat_gaps(&[], 10, &mut selection)).await;
     assert_eq!(
         taken_from(&phone, &laptop),
-        0,
-        "the original live lower claim still holds this gap after decline and accept"
+        1,
+        "the original live lower claim still holds its gap after decline and accept"
     );
     assert_eq!(
         relay.published_event_ids().len(),
         before,
         "no renewed claim before its original expiry"
     );
-    // The approver's independent direct flow does not use advisory gap claims.
-    phone
-        .client
-        .add_linked_devices_to_chats(&[], &mut Default::default())
-        .await;
-    assert_eq!(taken_from(&phone, &laptop), 1);
-    assert_eq!(leaves_of(&phone, &laptop, &direct, &group), 1);
-    assert_eq!(leaves_of(&phone, &laptop, &gap, &group), 0);
-    phone.client.sibling_key_package_upkeep(&[]).await;
-    phone
-        .client
-        .fill_sibling_chat_gaps(&[], 10, &mut Default::default())
-        .await;
+    boxed(|| phone.client.sibling_key_package_upkeep(&[])).await;
+    let mut selection = Default::default();
+    boxed(|| phone.client.fill_sibling_chat_gaps(&[], 10, &mut selection)).await;
 
     // Both the global eligibility snapshot and the declined chat's due pass
     // were consumed above. Only a winning app decision changes now: no chat
@@ -1707,10 +1972,8 @@ async fn a_declined_generation_holds_automatic_adds_until_a_later_accept() {
     assert_eq!(phone.client.runtime.epoch_pin(&group).unwrap(), pin);
     assert_eq!(phone.client.runtime.epoch_pin(&gap).unwrap(), chat_pin);
     assert!(store.leave_request(&gap).unwrap().is_none());
-    phone
-        .client
-        .fill_sibling_chat_gaps(&[], 10, &mut Default::default())
-        .await;
+    let mut selection = Default::default();
+    boxed(|| phone.client.fill_sibling_chat_gaps(&[], 10, &mut selection)).await;
     assert_eq!(
         taken_from(&phone, &laptop),
         2,
@@ -1727,18 +1990,30 @@ async fn a_declined_generation_holds_automatic_adds_until_a_later_accept() {
     );
 }
 
-/// The direct post-link burst belongs to the approver. A different sibling
-/// can still fill the missing chats through the advisory claim flow while
-/// that approver is offline; the returning approver adds no duplicate.
+/// The direct post-link burst belongs to the approver. Another sibling, even
+/// one in a lower slot, leaves the new device to it while it is active
+/// (mdk#3537), and fills the missing chats through the advisory claim flow
+/// once the approver has gone quiet; the returning approver adds no
+/// duplicate. A chat the laptop holds confirmed but with no decision, as
+/// when accepted with device groups off, first gets its acceptance sent,
+/// with no claim to hold up the Add that follows (mdk#3546).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_sibling_fills_missing_chats_while_the_approver_is_offline() {
-    let (relay, [mut phone, mut laptop, mut tablet]) = alice_devices::<3>().await;
+    let (relay, [first, second, mut tablet]) = alice_devices::<3>().await;
+    let (mut laptop, mut phone) = if first.slot_hex() < second.slot_hex() {
+        (first, second)
+    } else {
+        (second, first)
+    };
     let chats = chats(&mut phone, 2).await;
     let group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
     passes(&relay, &mut [&mut phone, &mut laptop], 4).await;
     assert!(chats.iter().all(|chat| joined(&laptop, chat)));
 
     link(&relay, &mut phone, &mut tablet, "Tablet").await;
+    // Publish the approver's inventory before it goes offline. The laptop
+    // can then do every Add and the tablet still recognizes completion.
+    passes(&relay, &mut [&mut phone], 1).await;
     hold_key_packages(&relay, &mut laptop, &mut tablet).await;
     laptop
         .client
@@ -1748,6 +2023,26 @@ async fn a_sibling_fills_missing_chats_while_the_approver_is_offline() {
     assert_eq!(taken_from(&laptop, &tablet), 0);
     assert!(!chats.iter().any(|chat| joined(&tablet, chat)));
 
+    // The phone approved the link just now, so it is active: the laptop
+    // neither claims nor spends stock for the tablet.
+    let before = relay.published_event_ids().len();
+    laptop
+        .client
+        .fill_sibling_chat_gaps(&[], LINK_CHAT_ADDS_PER_PASS, &mut Default::default())
+        .await;
+    assert_eq!(relay.published_event_ids().len(), before);
+    assert_eq!(taken_from(&laptop, &tablet), 0);
+
+    account_database(&laptop.app)
+        .execute(
+            "DELETE FROM invitation_decisions WHERE group_id_hex = ?1",
+            [hex::encode(chats[0].as_slice())],
+        )
+        .unwrap();
+
+    // Two hours on, the phone has not been heard from.
+    laptop.client.sibling_chat_gaps.test_approver_clock_ahead =
+        crate::client::device_heartbeats::APPROVER_ACTIVE_SECS;
     tokio::time::timeout(Duration::from_secs(30), async {
         while !chats.iter().all(|chat| joined(&tablet, chat)) {
             passes(&relay, &mut [&mut laptop, &mut tablet], 1).await;
@@ -1768,6 +2063,24 @@ async fn a_sibling_fills_missing_chats_while_the_approver_is_offline() {
     })
     .await
     .expect("the online sibling fills both missing chats");
+    // The acceptance the laptop sent first settles that chat. The other's
+    // decision reaches the tablet only by a later broadcast (mdk#3556).
+    assert!(
+        !tablet
+            .client
+            .state_group_record(&chats[0])
+            .unwrap()
+            .pending_confirmation
+    );
+    assert_eq!(
+        tablet.op(DeviceLinkOp::Read).await.chat_progress,
+        vec![crate::LinkChatProgress {
+            slot_id_hex: tablet.slot_hex(),
+            on_new_device: true,
+            total: 2,
+            remaining: 0,
+        }]
+    );
     assert_eq!(taken_from(&laptop, &tablet), chats.len());
 
     passes(&relay, &mut [&mut phone, &mut tablet, &mut laptop], 3).await;
@@ -1776,6 +2089,106 @@ async fn a_sibling_fills_missing_chats_while_the_approver_is_offline() {
         assert_eq!(leaves_of(&phone, &tablet, chat, &group), 1);
     }
     assert_eq!(taken_from(&phone, &tablet), 0);
+}
+
+/// mdk#3537: an approver in the lowest slot that comes back to find a
+/// higher sibling's live claim on a chat for its new device, before that
+/// sibling's Add, leaves the chat to it. The claim arrives with the new
+/// device's first commit, before the approver has settled its own link. One
+/// maintenance turn adds the device to the unclaimed chat, and neither the
+/// direct pass nor the approver's own gap filling spends stock for or adds it
+/// in the claimed one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_returning_approver_leaves_a_claimed_chat_to_a_higher_sibling() {
+    let (relay, [first, second, mut tablet]) = alice_devices::<3>().await;
+    let (mut phone, mut laptop) = if first.slot_hex() < second.slot_hex() {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    let chats = chats(&mut phone, 2).await;
+    let group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
+    passes(&relay, &mut [&mut phone, &mut laptop], 4).await;
+    assert!(chats.iter().all(|chat| joined(&laptop, chat)));
+    // The phone links the tablet, then is away while the tablet joins and
+    // makes its first commit, and the laptop claims the first chat.
+    let slot = choose_link(&relay, &mut phone, &mut tablet).await;
+    tablet.op(DeviceLinkOp::ConfirmMatch).await;
+    tablet.step(&relay).await; // the phone's confirm in, the tablet's out
+    phone.step(&relay).await; // the tablet's confirm in: the commit
+    let joined_tablet = tablet.step(&relay).await; // the Welcome, and its first commit
+    assert_eq!(joined_tablet.new_device, Some(NewDeviceLinkState::Linked));
+    converge_device_group(&mut laptop.client, &relay, &mut laptop.cursor, &group, 4).await;
+    let claim = format!(
+        "{{\"v\":1,\"from\":\"{}\",\"to\":\"{}\",\"chat\":\"{}\"}}",
+        laptop.slot_hex(),
+        tablet.slot_hex(),
+        hex::encode(chats[0].as_slice())
+    );
+    assert!(
+        laptop
+            .client
+            .send_device_group_message(&group, 458, claim)
+            .await
+            .unwrap()
+    );
+    deliver_new(&mut phone.client, &relay, &mut phone.cursor).await;
+    assert_eq!(
+        link_record(&phone, &group, &slot).outcome,
+        DeviceLinkOutcome::Pending,
+        "the claim arrived before the phone settled its link"
+    );
+    let settled = phone.step(&relay).await;
+    assert_eq!(
+        settled.prompt_for_slot(&slot).unwrap().state,
+        DeviceLinkPromptState::Linked
+    );
+    hold_key_packages(&relay, &mut phone, &mut tablet).await;
+    phone.client.run_due_maintenance().await.unwrap();
+    assert_eq!(leaves_of(&phone, &tablet, &chats[0], &group), 0);
+    assert_eq!(leaves_of(&phone, &tablet, &chats[1], &group), 1);
+    assert_eq!(taken_from(&phone, &tablet), 1);
+}
+
+/// mdk#3537: the hold covers only chats the approver is in, where its
+/// direct pass could add the new device. A sibling adds the new device to
+/// a chat the approver never joined while the approver is active.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sibling_fills_a_chat_its_active_approver_is_not_in() {
+    let (relay, [mut phone, mut laptop, mut tablet]) = alice_devices::<3>().await;
+    // Made before the laptop is linked, so no sibling founds it.
+    let chat = chats(&mut laptop, 1).await.remove(0);
+    let group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
+    // Keep the phone out of the laptop's chat.
+    phone
+        .client
+        .update_linked_device_settings(&phone.slot_hex(), Some(false), None, None)
+        .await
+        .unwrap();
+    link(&relay, &mut phone, &mut tablet, "Tablet").await;
+    hold_key_packages(&relay, &mut laptop, &mut tablet).await;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !joined(&tablet, &chat) {
+            passes(&relay, &mut [&mut laptop, &mut tablet], 1).await;
+            for client in [&mut laptop.client, &mut tablet.client] {
+                for group in client.take_pending_convergence_groups() {
+                    client
+                        .advance_convergence_with_projection_progress_and_yield(
+                            &group,
+                            None,
+                            std::future::pending(),
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the laptop adds the tablet to a chat the phone is not in");
+    assert_eq!(leaves_of(&laptop, &phone, &chat, &group), 0);
+    assert_eq!(taken_from(&laptop, &tablet), 1);
 }
 
 /// A live claim from a lower slot holds just that chat's Add. Another chat
@@ -1795,6 +2208,11 @@ async fn a_lower_sibling_claim_holds_only_its_chat() {
     assert!(chats.iter().all(|chat| joined(&high, chat)));
     link(&relay, &mut low, &mut target, "New device").await;
     let target_slot: [u8; 32] = hex::decode(target.slot_hex()).unwrap().try_into().unwrap();
+    // This test is about claims between gap fillers, so the holder finds
+    // the target's approver quiet rather than leaving it the device
+    // (mdk#3537).
+    high.client.sibling_chat_gaps.test_approver_clock_ahead =
+        crate::client::device_heartbeats::APPROVER_ACTIVE_SECS;
     // Observe the completed link without running this holder's maintenance:
     // it has no private stock yet. Gap filling must request it, then a
     // hand-off must wake the waiting chat even with no membership change.
@@ -1884,6 +2302,21 @@ async fn a_lower_sibling_claim_holds_only_its_chat() {
     // A claimant that starts leaving no longer holds this chat back. Give
     // it usable stock first so its own no-claim assertion is not vacuous.
     hold_key_packages(&relay, &mut low, &mut target).await;
+    // The hand-off can arrive while the claimant still has device-group work.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !low
+            .client
+            .runtime
+            .device_group_takes_commit(&group, &[])
+            .unwrap()
+        {
+            boxed(|| converge_device_group(&mut low.client, &relay, &mut low.cursor, &group, 1))
+                .await;
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the claimant can commit after the private KeyPackage hand-off");
     let low_slot: [u8; 32] = hex::decode(low.slot_hex()).unwrap().try_into().unwrap();
     let marmot_session::DeviceRosterEdit::Committed(effects) = low
         .client
@@ -1900,6 +2333,9 @@ async fn a_lower_sibling_claim_holds_only_its_chat() {
         .observe_drained_session_events(&effects)
         .await
         .unwrap();
+    // The forks above withdrew commits, which owe the small state again
+    // (mdk#3594). Send it first, so the count below sees only gap filling.
+    low.client.drive_changed_invitation_decisions().await;
     let before = relay.published_events.lock().unwrap().len();
     let stock = held_from(&low, &target);
     assert!(stock > 0);
@@ -2340,6 +2776,14 @@ async fn recovering_a_quarantined_chat_wakes_gap_filling() {
     let mut phone = reopen(phone).await;
     assert_eq!(phone.client.quarantined_groups().len(), 1);
     assert_eq!(taken_from(&phone, &laptop), 0);
+    phone
+        .client
+        .add_linked_devices_to_chats(&[], &mut Default::default())
+        .await;
+    let progress = laptop.step(&relay).await.chat_progress;
+    assert_eq!(progress.len(), 1);
+    assert_eq!((progress[0].total, progress[0].remaining), (0, 0));
+
     let pin = phone.client.runtime.epoch_pin(&group).unwrap();
     phone
         .client
@@ -2358,6 +2802,14 @@ async fn recovering_a_quarantined_chat_wakes_gap_filling() {
         .await;
     assert_eq!(taken_from(&phone, &laptop), 1);
     assert_eq!(leaves_of(&phone, &laptop, &chat, &group), 1);
+    phone
+        .client
+        .add_linked_devices_to_chats(&[], &mut Default::default())
+        .await;
+    passes(&relay, &mut [&mut laptop], 2).await;
+    let progress = laptop.op(DeviceLinkOp::Read).await.chat_progress;
+    assert_eq!(progress.len(), 1);
+    assert_eq!((progress[0].total, progress[0].remaining), (1, 0));
 }
 
 /// With "add to all my chats" off, the new device is added to no chat,
@@ -2374,6 +2826,8 @@ async fn a_new_device_without_add_to_all_my_chats_is_added_to_none() {
     passes(&relay, &mut [&mut phone, &mut laptop], 4).await;
 
     assert!(held_from(&phone, &laptop) > 0);
+    assert!(phone.op(DeviceLinkOp::Read).await.chat_progress.is_empty());
+    assert!(laptop.op(DeviceLinkOp::Read).await.chat_progress.is_empty());
     assert_eq!(taken_from(&phone, &laptop), 0);
     assert!(!chats.iter().any(|chat| joined(&laptop, chat)));
 }
@@ -2520,6 +2974,9 @@ async fn a_chat_closed_to_linked_devices_is_counted_and_takes_no_key_package() {
     assert_eq!(phone.client.chats_closed_to_linked_devices().unwrap(), 1);
     passes(&relay, &mut [&mut phone, &mut laptop], 5).await;
 
+    let progress = laptop.op(DeviceLinkOp::Read).await.chat_progress;
+    assert_eq!(progress.len(), 1);
+    assert_eq!((progress[0].total, progress[0].remaining), (1, 0));
     assert!(joined(&laptop, &open));
     assert!(!joined(&laptop, &closed));
     assert_eq!(leaves_of(&phone, &laptop, &closed, &group), 0);
@@ -2548,7 +3005,7 @@ async fn a_chat_that_already_holds_the_new_device_gets_no_add() {
         MarmotAppConfig::white_noise()
             .with_dev_settlement_quiescence_ms(0)
             .with_dev_scheduled_convergence_delay_ms(0)
-            .with_dev_device_groups(true),
+            .with_device_groups(true),
     )
     .with_test_relay_client(relay.clone());
     remember_test_member_inbox(&bob_app, &alice_id, "wss://relay.example");
@@ -2884,12 +3341,124 @@ async fn a_pass_adds_the_new_device_to_at_most_its_cap_of_chats() {
     first.push(false);
     assert_eq!(added, first, "the chat the list shows last waits");
 
+    // Deliver the first batch. Hold all subsequent publications away from
+    // the laptop until the phone has confirmed its final Add.
+    passes(&relay, &mut [&mut laptop], 2).await;
+    let slot = laptop.slot_hex();
+    let expected = |on_new_device, remaining| {
+        vec![crate::LinkChatProgress {
+            slot_id_hex: slot.clone(),
+            on_new_device,
+            total: chats.len() as u32,
+            remaining,
+        }]
+    };
+    assert_eq!(
+        laptop.op(DeviceLinkOp::Read).await.chat_progress,
+        expected(true, 1)
+    );
+
     phone.client.run_due_maintenance().await.unwrap();
     assert!(
         chats
             .iter()
             .all(|chat| leaves_of(&phone, &laptop, chat, &group) == 1)
     );
+
+    assert_eq!(
+        phone.op(DeviceLinkOp::Read).await.chat_progress,
+        expected(false, 0)
+    );
+    let mut laptop = reopen(laptop).await;
+    assert_eq!(
+        laptop.op(DeviceLinkOp::Read).await.chat_progress,
+        expected(true, 1)
+    );
+    laptop.client.take_device_link_changed();
+    passes(&relay, &mut [&mut laptop], 2).await;
+    laptop.client.drive_device_pairing().await;
+    assert!(laptop.client.take_device_link_changed());
+    assert_eq!(
+        laptop.op(DeviceLinkOp::Read).await.chat_progress,
+        expected(true, 0)
+    );
+    assert!(chats.iter().all(|chat| joined(&laptop, chat)));
+}
+
+/// Withdrawing the sole carrier makes the view unknown until the approver
+/// repeats the inventory. Reopening the sender also repairs missing delivery.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_withdrawn_link_chat_inventory_is_repaired_after_reopen() {
+    use cgka_traits::engine::{AppMessageInvalidationReason, GroupEvent};
+    let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
+    let group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
+    passes(&relay, &mut [&mut phone, &mut laptop], 3).await;
+    let current = |device: &Device| {
+        account_database(&device.app)
+            .query_row(
+                "SELECT revision,message_id FROM link_chat_report_pages WHERE page=0",
+                [],
+                |row| Ok((row.get::<_, u32>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .unwrap()
+    };
+    let (revision, carrier) = current(&laptop);
+    let storage = laptop.app.account_storage("alice").unwrap().app_storage();
+    let request_owed = || {
+        storage
+            .small_state_schedule()
+            .unwrap()
+            .is_some_and(|s| s.request_owed)
+    };
+    assert!(!request_owed());
+    let event = |id| GroupEvent::AppMessageInvalidated {
+        group_id: group.clone(),
+        message_id: cgka_traits::MessageId::new(id),
+        epoch: EpochId(0),
+        reason: AppMessageInvalidationReason::LosingBranch,
+        decrypted_payload_ref: None,
+    };
+    laptop
+        .client
+        .observe_device_group_event(&event(carrier))
+        .unwrap();
+    assert!(
+        !request_owed(),
+        "an inventory withdrawal owes no small-state broadcast"
+    );
+    assert!(laptop.op(DeviceLinkOp::Read).await.chat_progress.is_empty());
+    let mut phone = reopen(phone).await;
+    passes(&relay, &mut [&mut phone, &mut laptop], 2).await;
+    let progress = laptop.op(DeviceLinkOp::Read).await.chat_progress;
+    assert_eq!(progress.len(), 1);
+    assert_eq!((progress[0].total, progress[0].remaining), (0, 0));
+    let (repaired, carrier) = current(&laptop);
+    assert_eq!(repaired, revision);
+
+    // Sender and receiver refer to the same publication by different ids.
+    let sender_id = phone
+        .app
+        .account_storage("alice")
+        .unwrap()
+        .app_storage()
+        .device_group_messages()
+        .unwrap()
+        .into_iter()
+        .rfind(|(.., kind)| *kind == 477)
+        .unwrap()
+        .2
+        .unwrap();
+    phone
+        .client
+        .observe_device_group_event(&event(hex::decode(sender_id).unwrap()))
+        .unwrap();
+    laptop
+        .client
+        .observe_device_group_event(&event(carrier))
+        .unwrap();
+    assert!(laptop.op(DeviceLinkOp::Read).await.chat_progress.is_empty());
+    passes(&relay, &mut [&mut phone, &mut laptop], 1).await;
+    assert_eq!(laptop.op(DeviceLinkOp::Read).await.chat_progress, progress);
 }
 
 /// The old-chat opt-out does not exclude a linked sibling from a new
@@ -4263,4 +4832,263 @@ async fn compatible_private_stock_keeps_usable_order_and_longest_fallback() {
         fresh_ref,
         "duplicate reception preserves the selected allocation"
     );
+}
+
+/// An invitation answered on one linked device shows as answered on the
+/// other within seconds, with device groups on and nothing else happening.
+/// Each worker used to wait for its next maintenance pass, 15 s apart, the
+/// phone to send the answer and the laptop to apply it, so a user waited
+/// about a minute, and the receiving device's chat list changed only with
+/// the chat's next event (mdk#3566). Each device's runtime here starts on
+/// the account the fixtures linked, and the test stands in for the relay
+/// between them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_linked_device_shows_an_answered_invitation_within_seconds() {
+    let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
+    link(&relay, &mut phone, &mut laptop, "Laptop").await;
+    let (_bob_dir, _bob, chat) =
+        invite_account_pending(&relay, &mut phone, &mut laptop, false, None).await;
+    let chat_hex = hex::encode(chat.as_slice());
+    passes(&relay, &mut [&mut phone, &mut laptop], 2).await;
+    let pending = |app: &MarmotApp| {
+        app.group("alice", &chat_hex)
+            .unwrap()
+            .expect("the invited chat")
+            .pending_confirmation
+    };
+    assert!(pending(&phone.app) && pending(&laptop.app));
+    let Device {
+        _dir: _phone_dir,
+        app: phone_app,
+        client: phone_client,
+        ..
+    } = phone;
+    let Device {
+        _dir: _laptop_dir,
+        app: laptop_app,
+        client: laptop_client,
+        ..
+    } = laptop;
+    drop((phone_client, laptop_client));
+
+    // What the runtimes publish from their start on is relayed below.
+    let relayed_from = relay.published_events.lock().unwrap().len();
+    let phone_runtime = MarmotAppRuntime::new(phone_app.clone());
+    let laptop_runtime = MarmotAppRuntime::new(laptop_app.clone());
+    let maintenance_runs = |runtime: &MarmotAppRuntime| {
+        runtime
+            .app_performance_snapshot()
+            .runtime_operations
+            .into_iter()
+            .find(|snapshot| {
+                snapshot.operation == crate::RuntimePerformanceOperation::WorkerMaintenanceDue
+            })
+            .expect("every runtime operation is exported")
+            .completed
+    };
+    for runtime in [&phone_runtime, &laptop_runtime] {
+        runtime.reconcile_accounts().await.unwrap();
+    }
+    // Each worker's first maintenance pass runs at start. Answer after both
+    // have run it, so the next pass by the clock is a full interval away.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while maintenance_runs(&phone_runtime) == 0 || maintenance_runs(&laptop_runtime) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("both workers run their startup maintenance");
+
+    // The relay between the devices: what either publishes from here on
+    // reaches both, as it would live.
+    let (stop, forwarder) = spawn_relay_forwarder(
+        &relay,
+        vec![phone_app.clone(), laptop_app.clone()],
+        relayed_from,
+    );
+
+    // What the laptop's user sees: its chat list.
+    let mut laptop_chats = laptop_runtime
+        .subscribe_chat_list("alice", true)
+        .await
+        .unwrap();
+    assert!(
+        laptop_chats
+            .snapshot
+            .iter()
+            .any(|row| row.group_id_hex == chat_hex && row.pending_confirmation)
+    );
+    phone_runtime
+        .accept_group_invite("alice", &chat)
+        .await
+        .unwrap();
+    let answered = std::time::Instant::now();
+    // Well under a maintenance pass apart, with room for a loaded runner:
+    // unloaded, it shows within a second, or about three when the devices'
+    // startup commits fork their device group. An answer that loses that
+    // fork is sent again at once (mdk#3573).
+    let shown = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let rows = match laptop_chats.recv().await.expect("the chat list stays open") {
+                crate::RuntimeChatListUpdate::Row { row, .. } => vec![*row],
+                crate::RuntimeChatListUpdate::Snapshot { rows, .. } => rows,
+                crate::RuntimeChatListUpdate::RemoveRow { .. } => continue,
+            };
+            if rows
+                .iter()
+                .any(|row| row.group_id_hex == chat_hex && !row.pending_confirmation)
+            {
+                break;
+            }
+        }
+    })
+    .await;
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    forwarder.await.unwrap();
+    phone_runtime.shutdown().await;
+    laptop_runtime.shutdown().await;
+    assert!(
+        shown.is_ok(),
+        "the laptop shows the answer within seconds, not after {:?}",
+        answered.elapsed()
+    );
+}
+
+/// A wake-collection runtime (`CursorPersistence::Frozen`, as a notification
+/// extension runs) that receives a sibling's decline leaves it for an
+/// advancing runtime: it requests no Leave, so publishes none, and the
+/// decline stays owed. Maintenance never runs a pass there; the worker's
+/// invitation step must not either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_frozen_runtime_leaves_a_siblings_decline_owed() {
+    use cgka_traits::storage::{GroupStorage as _, LeaveRequestStorage as _};
+    let (relay, [mut phone, mut laptop]) = alice_devices::<2>().await;
+    link(&relay, &mut phone, &mut laptop, "Laptop").await;
+    let (_bob_dir, _bob, chat) =
+        invite_account_pending(&relay, &mut phone, &mut laptop, false, None).await;
+    let chat_hex = hex::encode(chat.as_slice());
+    passes(&relay, &mut [&mut phone, &mut laptop], 2).await;
+    let Device {
+        _dir: _phone_dir,
+        app: phone_app,
+        client: phone_client,
+        ..
+    } = phone;
+    let Device {
+        _dir: laptop_dir,
+        app: laptop_app,
+        client: laptop_client,
+        ..
+    } = laptop;
+    drop((phone_client, laptop_client));
+    // The laptop opens again as a wake-collection process.
+    laptop_app.close_storage().unwrap();
+    drop(laptop_app);
+    let frozen = MarmotApp::with_relay_and_config(
+        laptop_dir.path(),
+        "wss://relay.example",
+        MarmotAppConfig::white_noise()
+            .with_dev_settlement_quiescence_ms(0)
+            .with_dev_scheduled_convergence_delay_ms(0)
+            .with_device_groups(true)
+            .with_cursor_persistence(crate::CursorPersistence::Frozen),
+    )
+    .with_test_relay_client(relay.clone());
+
+    let relayed_from = relay.published_events.lock().unwrap().len();
+    let phone_runtime = MarmotAppRuntime::new(phone_app.clone());
+    let frozen_runtime = MarmotAppRuntime::new(frozen.clone());
+    for runtime in [&phone_runtime, &frozen_runtime] {
+        runtime.reconcile_accounts().await.unwrap();
+    }
+    // The relay between the devices.
+    let (stop, forwarder) = spawn_relay_forwarder(
+        &relay,
+        vec![phone_app.clone(), frozen.clone()],
+        relayed_from,
+    );
+
+    phone_runtime
+        .decline_group_invite("alice", &chat)
+        .await
+        .unwrap();
+    let account = frozen.account_storage("alice").unwrap();
+    let generation = account
+        .invitation_admission(&chat)
+        .unwrap()
+        .unwrap()
+        .generation;
+    let storage = account.app_storage();
+    let merged = tokio::time::timeout(Duration::from_secs(30), async {
+        let mut look = tokio::time::interval(Duration::from_millis(10));
+        while storage
+            .invitation_decision(&chat_hex, &generation)
+            .unwrap()
+            .is_none_or(|held| !held.declined)
+        {
+            look.tick().await;
+        }
+    })
+    .await;
+    // Two commands through the worker: each turn's invitation step has run
+    // before the second answers.
+    for _ in 0..2 {
+        frozen_runtime.linked_devices("alice").await.unwrap();
+    }
+    let leave = account.leave_request(&chat).unwrap();
+    let owed = storage.invitation_decision_work().unwrap();
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    forwarder.await.unwrap();
+    phone_runtime.shutdown().await;
+    frozen_runtime.shutdown().await;
+    merged.expect("the laptop merges the phone's decline");
+    assert!(
+        leave.is_none(),
+        "a wake-collection runtime requests no Leave for a sibling's decline"
+    );
+    assert!(
+        owed.iter()
+            .any(|work| work.decision.group_id_hex == chat_hex && work.decline_owed),
+        "the decline stays owed for an advancing runtime"
+    );
+}
+
+/// Relays what `relay` holds from index `from` on to each of `apps`, as a
+/// live relay would, their own events included, until the returned flag is
+/// set. Each look waits 10 ms, leaving the CPU to the workers under test.
+fn spawn_relay_forwarder(
+    relay: &Arc<ScriptedPushRelayClient>,
+    apps: Vec<MarmotApp>,
+    from: usize,
+) -> (
+    Arc<std::sync::atomic::AtomicBool>,
+    tokio::task::JoinHandle<()>,
+) {
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let forwarder = tokio::spawn({
+        let relay = relay.clone();
+        let stop = stop.clone();
+        async move {
+            let mut look = tokio::time::interval(Duration::from_millis(10));
+            let mut cursor = from;
+            while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                let events = relay.published_events.lock().unwrap()[cursor..].to_vec();
+                cursor += events.len();
+                for event in events {
+                    for app in &apps {
+                        let _ = app
+                            .relay_plane
+                            .handle_relay_event_for_test(NostrRelayEvent {
+                                endpoint: TransportEndpoint("wss://relay.example".to_owned()),
+                                subscription_id: Some("linked-devices".to_owned()),
+                                event: event.clone(),
+                            })
+                            .await;
+                    }
+                }
+                look.tick().await;
+            }
+        }
+    });
+    (stop, forwarder)
 }

@@ -27,6 +27,7 @@ mod devices;
 mod heartbeats;
 mod history;
 pub(super) mod history_delivery;
+mod idle_maintenance;
 mod inactivity;
 mod private_key_packages;
 mod removal;
@@ -50,7 +51,7 @@ fn device_group_app_on(
             .with_deployment(deployment)
             .with_dev_settlement_quiescence_ms(0)
             .with_dev_scheduled_convergence_delay_ms(0)
-            .with_dev_device_groups(true)
+            .with_device_groups(true)
             .with_allow_loopback_blob_endpoints(true),
     )
     .with_test_relay_client(relay)
@@ -551,7 +552,7 @@ async fn a_device_without_the_roster_takes_no_link() {
         .create_account("alice")
         .unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
-    let app = super::canonical_membership::app_at(&dir, relay);
+    let app = ordinary_app_on(&dir, relay);
     assert!(
         !app.supported_app_component_ids()
             .contains(&DEVICE_ROSTER_COMPONENT_ID)
@@ -1309,24 +1310,26 @@ async fn each_device_lists_the_trusted_roster_itself_first() {
     assert_eq!(laptop.linked_devices().unwrap().len(), 4);
 }
 
-/// An app opened as a release host opens it: device groups off.
+/// An app that opens the root with device groups off, such as a push
+/// extension on an older library or a host that turns them off.
 fn ordinary_app_on(dir: &tempfile::TempDir, relay: Arc<ScriptedPushRelayClient>) -> MarmotApp {
     MarmotApp::with_relay_and_config(
         dir.path(),
         "wss://relay.example",
         MarmotAppConfig::white_noise()
             .with_dev_settlement_quiescence_ms(0)
-            .with_dev_scheduled_convergence_delay_ms(0),
+            .with_dev_scheduled_convergence_delay_ms(0)
+            .with_device_groups(false),
     )
     .with_test_relay_client(relay)
 }
 
-/// An ordinary opener of a root that holds a device group, such as a host's
-/// push extension on an experimental test build, is refused before its
+/// An opener with device groups off, such as a push extension on an older
+/// library, of a root that holds a device group is refused before its
 /// session opens (mdk#3012). It hydrates, drains, subscribes and sends
-/// nothing, so a device-group commit the experimental opener left
+/// nothing, so a device-group commit a device-groups opener left
 /// mid-publication stays staged for the next one. A root without device-group
-/// state, and the experimental constructor, still open.
+/// state, and an opener with device groups on, still open.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_ordinary_opener_of_a_device_group_root_is_refused() {
     let Devices {
@@ -1735,6 +1738,47 @@ async fn settled_linked_devices() -> (Devices, GroupId) {
     devices.laptop.run_due_maintenance().await.unwrap();
     deliver_all(&mut devices.phone, &devices.relay).await;
     (devices, group)
+}
+
+/// A settled device group's maintenance pass, the session maintenance every
+/// idle tick runs, takes no writer transaction on either device's app or
+/// session database (mdk#3479). Passes may still owe work at first; rounds
+/// settle until three in a row write nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_settled_device_groups_maintenance_takes_no_writer() {
+    let (mut devices, _) = boxed(settled_linked_devices).await;
+    let writers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    for client in [&devices.phone, &devices.laptop] {
+        let app = client.app.account_storage("alice").unwrap();
+        for storage in [app, client.engine_storage.clone()] {
+            let writers = writers.clone();
+            storage.set_timing_observer(Some(Arc::new(move |operation, _, _| {
+                if operation == storage_sqlite::SqliteTimingOperation::WriteBegin {
+                    writers.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            })));
+        }
+    }
+    let written = || writers.load(std::sync::atomic::Ordering::Relaxed);
+    let mut quiet = 0;
+    for _ in 0..8 {
+        let before = written();
+        for client in [&mut devices.phone, &mut devices.laptop] {
+            boxed(|| client.run_due_maintenance()).await.unwrap();
+        }
+        quiet = if written() == before { quiet + 1 } else { 0 };
+        if quiet == 3 {
+            break;
+        }
+        // What a round sent reaches the other device; delivery writes.
+        for client in [&mut devices.phone, &mut devices.laptop] {
+            deliver_all(client, &devices.relay).await;
+        }
+    }
+    assert_eq!(
+        quiet, 3,
+        "a settled device group's maintenance pass takes no writer"
+    );
 }
 
 /// `devices` with the phone's client reopened with the audit log on, which a

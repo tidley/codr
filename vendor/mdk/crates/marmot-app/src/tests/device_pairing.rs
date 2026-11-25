@@ -7,6 +7,7 @@
 
 use super::canonical_membership::{deliver_new, published_key_package};
 use super::*;
+use crate::client::boxed;
 use crate::client::device_group::{LINK_DEADLINE_SECS, WELCOME_WAIT_SECS};
 use crate::{
     DeviceLinkChoices, DeviceLinkEndReason, DeviceLinkOp, DeviceLinkPromptState,
@@ -25,6 +26,11 @@ mod linked_device_chats;
 mod three_device_journeys;
 
 /// One of Alice's devices, with its own cursor over the shared relay.
+///
+/// The fixtures here return boxed futures and await large ones through
+/// [`boxed`]: a debug build gives each future an async body awaits its own
+/// slot in that body's poll frame, so a test awaiting dozens of them inline
+/// holds megabytes of the 4 MiB test thread stack at once.
 struct Device {
     _dir: tempfile::TempDir,
     app: MarmotApp,
@@ -35,13 +41,20 @@ struct Device {
 impl Device {
     /// Deliver what the relay holds that this device has not seen, then
     /// read linking as it now stands.
-    async fn step(&mut self, relay: &ScriptedPushRelayClient) -> DeviceLinkSnapshot {
-        deliver_new(&mut self.client, relay, &mut self.cursor).await;
-        self.client.device_link(DeviceLinkOp::Read).await.unwrap()
+    fn step(
+        &mut self,
+        relay: &ScriptedPushRelayClient,
+    ) -> impl Future<Output = DeviceLinkSnapshot> {
+        boxed(move || async move {
+            boxed(|| deliver_new(&mut self.client, relay, &mut self.cursor)).await;
+            boxed(|| self.client.device_link(DeviceLinkOp::Read))
+                .await
+                .unwrap()
+        })
     }
 
-    async fn op(&mut self, op: DeviceLinkOp) -> DeviceLinkSnapshot {
-        self.client.device_link(op).await.unwrap()
+    fn op(&mut self, op: DeviceLinkOp) -> impl Future<Output = DeviceLinkSnapshot> {
+        boxed(move || async move { boxed(|| self.client.device_link(op)).await.unwrap() })
     }
 
     fn slot_hex(&self) -> String {
@@ -77,8 +90,9 @@ impl Device {
 
 /// Alice's devices, each signed in with the same key and with a published
 /// KeyPackage, sharing one scripted relay.
-async fn alice_devices<const N: usize>() -> (Arc<ScriptedPushRelayClient>, [Device; N]) {
-    alice_devices_settling_after::<N>(0).await
+fn alice_devices<const N: usize>()
+-> impl Future<Output = (Arc<ScriptedPushRelayClient>, [Device; N])> {
+    boxed(|| alice_devices_settling_after::<N>(0))
 }
 
 /// [`alice_devices`], with a settlement window of `settlement_ms`.
@@ -107,12 +121,12 @@ async fn alice_devices_settling_after<const N: usize>(
             MarmotAppConfig::white_noise()
                 .with_dev_settlement_quiescence_ms(settlement_ms)
                 .with_dev_scheduled_convergence_delay_ms(0)
-                .with_dev_device_groups(true),
+                .with_device_groups(true),
         )
         .with_test_relay_client(relay.clone());
         remember_test_member_inbox(&app, &alice_id, "wss://relay.example");
-        let mut client = app.client("alice").await.unwrap();
-        published_key_package(&mut client, &relay).await;
+        let mut client = boxed(|| app.client("alice")).await.unwrap();
+        boxed(|| published_key_package(&mut client, &relay)).await;
         devices.push(Device {
             _dir: dir,
             app,
@@ -150,93 +164,92 @@ fn prompt_code(
 
 /// Run a link from `new` to `existing` through to the Welcome, the new
 /// device confirming first. Returns the device group.
-async fn link(
+fn link(
     relay: &ScriptedPushRelayClient,
     existing: &mut Device,
     new: &mut Device,
     label: &str,
-) -> GroupId {
-    link_with(relay, existing, new, DeviceLinkChoices::new(label)).await
+) -> impl Future<Output = GroupId> {
+    link_with(relay, existing, new, DeviceLinkChoices::new(label))
 }
 
 /// [`link`], with `choices` for the new device.
-async fn link_with(
+fn link_with(
     relay: &ScriptedPushRelayClient,
     existing: &mut Device,
     new: &mut Device,
     choices: DeviceLinkChoices,
-) -> GroupId {
-    let started = new.op(DeviceLinkOp::Start).await;
-    assert_eq!(
-        started.new_device,
-        Some(NewDeviceLinkState::WaitingForAnswer)
-    );
-    existing.step(relay).await; // request in, answer out
-    let revealed = new.step(relay).await; // answer in, reveal out
-    let new_code = comparing_code(revealed.new_device.as_ref().unwrap());
-    assert_eq!(new_code.len(), 7);
-    assert!(new_code.iter().all(|emoji| !emoji.description.is_empty()));
-    let prompt = existing.step(relay).await; // reveal in: the code
-    let (prompt_id, existing_code) = prompt_code(&prompt, &new.slot_hex());
-    assert_eq!(existing_code, new_code, "both screens show the same emoji");
+) -> impl Future<Output = GroupId> {
+    boxed(move || async move {
+        let started = new.op(DeviceLinkOp::Start).await;
+        assert_eq!(
+            started.new_device,
+            Some(NewDeviceLinkState::WaitingForAnswer)
+        );
+        existing.step(relay).await; // request in, answer out
+        let revealed = new.step(relay).await; // answer in, reveal out
+        let new_code = comparing_code(revealed.new_device.as_ref().unwrap());
+        assert_eq!(new_code.len(), 7);
+        assert!(new_code.iter().all(|emoji| !emoji.description.is_empty()));
+        let prompt = existing.step(relay).await; // reveal in: the code
+        let (prompt_id, existing_code) = prompt_code(&prompt, &new.slot_hex());
+        assert_eq!(existing_code, new_code, "both screens show the same emoji");
 
-    let waiting = new.op(DeviceLinkOp::ConfirmMatch).await;
-    assert_eq!(
-        waiting.new_device,
-        Some(NewDeviceLinkState::WaitingForOtherDevice)
-    );
-    let linking = existing.op(DeviceLinkOp::Link { prompt_id, choices }).await;
-    assert_eq!(
-        linking.prompt_for_slot(&new.slot_hex()).unwrap().state,
-        DeviceLinkPromptState::Linking
-    );
-    let joining = new.step(relay).await; // existing confirm in, own confirm out
-    assert_eq!(joining.new_device, Some(NewDeviceLinkState::Joining));
-    let committed = existing.step(relay).await; // new confirm in: the commit
-    assert_eq!(
-        committed.prompt_for_slot(&new.slot_hex()).unwrap().state,
-        DeviceLinkPromptState::Linking,
-        "only the new device's first commit makes the link"
-    );
-    join_then_linked(relay, existing, new).await;
-    new.client.trusted_device_group().unwrap().unwrap()
+        let waiting = new.op(DeviceLinkOp::ConfirmMatch).await;
+        assert_eq!(
+            waiting.new_device,
+            Some(NewDeviceLinkState::WaitingForOtherDevice)
+        );
+        let linking = existing.op(DeviceLinkOp::Link { prompt_id, choices }).await;
+        assert_eq!(
+            linking.prompt_for_slot(&new.slot_hex()).unwrap().state,
+            DeviceLinkPromptState::Linking
+        );
+        let joining = new.step(relay).await; // existing confirm in, own confirm out
+        assert_eq!(joining.new_device, Some(NewDeviceLinkState::Joining));
+        let committed = existing.step(relay).await; // new confirm in: the commit
+        assert_eq!(
+            committed.prompt_for_slot(&new.slot_hex()).unwrap().state,
+            DeviceLinkPromptState::Linking,
+            "only the new device's first commit makes the link"
+        );
+        join_then_linked(relay, existing, new).await;
+        new.client.trusted_device_group().unwrap().unwrap()
+    })
 }
 
 /// The new device joins through its Welcome and makes its first commit in
 /// the device group on the same drive. The device that linked it reads that
 /// commit and shows the link made, after its settlement window if it waits
 /// one.
-async fn join_then_linked(
+fn join_then_linked(
     relay: &ScriptedPushRelayClient,
     existing: &mut Device,
     new: &mut Device,
-) {
-    let joined = new.step(relay).await; // the Welcome, and its first commit
-    assert_eq!(joined.new_device, Some(NewDeviceLinkState::Linked));
-    let give_up = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let read = existing.step(relay).await; // that commit
-        let state = read.prompt_for_slot(&new.slot_hex()).unwrap().state.clone();
-        if state == DeviceLinkPromptState::Linked || std::time::Instant::now() >= give_up {
-            assert_eq!(state, DeviceLinkPromptState::Linked);
-            return;
+) -> impl Future<Output = ()> {
+    boxed(move || async move {
+        let joined = new.step(relay).await; // the Welcome, and its first commit
+        assert_eq!(joined.new_device, Some(NewDeviceLinkState::Linked));
+        let give_up = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let read = existing.step(relay).await; // that commit
+            let state = read.prompt_for_slot(&new.slot_hex()).unwrap().state.clone();
+            if state == DeviceLinkPromptState::Linked || std::time::Instant::now() >= give_up {
+                assert_eq!(state, DeviceLinkPromptState::Linked);
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            // The worker's timer would take the held commit once the window
+            // passed.
+            let group = existing.client.trusted_device_group().unwrap().unwrap();
+            let advanced = boxed(|| existing.client.runtime.advance_convergence(&group))
+                .await
+                .unwrap();
+            boxed(|| existing.client.observe_drained_session_events(&advanced))
+                .await
+                .unwrap();
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        // The worker's timer would take the held commit once the window
-        // passed.
-        let group = existing.client.trusted_device_group().unwrap().unwrap();
-        let advanced = existing
-            .client
-            .runtime
-            .advance_convergence(&group)
-            .await
-            .unwrap();
-        existing
-            .client
-            .observe_drained_session_events(&advanced)
-            .await
-            .unwrap();
-    }
+    })
 }
 
 /// The link of `slot` that `device` recorded in `group`.
@@ -310,6 +323,19 @@ async fn a_first_link_creates_the_device_group_with_the_chosen_label_and_setting
     laptop.step(&relay).await;
     let joins = laptop.app.account_storage("alice").unwrap().app_storage();
     assert!(joins.device_group_joins().unwrap().is_empty());
+    // No message from an older or offline approver and an authenticated
+    // report of zero eligible chats are different answers.
+    assert!(laptop.op(DeviceLinkOp::Read).await.chat_progress.is_empty());
+    boxed(|| phone.client.run_due_maintenance()).await.unwrap();
+    assert_eq!(
+        laptop.step(&relay).await.chat_progress,
+        vec![crate::LinkChatProgress {
+            slot_id_hex: laptop.slot_hex(),
+            on_new_device: true,
+            total: 0,
+            remaining: 0,
+        }]
+    );
 }
 
 /// A real made link can disappear from the approver's selected roster. Its
@@ -758,6 +784,182 @@ async fn a_completed_link_can_disappear_from_the_approvers_selected_roster() {
         .expect("the authentic still-published sibling is listed");
     assert!(known_departure.signed_in);
     assert!(!known_departure.previously_linked_here);
+}
+
+/// Alice signing in on one more device, sharing `first`'s relay, after
+/// whatever `first` has done.
+async fn another_alice_device(relay: &Arc<ScriptedPushRelayClient>, first: &Device) -> Device {
+    let first_home = AccountHome::open(first._dir.path());
+    let alice_id = first_home.account("alice").unwrap().account_id_hex;
+    let secret = first_home
+        .load_signing_keys("alice")
+        .unwrap()
+        .secret_key()
+        .to_secret_hex();
+    let dir = tempfile::tempdir().unwrap();
+    AccountHome::open(dir.path())
+        .import_account("alice", &secret)
+        .unwrap();
+    let app = MarmotApp::with_relay_and_config(
+        dir.path(),
+        "wss://relay.example",
+        MarmotAppConfig::white_noise()
+            .with_dev_settlement_quiescence_ms(0)
+            .with_dev_scheduled_convergence_delay_ms(0)
+            .with_device_groups(true),
+    )
+    .with_test_relay_client(relay.clone());
+    remember_test_member_inbox(&app, &alice_id, "wss://relay.example");
+    let mut client = app.client("alice").await.unwrap();
+    published_key_package(&mut client, relay).await;
+    Device {
+        _dir: dir,
+        app,
+        client,
+        cursor: 0,
+    }
+}
+
+/// A device the user removes is not a sign-in to ask about or a rejection
+/// to report. The phone saw the laptop as a new sign-in before linking it,
+/// so it keeps a sign-in record of the laptop's slot. Once the phone removes
+/// the laptop, whose slot the roster then records as `removed`, and links
+/// the laptop again as it signs in afresh (a new slot, the account's same
+/// key), the phone lists neither the old slot nor a rejection of it, and its
+/// compromise warning stays empty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_removed_and_relinked_device_is_not_a_rejected_sign_in() {
+    let (relay, [mut phone]) = alice_devices::<1>().await;
+    phone.client.check_sign_ins().await.unwrap();
+    let mut laptop = another_alice_device(&relay, &phone).await;
+    let mut relinked = another_alice_device(&relay, &phone).await;
+    let old_slot = laptop.slot_hex();
+    phone.client.check_sign_ins().await.unwrap();
+    let record = phone
+        .app
+        .account_storage("alice")
+        .unwrap()
+        .app_storage()
+        .sign_in(&old_slot)
+        .unwrap()
+        .expect("the phone saw the laptop as a new sign-in");
+    assert!(!record.before_this_device);
+    let group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
+
+    phone.client.remove_linked_device(&old_slot).await.unwrap();
+    let old_slot_id: [u8; 32] = hex::decode(&old_slot).unwrap().try_into().unwrap();
+    assert_eq!(
+        phone.roster(&group).rejected_slots[&old_slot_id].reason,
+        cgka_traits::app_components::RejectedSlotReasonV1::Removed
+    );
+
+    assert_ne!(
+        relinked.slot_hex(),
+        old_slot,
+        "a fresh sign-in is a new slot"
+    );
+    link(&relay, &mut phone, &mut relinked, "Laptop").await;
+    phone.client.check_sign_ins().await.unwrap();
+
+    assert_eq!(phone.client.compromise_warning().unwrap(), []);
+    let listed = phone.client.unrecognized_sign_ins().unwrap();
+    assert!(
+        listed
+            .iter()
+            .all(|sign_in| sign_in.slot_id_hex != old_slot
+                && sign_in.slot_id_hex != relinked.slot_hex()),
+        "{listed:?}"
+    );
+
+    // The `removed` record goes (its expiry), and the laptop's publication
+    // from before its removal is still served: the user linked and removed
+    // that device, so it is no new sign-in, now or after a restart.
+    boxed(|| {
+        super::sign_ins::commit_roster(
+            &mut phone.client,
+            &group,
+            vec![DeviceRosterOperationV1::RemoveRejectedSlot(old_slot_id)],
+        )
+    })
+    .await;
+    assert!(
+        !phone
+            .roster(&group)
+            .rejected_slots
+            .contains_key(&old_slot_id)
+    );
+    for reopened in [false, true] {
+        if reopened {
+            phone = reopen(phone).await;
+        }
+        phone.client.check_sign_ins().await.unwrap();
+        let listed = phone.client.unrecognized_sign_ins().unwrap();
+        assert!(
+            listed.iter().all(|sign_in| sign_in.slot_id_hex != old_slot),
+            "{listed:?}"
+        );
+        assert_eq!(phone.client.compromise_warning().unwrap(), []);
+    }
+}
+
+/// A removal this device never recorded, as after an upgrade, is recorded by
+/// the maintenance pass that asks the worker for a sign-in read, before that
+/// pass's session maintenance can drop the expired record and before the
+/// read begins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_detached_check_records_a_removal_before_the_record_can_expire() {
+    let (relay, [mut phone]) = alice_devices::<1>().await;
+    phone.client.check_sign_ins().await.unwrap();
+    let mut laptop = another_alice_device(&relay, &phone).await;
+    let old_slot = laptop.slot_hex();
+    phone.client.check_sign_ins().await.unwrap();
+    let storage = phone.app.account_storage("alice").unwrap().app_storage();
+    let record = storage.sign_in(&old_slot).unwrap().unwrap();
+    let group = link(&relay, &mut phone, &mut laptop, "Laptop").await;
+    phone.client.remove_linked_device(&old_slot).await.unwrap();
+    let old_slot_id: [u8; 32] = hex::decode(&old_slot).unwrap().try_into().unwrap();
+    assert!(
+        phone
+            .roster(&group)
+            .rejected_slots
+            .contains_key(&old_slot_id)
+    );
+
+    // As before migration 0211: no removal recorded, the sign-in still here.
+    storage
+        .execute_batch_for_test(&format!(
+            "DELETE FROM account_sign_in_removals;
+             INSERT INTO account_sign_ins (slot_id_hex, before_this_device, client, appeared_at,
+                 last_published_at, key_package_event_id_hex, key_package_ref_hex, signed_in,
+                 answer, answered_at, roster_pending)
+             VALUES ('{}', 0, '', {}, {}, '{}', '{}', 1, 'none', NULL, 0);",
+            record.slot_id_hex,
+            record.appeared_at,
+            record.last_published_at,
+            record.key_package_event_id_hex,
+            record.key_package_ref_hex,
+        ))
+        .unwrap();
+    phone.client.detach_sign_in_reads();
+    boxed(|| phone.client.drive_sign_ins()).await;
+    assert!(phone.client.take_sign_in_check_request());
+
+    // The pass's session maintenance drops the expired record; the read
+    // comes after.
+    boxed(|| {
+        super::sign_ins::commit_roster(
+            &mut phone.client,
+            &group,
+            vec![DeviceRosterOperationV1::RemoveRejectedSlot(old_slot_id)],
+        )
+    })
+    .await;
+    phone.client.check_sign_ins().await.unwrap();
+    let listed = phone.client.unrecognized_sign_ins().unwrap();
+    assert!(
+        listed.iter().all(|sign_in| sign_in.slot_id_hex != old_slot),
+        "{listed:?}"
+    );
 }
 
 /// A later link adds the new device to the device group in one commit, by a
@@ -1700,7 +1902,7 @@ async fn a_failed_links_removal_found_after_a_restart_stops_nothing() {
         MarmotAppConfig::white_noise()
             .with_dev_settlement_quiescence_ms(0)
             .with_dev_scheduled_convergence_delay_ms(0)
-            .with_dev_device_groups(true),
+            .with_device_groups(true),
     )
     .with_test_relay_client(relay.clone());
     let bootstrap = || {
@@ -2461,7 +2663,7 @@ async fn a_retained_link_commit_that_rolls_back_ends_the_link() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refused_link_commit_ends_the_link_on_both_devices() {
     let (relay, [mut phone, mut laptop, mut tablet]) =
-        alice_devices_settling_after::<3>(1_500).await;
+        boxed(|| alice_devices_settling_after::<3>(1_500)).await;
     let (group, slot) =
         link_tablet_until_commit(&relay, &mut phone, &mut laptop, &mut tablet).await;
 
@@ -2552,7 +2754,7 @@ async fn a_failing_link_waits_for_its_welcomes_withdrawal_until_its_deadline() {
     assert_eq!(outcome(), DeviceLinkOutcome::Failed);
 }
 
-/// Without device groups, linking is refused and nothing runs.
+/// With device groups turned off, linking is refused and nothing runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn linking_is_refused_without_device_groups() {
     let dir = tempfile::tempdir().unwrap();
@@ -2562,7 +2764,7 @@ async fn linking_is_refused_without_device_groups() {
     let app = MarmotApp::with_relay_and_config(
         dir.path(),
         "wss://relay.example",
-        MarmotAppConfig::white_noise(),
+        MarmotAppConfig::white_noise().with_device_groups(false),
     )
     .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
     let mut client = app.client("alice").await.unwrap();

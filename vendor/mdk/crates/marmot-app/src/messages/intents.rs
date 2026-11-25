@@ -1,6 +1,3 @@
-use cgka_traits::agent_text_stream::{
-    AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN, AGENT_TEXT_STREAM_PROFILE_STREAM_ID_LEN,
-};
 use cgka_traits::app_event::{
     AGENT_ACTIVITY_STATUS_TAG, AGENT_OPERATION_NAME_TAG, AGENT_OPERATION_STATUS_TAG,
     AGENT_OPERATION_TYPE_TAG, EVENT_REF_TAG, GROUP_SYSTEM_TYPE_TAG,
@@ -8,8 +5,6 @@ use cgka_traits::app_event::{
     MARMOT_APP_EVENT_KIND_AGENT_STREAM_START, MARMOT_APP_EVENT_KIND_CHAT,
     MARMOT_APP_EVENT_KIND_DELETE, MARMOT_APP_EVENT_KIND_EDIT, MARMOT_APP_EVENT_KIND_GROUP_SYSTEM,
     MARMOT_APP_EVENT_KIND_REACTION, MarmotAppEvent as MarmotInnerEvent, QUOTE_REF_TAG,
-    STREAM_BROKER_TAG, STREAM_CHUNKS_TAG, STREAM_FINAL_KIND_TAG, STREAM_HASH_TAG,
-    STREAM_PARENT_TAG, STREAM_ROUTE_TAG, STREAM_START_TAG, STREAM_TAG, STREAM_TYPE_TAG,
 };
 use cgka_traits::app_event::{
     MARMOT_APP_EVENT_KIND_REMOVE, MARMOT_APP_EVENT_KIND_REPORT, MARMOT_APP_EVENT_KIND_REVIEW,
@@ -26,7 +21,7 @@ use nostr::nips::nip21::Nip21;
 use serde_json::{Map, Value, json};
 
 use crate::ids::parse_account_id_hex;
-use crate::{AgentTextStreamFinishRequest, AppError, MediaAttachmentReference};
+use crate::{AppError, MediaAttachmentReference};
 use crate::{
     MARMOT_APP_EVENT_KIND_PUSH_TOKEN_LIST, MARMOT_APP_EVENT_KIND_PUSH_TOKEN_REMOVAL,
     MARMOT_APP_EVENT_KIND_PUSH_TOKEN_UPDATE,
@@ -38,9 +33,9 @@ pub(crate) const PUBKEY_REF_TAG: &str = "p";
 /// Upper bound for app-internal Markdown mention scans over untrusted message
 /// plaintext. The sender stores the full content, but p-tag derivation only
 /// parses this bounded prefix so one hostile message cannot force unbounded
-/// synchronous Markdown work before send/classification (mdk#654).
-pub(crate) const MAX_MARKDOWN_MENTION_SCAN_BYTES: usize =
-    AGENT_TEXT_STREAM_MAX_PLAINTEXT_FRAME_LEN as usize;
+/// synchronous Markdown work before send/classification (mdk#654). The value
+/// is the plaintext frame cap the retired agent text stream used.
+pub(crate) const MAX_MARKDOWN_MENTION_SCAN_BYTES: usize = 65_519;
 
 /// Reactions are display metadata that flow into timelines and notification
 /// previews. Keep them compact and free of terminal/control sequences while
@@ -182,12 +177,17 @@ fn mention_p_tags(content: &str) -> Vec<Vec<String>> {
     tags
 }
 
-/// Value of the `stream-type` tag on an agent text stream start event.
-const STREAM_TYPE_TEXT: &str = "text";
-/// Value of the `route` tag on a brokered QUIC agent text stream start event.
-pub(crate) const STREAM_ROUTE_QUIC: &str = "quic";
-/// `final-kind` tag value: the kind of the eventual stream-final chat message.
-const STREAM_FINAL_KIND_CHAT: &str = "9";
+fn append_mention_tags(tags: &mut Vec<Vec<String>>, content: &str) {
+    for mention in mention_p_tags(content) {
+        if !tags.iter().any(|tag| {
+            tag.first().is_some_and(|name| name == PUBKEY_REF_TAG) && tag.get(1) == mention.get(1)
+        }) {
+            tags.push(mention);
+        }
+    }
+}
+
+pub(crate) use cgka_traits::is_nip22_comment;
 
 /// A structured outgoing app message, resolved into a [`MarmotInnerEvent`] by
 /// the account worker, which owns the authoring account id and the clock.
@@ -232,13 +232,17 @@ pub(crate) enum AppMessageIntent {
     DeleteReactions {
         reaction_message_ids: Vec<String>,
     },
+    /// `tags` are extra application tags; the reply owns `e` and `q`.
     Reply {
         target_message_id: String,
         text: String,
+        tags: Vec<Vec<String>>,
     },
+    /// `tags` are extra application tags; the edit owns `e`.
     Edit {
         target_message_id: String,
         content: String,
+        tags: Vec<Vec<String>>,
     },
     Delete {
         target_message_id: String,
@@ -259,13 +263,15 @@ pub(crate) enum AppMessageIntent {
         caption: Option<String>,
         message_tags: Vec<Vec<String>>,
     },
-    StreamStart {
-        stream_id: Vec<u8>,
-        parent_message_id: Option<String>,
-        quic_candidates: Vec<String>,
-    },
-    StreamFinal {
-        request: AgentTextStreamFinishRequest,
+    /// A NIP-22 thread message (kind 1111) answering `parent_message_id`.
+    /// The account worker fills `placement` from local rows before the event
+    /// is built.
+    ThreadMessage {
+        parent_message_id: String,
+        content: String,
+        attachments: Vec<MediaAttachmentReference>,
+        message_tags: Vec<Vec<String>>,
+        placement: Option<ThreadPlacement>,
     },
     AgentActivity {
         status: String,
@@ -302,16 +308,29 @@ pub(crate) enum AppMessageIntent {
     PushTokenRemoval {
         content: String,
     },
-    /// An app-defined event with an arbitrary non-reserved kind. Tags and
-    /// content pass through verbatim: the intent layer neither derives
-    /// `p`-tags from the content nor shapes the payload, so the caller owns
-    /// the event's semantics end to end.
+    /// An event with an arbitrary non-reserved kind. Tags and content pass
+    /// through unchanged, except NIP-22 comments (1111 with a numeric lowercase
+    /// `k` tag or a lowercase `e` tag) gain missing mention `p` tags.
     Custom {
         kind: u64,
         tags: Vec<Vec<String>>,
         content: String,
     },
 }
+
+/// Where a new thread message goes: its root and parent, with the kinds and
+/// authors the NIP-22 tags name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ThreadPlacement {
+    pub(crate) root_message_id: String,
+    pub(crate) root_kind: u64,
+    pub(crate) root_author: String,
+    pub(crate) parent_kind: u64,
+    pub(crate) parent_author: String,
+}
+
+/// Tag names a thread message's own placement owns; callers cannot pass them.
+const THREAD_PLACEMENT_TAGS: [&str; 5] = ["E", "K", "P", "e", "k"];
 
 /// Build the inner Marmot app event for `intent`, authored by `sender_pubkey_hex`
 /// at `created_at`. `Unreact` must be resolved to `DeleteReactions` before this
@@ -393,6 +412,7 @@ pub(crate) fn build_inner_event_with_media_reply(
         AppMessageIntent::Reply {
             target_message_id,
             text,
+            tags: extra,
         } => {
             validate_message_ref(target_message_id)?;
             if text.trim().is_empty() {
@@ -404,12 +424,14 @@ pub(crate) fn build_inner_event_with_media_reply(
                 event_ref_tag(target_message_id),
                 vec![QUOTE_REF_TAG.to_owned(), target_message_id.clone()],
             ];
-            tags.extend(mention_p_tags(text));
+            append_application_tags(&mut tags, extra, &["e", "q"])?;
+            append_distinct(&mut tags, mention_p_tags(text));
             Ok(event(MARMOT_APP_EVENT_KIND_CHAT, tags, text.clone()))
         }
         AppMessageIntent::Edit {
             target_message_id,
             content,
+            tags: extra,
         } => {
             validate_message_ref(target_message_id)?;
             if content.trim().is_empty() {
@@ -418,7 +440,8 @@ pub(crate) fn build_inner_event_with_media_reply(
                 ));
             }
             let mut tags = vec![event_ref_tag(target_message_id)];
-            tags.extend(mention_p_tags(content));
+            append_application_tags(&mut tags, extra, &["e"])?;
+            append_distinct(&mut tags, mention_p_tags(content));
             Ok(event(MARMOT_APP_EVENT_KIND_EDIT, tags, content.clone()))
         }
         AppMessageIntent::Report {
@@ -555,19 +578,12 @@ pub(crate) fn build_inner_event_with_media_reply(
                     "media message requires at least one attachment".into(),
                 ));
             }
-            let source_epoch = attachments[0].source_epoch;
-            for attachment in attachments {
-                // Structural + group-policy validation of outbound attachments
-                // happens in `Client::send_media_attachments`, which holds the
-                // group's `allowed_locator_kinds`. Here we only enforce the
-                // cross-attachment invariant that one message shares a single
-                // source epoch.
-                if attachment.source_epoch != source_epoch {
-                    return Err(AppError::InvalidAppMessagePayload(
-                        "media attachments in one message must share a source epoch".into(),
-                    ));
-                }
-            }
+            // Structural + group-policy validation of outbound attachments
+            // happens in `Client::send_media_attachments`, which holds the
+            // group's `allowed_locator_kinds`. Here we only enforce the
+            // cross-attachment invariant that one message shares a single
+            // source epoch.
+            validate_shared_source_epoch(attachments)?;
             let mut tags: Vec<Vec<String>> = attachments
                 .iter()
                 .map(MediaAttachmentReference::imeta_tag)
@@ -587,79 +603,61 @@ pub(crate) fn build_inner_event_with_media_reply(
                 caption.clone().unwrap_or_default(),
             ))
         }
-        AppMessageIntent::StreamStart {
-            stream_id,
+        AppMessageIntent::ThreadMessage {
             parent_message_id,
-            quic_candidates,
+            content,
+            attachments,
+            message_tags,
+            placement,
         } => {
-            let stream_id_hex = hex::encode(stream_id);
-            if stream_id.len() != AGENT_TEXT_STREAM_PROFILE_STREAM_ID_LEN {
-                return Err(AppError::InvalidAppMessagePayload(
-                    "agent text stream id must be 32 bytes".into(),
-                ));
-            }
-            for candidate in quic_candidates {
-                transport_quic_stream::QuicCandidate::parse(candidate)
-                    .map_err(|_| AppError::AgentStreamInvalidCandidate(candidate.clone()))?;
-            }
-            let mut tags = vec![
-                vec![STREAM_TAG.to_owned(), stream_id_hex],
-                vec![STREAM_TYPE_TAG.to_owned(), STREAM_TYPE_TEXT.to_owned()],
-                vec![
-                    STREAM_FINAL_KIND_TAG.to_owned(),
-                    STREAM_FINAL_KIND_CHAT.to_owned(),
-                ],
-                vec![STREAM_ROUTE_TAG.to_owned(), STREAM_ROUTE_QUIC.to_owned()],
-            ];
-            if let Some(parent_message_id) = parent_message_id {
-                tags.push(vec![
-                    STREAM_PARENT_TAG.to_owned(),
-                    normalize_stream_parent_message_id(parent_message_id)?,
-                ]);
-            }
-            tags.extend(
-                quic_candidates
-                    .iter()
-                    .map(|candidate| vec![STREAM_BROKER_TAG.to_owned(), candidate.clone()]),
-            );
-            Ok(event(
-                MARMOT_APP_EVENT_KIND_AGENT_STREAM_START,
-                tags,
-                String::new(),
-            ))
-        }
-        AppMessageIntent::StreamFinal { request } => {
-            if request.stream_id.len() != AGENT_TEXT_STREAM_PROFILE_STREAM_ID_LEN {
-                return Err(AppError::InvalidAppMessagePayload(
-                    "agent text stream id must be 32 bytes".into(),
-                ));
-            }
-            let start_event_id = hex::decode(&request.start_event_id).map_err(|_| {
+            let placement = placement.as_ref().ok_or_else(|| {
                 AppError::InvalidAppMessagePayload(
-                    "agent text stream start event id must be 32-byte hex".into(),
+                    "thread message must be placed before event construction".into(),
                 )
             })?;
-            if start_event_id.len() != 32 {
+            validate_message_ref(parent_message_id)?;
+            validate_message_ref(&placement.root_message_id)?;
+            validate_message_tags(message_tags)?;
+            if message_tags
+                .iter()
+                .any(|tag| THREAD_PLACEMENT_TAGS.contains(&tag[0].as_str()))
+            {
                 return Err(AppError::InvalidAppMessagePayload(
-                    "agent text stream start event id must be 32-byte hex".into(),
+                    "thread message tags E, K, P, e and k are built by MDK".into(),
                 ));
             }
-            let tags = vec![
-                vec![STREAM_TAG.to_owned(), hex::encode(&request.stream_id)],
-                vec![STREAM_START_TAG.to_owned(), request.start_event_id.clone()],
+            if attachments.is_empty() && content.trim().is_empty() {
+                return Err(AppError::InvalidAppMessagePayload(
+                    "thread message requires text or an attachment".into(),
+                ));
+            }
+            validate_shared_source_epoch(attachments)?;
+            // NIP-22: E/K/P name the root, e/k the parent. The parent's author
+            // gets no `p`: in Marmot a `p` tag on a message is a mention.
+            let mut tags = vec![
                 vec![
-                    STREAM_HASH_TAG.to_owned(),
-                    hex::encode(request.transcript_hash),
+                    "E".to_owned(),
+                    placement.root_message_id.clone(),
+                    String::new(),
+                    placement.root_author.clone(),
                 ],
+                vec!["K".to_owned(), placement.root_kind.to_string()],
+                vec!["P".to_owned(), placement.root_author.clone()],
                 vec![
-                    STREAM_CHUNKS_TAG.to_owned(),
-                    request.chunk_count.to_string(),
+                    EVENT_REF_TAG.to_owned(),
+                    parent_message_id.clone(),
+                    String::new(),
+                    placement.parent_author.clone(),
                 ],
+                vec!["k".to_owned(), placement.parent_kind.to_string()],
             ];
+            tags.extend(attachments.iter().map(MediaAttachmentReference::imeta_tag));
+            tags.extend(message_tags.iter().cloned());
+            append_mention_tags(&mut tags, content);
             Ok(event(
-                MARMOT_APP_EVENT_KIND_CHAT,
+                cgka_traits::NIP22_COMMENT_KIND,
                 tags,
-                request.final_text_or_reference.clone(),
+                content.clone(),
             ))
         }
         AppMessageIntent::AgentActivity {
@@ -788,7 +786,11 @@ pub(crate) fn build_inner_event_with_media_reply(
             content,
         } => {
             validate_custom_event_kind(*kind)?;
-            Ok(event(*kind, tags.clone(), content.clone()))
+            let mut tags = tags.clone();
+            if is_nip22_comment(*kind, &tags) {
+                append_mention_tags(&mut tags, content);
+            }
+            Ok(event(*kind, tags, content.clone()))
         }
     }
 }
@@ -822,6 +824,32 @@ const RESERVED_APP_EVENT_KINDS: &[u64] = &[
 pub fn is_reserved_app_event_kind(kind: u64) -> bool {
     RESERVED_APP_EVENT_KINDS.contains(&kind)
         || crate::client::device_group::is_device_group_kind(kind)
+}
+
+/// Append caller tags after the tags an event structure owns. `owned` names
+/// the tags the structure already places (a reply's `e`/`q`, an edit's `e`);
+/// a caller copy could name another target, so it is refused.
+fn append_application_tags(
+    tags: &mut Vec<Vec<String>>,
+    extra: &[Vec<String>],
+    owned: &[&str],
+) -> Result<(), AppError> {
+    validate_message_tags(extra)?;
+    if extra.iter().any(|tag| owned.contains(&tag[0].as_str())) {
+        return Err(AppError::InvalidAppMessagePayload(
+            "additional tags cannot replace the event's own reference tags".into(),
+        ));
+    }
+    tags.extend_from_slice(extra);
+    Ok(())
+}
+
+fn append_distinct(tags: &mut Vec<Vec<String>>, more: Vec<Vec<String>>) {
+    for tag in more {
+        if !tags.contains(&tag) {
+            tags.push(tag);
+        }
+    }
 }
 
 // Application tags may decorate chat, but encrypted media references remain typed.
@@ -884,6 +912,21 @@ fn event_ref_tag(target_message_id: &str) -> Vec<String> {
     vec![EVENT_REF_TAG.to_owned(), target_message_id.to_owned()]
 }
 
+fn validate_shared_source_epoch(attachments: &[MediaAttachmentReference]) -> Result<(), AppError> {
+    let Some(first) = attachments.first() else {
+        return Ok(());
+    };
+    if attachments
+        .iter()
+        .any(|attachment| attachment.source_epoch != first.source_epoch)
+    {
+        return Err(AppError::InvalidAppMessagePayload(
+            "media attachments in one message must share a source epoch".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_message_ref(target_message_id: &str) -> Result<(), AppError> {
     if target_message_id.trim().is_empty() {
         return Err(AppError::InvalidAppMessagePayload(
@@ -891,20 +934,6 @@ fn validate_message_ref(target_message_id: &str) -> Result<(), AppError> {
         ));
     }
     Ok(())
-}
-
-fn normalize_stream_parent_message_id(parent_message_id: &str) -> Result<String, AppError> {
-    let raw = hex::decode(parent_message_id).map_err(|_| {
-        AppError::InvalidAppMessagePayload(
-            "agent text stream parent message id must be 32-byte hex".into(),
-        )
-    })?;
-    if raw.len() != 32 {
-        return Err(AppError::InvalidAppMessagePayload(
-            "agent text stream parent message id must be 32-byte hex".into(),
-        ));
-    }
-    Ok(hex::encode(raw))
 }
 
 fn validate_non_empty_field(value: &str, field: &str) -> Result<String, AppError> {
@@ -945,16 +974,6 @@ pub(crate) fn encode_inner_event(event: &MarmotInnerEvent) -> Result<Vec<u8>, Ap
     event
         .encode()
         .map_err(|err| AppError::InvalidAppMessagePayload(err.to_string()))
-}
-
-/// True when an inner event is a kind-9 chat that finalizes an agent text
-/// stream (it carries a `stream` tag plus a `stream-start` or `stream-hash`
-/// tag). Such events flow as normal timeline messages, not start signals.
-pub fn is_stream_final_event(kind: u64, tags: &[Vec<String>]) -> bool {
-    kind == MARMOT_APP_EVENT_KIND_CHAT
-        && tag_value(tags, STREAM_TAG).is_some()
-        && (tag_value(tags, STREAM_START_TAG).is_some()
-            || tag_value(tags, STREAM_HASH_TAG).is_some())
 }
 
 /// First value of the named tag (`tag[0] == name` -> `tag[1]`).
@@ -1067,6 +1086,81 @@ mod mention_tests {
     }
 
     #[test]
+    fn custom_comment_mentions() {
+        let hex = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        let npub = npub_for_account_id(hex).unwrap();
+        let content = format!("hi @{npub}, again nostr:{npub}, and @{npub}");
+        for existing in [
+            None,
+            Some(vec!["p".into(), hex.into()]),
+            Some(vec!["p".into(), hex.into(), "wss://relay.example".into()]),
+            Some(vec![
+                "p".into(),
+                hex.into(),
+                String::new(),
+                "mention".into(),
+            ]),
+        ] {
+            let mut tags = vec![
+                vec!["k".into(), "9".into()],
+                vec!["e".into(), "ab".repeat(32), "parent hint".into()],
+                vec!["q".into(), "cd".repeat(32)],
+                vec!["app".into(), "keep me".into()],
+            ];
+            if let Some(existing) = existing {
+                tags.push(existing);
+            }
+            let mut expected = tags.clone();
+            if expected.len() == 4 {
+                expected.push(vec!["p".into(), hex.into()]);
+            }
+            let event = build_inner_event(
+                &AppMessageIntent::Custom {
+                    kind: 1111,
+                    tags,
+                    content: content.clone(),
+                },
+                hex,
+                42,
+            )
+            .unwrap();
+            assert_eq!(event.kind, 1111);
+            assert_eq!(event.content, content);
+            assert_eq!(event.tags, expected);
+        }
+    }
+
+    #[test]
+    fn custom_mentions_require_kind() {
+        let hex = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        let npub = npub_for_account_id(hex).unwrap();
+        let content = format!("unchanged @{npub} and nostr:{npub}");
+        for (kind, tags) in [
+            (12345, vec![vec!["k".into(), "9".into()]]),
+            (1111, vec![]),
+            (1111, vec![vec!["K".into(), "9".into()]]),
+            (1111, vec![vec!["k".into()]]),
+            (1111, vec![vec!["k".into(), "not a kind".into()]]),
+            (1111, vec![vec!["k".into(), "-1".into()]]),
+            (1111, vec![vec!["k".into(), "18446744073709551616".into()]]),
+        ] {
+            let event = build_inner_event(
+                &AppMessageIntent::Custom {
+                    kind,
+                    tags: tags.clone(),
+                    content: content.clone(),
+                },
+                hex,
+                42,
+            )
+            .unwrap();
+            assert_eq!(event.kind, kind);
+            assert_eq!(event.tags, tags);
+            assert_eq!(event.content, content);
+        }
+    }
+
+    #[test]
     fn local_admission_preserves_legacy_chat_reply_and_media_wire_identity() {
         let sender = valid_pubkey_hex();
         let intents = [
@@ -1076,6 +1170,7 @@ mod mention_tests {
             AppMessageIntent::Reply {
                 target_message_id: "aa".repeat(32),
                 text: "same text".into(),
+                tags: Vec::new(),
             },
             AppMessageIntent::Media {
                 message_tags: Vec::new(),
@@ -1120,6 +1215,7 @@ mod mention_tests {
         let intent = AppMessageIntent::Reply {
             target_message_id: target.clone(),
             text: format!("re nostr:{npub}"),
+            tags: Vec::new(),
         };
         let event = build_inner_event(&intent, &valid_pubkey_hex(), 0).unwrap();
         assert!(
@@ -1291,6 +1387,58 @@ mod application_tag_tests {
         let event = build_inner_event(&intent, &sender(), 1).unwrap();
         assert_eq!(event.kind, MARMOT_APP_EVENT_KIND_CHAT);
         assert_eq!(event.tags, tags());
+    }
+
+    #[test]
+    fn reply_and_edit_place_application_tags_after_their_own_references() {
+        let target = "abc123".to_owned();
+        let words = vec![
+            vec!["turn".to_owned(), "turn-1".to_owned()],
+            vec!["phase".to_owned(), "commentary".to_owned()],
+        ];
+        let reply = AppMessageIntent::Reply {
+            target_message_id: target.clone(),
+            text: "hello".into(),
+            tags: words.clone(),
+        };
+        let event = build_inner_event(&reply, &sender(), 1).unwrap();
+        assert_eq!(event.tags[0], vec!["e".to_owned(), target.clone()]);
+        assert_eq!(event.tags[1], vec!["q".to_owned(), target.clone()]);
+        assert_eq!(&event.tags[2..], words);
+        let edit = AppMessageIntent::Edit {
+            target_message_id: target.clone(),
+            content: "hello".into(),
+            tags: words.clone(),
+        };
+        let event = build_inner_event(&edit, &sender(), 1).unwrap();
+        assert_eq!(event.kind, MARMOT_APP_EVENT_KIND_EDIT);
+        assert_eq!(event.tags[0], vec!["e".to_owned(), target.clone()]);
+        assert_eq!(&event.tags[1..], words);
+
+        // A caller copy of an owned reference could name another target.
+        let other = vec![vec!["e".to_owned(), "def456".to_owned()]];
+        for intent in [
+            AppMessageIntent::Reply {
+                target_message_id: target.clone(),
+                text: "hello".into(),
+                tags: vec![vec!["q".to_owned(), "def456".to_owned()]],
+            },
+            AppMessageIntent::Edit {
+                target_message_id: target.clone(),
+                content: "hello".into(),
+                tags: other,
+            },
+            AppMessageIntent::Edit {
+                target_message_id: target.clone(),
+                content: "hello".into(),
+                tags: vec![vec!["imeta".to_owned(), "url x".to_owned()]],
+            },
+        ] {
+            assert!(matches!(
+                build_inner_event(&intent, &sender(), 1),
+                Err(AppError::InvalidAppMessagePayload(_))
+            ));
+        }
     }
 
     #[test]

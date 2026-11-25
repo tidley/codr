@@ -9,6 +9,8 @@
 //! lower than its rejoin's floor, so it never reopens what lay before the
 //! copy, and a visit completes from that floor.
 
+use std::collections::BTreeMap;
+
 use cgka_traits::storage::StorageResult;
 use storage_sqlite::{RecoveryCause, RecoveryEligibility, TRANSPORT_RECONCILIATION_RETENTION_SECS};
 
@@ -21,6 +23,8 @@ use super::{DebtTurn, RecoveryRunnerPolicy, sooner};
 pub(super) struct Advanced {
     pub(super) next_due: Option<u64>,
     pub(super) started: bool,
+    /// Latest visit endpoint by group, including visits in backoff or parked.
+    pub(super) visit_ends: BTreeMap<Vec<u8>, u64>,
 }
 
 /// Prepare due return visits and report the earliest future one. This runs in
@@ -34,6 +38,7 @@ pub(super) fn advance(
     let mut admission = Admission::new(turn);
     let mut next = None;
     let mut started = false;
+    let mut visit_ends = BTreeMap::new();
     let floor = turn
         .now
         .saturating_sub(TRANSPORT_RECONCILIATION_RETENTION_SECS);
@@ -44,11 +49,15 @@ pub(super) fn advance(
     for demand in app
         .pending_recovery_demands()?
         .into_iter()
-        .filter(|demand| {
-            demand.cause == RecoveryCause::EpochGap
-                && demand.eligibility != RecoveryEligibility::NeedsDeepRepair
-        })
+        .filter(|demand| demand.cause == RecoveryCause::EpochGap)
     {
+        let state = app.recovery_epoch_gap_retry(demand.ticket)?;
+        if let (Some(state), Some(group)) = (state, &demand.group_id) {
+            visit_ends.insert(group.clone(), state.visit_until_seconds);
+        }
+        if demand.eligibility == RecoveryEligibility::NeedsDeepRepair {
+            continue;
+        }
         let routes = turn
             .routes
             .iter()
@@ -74,7 +83,6 @@ pub(super) fn advance(
                 ))
             })
             .collect::<StorageResult<Vec<_>>>()?;
-        let state = app.recovery_epoch_gap_retry(demand.ticket)?;
         if state.is_some_and(|state| state.exhausted) {
             app.begin_recovery_epoch_gap_retry(demand.ticket, &floors, turn.now)?;
             continue;
@@ -93,12 +101,15 @@ pub(super) fn advance(
             let mut answered = false;
             for (route, (_, since)) in routes.iter().zip(&floors) {
                 let since = (*since).max(copy_floor);
+                // If retention overtook the visit, still require proof at the
+                // surviving floor instead of certifying an empty interval.
+                let visit_until = state.visit_until_seconds.max(since);
                 for relay in &route.required {
                     let covered = app.recovery_coverage_covers(
                         &route.route,
                         std::slice::from_ref(relay),
                         since,
-                        turn.owed_until(route, relay),
+                        turn.owed_until(route, relay).min(visit_until),
                     )?;
                     answered |= covered;
                     if !covered && !admission.source_left_frontier(route, relay)? {
@@ -147,5 +158,6 @@ pub(super) fn advance(
     Ok(Advanced {
         next_due: next,
         started,
+        visit_ends,
     })
 }

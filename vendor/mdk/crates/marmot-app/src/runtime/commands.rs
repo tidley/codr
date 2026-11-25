@@ -8,27 +8,27 @@ use zeroize::Zeroizing;
 use std::sync::Arc;
 use std::time::Instant;
 
-use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
 use cgka_traits::{GroupId, SecretBytes};
 use tokio::sync::{mpsc, oneshot};
 
 use super::account_worker::GroupCreationRequest;
 use super::{
-    AccountManager, AccountWorkerCommand, Emit, ReadClass, ReadReply, Unpublished, WorkerLane,
-    account_worker_response, local_account_worker_response, long_account_worker_catch_up_response,
-    long_account_worker_response, publish_app_runtime_group_state_updated,
+    AccountManager, AccountWorkerCommand, Emit, ReadClass, ReadReply, Unpublished, WorkerCommands,
+    WorkerLane, account_worker_response, local_account_worker_response,
+    long_account_worker_catch_up_response, long_account_worker_response,
+    publish_app_runtime_group_state_updated,
 };
 use crate::client::read_state::{ReadAnswer, ReadState, reissue};
 use crate::messages::AppMessageIntent;
 use crate::{
-    AgentOperationEventRequest, AgentTextStreamFinishRequest, AppBlobEndpoint,
-    AppCreateGroupOptions, AppDisbandRequest, AppError, AppGroupConversationSnapshot,
-    AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord, AppGroupRoster,
-    AppPreparedGroupImageUpload, AppQuarantinedGroup, CanonicalCreatedGroup, CreatedGroup,
-    GroupInviteDeclineResult, GroupPushDebugInfo, MaintenanceRunSummary, MediaAttachmentReference,
-    MediaDownloadResult, MediaUploadRequest, MediaUploadResult, NotificationSettings,
-    PendingWelcomeDelivery, PushPlatform, PushRegistration, PushRegistrationShareOutcome,
-    PushRegistrationSyncResult, RetentionSweepReport, SecureDeleteExpiredResult, SendSummary,
+    AgentOperationEventRequest, AppBlobEndpoint, AppCreateGroupOptions, AppDisbandRequest,
+    AppError, AppGroupConversationSnapshot, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord,
+    AppGroupRoster, AppPreparedGroupImageUpload, AppQuarantinedGroup, CanonicalCreatedGroup,
+    CreatedGroup, GroupInviteDeclineResult, GroupPushDebugInfo, MaintenanceRunSummary,
+    MediaAttachmentReference, MediaDownloadResult, MediaUploadRequest, MediaUploadResult,
+    NotificationSettings, PendingWelcomeDelivery, PushPlatform, PushRegistration,
+    PushRegistrationShareOutcome, PushRegistrationSyncResult, RetentionSweepReport,
+    SecureDeleteExpiredResult, SendSummary,
 };
 use marmot_observability::AppPerformanceOperation;
 
@@ -45,6 +45,9 @@ enum StateRead {
     /// A read the worker answers through `respond_diagnosed` within the
     /// local wait: a failure is counted as a storage failure.
     DiagnosedLocal,
+    /// A storage read the worker answers through `reply`, within the app
+    /// wait: no failure is counted.
+    Uncounted,
 }
 
 impl StateRead {
@@ -58,7 +61,7 @@ impl StateRead {
     ) -> Result<T, AppError> {
         match self {
             Self::Local | Self::DiagnosedLocal => local_account_worker_response(response).await,
-            Self::Diagnosed => account_worker_response(response).await,
+            Self::Diagnosed | Self::Uncounted => account_worker_response(response).await,
         }
     }
 }
@@ -104,6 +107,27 @@ impl AccountManager {
         answer: impl FnOnce(&ReadState) -> ReadAnswer<T>,
         command: impl FnOnce(ReadReply<Result<T, AppError>>) -> AccountWorkerCommand,
     ) -> Result<T, AppError> {
+        self.read_from_state_where_held(
+            account_ref,
+            class,
+            read,
+            |state| Some(answer(state)),
+            command,
+        )
+        .await
+    }
+
+    /// [`Self::read_from_state`] for a read whose answer the version may not
+    /// hold: `answer` gives `None` for such a request, which the worker
+    /// then answers.
+    async fn read_from_state_where_held<T>(
+        &self,
+        account_ref: &str,
+        class: ReadClass,
+        read: StateRead,
+        answer: impl FnOnce(&ReadState) -> Option<ReadAnswer<T>>,
+        command: impl FnOnce(ReadReply<Result<T, AppError>>) -> AccountWorkerCommand,
+    ) -> Result<T, AppError> {
         let lane = self.worker_lane(account_ref).await?;
         if let Some(answer) = self.answer_from_state(&lane, read, answer) {
             return answer;
@@ -113,16 +137,17 @@ impl AccountManager {
     }
 
     /// `answer` from `lane`'s current version of A, or `None` when the
-    /// worker must answer: before its first publish, or for a published
-    /// failure [`reissue`] cannot copy exactly.
+    /// worker must answer: before its first publish, for a request the
+    /// version holds no answer to (`answer` gives `None`), or for a
+    /// published failure [`reissue`] cannot copy exactly.
     fn answer_from_state<T>(
         &self,
         lane: &WorkerLane,
         read: StateRead,
-        answer: impl FnOnce(&ReadState) -> ReadAnswer<T>,
+        answer: impl FnOnce(&ReadState) -> Option<ReadAnswer<T>>,
     ) -> Option<Result<T, AppError>> {
         let result = match lane.read_state.version(&self.app.storage_closed) {
-            Ok(Some(state)) => reissue(answer(&state))?,
+            Ok(Some(state)) => reissue(answer(&state)?)?,
             Ok(None) => return None,
             Err(error) => Err(error),
         };
@@ -316,6 +341,20 @@ impl AccountManager {
     }
 
     #[cfg(test)]
+    pub(super) async fn overdue_component_recheck_for_test(
+        &self,
+        account_ref: &str,
+    ) -> Result<(), AppError> {
+        let commands = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        commands
+            .send(AccountWorkerCommand::OverdueComponentRecheckForTest { respond })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        response.await.map_err(|_| AppError::TransportClosed)?
+    }
+
+    #[cfg(test)]
     pub(super) async fn unhydrated_group_count_for_test(
         &self,
         account_ref: &str,
@@ -335,7 +374,7 @@ impl AccountManager {
         }
     }
 
-    pub(super) fn spawn_invite_catch_up(&self, command: mpsc::Sender<AccountWorkerCommand>) {
+    pub(super) fn spawn_invite_catch_up(&self, command: WorkerCommands) {
         let mut tasks = self
             .invite_catch_up_tasks
             .lock()
@@ -369,11 +408,7 @@ impl AccountManager {
     /// changing the mutation's result. Once the command worker has confirmed
     /// a publish, a read-side catch-up fault cannot roll it back; surfacing
     /// that fault would tell the host to retry work already visible to peers.
-    async fn catch_up_committed(
-        &self,
-        command: mpsc::Sender<AccountWorkerCommand>,
-        method: &'static str,
-    ) {
+    async fn catch_up_committed(&self, command: WorkerCommands, method: &'static str) {
         let observation = self
             .shared
             .observer
@@ -391,7 +426,7 @@ impl AccountManager {
         }
     }
 
-    fn spawn_create_catch_up(&self, command: mpsc::Sender<AccountWorkerCommand>) {
+    fn spawn_create_catch_up(&self, command: WorkerCommands) {
         let manager = self.clone();
         tokio::spawn(async move {
             // Test-only barrier (`test-policy-overrides`): lets integration
@@ -538,6 +573,7 @@ impl AccountManager {
         &self,
         account_ref: &str,
         peer_account_id: &str,
+        options: crate::DirectConversationOptions,
     ) -> Result<GroupId, AppError> {
         let account = self.resolve(account_ref)?;
         let peer_account_id_hex = crate::ids::account_id_hex_from_ref(peer_account_id)?;
@@ -552,7 +588,12 @@ impl AccountManager {
                 request: GroupCreationRequest::Direct {
                     peer_account_id_hex: peer_account_id_hex.clone(),
                 },
-                options: AppCreateGroupOptions::default(),
+                // The worker applies these only when it creates the group;
+                // reuse returns the founded group untouched.
+                options: AppCreateGroupOptions {
+                    disappearing_message_secs: options.disappearing_message_secs,
+                    ..Default::default()
+                },
                 respond,
             })
             .await
@@ -670,29 +711,36 @@ impl AccountManager {
         long_account_worker_response(response).await
     }
 
+    /// From A (mdk#3273 PR 5), except while the version's list of prepared
+    /// uploads failed: the worker's single read of the upload answers then.
     pub async fn prepared_group_image_status(
         &self,
         account_ref: &str,
         upload_id: String,
     ) -> Result<AppPreparedGroupImageUpload, AppError> {
-        let (command, respond, response) = self.read_command(account_ref, ReadClass::R1).await?;
-        command
-            .send(AccountWorkerCommand::PreparedGroupImageStatus { upload_id, respond })
-            .await
-            .map_err(|_| AppError::TransportClosed)?;
-        account_worker_response(response).await
+        let lookup = upload_id.clone();
+        self.read_from_state_where_held(
+            account_ref,
+            ReadClass::R1,
+            StateRead::Diagnosed,
+            move |state| state.prepared_group_image_status(&lookup),
+            |respond| AccountWorkerCommand::PreparedGroupImageStatus { upload_id, respond },
+        )
+        .await
     }
 
     pub async fn prepared_group_images(
         &self,
         account_ref: &str,
     ) -> Result<Vec<AppPreparedGroupImageUpload>, AppError> {
-        let (command, respond, response) = self.read_command(account_ref, ReadClass::R1).await?;
-        command
-            .send(AccountWorkerCommand::PreparedGroupImages { respond })
-            .await
-            .map_err(|_| AppError::TransportClosed)?;
-        account_worker_response(response).await
+        self.read_from_state(
+            account_ref,
+            ReadClass::R1,
+            StateRead::Diagnosed,
+            ReadState::prepared_group_images,
+            |respond| AccountWorkerCommand::PreparedGroupImages { respond },
+        )
+        .await
     }
 
     pub async fn create_group_with_prepared_initial_image(
@@ -1491,44 +1539,62 @@ impl AccountManager {
         account_worker_response(response).await
     }
 
+    /// `GroupRecoveryStatus` from A (mdk#3273 PR 8) for a group in the
+    /// version's mirror, after the hydration request its worker command
+    /// made with `ensure_group_hydrated`. Any other id, a locally deleted
+    /// group whose MLS state is kept or one the engine does not store, is
+    /// answered by the worker command, which answers it as before A: the
+    /// third exception to answering from A, beside the hydration request
+    /// and a failure with no exact copy. The version's mirror decides,
+    /// never a failure (mdk#3273 decision 1).
     pub async fn group_recovery_status(
         &self,
         account_ref: &str,
         group_id: &GroupId,
     ) -> Result<crate::GroupRecoveryStatus, AppError> {
-        let (command, respond, response) = self.read_command(account_ref, ReadClass::R9).await?;
-        command
-            .send(AccountWorkerCommand::GroupRecoveryStatus {
+        let lane = self.worker_lane(account_ref).await?;
+        self.read_group_from_state(
+            &lane,
+            ReadClass::R9,
+            StateRead::Uncounted,
+            Admission::Queue,
+            std::slice::from_ref(group_id),
+            HydrationFailure::Returned,
+            |state| async move { reissue(state.group_recovery_status(group_id)?) },
+            |respond| AccountWorkerCommand::GroupRecoveryStatus {
                 group_id: group_id.clone(),
                 respond,
-            })
-            .await
-            .map_err(|_| AppError::TransportClosed)?;
-        account_worker_response(response).await
+            },
+        )
+        .await
     }
 
     pub async fn history_notices(
         &self,
         account_ref: &str,
     ) -> Result<Vec<crate::HistoryNotice>, AppError> {
-        let (command, respond, response) = self.read_command(account_ref, ReadClass::R9).await?;
-        command
-            .send(AccountWorkerCommand::HistoryNotices { respond })
-            .await
-            .map_err(|_| AppError::TransportClosed)?;
-        account_worker_response(response).await
+        self.read_from_state(
+            account_ref,
+            ReadClass::R9,
+            StateRead::Diagnosed,
+            ReadState::history_notices,
+            |respond| AccountWorkerCommand::HistoryNotices { respond },
+        )
+        .await
     }
 
     pub async fn account_recovery_status(
         &self,
         account_ref: &str,
     ) -> Result<crate::AccountRecoveryStatus, AppError> {
-        let (command, respond, response) = self.read_command(account_ref, ReadClass::R9).await?;
-        command
-            .send(AccountWorkerCommand::AccountRecoveryStatus { respond })
-            .await
-            .map_err(|_| AppError::TransportClosed)?;
-        account_worker_response(response).await
+        self.read_from_state(
+            account_ref,
+            ReadClass::R9,
+            StateRead::Diagnosed,
+            ReadState::account_recovery_status,
+            |respond| AccountWorkerCommand::AccountRecoveryStatus { respond },
+        )
+        .await
     }
 
     pub async fn linked_devices(
@@ -1547,12 +1613,14 @@ impl AccountManager {
         &self,
         account_ref: &str,
     ) -> Result<Vec<crate::ChatHistoryImport>, AppError> {
-        let (command, respond, response) = self.read_command(account_ref, ReadClass::R2).await?;
-        command
-            .send(AccountWorkerCommand::ChatHistoryImports { respond })
-            .await
-            .map_err(|_| AppError::TransportClosed)?;
-        local_account_worker_response(response).await
+        self.read_from_state(
+            account_ref,
+            ReadClass::R2,
+            StateRead::DiagnosedLocal,
+            ReadState::chat_history_imports,
+            |respond| AccountWorkerCommand::ChatHistoryImports { respond },
+        )
+        .await
     }
 
     pub async fn key_package_refresh_overdue(&self, account_ref: &str) -> Result<bool, AppError> {
@@ -1619,12 +1687,14 @@ impl AccountManager {
     }
 
     pub async fn started_fresh(&self, account_ref: &str) -> Result<bool, AppError> {
-        let (command, respond, response) = self.read_command(account_ref, ReadClass::R2).await?;
-        command
-            .send(AccountWorkerCommand::StartedFresh { respond })
-            .await
-            .map_err(|_| AppError::TransportClosed)?;
-        local_account_worker_response(response).await
+        self.read_from_state(
+            account_ref,
+            ReadClass::R2,
+            StateRead::DiagnosedLocal,
+            ReadState::started_fresh,
+            |respond| AccountWorkerCommand::StartedFresh { respond },
+        )
+        .await
     }
 
     pub async fn compromise_warning(
@@ -2002,17 +2072,72 @@ impl AccountManager {
         account_ref: &str,
         group_id: &GroupId,
     ) -> Result<Option<crate::GroupCommitDelivery>, AppError> {
-        self.read_from_state(
-            account_ref,
+        let lane = self.worker_lane(account_ref).await?;
+        self.read_group_from_state(
+            &lane,
             ReadClass::R3,
             StateRead::Diagnosed,
-            |state| state.group_commit_delivery(group_id),
+            Admission::Queue,
+            std::slice::from_ref(group_id),
+            HydrationFailure::Ignored,
+            |state| async move { reissue(state.group_commit_delivery(group_id)) },
             |respond| AccountWorkerCommand::GroupCommitDelivery {
                 group_id: group_id.clone(),
                 respond,
             },
         )
         .await
+    }
+
+    pub async fn group_changes_not_delivered(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<Vec<crate::GroupChangeNotDelivered>, AppError> {
+        let (command, respond, response) = self.read_command(account_ref, ReadClass::R3).await?;
+        command
+            .send(AccountWorkerCommand::GroupChangesNotDelivered {
+                group_id: group_id.clone(),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    pub async fn group_pending_commit(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+    ) -> Result<Option<crate::GroupPendingCommit>, AppError> {
+        let (command, respond, response) = self.read_command(account_ref, ReadClass::R3).await?;
+        command
+            .send(AccountWorkerCommand::GroupPendingCommit {
+                group_id: group_id.clone(),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
+    }
+
+    pub async fn acknowledge_change_not_delivered(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        commit_id_hex: &str,
+    ) -> Result<bool, AppError> {
+        let command = self.worker_commands(account_ref).await?;
+        let (respond, response) = oneshot::channel();
+        command
+            .send(AccountWorkerCommand::AcknowledgeChangeNotDelivered {
+                group_id: group_id.clone(),
+                commit_id_hex: commit_id_hex.to_owned(),
+                respond,
+            })
+            .await
+            .map_err(|_| AppError::TransportClosed)?;
+        account_worker_response(response).await
     }
 
     pub async fn dismiss_history_notice(
@@ -2857,6 +2982,22 @@ impl AccountManager {
         request: crate::MediaFileUploadRequest,
         control: std::sync::Arc<crate::MediaFileTransferControl>,
     ) -> Result<MediaUploadResult, AppError> {
+        self.upload_file_sources(
+            account_ref,
+            group_id,
+            crate::media::file_transfer::FileUploadSources::Host(request),
+            control,
+        )
+        .await
+    }
+
+    pub(crate) async fn upload_file_sources(
+        &self,
+        account_ref: &str,
+        group_id: &GroupId,
+        request: crate::media::file_transfer::FileUploadSources,
+        control: std::sync::Arc<crate::MediaFileTransferControl>,
+    ) -> Result<MediaUploadResult, AppError> {
         control.check()?;
         let (command, admission) = self.media_worker_commands(account_ref).await?;
         let (respond, response) = oneshot::channel();
@@ -2966,52 +3107,6 @@ impl AccountManager {
             .await
             .map_err(|_| AppError::TransportClosed)?;
         account_worker_response(response).await
-    }
-
-    pub(crate) async fn start_agent_text_stream(
-        &self,
-        account_ref: &str,
-        group_id: &GroupId,
-        stream_id: Vec<u8>,
-        parent_message_id: Option<String>,
-        quic_candidates: Vec<String>,
-    ) -> Result<(MarmotInnerEvent, SendSummary), AppError> {
-        let command = self.worker_commands(account_ref).await?;
-        let (respond, response) = oneshot::channel();
-        command
-            .send(AccountWorkerCommand::StartAgentTextStream {
-                group_id: group_id.clone(),
-                stream_id,
-                parent_message_id,
-                quic_candidates,
-                respond,
-            })
-            .await
-            .map_err(|_| AppError::TransportClosed)?;
-        let result = account_worker_response(response).await?;
-        self.schedule_audit_log_tracker_update("start_agent_text_stream");
-        Ok(result)
-    }
-
-    pub(crate) async fn finish_agent_text_stream(
-        &self,
-        account_ref: &str,
-        group_id: &GroupId,
-        request: AgentTextStreamFinishRequest,
-    ) -> Result<(MarmotInnerEvent, SendSummary), AppError> {
-        let command = self.worker_commands(account_ref).await?;
-        let (respond, response) = oneshot::channel();
-        command
-            .send(AccountWorkerCommand::FinishAgentTextStream {
-                group_id: group_id.clone(),
-                request,
-                respond,
-            })
-            .await
-            .map_err(|_| AppError::TransportClosed)?;
-        let result = account_worker_response(response).await?;
-        self.schedule_audit_log_tracker_update("finish_agent_text_stream");
-        Ok(result)
     }
 
     pub async fn retry_group_convergence(
@@ -3161,11 +3256,9 @@ impl AccountManager {
         let Some(lane) = self.existing_worker_commands(account_ref).await? else {
             return Ok(None);
         };
-        if let Some(answer) = self.answer_from_state(
-            &lane,
-            StateRead::Diagnosed,
-            ReadState::key_package_maintenance_status,
-        ) {
+        if let Some(answer) = self.answer_from_state(&lane, StateRead::Diagnosed, |state| {
+            Some(state.key_package_maintenance_status())
+        }) {
             return answer.map(Some);
         }
         self.ask_worker(
@@ -3211,11 +3304,15 @@ impl AccountManager {
         account_ref: &str,
         group_id: &GroupId,
     ) -> Result<cgka_traits::GroupMaintenanceStatus, AppError> {
-        self.read_from_state(
-            account_ref,
+        let lane = self.worker_lane(account_ref).await?;
+        self.read_group_from_state(
+            &lane,
             ReadClass::R3,
             StateRead::Diagnosed,
-            |state| state.maintenance_status(group_id),
+            Admission::Queue,
+            std::slice::from_ref(group_id),
+            HydrationFailure::Ignored,
+            |state| async move { reissue(state.maintenance_status(group_id)) },
             |respond| AccountWorkerCommand::MaintenanceStatus {
                 group_id: group_id.clone(),
                 respond,
@@ -3345,7 +3442,7 @@ mod tests {
             "wss://relay.example",
         ));
         let manager = runtime.accounts();
-        let (commands, mut received) = mpsc::channel(1);
+        let (commands, mut received) = crate::runtime::test_worker_channel(1);
         let (shutdown, stopped) = oneshot::channel();
         let handle = tokio::spawn(async move {
             let Some(AccountWorkerCommand::AcceptGroupInvite { respond, .. }) =
@@ -3406,7 +3503,7 @@ mod tests {
             "wss://relay.example",
         ));
         let manager = runtime.accounts();
-        let (command, mut received) = mpsc::channel(1);
+        let (command, mut received) = crate::runtime::test_worker_channel(1);
         let catch_up = manager.catch_up_committed(command, "test");
         let worker = async {
             let Some(AccountWorkerCommand::CatchUp { respond }) = received.recv().await else {
@@ -3434,7 +3531,7 @@ mod tests {
             dir.path(),
             "wss://relay.example",
         ));
-        let (commands, mut received) = mpsc::channel(1);
+        let (commands, mut received) = crate::runtime::test_worker_channel(1);
         let (respond, _response) = ReadReply::unobserved();
         commands
             .try_send(AccountWorkerCommand::KeyPackageMaintenanceStatus { respond })
@@ -3509,7 +3606,7 @@ mod tests {
         assert!(runtime.accounts().workers.lock().await.is_empty());
 
         let manager = runtime.accounts();
-        let (commands, mut received) = mpsc::channel(1);
+        let (commands, mut received) = crate::runtime::test_worker_channel(1);
         let (shutdown, stopped) = oneshot::channel();
         let handle = tokio::spawn(async move {
             while let Some(command) = received.recv().await {
@@ -3578,7 +3675,7 @@ mod tests {
         async fn read(
             manager: &AccountManager,
             account: &str,
-            received: &mut mpsc::Receiver<AccountWorkerCommand>,
+            received: &mut crate::runtime::TestWorkerReceiver,
             answer: Option<AppError>,
         ) -> Result<PeriodicMaintenancePolicy, AppError> {
             let Some(answer) = answer else {
@@ -3611,7 +3708,7 @@ mod tests {
             "wss://relay.example",
         ));
         let manager = runtime.accounts();
-        let (commands, mut received) = mpsc::channel(1);
+        let (commands, mut received) = crate::runtime::test_worker_channel(1);
         let (publisher, read_state) = read_state_channel();
         let (shutdown, stopped) = oneshot::channel();
         let handle = tokio::spawn(async move {
@@ -3651,20 +3748,31 @@ mod tests {
         let account_engine = |engine| AppError::Account(AccountError::Engine(engine));
         let session_engine =
             |engine| AppError::Account(AccountError::Session(SessionError::Engine(engine)));
-        let copyable: [&dyn Fn() -> AppError; 8] = [
+        let app_session_engine = |engine| AppError::Session(SessionError::Engine(engine));
+        let lifetime = || EngineError::InvalidKeyPackageLifetime {
+            not_before: Some(1),
+            not_after: None,
+        };
+        let copyable: [&dyn Fn() -> AppError; 13] = [
             &|| AppError::UnknownGroup("11".to_owned()),
             &|| AppError::Storage(storage()),
             &|| account_engine(EngineError::UnknownGroup(group.clone())),
             &|| account_engine(EngineError::GroupNotHydrated(group.clone())),
             &|| account_engine(EngineError::Storage(storage())),
+            &|| account_engine(lifetime()),
             &|| session_engine(EngineError::UnknownGroup(group.clone())),
             &|| session_engine(EngineError::GroupNotHydrated(group.clone())),
             &|| session_engine(EngineError::Storage(storage())),
+            &|| app_session_engine(EngineError::UnknownGroup(group.clone())),
+            &|| app_session_engine(EngineError::GroupNotHydrated(group.clone())),
+            &|| app_session_engine(EngineError::Storage(storage())),
+            &|| app_session_engine(lifetime()),
         ];
-        let uncopyable: [&dyn Fn() -> AppError; 3] = [
+        let uncopyable: [&dyn Fn() -> AppError; 4] = [
             &|| AppError::Sqlite(rusqlite::Error::InvalidQuery),
             &|| account_engine(EngineError::UnknownPending),
             &|| session_engine(EngineError::UnknownPending),
+            &|| app_session_engine(EngineError::UnknownPending),
         ];
         for (index, failure) in copyable.iter().enumerate() {
             // A failure with no exact copy sends the read to the worker, whose

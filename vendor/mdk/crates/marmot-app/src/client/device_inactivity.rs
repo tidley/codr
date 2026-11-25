@@ -122,6 +122,7 @@ impl AppClient {
             return;
         }
         if let Err(error) = self.try_device_inactivity_upkeep(held, now).await {
+            self.device_group_work_changed = true;
             tracing::warn!(
                 target: TRACE_TARGET,
                 method = "device_inactivity_upkeep",
@@ -135,7 +136,6 @@ impl AppClient {
     /// trusts: automatic recovery gave up on an epoch gap at its epoch, or its
     /// copy is unrecoverable and no automatic rejoin is underway. Only the
     /// explicit reset and fresh pairing bring it back (D112).
-    #[cfg(feature = "unreleased-device-pairing")]
     pub(crate) fn device_group_stalled(&self) -> Result<bool, AppError> {
         let Some(group_id) = self.trusted_device_group()? else {
             return Ok(false);

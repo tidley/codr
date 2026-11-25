@@ -9,6 +9,16 @@ fn app_with_event_limits(
     relay: Arc<ScriptedPushRelayClient>,
     limits: &[(&str, u64)],
 ) -> MarmotApp {
+    app_with_config_and_event_limits(dir, relay, limits, MarmotAppConfig::white_noise())
+}
+
+/// [`app_with_event_limits`] built from `config`.
+fn app_with_config_and_event_limits(
+    dir: &tempfile::TempDir,
+    relay: Arc<ScriptedPushRelayClient>,
+    limits: &[(&str, u64)],
+    config: MarmotAppConfig,
+) -> MarmotApp {
     let deployment = MarmotDeployment {
         relay_event_limits: limits
             .iter()
@@ -22,7 +32,7 @@ fn app_with_event_limits(
     MarmotApp::with_relays_and_config(
         dir.path(),
         vec!["wss://relay.example".into()],
-        MarmotAppConfig::white_noise()
+        config
             .with_deployment(deployment)
             .with_allow_loopback_relay_endpoints(true)
             .with_open_ranking_provider(None, Vec::new()),
@@ -180,7 +190,8 @@ async fn a_create_whose_welcome_fits_one_inbox_relay_sends_it_only_there() {
 
 /// An invite whose Welcome fits none of the invitee's inbox relays is refused
 /// before its commit is sent: the commit rolls back, no Welcome stays owed,
-/// and nothing reaches a relay.
+/// and nothing reaches a relay. The sender's audit shows the Welcome
+/// prepared, its size, and its withdrawal as too large, in its group.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_invite_whose_welcome_fits_no_inbox_relay_is_refused_unsent() {
     let dir = tempfile::tempdir().unwrap();
@@ -189,6 +200,8 @@ async fn an_invite_whose_welcome_fits_no_inbox_relay_is_refused_unsent() {
     let bob = home.create_account("bob").unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
     let app = app_with_event_limits(&dir, relay.clone(), &[("wss://inbox.example", 200)]);
+    app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
+        .unwrap();
     remember_test_member_inbox(&app, &bob.account_id_hex, "wss://inbox.example");
     app.client("bob")
         .await
@@ -232,6 +245,37 @@ async fn an_invite_whose_welcome_fits_no_inbox_relay_is_refused_unsent() {
         relay.attempted_events().len(),
         attempted,
         "neither the commit nor the Welcome reached a relay"
+    );
+    let group_ref = marmot_forensics::v5::GroupRef::from_group_id(group.as_slice()).unwrap();
+    let welcome_rows = v5_audit_rows(&app, "alice")
+        .into_iter()
+        .filter(|row| {
+            row["event"]["type"]
+                .as_str()
+                .unwrap()
+                .starts_with("welcome_")
+        })
+        .inspect(|row| assert_eq!(row["group_ref"], group_ref.as_str(), "{row}"))
+        .collect::<Vec<_>>();
+    let kinds = welcome_rows
+        .iter()
+        .map(|row| row["event"]["type"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kinds,
+        [
+            "welcome_prepared",
+            "welcome_event_size",
+            "welcome_withdrawn"
+        ]
+    );
+    let withdrawn = &welcome_rows[2]["event"];
+    assert_eq!(withdrawn["reason"], "welcome_too_large");
+    assert_eq!(withdrawn["oversized_size_class"], "under_64_kib");
+    assert!(
+        welcome_rows
+            .iter()
+            .all(|row| row["event"]["outer_event_ref"] == withdrawn["outer_event_ref"])
     );
 }
 
@@ -291,13 +335,27 @@ async fn account_publishes_over_a_known_limit_are_refused_unsent() {
 }
 
 /// Founding-Welcome sizes measured on both sides of the 64 KiB boundary
-/// (mdk#2334); see the notes in the file.
+/// (mdk#2334), with device groups off and on (mdk#3480); see the notes in
+/// the file.
 const FOUNDING_WELCOME_SIZES: &str =
     include_str!("../../tests/fixtures/founding_welcome_sizes.json");
 
 #[derive(Debug, serde::Deserialize)]
 struct FoundingWelcomeSizes {
-    rows: Vec<FoundingWelcomeSize>,
+    device_groups_off: Vec<FoundingWelcomeSize>,
+    device_groups_on: Vec<FoundingWelcomeSize>,
+}
+
+impl FoundingWelcomeSizes {
+    /// The rows measured with device groups `on` or off. With them on, every
+    /// leaf advertises the device roster, so the Welcome is larger.
+    fn rows(self, device_groups: bool) -> Vec<FoundingWelcomeSize> {
+        if device_groups {
+            self.device_groups_on
+        } else {
+            self.device_groups_off
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -371,18 +429,31 @@ fn founding_welcome_size(
 }
 
 /// A founding Welcome's bytes, not its roster count, decide the known-limit
-/// boundary (mdk#2334). Under a 64 KiB limit the largest roster that fits is
-/// created and its Welcomes are sent there; one more member is refused with
-/// nothing written or sent. On a 2 MiB relay that larger roster is created.
-/// The measured Welcome layers match the fixture.
+/// boundary (mdk#2334), with device groups off.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_bulk_create_fits_a_known_limit_up_to_the_fixture_boundary() {
+async fn a_bulk_create_fits_a_known_limit_up_to_the_fixture_boundary_with_device_groups_off() {
+    a_bulk_create_fits_a_known_limit_up_to_the_fixture_boundary(false).await;
+}
+
+/// The same with device groups on, where every leaf also advertises the
+/// device roster and so moves the boundary (mdk#3480).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bulk_create_fits_a_known_limit_up_to_the_fixture_boundary_with_device_groups_on() {
+    a_bulk_create_fits_a_known_limit_up_to_the_fixture_boundary(true).await;
+}
+
+/// Under a 64 KiB limit the largest roster that fits is created and its
+/// Welcomes are sent there; one more member is refused with nothing written
+/// or sent. On a 2 MiB relay that larger roster is created. The measured
+/// Welcome layers match the fixture's rows for `device_groups`.
+async fn a_bulk_create_fits_a_known_limit_up_to_the_fixture_boundary(device_groups: bool) {
     const SMALL: &str = "wss://small.example";
     const LARGE: &str = "wss://large.example";
     const SMALL_LIMIT: u64 = 64 * 1024;
-    let expected: FoundingWelcomeSizes = serde_json::from_str(FOUNDING_WELCOME_SIZES).unwrap();
+    let expected = serde_json::from_str::<FoundingWelcomeSizes>(FOUNDING_WELCOME_SIZES)
+        .unwrap()
+        .rows(device_groups);
     let (fits, too_large) = expected
-        .rows
         .windows(2)
         .find(|pair| {
             pair[0].gift_wrap_json_bytes as u64 <= SMALL_LIMIT
@@ -396,10 +467,11 @@ async fn a_bulk_create_fits_a_known_limit_up_to_the_fixture_boundary() {
     let home = AccountHome::open(dir.path());
     home.create_account("alice").unwrap();
     let relay = Arc::new(ScriptedPushRelayClient::default());
-    let app = app_with_event_limits(
+    let app = app_with_config_and_event_limits(
         &dir,
         relay.clone(),
         &[(SMALL, SMALL_LIMIT), (LARGE, 2 * 1024 * 1024)],
+        MarmotAppConfig::white_noise().with_device_groups(device_groups),
     );
     let mut keys = std::collections::HashMap::new();
     let mut invitees = Vec::new();
@@ -498,8 +570,9 @@ async fn a_bulk_create_fits_a_known_limit_up_to_the_fixture_boundary() {
     assert!(measured[2].gift_wrap_json_bytes as u64 > SMALL_LIMIT);
     assert_eq!(
         measured,
-        expected.rows,
-        "founding Welcome sizes changed; measured rows:\n{}",
+        expected,
+        "founding Welcome sizes with device groups {} changed; measured rows:\n{}",
+        if device_groups { "on" } else { "off" },
         serde_json::to_string_pretty(&measured).unwrap()
     );
 }
@@ -680,6 +753,8 @@ async fn a_queued_invite_whose_welcome_fits_no_inbox_relay_is_retired_unsent() {
         &[("wss://small-inbox.example", 200)],
         QUIESCENCE_MS,
     );
+    app.set_audit_log_settings(crate::AuditLogSettings { enabled: true })
+        .unwrap();
     let carol = super::push_token_reshare::Device::create(&home, &app, "carol").await;
     remember_member_inbox_at(&app, &carol.account_id_hex, "wss://small-inbox.example", 2);
     let (mut alice, _bob, group) = chat_with_an_open_settlement_window(&home, &app, &relay).await;
@@ -746,6 +821,35 @@ async fn a_queued_invite_whose_welcome_fits_no_inbox_relay_is_retired_unsent() {
         sent_before,
         "neither the commit nor the Welcome was sent"
     );
+    // The drained invite's Welcome is audited as a direct invite's is:
+    // prepared on its commit, then withdrawn as too large, never started.
+    let group_ref = marmot_forensics::v5::GroupRef::from_group_id(group.as_slice()).unwrap();
+    let welcome_rows = v5_audit_rows(&app, "alice")
+        .into_iter()
+        .filter(|row| {
+            row["group_ref"] == group_ref.as_str()
+                && row["event"]["type"]
+                    .as_str()
+                    .is_some_and(|kind| kind.starts_with("welcome_"))
+        })
+        .collect::<Vec<_>>();
+    let prepared = welcome_rows
+        .iter()
+        .find(|row| row["event"]["type"] == "welcome_prepared" && row["event"]["mode"] == "invite")
+        .expect("the drained invite's Welcome was prepared");
+    assert_eq!(prepared["event"]["basis"]["kind"], "commit");
+    let outer = &prepared["event"]["outer_event_ref"];
+    let withdrawn = welcome_rows
+        .iter()
+        .find(|row| {
+            row["event"]["type"] == "welcome_withdrawn" && row["event"]["outer_event_ref"] == *outer
+        })
+        .expect("the refused Welcome was withdrawn");
+    assert_eq!(withdrawn["event"]["reason"], "welcome_too_large");
+    assert!(!welcome_rows.iter().any(|row| {
+        row["event"]["type"] == "welcome_publish_started"
+            && row["event"]["outer_event_ref"] == *outer
+    }));
 }
 
 /// How every relay refuses an account publish for size in the tests below

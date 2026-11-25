@@ -10,6 +10,12 @@ use tokio::{
 pub const PROTOCOL: &str = "marmot.agent-control.v2";
 pub const MAX_FRAME: usize = 1024 * 1024;
 
+pub(crate) fn is_chat_timeline_row(row: &Value) -> bool {
+    // MDK 0.19 projects a thread's authoritative lowercase `e` parent here.
+    // Other kind-1111/custom rows must not become agent prompts or chat activity.
+    row["kind"] == 9 || (row["kind"] == 1111 && row["reply_to_message_id_hex"].is_string())
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("Socket unavailable before request submission")]
 pub struct NotSubmitted;

@@ -15,6 +15,8 @@ mod tests;
 
 use announce::PushShareForm;
 pub(crate) use announce::{AcceptedPushAnnounce, PushAnnounceTiming, PushFetchClock};
+#[cfg(test)]
+pub(crate) use announce::{TestPushOverride, TestPushOverrideGuard};
 pub(crate) use repair::PushRepairs;
 
 const PUSH_PUBLISH_CONCURRENCY: usize = 4;
@@ -1239,8 +1241,12 @@ pub(crate) fn notification_trigger_for_intent(
         | AppMessageIntent::Sticker { .. }
         | AppMessageIntent::Reply { .. }
         | AppMessageIntent::Media { .. }
-        | AppMessageIntent::Poll { .. }
-        | AppMessageIntent::StreamFinal { .. } => {
+        | AppMessageIntent::ThreadMessage { .. }
+        | AppMessageIntent::Poll { .. } => Some(notifications::NotificationTrigger::NewMessage),
+        // A thread message sent through the custom-event path wakes members too.
+        AppMessageIntent::Custom { kind, tags, .. }
+            if cgka_traits::thread_message_parent(*kind, tags).is_some() =>
+        {
             Some(notifications::NotificationTrigger::NewMessage)
         }
         AppMessageIntent::Report { .. }
@@ -1252,7 +1258,6 @@ pub(crate) fn notification_trigger_for_intent(
         | AppMessageIntent::Edit { .. }
         | AppMessageIntent::Delete { .. }
         | AppMessageIntent::PollResponse { .. }
-        | AppMessageIntent::StreamStart { .. }
         | AppMessageIntent::AgentActivity { .. }
         | AppMessageIntent::AgentOperation { .. }
         | AppMessageIntent::GroupSystem { .. }

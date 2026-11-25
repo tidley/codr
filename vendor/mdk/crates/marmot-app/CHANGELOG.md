@@ -2,6 +2,303 @@
 
 ## Unreleased
 
+## 0.19.0 - 2026-11-22
+
+### Breaking changes
+
+- The agent text stream over QUIC (live agent text previews) is removed. Gone: `MarmotAppRuntime::open_agent_publisher`,
+  `start_agent_text_stream`, `start_agent_text_stream_with_parent`, `finish_agent_text_stream`,
+  `watch_agent_text_stream`, `agent_text_stream_crypto_for_start_event`, `agent_text_stream_exporter_secret` and
+  `agent_streams`; `AppClient::agent_text_stream_exporter_secret`; `AgentPublisher*`, `AgentStream*`,
+  `AgentTextStreamCryptoContext`, `AgentTextStreamFinishRequest`, `RuntimeAgentStream*`, `StreamStartView` and
+  `is_stream_final_event`; `MarmotAppEvent::AgentStreamStarted` and `RuntimeMessageUpdate::AgentStreamStarted`; the
+  `AppError::AgentStream*` variants; `AppAgentTextStreamComponent`, `AppGroupRecord::agent_text_stream` and the
+  `AGENT_TEXT_STREAM_COMPONENT(_ID)` re-exports.
+- A kind-1200 stream start no longer reaches message subscribers and has no timeline row; a stream-final kind-9
+  message is an ordinary chat message.
+- New groups no longer include the retired agent text stream component (`0x8006`), and the retired `send` and
+  `fanout` role capabilities are no longer advertised, so every account republishes its KeyPackage once. Groups that
+  already require `0x8006` keep working: support for it and the `receive` role stays advertised, and their record
+  carries `0x8006` in `unknown_components`. `AppError::InvalidAgentTextStreamPolicy` is gone.
+- `save_message_draft_inputs_if_revision` keeps every attachment the draft holds that the save does not name,
+  inline or file-backed, after the named ones in their stored order. Remove one with the new
+  `MessageDraftAttachmentInput::Removed(id)`, which also unlinks its file; removing an id the draft no longer holds
+  changes nothing. A save from a composer that has not loaded the draft, or that races a staging copy, no longer
+  deletes a file it did not know about. Hosts that removed attachments by leaving them out must send `Removed`
+  (#3586). `save_message_draft_if_revision` still replaces the whole list.
+
+### Added
+
+- `MarmotAppRuntime::send_thread_message` sends a NIP-22 thread message (kind 1111) with text, attachments or both,
+  building the `E`/`K`/`P` root and `e`/`k` parent tags from the parent's row. `TimelineThreadRef` is re-exported.
+- Crash-safe tagged sends: `MarmotAppRuntime::submit_tagged_text`, `submit_tagged_reply` and
+  `submit_tagged_edit_for_local_send` admit kind-9 text, replies and pending edits that carry application tags inside
+  the encrypted event, under `send_tagged_text`'s tag rules (`imeta` refused; a reply's `e`/`q` and an edit's `e` are
+  its own). `submit_custom_event` does the same for `send_custom_event`. Each takes a client token like `submit_text`:
+  an identical retry after restart returns the original message id while the same account-device and group retain
+  the association and its status is not rejected. A retry on another device or after the source expires can create
+  another message. `local_send_status` reports its progress,
+  and the tags (and a custom event's kind) are part of the request, so a token reused with other tags is refused.
+  Untagged submissions keep their existing request hashes.
+
+### Changed
+
+- Thread messages notify like kind 9 (live, background wake and push to other members, also when sent through
+  `send_custom_event` or published later from the queue), count as mentions when they mention the account, bring back
+  a locally deleted chat like kind 9, advance the sender's read position like a chat send, and carry mention
+  identities in conversation presentation. See `docs/marmot-architecture/overview/thread-messages.md`.
+
+### Fixed
+
+- An account whose sign-out a device removal holds no longer retries maintenance every 15 s until the hold lifts.
+  Maintenance, the invitation step and device-group due times share one check of whether passes run.
+- An invitation answer whose device-group update lost a fork between linked devices is sent again on the worker's
+  next turn, not at the next maintenance pass, so the other device shows it within seconds instead of after up to
+  15 s (mdk#3573).
+- An invitation answer sent in a device-group update on a commit that then lost a fork reaches the other linked
+  device again. Branch selection parks such an update with its branch instead of withdrawing it, so it was never sent
+  again and the other device kept showing the invitation as pending. A withdrawn device-group commit now owes the
+  small state again, and its answers go out on the worker's next turn (mdk#3594).
+
+## 0.18.0 - 2026-11-20
+
+### Breaking changes
+
+- DeviceLinkSnapshot gains `chat_progress`. It reports remaining eligible Adds on the approver and remaining local joins on the new device (#3532). Update Rust struct literals.
+
+- Every build includes multi-device (mdk#2628). The `dev-device-groups` and `unreleased-device-pairing` Cargo
+  features are gone: `marmot-pairing` is always linked and the engine may always advertise the device roster.
+  `MarmotAppConfig::dev_device_groups` / `with_dev_device_groups` are renamed `device_groups` / `with_device_groups`
+  and take effect in every build. Struct literals and builder calls need the new name.
+- Device groups are on by default (`MarmotAppConfig::device_groups` defaults to true): the device roster is
+  advertised, device linking, linked devices and backups work, and Leave steps a nonlast admin down itself. A host
+  that must stay off sets `with_device_groups(false)` in every opener of a root.
+
+### Added
+
+- `AppError::NoUsableRelay` reports a group send none of whose relays MDK may send to, such as relays at
+  private-network addresses, in place of `AppError::Publish`; `marmot_session::PublishFailure` gains
+  `no_usable_relay`, set when the transport refused every target of a group send before sending (#3305).
+- `MarmotAppRuntime::follow_availability_page`, `refresh_follow_availability`,
+  `follow_availability_status`, and `cancel_follow_availability` expose bounded direct-follow
+  availability (mdk#1996). The account-local projection persists freshness and publication metadata without raw
+  KeyPackages; offline pages report `ready`, `unknown`, or a temporary `not_found` and refresh reports aggregate
+  partial progress with operation-matched cancellation.
+- Opt-in relay telemetry exports `relay_read_back_requests` and `relay_read_back_found`: device-wide, unlabeled
+  counts of the read-back REQs sent for pending commits and of the relays that returned the exact event (mdk#2332).
+  `RelayTelemetryRollup` gains the matching fields; struct literals need them or `..Default::default()`.
+- `MarmotAppRuntime::group_pending_commit` (and `AppClient`) returns `GroupPendingCommit` for the group's own commit
+  that has not confirmed yet, `GroupPendingCommitState::Sending` or `Stuck`, with its relays (mdk#2332).
+  `AccountDeviceRuntime::pending_commit` in `marmot-session` is its source.
+- `MarmotAppRuntime::group_changes_not_delivered` and `acknowledge_change_not_delivered` read and clear
+  `GroupChangeNotDelivered` records (mdk#2332); `AppClient` has both too. Host group-change commands name their
+  commits, so a rollback after the command returned is recorded.
+- Interactive onboarding suggests removing declared relays its check showed can't serve their role (#3449). A
+  relay that refused the declared-route check with `auth-required` or `payment-required` while the inspection held
+  the account's local key joins retired relays as a removal candidate in `propose_onboarding_relay_repair`.
+  Timeouts, unreachable relays, `AccessRestricted`, external-signer refusals and `Unsafe`/`Invalid` entries never
+  qualify. On a passed step the preview is strictly `RemovalOnly` and keeps an entry that is the list's last
+  allowed route for one of its roles. On a failing step it joins the existing minimal repair, which adds a default
+  when a role is left empty. `OnboardingAction::RemoveUnusableRelays` is offered exactly when that preview is
+  approvable and removes an entry, including the existing retired-relay cleanup. Every `Removed`
+  `OnboardingRelayTagChange` carries `removal_reason` (`OnboardingRelayRemovalReason`). It is advice:
+  readiness never depends on it, and cancelling keeps the step's status and the action. A retired-relay preview
+  saved by an earlier build has no reasons and still approves.
+- Interactive onboarding records an `mdk_onboarding_summary` usage-diagnostics aggregate when a saved checkpoint
+  leaves a step in a blocking status (#3440). `ProductFamily::Onboarding` is the new family. Its rows carry only the
+  step, status, issue classes, finding context and a bucketed failing-source count. Each attempt counts a distinct
+  step, status and issue once, durably and only under consent. The registry revision changes, so a granted receipt
+  requires acceptance again.
+- `MarmotAppRuntime::start_direct_conversation_with_options` takes `DirectConversationOptions` with a founding
+  `disappearing_message_secs`. A new direct conversation carries it in its founding MLS state and Welcome; reuse,
+  retry and same-account concurrent starts keep the existing group's duration and roles. `start_direct_conversation`
+  is unchanged (#3365).
+- File-backed composer-draft attachments up to the encrypted-media blob limit
+  (#3431): `stage_message_draft_attachment_file`,
+  `read_message_draft_attachment`, `open_message_draft_attachment_handoff` and
+  `upload_message_draft_attachments` on `MarmotAppRuntime`, and
+  `save_message_draft_inputs_if_revision`, which keeps attachments by id
+  (`MessageDraftAttachmentInput::Retained`). Every draft save, clear and delete
+  unlinks the files it released before returning.
+- `OnboardingDevicePackage::client` carries the sanitized app label from an
+  other-installation package's `client` tag (first value only; control, bidi and
+  invisible characters removed; at most 64 grapheme clusters and 1024 bytes). It is
+  peer-controlled display text, not evidence of which app published the package.
+  Older checkpoints read it as `None` (#3438).
+
+### Changed
+
+- The prepared group image status and list (an upload in flight reads `Uploading`), the fresh-start flag and chat
+  history imports answer from the published read state, as the 0.17.0 account and group reads do (mdk#3273, #3468).
+  History notices and account recovery status follow (#3428), and reads that could answer before the worker would
+  (`group_commit_delivery` and `maintenance_status` for an unhydrated group, `quarantined_groups` after a reconnect,
+  history notices for an unrecoverable group, the backup-restore watch) now wait for the state the worker would
+  give (#3533).
+- WN Agent and every other host that opens with `MarmotAppConfig::white_noise()` or `default()` runs with device
+  groups on (mdk#2628).
+- Runtime shutdown gives Welcome waves still publishing one bound, 2 s after shutdown begins, shared by the runtime and
+  every account worker, before it cancels them (#3488). A wave a create or invite started counts from before the host
+  hears of it. `shutdown_and_close` still closes storage first, so a wave that settles after the close leaves its
+  Welcome owed and the next start sends it once more. Sign-out, unlink and client replacement still cancel at once.
+- Destructive sign-out reports a member Leave it could only queue in `group_leave_failures` instead of counting the
+  group as left (#3539).
+- Background history drains without a standing live tail owe history only through where the drain first saw the
+  route, so a drain over slow relays ends instead of polling them continuously; epoch-gap visits are bounded in time
+  and passive polling per gap unit is limited (#3541, #3548). `RecoveryStatusChanged` is published when a route's
+  catching-up state changes, not a relay's.
+- Commit-preparing group commands fail with `AppError::GroupCommitPending` while the group's own commit is pending,
+  before the catching-up and undelivered checks and without spending their acknowledgements (mdk#2332). So do a
+  member's `leave_group` and `decline_group_invite`. They failed with the engine's untyped refusal before.
+  `disband_group` and an admin's leave keep the advisory checks alone.
+- `send_message_draft` and captured-media admission match prepared media to
+  the draft's attachments after an upload's version normalization (a V1
+  upload trims the file name; both versions canonicalize the media type)
+  instead of comparing the strings literally (#3431).
+
+- Every job the 15 s maintenance tick ran, other than session maintenance (`run_due_maintenance`), now runs on the
+  account worker's own schedule (mdk#2923 step B): local-submission retries, the content-report backfill, legacy message
+  promotion, device pairing timers, the compaction and housekeeping batch, the KeyPackage catch-up, push join windows
+  and announce/repair retries, and history dispatch. Each runs when an event wakes it and at the deadline its data
+  gives; the sweeps that finish (backfill, promotion) run batch after batch until done; pairing runs every 15 s only
+  while pairing state exists, and push only while a join window is open, an announce is owed or a repair ask is held.
+  History dispatch counts backup deadlines only while backups are configured, so with device groups on and no recovery
+  key it runs once at startup and then rests until a history transfer, a restore, or a change to backup eligibility (a
+  kept recovery key or a commit to the trusted device group) wakes it. An idle device no longer samples the push fetch
+  clock, so its push token change goes out at once as a plain `PushTokenUpdate`, and the announce it owes follows once
+  the clock settles: two group messages per group instead of one. A slot withdrawal, a sign-in check that finds the slot
+  superseded or emptied, and every maintenance pass wake the KeyPackage catch-up. The tick runs session maintenance and
+  the watchdog, which counts a missed wake for each job (`watchdog_missed_wake_*`).
+- The attachment, avatar and presentation passes no longer run on every maintenance tick (mdk#2923 step B). Each runs
+  when an event wakes it and at the deadline its data gives: the attachment pass at the earliest acquisition `due` among
+  its candidates (a request, a lease end, a retry, a deferral or a readmission backoff), an acquisition or partial
+  expiry, and at least hourly; the avatar pass at the earliest avatar acquisition `due`. Work no column announces is
+  still polled every 15 s while it exists: a staged upload, a row parked for free disk space, a running media sweep
+  batch, and presentation rows that cannot be applied yet. An idle account runs none of them. The tick's watchdog also
+  checks the passes (`watchdog_missed_wake_attachment_pass`, `_avatar_pass`, `_presentation_pass`).
+- Recovery and post-join work run on the account worker's own schedule, not on every maintenance tick (mdk#2923 step B).
+  Each runs once when the worker opens, then when an event wakes it (a receive, a convergence pass, a new replay
+  generation, a join, maintenance pausing or resuming) and again 15 s later while it still has work. An account with
+  nothing owed runs neither. While the adapter is inactive (offline, or no relays) the replay generation never
+  authorizes, so recovery keeps its 15 s cadence; since mdk#3238 a repeat pass writes nothing. The tick checks as a
+  watchdog that no job with work lacks a wake or deadline; a miss is counted as `watchdog_missed_wake_recovery` or
+  `watchdog_missed_wake_post_join`, logged once per job per worker, and the job runs. A rolled-back compaction now waits
+  1 minute, then 10 minutes, before its next attempt, instead of retrying on the next tick.
+- Account-scoped work wakes only that account's worker (mdk#2923 step B). A chat-list, message, avatar or attachment
+  change for one account no longer runs every other account's presentation, avatar and attachment passes; shared profile
+  and directory changes and attachment controls still wake every account. The expired private KeyPackage discard reads
+  first and opens no writer transaction when nothing has expired, so an idle tick no longer writes the session database.
+  New runtime operation `storage_session_write_begin` counts writer transactions on the engine's session connection.
+
+- Session maintenance (`run_due_maintenance`) no longer runs on every 15 s maintenance tick (mdk#3265). The account
+  worker runs it at the earliest time its data gives: a periodic rotation or leaf refresh deadline, a self-update
+  obligation's phase deadline, a KeyPackage refresh, expiry or relay backoff, a transport fanout's backoff or bound, a
+  private KeyPackage expiry, a reinvite retry, or the 10-minute component recheck. A self-update held by an epoch gap is
+  due when its 24 h hold ends, and one held by an undelivered commit an hour after that commit's first acknowledgement.
+  Work with no stored time (a send failure, an in-memory retry, a rejoin offer, an unrecoverable group, an overdue
+  component recheck) retries 15 s after the last run while it lasts, as before; device-group passes have their own
+  times (below). KeyPackage
+  publication retries now follow their stored backoff (30 s doubling to 1 h) instead of every tick. The due time is
+  re-read at most once a second, after a command, a receive, a convergence pass, a recovery turn or a maintenance run,
+  and timed as `worker_maintenance_next_due`. The watchdog's own read on each tick is timed apart, as
+  `watchdog_maintenance_next_due`. A maintenance run wakes the KeyPackage catch-up only when it changed whether the
+  catch-up is due or when it next comes due, so the catch-up's own deadline decides otherwise. The relay-config retry
+  after an inactive account (mdk#3263) moves from the tick to the same schedule. The tick's watchdog counts session
+  maintenance found due before its deadline (`watchdog_missed_wake_session_maintenance`) and a relay-config retry with
+  no deadline (`watchdog_missed_wake_relay_config`).
+
+- With device groups on, an idle account no longer runs session maintenance every 15 s (mdk#3265, after mdk#3361).
+  Device-group passes run at their own times: the sign-in check, and once linked the hourly heartbeat, the small-state
+  broadcast, private KeyPackage request pacing, a leaving sibling's decision, gap filling and inventory pages. They
+  retry 15 s after the last run only while they owe work with no time: something left unsent, held invitation work, a
+  device-group event, a small-state edit or a pass that failed. Device pairing runs only while linking is under way,
+  not for every settled device group. Deadlines a week or more out (history expiry, inactivity, takeover) ride the
+  run the hourly heartbeat brings, so they can be up to an hour late, and a sibling's decline this device cannot
+  apply as the chat's last admin waits for the next maintenance run, up to an hour.
+
+### Fixed
+
+- A newly linked device no longer reads traffic stamped up to five minutes after its Welcome as stall evidence
+  (#3552). Such pre-join history armed a false epoch gap, which offered a needless Reset Device List (mdk#3536) and held
+  device-group work, so the approver added the device to no chats until an unrelated commit (mdk#3535).
+- A fresh account no longer fails KeyPackage rotation with "legacy key package replacement is pending" or reports
+  `RecoveryRequired` because an early read created its database (#3483, #3509). The account database records that it
+  was created empty, and the cutover and the legacy recovery check read that record instead of the file's existence.
+  The device-group removal look no longer opens a database that does not exist.
+- A linked and then removed device's slot no longer shows as "Rejected on another of your devices" (#3482).
+- An invitation answered on one linked device shows as answered on the other within seconds (mdk#3566). The answer is
+  sent on the worker's next turn, a sibling's winning answer is applied when it arrives, and the chat then reports
+  `GroupStateUpdated`, as a host accept does. Before, each device waited for a maintenance pass, and the receiving device's chat
+  list changed only with the chat's next event.
+
+- A sibling Add forwards how this device holds the chat, and the new device's copy shows it the same way (mdk#3546).
+  A copy with no invitation generation that is confirmed here arrives confirmed; one with a generation settles through
+  its shared decision and can stay pending until that decision arrives (mdk#3556). An unanswered invitation arrives
+  pending with the original inviter as `welcomer_account_id_hex` instead of the account itself.
+
+- When a device is linked to an account that already has two or more devices, its approver and the other devices
+  no longer both add it to the same chat in the usual case, which forked chats (mdk#3537). While the approver is active
+  (heard from, or approving the link, within the last two hours) and the link is under a week old, other devices leave
+  the new device to the approver in the chats the approver is in, and gap-fill it there only once the approver goes
+  quiet. The approver's direct post-link pass publishes no gap-fill claim, and neither it nor the approver's own gap
+  filling adds the device to a chat another device holds a live claim for, whatever that device's slot. No wire
+  change. A residual race remains at the hand-off edges, where claims arrive late, and with a sibling running an
+  older version, which still gap-fills at once. An approver that keeps sending heartbeats while it cannot add the
+  device holds the others back for up to a week.
+
+- A device the user linked and then removed no longer comes back as a new sign-in once its `removed` roster record
+  expires. Every device that trusts the device group records the removal when its roster shows the record, drops the
+  slot's sign-in, and keeps any publication from before the removal (allowing the directory's future skew) from
+  listing it again, a restart included. A later publication in that slot is still a new sign-in. Rejections are unchanged.
+- With device groups on, an idle maintenance tick takes no writer transaction again (mdk#3479), whether the account
+  holds no device group or a settled one: the history-delivery expiry, small-state pass, private KeyPackage upkeep
+  and device-inactivity coverage read first and write only when they have work.
+- Reassess retained current-epoch ciphertext after local replay settles before retiring an advanced epoch gap.
+  When enough failures remain, persist the successor request before deleting the old request. Failed writes keep
+  recovery demand, and secondary outbound retries do not block the handoff. Successive missing commits can recover
+  without reopening the account or receiving fresh traffic.
+- Emoji discovery applies its 60-set limit after deduplicating coordinates, so overlapping revisions from additional
+  relays no longer hide older sets below that limit (#3492).
+- The compaction and housekeeping batch looks again 15 s after the account's storage fails to open, instead of resting
+  until an unrelated wake. This closes a gap left by mdk#2923 step B.
+- Reinstalling the installed version of an emoji set no longer deletes images it already holds (#3464). A verified
+  image whose refresh fails or does not fit the byte budget is kept, counts in `installed_count` and is not in
+  `skipped`. Newly downloaded images are added, successful refreshes replace the old bytes, and a stored image that
+  fails its hash check is fetched again. Installing a different version still replaces the whole set.
+- Sticker pack reads (discovery and installed-pack refresh in `sync_sticker_packs`, `fetch_sticker_pack`,
+  `install_sticker_pack`, and `fetch_sticker_asset`'s on-demand pack fetch) query the runtime's configured relays as
+  well as the account's NIP-65 relays, deduplicated and filtered by the host-safety rule, so a pack only the host's
+  relays hold is found. The newest version of a pack among the relays that answered wins; a read that misses a relay
+  can keep an older version until a later read reaches it. The installed list (kind 10031) is still read from and
+  published to the account's relays only. Emoji set reads (`sync_emoji_sets`, `fetch_emoji_set` and the sets
+  `user_emoji_list` points to) use the same relays; the kind-10030 emoji list itself, including through
+  `fetch_emoji_set`, is still read from the account's relays only. Share-link hints are the relays that sent the
+  stored version of the pack: a relay that was only queried, or sent only a version that lost NIP-01 replacement, is
+  never a hint. `transport_nostr::PublicEventFetch` gains `sources` (the relays that sent each verified event); public
+  reads verify each event before deduplicating it, so a relay's forged copy can no longer displace the genuine copy
+  another relay sent.
+- Interactive onboarding keeps a single-device acknowledgment when Continue follows a pause of more than five
+  minutes. The stale prerequisite checks and device discovery still run again, but the notice returns only when
+  discovery shows another slot, a slot newly carrying a usable package, a new finding or a less complete result
+  (#3442).
+- Onboarding relay inspections classify a CLOSED `ERROR: auth-required: ...` as `AuthenticationRequired` (not
+  `AccessRestricted`), retry the REQ once after NIP-42 authentication when the account can sign, and wait up to 8 s
+  for EOSE instead of 3 s. `CHECK_WAIT` is checked at compile time to outlast an inspection (#3439).
+- Custom sends of NIP-22 comments (kind 1111 with a numeric lowercase `k` tag) derive mention `p` tags without
+  duplicating an existing pubkey tag, including one carrying a relay hint. Author edits of these comments pass
+  send admission (#3409).
+- Imported-account onboarding no longer strands a relay or inbox list whose check is inconclusive (#3441). Examples
+  are a list whose only relay refuses the declared-route probe, or a missing list next to one dead declared relay.
+  The step's `RetryableFailure` now offers `EditRelays` and, where defaults can change the list,
+  `UseRecommendedRelays`. `propose_onboarding_relays` and `propose_onboarding_relay_repair` accept it, and a lookup
+  that found nothing while a source failed adds `DiscoveryIncomplete`. `OnboardingRepairProposal::inconclusive`
+  marks a proposal built on an inconclusive check. Approving it no longer needs every source to answer. A declared
+  relay or public indexer must answer (the host's discovery relays only when no indexer is searched), and the
+  proposal's record must still be the newest any answering source holds. The failed sources stay in the findings.
+  Proposals from complete checks keep the all-sources rule, and cancelling a relay proposal keeps the step's
+  status.
+- Received NIP-22 comments cache their source-epoch media keys, and history bundles carry their attachment file keys
+  so comment media remains decryptable after epoch advancement and on devices importing that history (#3409).
+
 ## 0.17.0 - 2026-11-15
 
 ### Breaking changes

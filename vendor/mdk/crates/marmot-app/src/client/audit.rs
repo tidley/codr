@@ -178,6 +178,10 @@ impl AppClient {
             AppMessageIntent::Media { attachments, .. } => {
                 ("send_media", Some(attachments.len() as u64))
             }
+            AppMessageIntent::ThreadMessage { attachments, .. } if !attachments.is_empty() => {
+                ("send_media", Some(attachments.len() as u64))
+            }
+            AppMessageIntent::ThreadMessage { .. } => ("reply_message", None),
             AppMessageIntent::Custom { .. } => ("send_custom_event", None),
             AppMessageIntent::Poll { options, .. } => ("create_poll", Some(options.len() as u64)),
             AppMessageIntent::PollResponse { option_ids, .. } => {
@@ -185,9 +189,7 @@ impl AppClient {
             }
             AppMessageIntent::Report { .. } => ("report_message", None),
             AppMessageIntent::DismissReports { .. } => ("dismiss_reports", None),
-            AppMessageIntent::StreamStart { .. }
-            | AppMessageIntent::StreamFinal { .. }
-            | AppMessageIntent::AgentActivity { .. }
+            AppMessageIntent::AgentActivity { .. }
             | AppMessageIntent::AgentOperation { .. }
             | AppMessageIntent::GroupSystem { .. }
             | AppMessageIntent::PushTokenUpdate { .. }
@@ -798,10 +800,11 @@ mod tests {
         assert_eq!(action.origin, "local_user");
         assert_eq!(action.target_count, None);
 
-        let machine = AppMessageIntent::StreamStart {
-            stream_id: vec![1],
-            parent_message_id: None,
-            quic_candidates: Vec::new(),
+        let machine = AppMessageIntent::AgentActivity {
+            status: "working".to_owned(),
+            text: String::new(),
+            reply_to_message_id: None,
+            extra: None,
         };
         assert!(super::AppClient::message_human_action_context(&machine).is_none());
     }

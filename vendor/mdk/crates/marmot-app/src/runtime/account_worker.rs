@@ -4,10 +4,17 @@
 mod attachments;
 mod read_queue;
 pub(crate) mod recovery_credits;
+mod schedule;
+mod sign_in_reads;
+mod welcome_runs;
 
+use read_queue::run_as_account_worker;
 pub(crate) use read_queue::{
-    ReadClass, ReadReply, WorkerLane, WorkerReply, WorkerUnit, WorkerUnitGauge,
+    QueuedCommand, ReadClass, ReadReply, UnitKind, WorkerCommands, WorkerInbox, WorkerLane,
+    WorkerReply, WorkerUnit, WorkerUnitGauge, observe_on_account_worker,
 };
+#[cfg(test)]
+pub(crate) use read_queue::{TestWorkerReceiver, test_worker_channel, test_worker_queue};
 
 use crate::RuntimePerformanceOperation as RuntimeOp;
 use marmot_observability::{Observation, Outcome as TelemetryOutcome};
@@ -19,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use cgka_traits::app_event::MARMOT_APP_EVENT_KIND_AGENT_STREAM_START;
 use cgka_traits::engine::KeyPackage;
-use cgka_traits::{GroupId, MessageId, SecretBytes};
+use cgka_traits::{GroupId, SecretBytes};
 use futures::FutureExt;
 use marmot_account::{AccountHomeError, AccountSetupKind, AccountSetupPhase, AccountSetupState};
 use rand::RngCore;
@@ -33,37 +40,36 @@ use super::conversation_window::{
     CapturedConversation, ConversationWindowError, capture_conversation,
 };
 use super::{
-    MarmotAppEvent, RuntimeAccountError, RuntimeAgentStreamMessage, RuntimeGroupEvent,
-    RuntimeLifecycle, RuntimeMessageReceived, RuntimeProjectionUpdate, RuntimeSharedServices,
+    MarmotAppEvent, RuntimeAccountError, RuntimeGroupEvent, RuntimeLifecycle,
+    RuntimeMessageReceived, RuntimeProjectionUpdate, RuntimeSharedServices,
     runtime_shutdown_requested, wait_for_runtime_shutdown,
 };
 use crate::client::history_recovery::recovery_runner::host::{SpawnedRunner, next_runner_turn};
 use crate::client::read_state::{ReadStateReader, ReadStateSender, UploadsInFlight};
 use crate::client::{
-    CommittedSyncProgress, CompletedWelcomeDeliveryRecovery, EncryptedMediaUploadFinish,
-    PreparedGroupImageUploadStart, RetainedSendWake,
+    CommittedSyncProgress, EncryptedMediaUploadFinish, PreparedGroupImageUploadStart,
+    RetainedSendWake,
 };
 use crate::messages::AppMessageIntent;
 use crate::{
     ACCOUNT_WORKER_RECONNECT_BASE_DELAY, ACCOUNT_WORKER_RECONNECT_JITTER_MAX_MS,
     ACCOUNT_WORKER_RECONNECT_MAX_DELAY, APP_RUNTIME_ACCOUNT_SHUTDOWN_WAIT, AccountCatchUpFailure,
-    AgentTextStreamFinishRequest, AppBlobEndpoint, AppClient, AppCreateGroupOptions,
-    AppDisbandRequest, AppError, AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord,
-    AppPreparedGroupImageUpload, AppProjectionUpdate, AppQuarantinedGroup, CanonicalCreatedGroup,
-    ChatListUpdateTrigger, ClassifiedSyncFailure, ConvergenceScheduleState,
-    EpochBackfillRunOutcome, GroupInviteDeclineResult, MaintenanceRunSummary, MarmotApp,
-    MarmotRelayPlane, MediaAttachmentReference, MediaDownloadResult, MediaUploadResult,
-    NotificationSettings, PendingWelcomeDelivery, PushPlatform, PushRegistration,
-    PushRegistrationShareOutcome, PushRegistrationSyncResult, ReceivedMessage,
-    RetentionSweepReport, SecureDeleteExpiredResult, SendSummary, SyncSummary,
+    AppBlobEndpoint, AppClient, AppCreateGroupOptions, AppDisbandRequest, AppError,
+    AppGroupMemberRecord, AppGroupMlsState, AppGroupRecord, AppPreparedGroupImageUpload,
+    AppProjectionUpdate, AppQuarantinedGroup, CanonicalCreatedGroup, ChatListUpdateTrigger,
+    ClassifiedSyncFailure, ConvergenceScheduleState, EpochBackfillRunOutcome,
+    GroupInviteDeclineResult, MaintenanceRunSummary, MarmotApp, MarmotRelayPlane,
+    MediaAttachmentReference, MediaDownloadResult, MediaUploadResult, NotificationSettings,
+    PendingWelcomeDelivery, PushPlatform, PushRegistration, PushRegistrationShareOutcome,
+    PushRegistrationSyncResult, RetentionSweepReport, SecureDeleteExpiredResult, SendSummary,
+    SyncSummary,
 };
-use cgka_traits::app_event::MarmotAppEvent as MarmotInnerEvent;
 use marmot_observability::{AppPerformanceOperation, SyncFailureClassification, SyncFailureStage};
 
 pub(crate) struct ManagedAccountWorker {
     pub(super) ready: bool,
     pub(crate) handle: JoinHandle<()>,
-    pub(crate) commands: mpsc::Sender<AccountWorkerCommand>,
+    pub(crate) commands: WorkerCommands,
     pub(crate) media_admission: Arc<Semaphore>,
     pub(crate) shutdown: oneshot::Sender<()>,
     /// Which long unit the worker is inside, for host-read telemetry.
@@ -77,7 +83,8 @@ pub(crate) struct ManagedAccountWorker {
 enum RelayConfigWork {
     Idle,
     Ready,
-    RetryOnTick,
+    /// A failed update retries on the worker's schedule (mdk#3265).
+    Retry,
 }
 
 impl ManagedAccountWorker {
@@ -654,6 +661,19 @@ pub(crate) enum AccountWorkerCommand {
         group_id: GroupId,
         respond: ReadReply<Result<Option<crate::GroupCommitDelivery>, AppError>>,
     },
+    GroupChangesNotDelivered {
+        group_id: GroupId,
+        respond: ReadReply<Result<Vec<crate::GroupChangeNotDelivered>, AppError>>,
+    },
+    GroupPendingCommit {
+        group_id: GroupId,
+        respond: ReadReply<Result<Option<crate::GroupPendingCommit>, AppError>>,
+    },
+    AcknowledgeChangeNotDelivered {
+        group_id: GroupId,
+        commit_id_hex: String,
+        respond: oneshot::Sender<Result<bool, AppError>>,
+    },
     ConfirmGroupRejoin {
         welcome_id: cgka_traits::MessageId,
         token: Vec<u8>,
@@ -787,18 +807,6 @@ pub(crate) enum AccountWorkerCommand {
         now_ms: u64,
         respond: oneshot::Sender<Result<RetentionSweepReport, AppError>>,
     },
-    StartAgentTextStream {
-        group_id: GroupId,
-        stream_id: Vec<u8>,
-        parent_message_id: Option<String>,
-        quic_candidates: Vec<String>,
-        respond: oneshot::Sender<Result<(MarmotInnerEvent, SendSummary), AppError>>,
-    },
-    FinishAgentTextStream {
-        group_id: GroupId,
-        request: AgentTextStreamFinishRequest,
-        respond: oneshot::Sender<Result<(MarmotInnerEvent, SendSummary), AppError>>,
-    },
     RetryGroupConvergence {
         group_id: GroupId,
         respond: oneshot::Sender<Result<SendSummary, AppError>>,
@@ -923,6 +931,14 @@ pub(crate) enum AccountWorkerCommand {
     UnlinkDeviceForTest {
         respond: oneshot::Sender<Result<(), AppError>>,
     },
+    /// Run maintenance once, so it checks every live group's components,
+    /// then hold every group's component recheck overdue: the session's
+    /// monotonic clock jumps an hour on, and each later run fails before
+    /// session maintenance would check again (mdk#3265).
+    #[cfg(test)]
+    OverdueComponentRecheckForTest {
+        respond: oneshot::Sender<Result<(), AppError>>,
+    },
     /// Whether the worker runs a recovery runner, and if so one explicit pass
     /// of it, awaited off the worker. `None` without a runner.
     #[cfg(test)]
@@ -938,6 +954,45 @@ pub(crate) enum AccountWorkerCommand {
         respond:
             oneshot::Sender<Option<watch::Receiver<Arc<crate::client::read_state::ReadState>>>>,
     },
+}
+
+impl AccountWorkerCommand {
+    /// Whether serving this command can change what session maintenance
+    /// owes, so the worker re-reads its due time after it (mdk#3265). Reads
+    /// cannot, nor can the transport's subscription retry, which runs about
+    /// once a second while relays are out of reach; anything not listed here
+    /// counts as a change. A read that hydrates a group is not listed — the
+    /// group it makes live brings its own deadlines.
+    fn may_change_maintenance(&self) -> bool {
+        !matches!(
+            self,
+            Self::PreparedGroupImageStatus { .. }
+                | Self::PreparedGroupImages { .. }
+                | Self::QuarantinedGroups { .. }
+                | Self::ExporterSecret { .. }
+                | Self::HistoryNotices { .. }
+                | Self::AccountRecoveryStatus { .. }
+                | Self::LinkedDevices { .. }
+                | Self::ChatHistoryImports { .. }
+                | Self::KeyPackageRefreshOverdue { .. }
+                | Self::UnrecognizedSignIns { .. }
+                | Self::CompromiseWarning { .. }
+                | Self::RemovedDeviceLeftoverChats { .. }
+                | Self::ChatsClosedToLinkedDevices { .. }
+                | Self::BackupRestoreStatus { .. }
+                | Self::WatchBackupRestore { .. }
+                | Self::HistoryImportProvenance { .. }
+                | Self::BackupHistoryAvailability { .. }
+                | Self::BackupSettings { .. }
+                | Self::GroupCommitDelivery { .. }
+                | Self::PendingWelcomeDeliveries { .. }
+                | Self::KeyPackageMaintenanceStatus { .. }
+                | Self::DurablyOwnedKeyPackages { .. }
+                | Self::MaintenanceStatus { .. }
+                | Self::PeriodicMaintenancePolicy { .. }
+                | Self::RetryRuntimeGroupSubscriptions { .. }
+        )
+    }
 }
 
 impl AccountWorkerCommand {
@@ -975,7 +1030,7 @@ impl AccountWorkerCommand {
 enum DeferredStartupCommand {
     /// A non-read command to run against the live session after catch-up. Boxed
     /// because `AccountWorkerCommand` is far larger than the `CatchUp` variant.
-    Command(Box<AccountWorkerCommand>),
+    Command(Box<QueuedCommand>),
     /// A `CatchUp` coalesced onto the initial catch-up, fulfilled with its
     /// result at this position in the sequence.
     CatchUp(oneshot::Sender<Result<(), AccountCatchUpFailure>>),
@@ -988,15 +1043,17 @@ enum DeferredStartupCommand {
 /// the latest published version shows hydrated is acknowledged from it at
 /// once, and otherwise joins that FIFO.
 fn handle_startup_sync_command(
-    command: AccountWorkerCommand,
+    queued: QueuedCommand,
     published: Option<&watch::Receiver<Arc<crate::client::read_state::ReadState>>>,
     deferred: &mut Vec<DeferredStartupCommand>,
     setup_key_package_result: &mut Option<Result<usize, AppError>>,
 ) {
-    let Some(command) = acknowledge_from_published(command, published) else {
+    let Some(queued) =
+        queued.serve_or_keep(|command| acknowledge_from_published(command, published))
+    else {
         return;
     };
-    match command {
+    let Some(queued) = queued.serve_or_keep(|command| match command {
         AccountWorkerCommand::CaptureConversation {
             respond, queued, ..
         } => {
@@ -1004,50 +1061,42 @@ fn handle_startup_sync_command(
                 queued.finish(TelemetryOutcome::NotReady);
             }
             let _ = respond.send_not_ready(Err(ConversationWindowError::NotReady));
+            None
         }
         AccountWorkerCommand::ConfirmGroupRejoin { respond, .. } => {
             let _ = answer_off_quiescent(respond, Err(AppError::AccountWorkerBusy));
+            None
         }
         AccountWorkerCommand::DeclineGroupRejoin { respond, .. } => {
             let _ = answer_off_quiescent(respond, Err(AppError::AccountWorkerBusy));
+            None
         }
         AccountWorkerCommand::AcceptGroupInvite { respond, .. } => {
             // Invite acceptance needs the live client, which the initial
             // sync holds until it ends.
             let _ = answer_off_quiescent(respond, Err(AppError::AccountWorkerBusy));
+            None
         }
         AccountWorkerCommand::CatchUp { respond } => {
             // Join the initial catch-up at this FIFO position; do not start a
             // second acquisition while the startup grant is still owned.
             deferred.push(DeferredStartupCommand::CatchUp(respond));
+            None
         }
         AccountWorkerCommand::PublishSetupKeyPackage { respond } => {
             match setup_key_package_result.take() {
                 Some(result) => {
                     let _ = answer_off_quiescent(respond, result);
+                    None
                 }
-                None => deferred.push(DeferredStartupCommand::Command(Box::new(
-                    AccountWorkerCommand::PublishSetupKeyPackage { respond },
-                ))),
+                None => Some(AccountWorkerCommand::PublishSetupKeyPackage { respond }),
             }
         }
-        other => deferred.push(DeferredStartupCommand::Command(Box::new(other))),
-    }
-}
-
-/// Relay-only startup Welcome work. Dropping the worker aborts the task so no
-/// detached publication can outlive relay-plane/account shutdown; the exact
-/// durable artifact remains retryable on the next open.
-struct WelcomeRecoveryTask {
-    handle: JoinHandle<CompletedWelcomeDeliveryRecovery>,
-    message_ids: Vec<MessageId>,
-    drain_waiters: Vec<oneshot::Sender<()>>,
-}
-
-impl Drop for WelcomeRecoveryTask {
-    fn drop(&mut self) {
-        self.handle.abort();
-    }
+        other => Some(other),
+    }) else {
+        return;
+    };
+    deferred.push(DeferredStartupCommand::Command(Box::new(queued)));
 }
 
 fn install_storage_telemetry(
@@ -1075,23 +1124,38 @@ fn install_storage_telemetry(
             );
         })));
     }
+    // The engine has its own connection to the session database. Only its
+    // writer transactions are recorded, under their own operation, so the
+    // app database's timings keep their meaning (mdk#2923).
+    let telemetry = telemetry.clone();
+    client.engine_storage.set_timing_observer(Some(Arc::new(
+        move |operation, duration, success| {
+            if operation == storage_sqlite::SqliteTimingOperation::WriteBegin {
+                telemetry.record_runtime(
+                    RuntimeOp::StorageSessionWriteBegin,
+                    duration,
+                    if success {
+                        TelemetryOutcome::Success
+                    } else {
+                        TelemetryOutcome::Failure
+                    },
+                );
+            }
+        },
+    )));
 }
 
 pub(crate) fn spawn_app_runtime_account_worker(
     runtime: AccountWorkerRuntime,
-    command_tx: mpsc::Sender<AccountWorkerCommand>,
-    commands: mpsc::Receiver<AccountWorkerCommand>,
+    commands: mpsc::Receiver<QueuedCommand>,
     ready: oneshot::Sender<Result<(), AppError>>,
     startup_progress: AccountStartupProgress,
     shutdown: oneshot::Receiver<()>,
 ) -> JoinHandle<()> {
-    tokio::spawn(run_app_runtime_account_worker(
-        runtime,
-        command_tx,
-        commands,
-        ready,
-        startup_progress,
-        shutdown,
+    let telemetry = runtime.shared.observer.performance().clone();
+    tokio::spawn(run_as_account_worker(
+        telemetry,
+        run_app_runtime_account_worker(runtime, commands, ready, startup_progress, shutdown),
     ))
 }
 
@@ -1112,12 +1176,14 @@ fn stop_recovery_runner<'a>(
 
 async fn run_app_runtime_account_worker(
     runtime: AccountWorkerRuntime,
-    command_tx: mpsc::Sender<AccountWorkerCommand>,
-    mut commands: mpsc::Receiver<AccountWorkerCommand>,
+    host_commands: mpsc::Receiver<QueuedCommand>,
     ready: oneshot::Sender<Result<(), AppError>>,
     startup_progress: AccountStartupProgress,
     mut shutdown: oneshot::Receiver<()>,
 ) {
+    // The worker's own timers send on a channel of their own, so its
+    // retries run even while it takes no host command (mdk#3466).
+    let (mut commands, command_tx) = WorkerInbox::new(host_commands);
     let worker_started_at = Instant::now();
     let mut ready = Some(ready);
     let AccountWorkerRuntime {
@@ -1134,6 +1200,7 @@ async fn run_app_runtime_account_worker(
     } = runtime;
     let mut lifecycle_shutdown = lifecycle.subscribe_shutdown();
     let mut relay_config_updates = app.presentation_signals.profile_updates.subscribe();
+    let mut device_group_wakes = app.device_group_wakes.subscribe();
     let mut open_client = std::pin::pin!(app.runtime_local_client(
         &account_label,
         &relay_plane,
@@ -1599,25 +1666,32 @@ async fn run_app_runtime_account_worker(
     // What the runner's survey finds catching up; only a runner changes it.
     // Each client has its own, so a reconnect subscribes again.
     let mut recovery_catching_up = client.routing.subscribe_recovery_runner_catching_up();
+    // The sign-in slot read runs beside the writer, and a host check keeps
+    // its place while it waits (mdk#3466).
+    client.detach_sign_in_reads();
+    let mut sign_in_reads = sign_in_reads::SignInReads::default();
     let mut pending = deferred
         .into_iter()
         .map(|deferred_command| match deferred_command {
             DeferredStartupCommand::CatchUp(respond) => {
-                AccountWorkerCommand::StartupCatchUpResult {
+                QueuedCommand::unobserved(AccountWorkerCommand::StartupCatchUpResult {
                     result: catch_up_result.clone(),
                     respond,
-                }
+                })
             }
             DeferredStartupCommand::Command(command) => *command,
         })
         .collect::<VecDeque<_>>();
     // Skip only media waiting for capacity; retain FIFO order among the rest.
-    while let Some(index) = ready_command_index(&pending, &media_http) {
-        let command = pending
+    while let Some(index) = ready_command_index(&pending, &media_http, sign_in_reads.holds_place())
+    {
+        let (command, wait) = pending
             .remove(index)
-            .expect("selected pending command exists");
+            .expect("selected pending command exists")
+            .into_parts();
         match command {
             AccountWorkerCommand::CatchUp { respond } => {
+                wait.take_up();
                 handle_account_worker_catch_up(
                     &mut client,
                     respond,
@@ -1633,12 +1707,26 @@ async fn run_app_runtime_account_worker(
                 )
                 .await;
             }
+            AccountWorkerCommand::CheckSignIns { respond } => {
+                wait.take_up();
+                if let Some(settled) = sign_in_reads.check_now(&mut client, respond) {
+                    finish_sign_in_check(
+                        &mut client,
+                        settled,
+                        &shared,
+                        &events,
+                        &account_id_hex,
+                        &account_label,
+                    );
+                }
+            }
             AccountWorkerCommand::PublishSetupKeyPackage { respond }
                 if setup_key_package_result.is_some() =>
             {
                 // The durable setup lane may publish before background setup
                 // sends its worker command. Return that exact result even if
                 // the initial catch-up has already finished.
+                wait.take_up();
                 let _ = reply(
                     respond,
                     setup_key_package_result
@@ -1650,7 +1738,7 @@ async fn run_app_runtime_account_worker(
             command => {
                 handle_account_worker_command(
                     &mut client,
-                    command,
+                    QueuedCommand::from_parts(command, wait),
                     AccountWorkerCommandContext {
                         commands: &mut commands,
                         pending: &mut pending,
@@ -1697,27 +1785,40 @@ async fn run_app_runtime_account_worker(
     let mut presentation_maintenance = super::presentation::PresentationMaintenance::default();
     let mut presentation_wakeups = app.presentation_signals.subscribe_work();
     let mut relay_config_work = RelayConfigWork::Ready;
+    let mut account_wakeups = app
+        .presentation_signals
+        .subscribe_account_work(&account_label);
     let mut presentation_due = true;
     let mut avatar_due = true;
     let mut attachment_due = true;
     let mut attachment_admission = attachments::Admission::default();
+    // Recovery and post-join work run on their own wakes and deadlines;
+    // the tick only checks that none was missed (mdk#2923 step B).
+    let mut schedule = schedule::Schedule::opened();
+    #[cfg(test)]
+    let started = (TokioInstant::now(), std::time::Instant::now());
+    let mut maintenance_paused = client.runtime.maintenance_is_paused();
+    // When session maintenance next has work is re-read once after anything
+    // that may have moved it: a command that can change state, a receive, a
+    // convergence pass, a recovery turn, a scheduled recovery, post-join or
+    // KeyPackage catch-up, or a maintenance run (mdk#3265).
+    let mut maintenance_due_dirty = true;
+    let mut maintenance_last_run: Option<MaintenanceRun> = None;
+    // The wall second the current plan aims at, for the watchdog.
+    let mut maintenance_planned_wall: Option<u64> = None;
+    let mut maintenance_due_read_at: Option<TokioInstant> = None;
     let mut avatar_resumed = false;
     let mut avatar_identities = super::avatar::IdentityAvatarMaintenance::default();
 
-    // Prepare exact Welcome attempts under the serialized owner, then let only
-    // relay I/O run independently. The worker stays available for inbound
-    // delivery, maintenance, media completions, timers, and commands while a
-    // degraded relay is slow. Drain waiters join reconciliation below.
-    let mut welcome_recovery = client
-        .prepare_pending_welcome_delivery_recovery_best_effort()
-        .map(|recovery| {
-            let message_ids = recovery.message_ids().to_vec();
-            WelcomeRecoveryTask {
-                handle: tokio::spawn(recovery.run()),
-                message_ids,
-                drain_waiters: Vec::new(),
-            }
-        });
+    // From here on every detachable Welcome wave runs beside the writer
+    // (mdk#3466); the deferred commands above published theirs inline. The
+    // writer prepares each wave and settles it below, so the worker stays
+    // available for deliveries, maintenance, media completions, timers and
+    // commands while a degraded relay is slow. The startup retry is the
+    // first wave.
+    client.detach_welcome_waves();
+    client.start_startup_welcome_retry();
+    let mut welcome_runs = welcome_runs::WelcomeRuns::default();
 
     let mut yield_to_convergence = false;
     let mut local_submission_service_owed = false;
@@ -1726,6 +1827,8 @@ async fn run_app_runtime_account_worker(
     'worker: loop {
         // The previous unit has ended: publish what it wrote (mdk#3273).
         client.publish_read_state();
+        // And run beside the writer the Welcome waves it started.
+        welcome_runs.adopt(&mut client);
         // An unlinked device stops: no sends, commits, publications or
         // pairing answers once its device group removed it. The account is
         // already marked unlinked; the runtime deactivates it once this
@@ -1734,6 +1837,79 @@ async fn run_app_runtime_account_worker(
             stop_recovery_runner(&mut recovery_runner, &mut client).await;
             stop_unlinked_worker(&mut client, unlinked).await;
             break 'worker;
+        }
+        // Take the scheduled sign-in check the last unit asked for, and
+        // read again for a host check whose read a replacement dropped.
+        if let Some(settled) = sign_in_reads.adopt(&mut client) {
+            maintenance_due_dirty = true;
+            finish_sign_in_check(
+                &mut client,
+                settled,
+                &shared,
+                &events,
+                &account_id_hex,
+                &account_label,
+            );
+        }
+        // An invitation answered here, or one a sibling's decision settled,
+        // goes out and applies on this turn, not at the next maintenance
+        // pass (mdk#3566). What it leaves owed retries with maintenance. Not
+        // once shutdown is requested, as no scheduled job runs then: the
+        // answer is saved, and the next start sends and applies it.
+        // Nor once this worker alone is told to stop: the select below
+        // takes that signal, which checking it here leaves in place.
+        if client.invitation_decisions_changed
+            && !lifecycle.is_stopping()
+            && shutdown.is_empty()
+            && Box::pin(client.drive_changed_invitation_decisions()).await
+        {
+            publish_settled_invitations(&mut client, &events, &account_id_hex, &account_label);
+            maintenance_due_dirty = true;
+        }
+        // Re-arm the schedule from whichever path ran the recovery seam or
+        // the post-join advance since the last turn. Pausing or resuming
+        // maintenance wakes post-join and history dispatch: neither has a
+        // deadline while paused, so a resume must re-read both.
+        let now = TokioInstant::now();
+        if client.runtime.maintenance_is_paused() != maintenance_paused {
+            maintenance_paused = !maintenance_paused;
+            schedule.wake(schedule::Job::PostJoin);
+            schedule.wake(schedule::Job::HistoryDispatch);
+            // Device-group passes owe nothing while paused, and on resume
+            // the next run finds what they owe (mdk#3265).
+            if !maintenance_paused {
+                client.device_group_work_changed = true;
+            }
+            maintenance_due_dirty = true;
+        }
+        if let Some(owed) = client.recovery_seam_owed.take() {
+            schedule.ran(schedule::Job::Recovery, owed, now);
+        }
+        if std::mem::take(&mut client.post_join_advanced) {
+            schedule.ran(schedule::Job::PostJoin, client.post_join_owed(), now);
+        }
+        // Wake the jobs whose work arrives without time passing.
+        if std::mem::take(&mut client.key_package_lifecycle_changed) {
+            schedule.wake(schedule::Job::KeyPackageCatchUp);
+        }
+        if client
+            .history_dispatch_changed
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+            || (!schedule.pending(schedule::Job::HistoryDispatch)
+                && client.backup_eligibility_changed())
+        {
+            schedule.wake(schedule::Job::HistoryDispatch);
+        }
+        // Tests turn this wake off to show the watchdog finds owed timing.
+        #[cfg(test)]
+        let push_turn_wake = client.test_push_turn_wake();
+        #[cfg(not(test))]
+        let push_turn_wake = true;
+        if push_turn_wake && !schedule.pending(schedule::Job::Push) && client.push_timing_owed() {
+            schedule.wake(schedule::Job::Push);
+        }
+        if !schedule.pending(schedule::Job::DevicePairing) && client.device_pairing_owed() {
+            schedule.wake(schedule::Job::DevicePairing);
         }
         if recovery_runner.is_none() && client.recovery_runner_due() {
             // A successful paced preparation retry starts the runner here,
@@ -1757,7 +1933,7 @@ async fn run_app_runtime_account_worker(
         let native_progress = match if !admission_retry.ready() {
             Ok(false)
         } else {
-            admission_retry.admit_native_turn(&mut client).await
+            admission_retry.admit_native_turn(&mut client, &unit).await
         } {
             Ok(progress) => progress,
             Err(error) => {
@@ -1782,6 +1958,10 @@ async fn run_app_runtime_account_worker(
         if !client.has_pending_effect_projections()
             && let Some(turn) = recovery_runner.as_mut().and_then(SpawnedRunner::ready_turn)
         {
+            let _turn_unit = unit.time(UnitKind::RunnerTurn);
+            // A recovery turn can change what session maintenance owes, as
+            // the runner-turn arm's can.
+            maintenance_due_dirty = true;
             turn.serve(&mut client).await;
             publish_settled_recovery_copies(&mut client, &events, &account_id_hex, &account_label);
         }
@@ -1860,7 +2040,46 @@ async fn run_app_runtime_account_worker(
         // A changes with no write when a time-bound answer in it expires: wake
         // then, and the loop top publishes it (mdk#3273).
         let read_state_deadline = client.read_state_deadline();
-        let ready_command = ready_command_index(&pending, &media_http);
+        let ready_command = ready_command_index(&pending, &media_http, sign_in_reads.holds_place());
+        // Commands parked behind a waiting host check are not waiting
+        // commands: group commands and the worker's own work go ahead of them.
+        // At the parked bound the worker takes no more host commands until
+        // the host check is answered; its own sends still come in.
+        let parked = if sign_in_reads.holds_place() {
+            pending
+                .iter()
+                .filter(|queued| queued.command().waits_behind_sign_in_check())
+                .count()
+        } else {
+            0
+        };
+        let admit_host_commands = parked < sign_in_reads::PARKED_LIMIT;
+        // Spaced, so a burst of deliveries reads it once, not once each.
+        let due_read_ready =
+            maintenance_due_read_at.is_none_or(|at| at.elapsed() >= MAINTENANCE_DUE_READ_SPACING);
+        if maintenance_due_dirty && due_read_ready {
+            maintenance_due_dirty = false;
+            maintenance_due_read_at = Some(TokioInstant::now());
+            let step = shared
+                .observer
+                .performance()
+                .observe(RuntimeOp::WorkerMaintenanceNextDue);
+            let due = client.maintenance_due();
+            step.finish(TelemetryOutcome::Success);
+            let plan = maintenance_plan(
+                due,
+                maintenance_last_run,
+                crate::unix_now_seconds(),
+                TokioInstant::now(),
+            );
+            maintenance_planned_wall = plan.planned_wall;
+            schedule.reschedule(schedule::Job::SessionMaintenance, plan.at, plan.wall);
+        }
+        let mut scheduled_at = schedule.next_at(TokioInstant::now(), crate::unix_now_seconds());
+        if maintenance_due_dirty && let Some(read_at) = maintenance_due_read_at {
+            let reread = read_at + MAINTENANCE_DUE_READ_SPACING;
+            scheduled_at = Some(scheduled_at.map_or(reread, |at| at.min(reread)));
+        }
         #[cfg(test)]
         tests::secondary_retry_scheduler_tests::record_turn(
             &account_id_hex,
@@ -1871,12 +2090,19 @@ async fn run_app_runtime_account_worker(
         tokio::select! {
             biased;
             _ = wait_for_runtime_shutdown(&mut lifecycle_shutdown) => {
+                // The waves in flight get the shutdown bound to finish
+                // before exit cancels the rest (mdk#3466 L3). Their settles
+                // are recorded before the audit stop row.
+                if let Some(deadline) = lifecycle.welcome_wave_deadline() {
+                    welcome_runs.settle_until(&mut client, &shared, deadline).await;
+                }
                 client.finish_audit_recording();
                 stop_recovery_runner(&mut recovery_runner, &mut client).await;
                 break 'worker;
             }
             stop = &mut shutdown => {
                 if stop.is_ok() {
+                    welcome_runs.record_returned(&mut client);
                     client.finish_audit_recording();
                 }
                 stop_recovery_runner(&mut recovery_runner, &mut client).await;
@@ -1885,7 +2111,7 @@ async fn run_app_runtime_account_worker(
             () = std::future::ready(()), if relay_config_work == RelayConfigWork::Ready => {
                 relay_config_work = match client.sync_relay_liveness().await {
                     Ok(_) => RelayConfigWork::Idle,
-                    Err(error) if error.is_account_not_active() => RelayConfigWork::RetryOnTick,
+                    Err(error) if error.is_account_not_active() => RelayConfigWork::Retry,
                     Err(error) => {
                         publish_app_runtime_account_error(
                             Emit::Quiescent(&client),
@@ -1894,9 +2120,53 @@ async fn run_app_runtime_account_worker(
                             &account_label,
                             account_error_message("relay configuration reconciliation failed", &error),
                         );
-                        RelayConfigWork::RetryOnTick
+                        RelayConfigWork::Retry
                     }
                 };
+                if relay_config_work == RelayConfigWork::Retry {
+                    schedule.arm(
+                        schedule::Job::RelayConfig,
+                        Some(TokioInstant::now() + schedule::RETRY_WHILE_OWED),
+                    );
+                }
+            }
+            wake = device_group_wakes.recv() => {
+                // A change made outside this worker that can make its
+                // device-group maintenance owed (mdk#3265). A lagged
+                // receiver may have missed one of this account's.
+                let mut wakes = vec![wake];
+                loop {
+                    match device_group_wakes.try_recv() {
+                        Err(broadcast::error::TryRecvError::Empty) => break,
+                        next => wakes.push(next.map_err(|error| match error {
+                            broadcast::error::TryRecvError::Lagged(missed) => {
+                                broadcast::error::RecvError::Lagged(missed)
+                            }
+                            _ => broadcast::error::RecvError::Closed,
+                        })),
+                    }
+                }
+                for wake in wakes {
+                    match wake {
+                        Ok(crate::client::worker_due::DeviceGroupWake::SignInNudged(account))
+                            if account == account_id_hex =>
+                        {
+                            maintenance_due_dirty = true;
+                        }
+                        Ok(crate::client::worker_due::DeviceGroupWake::SmallStateEdited(label))
+                            if label == account_label =>
+                        {
+                            client.small_state_edited = true;
+                            maintenance_due_dirty = true;
+                        }
+                        Ok(_) => {}
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            client.small_state_edited = true;
+                            maintenance_due_dirty = true;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break 'worker,
+                    }
+                }
             }
             result = relay_config_updates.recv() => {
                 let mut changed = match result {
@@ -1916,42 +2186,43 @@ async fn run_app_runtime_account_worker(
                     relay_config_work = RelayConfigWork::Ready;
                 }
             }
-            recovered = async {
-                let recovery = welcome_recovery
-                    .as_mut()
-                    .expect("Welcome recovery branch requires a live task");
-                (&mut recovery.handle).await
-            }, if welcome_recovery.is_some() => {
-                let mut recovery = welcome_recovery
-                    .take()
-                    .expect("completed Welcome recovery task must still be owned");
-                match recovered {
-                    Ok(completed) => {
+            // A Welcome wave's publishes returned: settle it on the writer.
+            ended = welcome_runs.next(), if welcome_runs.is_running() => {
+                if let Some(ended) = ended {
+                    let _unit = unit.enter(WorkerUnit::WelcomeFanout);
+                    // A settled wave records its deliveries and their
+                    // retries, which session maintenance can owe.
+                    maintenance_due_dirty = true;
+                    if welcome_runs.settle(&mut client, ended).await {
                         client
-                            .finish_pending_welcome_delivery_recovery_best_effort(completed)
+                            .retry_pending_push_registration_shares_best_effort()
                             .await;
-                    }
-                    Err(error) => {
-                        client.abandon_pending_welcome_delivery_recovery(
-                            &recovery.message_ids,
-                        );
-                        tracing::warn!(
-                            target: "marmot_app::runtime",
-                            method = "startup_welcome_recovery",
-                            error_kind = if error.is_panic() { "panic" } else { "cancelled" },
-                            "startup Welcome relay task ended before reconciliation"
+                        scheduled_push_retry.observe_pending(
+                            client.has_pending_push_registration_work(),
+                            &command_tx,
                         );
                     }
-                }
-                for respond in recovery.drain_waiters.drain(..) {
-                    let _ = reply(respond, (), &client);
+                    publish_pending_welcome_delivery_events(
+                        &events,
+                        &account_id_hex,
+                        &account_label,
+                        &mut client,
+                    );
+                    schedule_pending_convergence_groups(&mut scheduled_convergence, &mut client);
+                    #[cfg(test)]
+                    tests::welcome_wave_tests::held_after_settle(&account_id_hex).await;
+                    welcome_runs.answer_waiting(&client, &shared);
                 }
             }
             // Consume completed blobs before admitting more commands.
             done = media_http_rx.recv() => {
                 match done {
                     Some(done) => {
-                        complete_media_http(&mut client, done, &shared, &media_http).await;
+                        let history_unsettled =
+                            complete_media_http(&mut client, done, &shared, &media_http).await;
+                        // A finished upload can send its message, which can
+                        // leave relay retries the plan does not know yet.
+                        maintenance_due_dirty = true;
                         // Ordinary transfers return the same credits used by
                         // restore; resume only after completion released one.
                         dispatch_backup_restore(&mut client, &media_http);
@@ -1973,6 +2244,20 @@ async fn run_app_runtime_account_worker(
                         );
                         avatar_due = true;
                         attachment_due = true;
+                        // A slot freed, and a history transfer may have
+                        // finished or backed off. One that failed and could
+                        // not record its deferral is still due now: retry it
+                        // in 15 s, never in a tight loop. A later completion
+                        // wakes dispatch and may retry it sooner; it is still
+                        // never more than once per completion.
+                        if history_unsettled {
+                            schedule.arm(
+                                schedule::Job::HistoryDispatch,
+                                Some(TokioInstant::now() + schedule::RETRY_WHILE_OWED),
+                            );
+                        } else {
+                            schedule.wake(schedule::Job::HistoryDispatch);
+                        }
                         schedule_pending_convergence_groups(
                             &mut scheduled_convergence,
                             &mut client,
@@ -1996,28 +2281,68 @@ async fn run_app_runtime_account_worker(
             }
             // Alternate a command and a ready recovery quantum. A permanently
             // nonempty command channel must not starve group convergence.
+            // The sign-in slot read returned: its continuation runs on the
+            // writer, against current state, as one unit.
+            read = sign_in_reads.next(), if sign_in_reads.is_running() => {
+                let _unit = unit.enter(WorkerUnit::Maintenance);
+                let settled = sign_in_reads.settle(&mut client, read).await;
+                // The continuation can replace this device's KeyPackage.
+                maintenance_due_dirty = true;
+                finish_sign_in_check(&mut client, settled, &shared, &events, &account_id_hex, &account_label);
+            }
             command = async {
                 match ready_command.and_then(|index| pending.remove(index)) {
                     Some(command) => Some(command),
-                    None => commands.recv().await,
+                    None => commands.recv_admitting(admit_host_commands).await,
                 }
             }, if !yield_to_convergence || !scheduled_convergence.has_ready() || scheduled_convergence_held_for_test(&account_id_hex) => {
                 yield_to_convergence = true;
+                let command = command.map(QueuedCommand::into_parts);
+                // A command that can change state can change what session
+                // maintenance owes; a read cannot.
+                if command
+                    .as_ref()
+                    .is_none_or(|(command, _)| command.may_change_maintenance())
+                {
+                    maintenance_due_dirty = true;
+                }
                 match command {
-                    Some(command) => {
+                    Some((command, wait)) => {
                         #[cfg(test)]
                         tests::secondary_retry_scheduler_tests::record_command(&account_id_hex, &command);
+                        // A host check waits: a command that names no group
+                        // keeps its order behind it. Parked commands are not
+                        // ready until the check is answered.
+                        if sign_in_reads.holds_place() && command.waits_behind_sign_in_check() {
+                            pending.push_back(QueuedCommand::from_parts(command, wait));
+                            continue;
+                        }
                         let command = match command {
-                            AccountWorkerCommand::Drain { respond } => {
-                                if let Some(recovery) = &mut welcome_recovery {
-                                    recovery.drain_waiters.push(respond);
-                                } else {
-                                    let _ = reply(respond, (), &client);
+                            AccountWorkerCommand::CheckSignIns { respond } => {
+                                wait.take_up();
+                                if let Some(settled) = sign_in_reads.check_now(&mut client, respond) {
+                                    finish_sign_in_check(&mut client, settled, &shared, &events, &account_id_hex, &account_label);
                                 }
+                                continue;
+                            }
+                            AccountWorkerCommand::Drain { respond } => {
+                                wait.take_up();
+                                // It waits for every Welcome wave started before it.
+                                welcome_runs.adopt(&mut client);
+                                welcome_runs.drain(respond, &client, &shared);
+                                continue;
+                            }
+                            AccountWorkerCommand::PendingWelcomeDeliveries { respond } => {
+                                wait.take_up();
+                                // So does a read of what is undelivered (W8):
+                                // it answers with each earlier wave settled.
+                                welcome_runs.adopt(&mut client);
+                                welcome_runs.read_pending_deliveries(respond, &client, &shared);
                                 continue;
                             }
                             #[cfg(test)]
                             AccountWorkerCommand::RecoveryRunnerPassForTest { budget, respond } => {
+                                wait.take_up();
                                 match &recovery_runner {
                                     Some(runner) => {
                                         let handle = runner.handle().clone();
@@ -2037,6 +2362,7 @@ async fn run_app_runtime_account_worker(
                             command.may_change_push_registration_work();
                         match command {
                             AccountWorkerCommand::CatchUp { respond } => {
+                                wait.take_up();
                                 handle_account_worker_catch_up(
                                     &mut client,
                                     respond,
@@ -2055,6 +2381,7 @@ async fn run_app_runtime_account_worker(
                             AccountWorkerCommand::PublishSetupKeyPackage { respond }
                                 if setup_key_package_result.is_some() =>
                             {
+                                wait.take_up();
                                 let _ = reply( respond,
                                     setup_key_package_result.take().expect("cached setup result"),&client,
                                 );
@@ -2062,7 +2389,7 @@ async fn run_app_runtime_account_worker(
                             command => {
                                 handle_account_worker_command(
                                     &mut client,
-                                    command,
+                                    QueuedCommand::from_parts(command, wait),
                                     AccountWorkerCommandContext {
                                         commands: &mut commands,
                                         pending: &mut pending,
@@ -2106,11 +2433,14 @@ async fn run_app_runtime_account_worker(
             // command/convergence alternation, including blocked predecessors.
             _ = tokio::time::sleep_until(local_submission_retry_at),
                 if local_submission_service_owed && local_submission_due
-                    && pending.is_empty() && commands.is_empty()
+                    && pending.len() == parked
+                    && commands.is_empty_admitting(admit_host_commands)
                     && !lifecycle.is_stopping() => {
                 // Recheck after polling the deadline: a buffered command may
                 // have arrived while the normal command arm was fairness-gated.
-                if !pending.is_empty() || !commands.is_empty() { continue 'worker; }
+                if pending.len() > parked || !commands.is_empty_admitting(admit_host_commands) {
+                    continue 'worker;
+                }
                 let retry = publish_next_local_submission(
                     &mut client, &app, &shared, &unit, &events,
                     &account_id_hex, &account_label,
@@ -2124,6 +2454,7 @@ async fn run_app_runtime_account_worker(
             }
             _ = scheduled_convergence.timer.as_mut(), if !scheduled_convergence_held_for_test(&account_id_hex) => {
                 yield_to_convergence = false;
+                maintenance_due_dirty = true;
                 let Some(group_id) = scheduled_convergence.take_ready() else { continue };
                 let local_submission_yield = wait_for_local_submission_or_shutdown(
                     app.clone(),
@@ -2294,11 +2625,19 @@ async fn run_app_runtime_account_worker(
                         account_error_message("native replay synchronization failed", &error),
                     );
                 }
+                // The watch moves on every replay change: a new generation,
+                // native progress, a fence armed or pruned, an EOSE. Each can
+                // change what the recovery seam owes, and only the seam
+                // imports replay loss, so each runs it once. A repeat pass on
+                // an inactive adapter returns early (mdk#3238).
+                schedule.wake(schedule::Job::Recovery);
                 publish_account_level_changes(
                     &mut client, &events, &account_id_hex, &account_label,
                 );
             }
             received = client.receive_next_delivery(), if !client.has_pending_effect_projections() => {
+                // An inbound commit or Welcome can open or settle an obligation.
+                maintenance_due_dirty = true;
                 #[cfg(test)]
                 if let Ok(transport_nostr::AccountDeliveryReceive::Delivery(delivery)) = &received
                     && let (Ok(event_id), Some(subscription_id)) = (
@@ -2327,6 +2666,12 @@ async fn run_app_runtime_account_worker(
                 // commands remain queued until that durable sequence lands.
                 let delivery_started = matches!(&received, Ok(transport_nostr::AccountDeliveryReceive::Delivery(_)))
                     .then(Instant::now);
+                // A delivery unit covers a received delivery or overflow, not
+                // a failed receive or the reconnect that follows a failure.
+                let delivery_unit = received
+                    .is_ok()
+                    .then(|| unit.time(UnitKind::Delivery))
+                    .flatten();
                 let receive_observation = shared.observer.performance().observe(RuntimeOp::WorkerReceive);
                 let result = match received {
                     Ok(transport_nostr::AccountDeliveryReceive::Delivery(delivery)) => {
@@ -2418,6 +2763,7 @@ async fn run_app_runtime_account_worker(
                         ).await;
                     }
                     Err(err) => {
+                        drop(delivery_unit);
                         publish_app_runtime_account_error(
                             Emit::Quiescent(&client),
                             &events,
@@ -2440,9 +2786,22 @@ async fn run_app_runtime_account_worker(
                         // this leaves room for a one-shot client during a
                         // prolonged transport outage.
                         let transport_account = client.adapter.account_id().clone();
+                        // Its Welcome waves belong to this client: settle
+                        // each on it, so none reaches the reopened one, and
+                        // answer their waits on it before the backoff.
+                        welcome_runs.settle_all(&mut client, &shared).await;
+                        publish_pending_welcome_delivery_events(
+                            &events,
+                            &account_id_hex,
+                            &account_label,
+                            &mut client,
+                        );
                         // Its turns need this client; the reopened one gets
                         // a runner of its own.
                         stop_recovery_runner(&mut recovery_runner, &mut client).await;
+                        // A read belongs to its client: a waiting host check
+                        // keeps its place, and the new client reads again.
+                        sign_in_reads.replace();
                         // A outlives the client: its successor continues
                         // the versions (mdk#3273).
                         let mut read_state = client.take_read_state();
@@ -2458,11 +2817,12 @@ async fn run_app_runtime_account_worker(
                                     _ = &mut shutdown => break 'worker,
                                     _ = &mut retry_delay => break,
                                     command = commands.recv() => {
-                                        match command {
-                                            Some(
+                                        match command.map(QueuedCommand::into_parts) {
+                                            Some((
                                                 command @ (AccountWorkerCommand::CatchUp { .. }
                                                 | AccountWorkerCommand::ConnectivityRestored { .. }),
-                                            ) => {
+                                                wait,
+                                            )) => {
                                                 // Host recovery commands are meaningful without
                                                 // an engine session: retain their responses and use
                                                 // them to end only this stale sleep. Coalesce an
@@ -2470,14 +2830,14 @@ async fn run_app_runtime_account_worker(
                                                 // new signals can still interrupt later sleeps, so
                                                 // extra attempts remain bounded by host signal rate
                                                 // while the network stays unavailable.
-                                                pending.push_back(command);
+                                                pending.push_back(QueuedCommand::from_parts(command, wait));
                                                 while let Ok(command) = commands.try_recv() {
-                                                    match command {
-                                                        command @ (AccountWorkerCommand::CatchUp { .. }
-                                                        | AccountWorkerCommand::ConnectivityRestored { .. }) => {
-                                                            pending.push_back(command);
+                                                    match command.into_parts() {
+                                                        (command @ (AccountWorkerCommand::CatchUp { .. }
+                                                        | AccountWorkerCommand::ConnectivityRestored { .. }), wait) => {
+                                                            pending.push_back(QueuedCommand::from_parts(command, wait));
                                                         }
-                                                        AccountWorkerCommand::CaptureConversation { respond, queued, .. } => {
+                                                        (AccountWorkerCommand::CaptureConversation { respond, queued, .. }, _) => {
                                                             if let Some(queued) = queued { queued.finish(TelemetryOutcome::NotReady); }
                                                             let _ = respond.send_not_ready(Err(ConversationWindowError::NotReady));
                                                         }
@@ -2500,7 +2860,7 @@ async fn run_app_runtime_account_worker(
                                                 );
                                                 break;
                                             }
-                                            Some(AccountWorkerCommand::CaptureConversation { respond, queued, .. }) => {
+                                            Some((AccountWorkerCommand::CaptureConversation { respond, queued, .. }, _)) => {
                                                 if let Some(queued) = queued { queued.finish(TelemetryOutcome::NotReady); }
                                                 let _ = respond.send_not_ready(Err(ConversationWindowError::NotReady));
                                             }
@@ -2538,17 +2898,19 @@ async fn run_app_runtime_account_worker(
                                     install_storage_telemetry(&reopened, shared.observer.performance());
                                     reopened.runtime_telemetry = Some(shared.observer.performance().clone());
                                     reopened.history_recovery.set_recovery_credits(shared.recovery_credit_pool());
-                                    reopened.resume_read_state(read_state.take());
                                     // A reconnect open is deferred like the
                                     // startup open; drain the hydration
                                     // eagerly here — the steady-state loop
                                     // below answers reads live and must not
                                     // hand out not-hydrated errors after a
-                                    // mid-session reconnect (mdk#1161).
+                                    // mid-session reconnect (mdk#1161). The
+                                    // reads that answer from A must not
+                                    // either: A moves to the reopened client
+                                    // only once it is drained.
                                     if let Err(err) = drain_deferred_hydration(&mut reopened).await
                                     {
                                         publish_app_runtime_account_error(
-                                            Emit::Quiescent(&reopened),
+                                            Emit::Unpublished(Unpublished::ReopenNotDrained),
                                             &events,
                                             &account_id_hex,
                                             &account_label,
@@ -2557,10 +2919,10 @@ async fn run_app_runtime_account_worker(
                                                 &err,
                                             ),
                                         );
-                                        read_state = reopened.take_read_state();
                                         drop(reopened);
                                         continue;
                                     }
+                                    reopened.resume_read_state(read_state.take());
                                     // Reconnect restores transport activation
                                     // and subscriptions, then resumes the live
                                     // receive tail. Do not block the command
@@ -2647,6 +3009,9 @@ async fn run_app_runtime_account_worker(
                                         &account_id_hex,
                                         &account_label,
                                     );
+                                    // An interrupted wave's Welcomes stay owed;
+                                    // maintenance's fanout retry sends them.
+                                    reopened.detach_welcome_waves();
                                     break reopened;
                                 }
                                 Err(setup_err) => {
@@ -2662,9 +3027,15 @@ async fn run_app_runtime_account_worker(
                         };
                         relay_config_work = RelayConfigWork::Ready;
                         replay_changes = client.adapter.replay_changes().await;
+                        client.detach_sign_in_reads();
                         recovery_runner = client.spawn_recovery_runner().await;
                         recovery_catching_up =
                             client.routing.subscribe_recovery_runner_catching_up();
+                        // The new client owes what a fresh open owes: run
+                        // every job once, as at startup, so none waits for
+                        // the watchdog or counts as a missed wake.
+                        schedule = schedule::Schedule::opened();
+                        maintenance_paused = client.runtime.maintenance_is_paused();
                         schedule_pending_convergence_groups(
                             &mut scheduled_convergence,
                             &mut client,
@@ -2676,6 +3047,8 @@ async fn run_app_runtime_account_worker(
             // An idle worker waits for the runner's next turn here; the
             // loop's top serves one per pass while other work is ready.
             turn = next_runner_turn(&mut recovery_runner), if !client.has_pending_effect_projections() => {
+                let _turn_unit = unit.time(UnitKind::RunnerTurn);
+                maintenance_due_dirty = true;
                 turn.serve(&mut client).await;
                 publish_settled_recovery_copies(&mut client, &events, &account_id_hex, &account_label);
             }
@@ -2695,15 +3068,27 @@ async fn run_app_runtime_account_worker(
                 });
                 avatar_due |= identities.as_ref().is_ok_and(|more| *more)
                     || acquisition.as_ref().is_ok_and(|more| *more);
-                if identities.is_err() || acquisition.is_err() {
+                let failed = identities.is_err() || acquisition.is_err();
+                if failed {
                     tracing::warn!(target: "marmot_app::runtime", method = "avatar_acquisition",
-                        "avatar maintenance failed; retrying on the next tick");
+                        "avatar maintenance failed; retrying in 15 s");
+                }
+                if !avatar_due {
+                    let (retry, wall) = avatar_pass_next_at(&client, failed);
+                    schedule.arm_timed(
+                        schedule::Job::AvatarPass,
+                        retry,
+                        wall,
+                        crate::unix_now_seconds(),
+                        TokioInstant::now(),
+                    );
                 }
             }
             _ = local_submission_wakeups.changed() => { local_submission_due = true; }
             _ = tokio::time::sleep_until(local_submission_retry_at),
                 if local_submission_due && (!local_submission_service_owed
-                    || (pending.is_empty() && commands.is_empty())) => {
+                    || (pending.len() == parked
+                        && commands.is_empty_admitting(admit_host_commands))) => {
                 let retry = publish_next_local_submission(
                     &mut client, &app, &shared, &unit, &events,
                     &account_id_hex, &account_label,
@@ -2718,20 +3103,30 @@ async fn run_app_runtime_account_worker(
             result = presentation_wakeups.changed() => {
                 if result.is_ok() { presentation_due = true; avatar_due = true; attachment_due = true; }
             }
+            result = account_wakeups.changed() => {
+                if result.is_ok() { presentation_due = true; avatar_due = true; attachment_due = true; }
+            }
             _ = tokio::task::yield_now(), if presentation_due => {
                 if lifecycle.is_stopping() { continue 'worker; }
                 avatar_due = true;
                 let step = shared.observer.performance().observe(RuntimeOp::WorkerPresentationPass);
                 let presentation = presentation_maintenance.run(&client, &account_id_hex);
                 step.finish_app(&presentation);
+                let failed = presentation.is_err();
                 presentation_due = match presentation {
                     Ok(more) => more,
                     Err(_) => {
                         tracing::warn!(target: "marmot_app::runtime", method = "chat_presentation_maintenance",
-                            "local chat presentation maintenance failed; retrying on the next wakeup or maintenance tick");
+                            "local chat presentation maintenance failed; retrying on the next wakeup or in 15 s");
                         false
                     }
                 };
+                if !presentation_due {
+                    schedule.arm(
+                        schedule::Job::PresentationPass,
+                        presentation_pass_next_at(&client, failed),
+                    );
+                }
             }
             more = attachment_admission.ready(), if attachment_admission.is_waiting() => {
                 attachment_due |= more;
@@ -2741,14 +3136,31 @@ async fn run_app_runtime_account_worker(
                 let step = shared.observer.performance().observe(RuntimeOp::WorkerAttachmentPass);
                 let attachment = attachments::schedule(&client, &shared, &media_http, &mut attachment_admission);
                 step.finish_app(&attachment);
+                let failed = attachment.is_err();
                 attachment_due = match attachment {
                     Ok(more) => more,
                     Err(_) => {
                         tracing::warn!(target: "marmot_app::runtime", method = "attachment_acquisition",
-                            "attachment maintenance failed; retrying on next wakeup or tick");
+                            "attachment maintenance failed; retrying on next wakeup or in 15 s");
                         false
                     }
                 };
+                // A pass may have deleted media rows, which frees pages.
+                schedule.wake(schedule::Job::Housekeeping);
+                if !attachment_due {
+                    let (next, wall) = attachments::next_pass_at(&client, &attachment_admission);
+                    schedule.arm_timed(
+                        schedule::Job::AttachmentPass,
+                        Some(if failed {
+                            next.min(TokioInstant::now() + schedule::RETRY_WHILE_OWED)
+                        } else {
+                            next
+                        }),
+                        wall,
+                        crate::unix_now_seconds(),
+                        TokioInstant::now(),
+                    );
+                }
             }
             // Native input still being admitted takes its next turn as soon as
             // commands and live input have had theirs, instead of waiting for
@@ -2760,196 +3172,276 @@ async fn run_app_runtime_account_worker(
             () = sleep(read_state_deadline.unwrap_or_default()), if read_state_deadline.is_some() => {
                 continue 'worker;
             }
-            _ = maintenance_tick.tick() => {
-                local_submission_due = true;
-                attachment_due = true;
-                presentation_due = true;
-                avatar_due = true;
-                if relay_config_work == RelayConfigWork::RetryOnTick {
-                    relay_config_work = RelayConfigWork::Ready;
+            () = sleep_until_scheduled(scheduled_at), if scheduled_at.is_some() && !lifecycle.is_stopping() => {
+                // These jobs ran inside the tick before, so reads queued behind
+                // them still count as waiting behind maintenance.
+                let _unit = unit.enter(WorkerUnit::Maintenance);
+                let now = TokioInstant::now();
+                let now_wall = crate::unix_now_seconds();
+                let context = EpochBackfillReportContext {
+                    events: &events,
+                    account_id_hex: &account_id_hex,
+                    account_label: &account_label,
+                    shared: &shared,
+                };
+                if schedule.due(schedule::Job::Recovery, now, now_wall) {
+                    // Recovery applies inbound state, which can change what
+                    // session maintenance owes (mdk#3265).
+                    maintenance_due_dirty = true;
+                    let owed = run_scheduled_recovery(&mut client, context).await;
+                    schedule.ran(schedule::Job::Recovery, owed, TokioInstant::now());
                 }
-                // Periodic maintenance is never urgent, and its longest leg
-                // runs past the whole shutdown budget: the key-package
-                // catch-up below is capped at 15s. Skip the tick outright once
-                // shutdown is requested rather than starting work the drain
-                // would then have to wait out.
+                if schedule.due(schedule::Job::PostJoin, now, now_wall) {
+                    maintenance_due_dirty = true;
+                    let owed = run_scheduled_post_join(&mut client, context).await;
+                    client.post_join_advanced = false;
+                    schedule.ran(schedule::Job::PostJoin, owed, TokioInstant::now());
+                }
+                // A pass's deadline sets it due; the pass arms its next one
+                // when it runs.
+                for (job, due) in [
+                    (schedule::Job::AttachmentPass, &mut attachment_due),
+                    (schedule::Job::AvatarPass, &mut avatar_due),
+                    (schedule::Job::PresentationPass, &mut presentation_due),
+                    (schedule::Job::LocalSubmission, &mut local_submission_due),
+                ] {
+                    if schedule.due(job, now, now_wall) {
+                        schedule.arm(job, None);
+                        *due = true;
+                    }
+                }
+                // The jobs the maintenance tick used to run, in its order.
+                let telemetry = shared.observer.performance().clone();
+                let retry = || Some(TokioInstant::now() + schedule::RETRY_WHILE_OWED);
+                if schedule.due(schedule::Job::ContentBackfill, now, now_wall) {
+                    let step = telemetry.observe(RuntimeOp::WorkerMaintenanceContentBackfill);
+                    let backfill = client.backfill_content_reports();
+                    step.finish_app(&backfill);
+                    let next = if backfill.is_err() {
+                        tracing::warn!(target: "marmot_app::account_worker",
+                            method = "report_backfill", "report backfill deferred");
+                        retry()
+                    } else {
+                        // The next batch on a later turn, until done. A
+                        // deadline at now waits for a timer turn, so every
+                        // ready arm above this one, and the tick, go first.
+                        client.content_report_backfill_owed().then(TokioInstant::now)
+                    };
+                    schedule.arm(schedule::Job::ContentBackfill, next);
+                }
+                if schedule.due(schedule::Job::LegacyPromotion, now, now_wall) {
+                    let step = telemetry.observe(RuntimeOp::WorkerMaintenanceLegacyPromotion);
+                    let outcome =
+                        run_legacy_message_promotion_batch(&client, &mut legacy_message_promotion);
+                    step.finish(outcome);
+                    let next = match legacy_message_promotion.status {
+                        LegacyMessagePromotionStatus::Pending
+                            if outcome == TelemetryOutcome::Failure => retry(),
+                        // The next batch on a later turn, behind every ready
+                        // arm above this one and the tick: a deadline at now
+                        // still waits for a timer turn.
+                        LegacyMessagePromotionStatus::Pending => Some(TokioInstant::now()),
+                        LegacyMessagePromotionStatus::Complete
+                        | LegacyMessagePromotionStatus::Halted => None,
+                    };
+                    schedule.arm(schedule::Job::LegacyPromotion, next);
+                }
+                if schedule.due(schedule::Job::DevicePairing, now, now_wall) {
+                    // Pairing timers, KeyPackage retries and link settlement.
+                    client.drive_device_pairing().await;
+                    if client.device_unlinked() {
+                        // Nothing more goes out; the next turn stops the worker.
+                        continue 'worker;
+                    }
+                    schedule.arm(
+                        schedule::Job::DevicePairing,
+                        if client.device_pairing_owed() { retry() } else { None },
+                    );
+                }
+                if schedule.due(schedule::Job::Housekeeping, now, now_wall) {
+                    #[cfg(test)]
+                    record_housekeeping_run(
+                        &account_id_hex,
+                        format!(
+                            "held +{:?} real +{:?} trigger={} {}",
+                            TokioInstant::now() - started.0,
+                            started.1.elapsed(),
+                            if schedule.woken(schedule::Job::Housekeeping) {
+                                "wake"
+                            } else {
+                                "deadline"
+                            },
+                            attachments::housekeeping_reason(&client, &attachment_admission),
+                        ),
+                    );
+                    let step = telemetry.observe(RuntimeOp::WorkerMaintenanceCompaction);
+                    attachments::compact_if_due(&client, &shared, &mut attachment_admission).await;
+                    step.finish(TelemetryOutcome::Success);
+                    attachments::spawn_legacy_migration(&client, &shared, &mut attachment_admission);
+                    schedule.arm(
+                        schedule::Job::Housekeeping,
+                        attachments::next_housekeeping_at(&client, &attachment_admission),
+                    );
+                }
+                if schedule.due(schedule::Job::KeyPackageCatchUp, now, now_wall) {
+                    if client.key_package_maintenance_requires_catch_up() {
+                        // The catch-up syncs inbound state and can consume
+                        // or replace the KeyPackage (mdk#3265).
+                        maintenance_due_dirty = true;
+                        run_key_package_catch_up(
+                            &mut client,
+                            &shared,
+                            &mut scheduled_convergence,
+                            context,
+                        )
+                        .await;
+                        if client.device_unlinked() {
+                            // The catch-up applied this device's removal:
+                            // nothing more goes out (D67).
+                            continue 'worker;
+                        }
+                    }
+                    if client.key_package_maintenance_requires_catch_up() {
+                        schedule.arm(schedule::Job::KeyPackageCatchUp, retry());
+                    } else {
+                        let now_wall = crate::unix_now_seconds();
+                        schedule.arm_wall(
+                            schedule::Job::KeyPackageCatchUp,
+                            client.key_package_catch_up_next_at().filter(|at| *at > now_wall),
+                            now_wall,
+                            TokioInstant::now(),
+                        );
+                    }
+                }
+                if schedule.due(schedule::Job::Push, now, now_wall) {
+                    // A join window ends once T has been counted since its
+                    // join completed, which only sampling fetch time shows.
+                    // Repair asks wait for the same clock, and replies for
+                    // their rank's slots.
+                    let step = telemetry.observe(RuntimeOp::WorkerMaintenancePush);
+                    client.advance_push_join_windows().await;
+                    if client.has_due_push_announce() || client.has_due_push_repair() {
+                        scheduled_push_retry.observe_pending(true, &command_tx);
+                    }
+                    step.finish(TelemetryOutcome::Success);
+                    schedule.arm(
+                        schedule::Job::Push,
+                        if client.push_timing_owed() { retry() } else { None },
+                    );
+                }
+                if schedule.due(schedule::Job::HistoryDispatch, now, now_wall) {
+                    let step = telemetry.observe(RuntimeOp::WorkerMaintenanceHistoryDispatch);
+                    dispatch_history_blobs(&mut client, &media_http);
+                    step.finish(TelemetryOutcome::Success);
+                    schedule.arm_wall(
+                        schedule::Job::HistoryDispatch,
+                        client.history_dispatch_next_at(),
+                        crate::unix_now_seconds(),
+                        TokioInstant::now(),
+                    );
+                }
+                if schedule.due(schedule::Job::RelayConfig, now, now_wall) {
+                    if relay_config_work == RelayConfigWork::Retry {
+                        relay_config_work = RelayConfigWork::Ready;
+                    }
+                    schedule.arm(schedule::Job::RelayConfig, None);
+                }
+                if schedule.due(schedule::Job::SessionMaintenance, now, now_wall) {
+                    maintenance_last_run = Some(MaintenanceRun {
+                        wall: crate::unix_now_seconds(),
+                        at: TokioInstant::now(),
+                    });
+                    maintenance_planned_wall = None;
+                    finish_periodic_maintenance(
+                        &mut client,
+                        &events,
+                        &account_id_hex,
+                        &account_label,
+                        &shared,
+                        &product_backlog,
+                        &mut scheduled_convergence,
+                    )
+                    .await;
+                    schedule.arm(schedule::Job::SessionMaintenance, None);
+                    maintenance_due_dirty = true;
+                }
+            }
+            _ = maintenance_tick.tick() => {
+                // Every job runs on its own wakes and deadlines, session
+                // maintenance included (mdk#3265). The tick only runs the
+                // watchdog below, which checks that none was missed. Skip it
+                // once shutdown is requested.
                 if lifecycle.is_stopping() {
                     continue 'worker;
                 }
                 let phase = shared.observer.performance().observe(RuntimeOp::WorkerMaintenance);
                 let _unit = unit.enter(WorkerUnit::Maintenance);
-                // Each phase below is also timed on its own, so a profile can
-                // name the one an idle tick spends its time in (mdk#2923).
                 let telemetry = shared.observer.performance().clone();
-                let step = telemetry.observe(RuntimeOp::WorkerMaintenanceContentBackfill);
-                let backfill = client.backfill_content_reports();
-                step.finish_app(&backfill);
-                if backfill.is_err() {
-                    tracing::warn!(
-                        target: "marmot_app::account_worker",
-                        method = "maintenance_tick",
-                        "report backfill deferred"
-                    );
-                }
-                let step = telemetry.observe(RuntimeOp::WorkerMaintenanceLegacyPromotion);
-                step.finish(run_legacy_message_promotion_batch(
-                    &client,
-                    &mut legacy_message_promotion,
-                ));
-                // Pairing timers, KeyPackage retries and link settlement.
-                client.drive_device_pairing().await;
-                if client.device_unlinked() {
-                    // Nothing more goes out; the next turn stops the worker.
-                    phase.finish(TelemetryOutcome::Success);
-                    continue 'worker;
-                }
-                let step = telemetry.observe(RuntimeOp::WorkerMaintenanceCompaction);
-                attachments::compact_if_due(&client, &shared, &mut attachment_admission).await;
-                step.finish(TelemetryOutcome::Success);
-                attachments::spawn_legacy_migration(
-                    &client,
-                    &shared,
-                    &mut attachment_admission,
-                );
-                if client.key_package_maintenance_requires_catch_up() {
-                    let step = telemetry.observe(RuntimeOp::WorkerMaintenanceKeyPackageCatchUp);
-                    let observation = shared.observer.product().begin(
-                        crate::ProductFamily::Maintenance, "catch_up", crate::ProductUnit::Attempt,
-                    );
-                    let catch_up = timeout(
-                        Duration::from_secs(15), client.sync_automatically_with_partial_progress(),
-                    ).await;
-                    let outcome = match &catch_up {
-                        Ok(Ok(_)) => KeyPackageMaintenanceCatchUpOutcome::Completed,
-                        Ok(Err(_)) => KeyPackageMaintenanceCatchUpOutcome::Failed,
-                        Err(_) => KeyPackageMaintenanceCatchUpOutcome::TimedOut,
+                // The watchdog: a job with work but no wake or deadline
+                // pending was missed. Count it; it runs on the next turn.
+                let owed_jobs = {
+                    let flags = WatchdogFlags {
+                        attachment_due,
+                        avatar_due,
+                        presentation_due,
+                        local_submission_due,
+                        legacy_promotion_pending: legacy_message_promotion.status
+                            == LegacyMessagePromotionStatus::Pending,
+                        relay_config_retry: relay_config_work == RelayConfigWork::Retry,
+                        admission: &attachment_admission,
                     };
-                    step.finish(match outcome {
-                        KeyPackageMaintenanceCatchUpOutcome::Completed => TelemetryOutcome::Success,
-                        KeyPackageMaintenanceCatchUpOutcome::Failed => TelemetryOutcome::Failure,
-                        KeyPackageMaintenanceCatchUpOutcome::TimedOut => TelemetryOutcome::Timeout,
-                    });
-                    if let Some(observation) = observation {
-                        observation.finish(outcome.as_str());
-                    }
-                    if client.device_unlinked() {
-                        // The catch-up applied this device's removal:
-                        // nothing more goes out (D67).
-                        phase.finish(TelemetryOutcome::Success);
-                        continue 'worker;
-                    }
-                    match catch_up {
-                        Ok(Ok(summary)) => {
-                            publish_app_runtime_summary_with_v5(&client,
-                                &events,
-                                &account_id_hex,
-                                &account_label,
-                                &summary,
-                            );
-                            start_post_join_history_after_visibility(
-                                &mut client,
-                                &summary,
-                                &events,
-                                &account_id_hex,
-                                &account_label,
-                            )
-                            .await;
-                            publish_client_pending_projection_updates(
-                                &mut client,
-                                &events,
-                                &account_id_hex,
-                                &account_label,
-                            );
-                            schedule_pending_convergence_groups(
-                                &mut scheduled_convergence,
-                                &mut client,
-                            );
-                        }
-                        Ok(Err(failure)) => {
-                            publish_sync_summary_with_audit(&client,
-                                &events,
-                                &account_id_hex,
-                                &account_label,
-                                &failure.partial_summary,
-                                &shared,
-                                "key_package_maintenance_catch_up",
-                            );
-                            start_post_join_history_after_visibility(
-                                &mut client,
-                                &failure.partial_summary,
-                                &events,
-                                &account_id_hex,
-                                &account_label,
-                            )
-                            .await;
-                            publish_app_runtime_account_error(
-                                Emit::Quiescent(&client),
-                                &events,
-                                &account_id_hex,
-                                &account_label,
-                                account_error_message(
-                                    "key package maintenance catch-up failed",
-                                    &failure.source,
-                                ),
-                            );
-                        }
-                        Err(_) => {
-                            tracing::warn!(
-                                target: "marmot_app::runtime",
-                                method = "key_package_maintenance_catch_up",
-                                "key package maintenance catch-up reached its time cap"
-                            );
-                        }
-                    }
-                }
-                // A join window ends once T has been counted since its join
-                // completed, which only time passing shows; the tick counts
-                // it and notices joins that completed. Repair asks wait for
-                // the same clock, and replies for their rank's slots.
-                let step = telemetry.observe(RuntimeOp::WorkerMaintenancePush);
-                client.advance_push_join_windows().await;
-                if client.has_due_push_announce() || client.has_due_push_repair() {
-                    scheduled_push_retry.observe_pending(true, &command_tx);
-                }
-                step.finish(TelemetryOutcome::Success);
-                scheduled_runtime_group_subscription_refresh.observe_pending(
-                    client.has_pending_runtime_group_subscription_refresh(),
-                    &command_tx,
-                );
-                let step = telemetry.observe(RuntimeOp::WorkerMaintenanceRecovery);
-                let selection = match refresh_recovery_at_seam(
-                    &mut client,
-                    EpochBackfillReportContext {
-                        events: &events,
-                        account_id_hex: &account_id_hex,
-                        account_label: &account_label,
-                        shared: &shared,
-                    },
-                )
-                .await
-                {
-                    Ok(()) => TelemetryOutcome::Success,
-                    Err(_) => TelemetryOutcome::Failure,
+                    schedule::Job::ALL.map(|job| job_owed_now(job, &client, &flags))
                 };
-                step.finish(selection);
-                finish_periodic_maintenance_after_recovery(
-                    &mut client,
-                    &events,
-                    &account_id_hex,
-                    &account_label,
-                    &shared,
-                    &product_backlog,
-                    &mut scheduled_convergence,
-                )
-                .await;
-                let step = telemetry.observe(RuntimeOp::WorkerMaintenanceHistoryDispatch);
-                dispatch_history_blobs(&mut client, &media_http);
-                step.finish(TelemetryOutcome::Success);
-
+                for (job, owed) in schedule::Job::ALL.into_iter().zip(owed_jobs) {
+                    let missed = if job == schedule::Job::SessionMaintenance {
+                        // A re-read is already pending: nothing was missed.
+                        if maintenance_due_dirty {
+                            continue;
+                        }
+                        let step = telemetry.observe(RuntimeOp::WatchdogMaintenanceNextDue);
+                        let due = client.maintenance_due();
+                        step.finish(TelemetryOutcome::Success);
+                        schedule.late(
+                            job,
+                            session_maintenance_late(
+                                due,
+                                maintenance_last_run.map(|run| run.wall),
+                                maintenance_planned_wall,
+                                crate::unix_now_seconds(),
+                            ),
+                        )
+                    } else {
+                        schedule.missed(job, owed, TokioInstant::now(), crate::unix_now_seconds())
+                    };
+                    let Some(first) = missed else {
+                        continue;
+                    };
+                    telemetry.record_runtime(
+                        watchdog_missed_wake_op(job),
+                        Duration::ZERO,
+                        TelemetryOutcome::Success,
+                    );
+                    if first {
+                        tracing::warn!(target: "marmot_app::runtime", method = "maintenance_watchdog",
+                            job = job.as_str(), "scheduled job had work with no wake pending");
+                    }
+                    match job {
+                        schedule::Job::AttachmentPass => attachment_due = true,
+                        schedule::Job::AvatarPass => avatar_due = true,
+                        schedule::Job::PresentationPass => presentation_due = true,
+                        schedule::Job::LocalSubmission => local_submission_due = true,
+                        _ => schedule.wake(job),
+                    }
+                }
                 phase.finish(TelemetryOutcome::Success);
             }
         }
     }
+    // No Welcome wave outlives the worker; its Welcomes stay owed.
+    welcome_runs.end().await;
+    // A waiting host check gets the error a queued command gets; no read
+    // outlives the worker.
+    sign_in_reads.end().await;
     // Each exit that still held the client stopped the runner on it; any
     // other exit's drop aborts the task and refunds the attempts it left
     // open. What a quantum staged stays durable.
@@ -2986,8 +3478,588 @@ async fn refresh_recovery_at_seam(
     report_pending_epoch_backfill_result(client, result, backfill_armed, observation, context)
 }
 
-/// Keep the domain maintenance continuation after the recovery outcome.
-async fn finish_periodic_maintenance_after_recovery(
+/// Run the recovery seam for the worker's schedule, timed as
+/// `worker_maintenance_recovery`. Whether it still has work afterwards; a
+/// failure counts as work, so it retries (mdk#2923).
+async fn run_scheduled_recovery(
+    client: &mut AppClient,
+    context: EpochBackfillReportContext<'_>,
+) -> bool {
+    let step = context
+        .shared
+        .observer
+        .performance()
+        .observe(RuntimeOp::WorkerMaintenanceRecovery);
+    let result = refresh_recovery_at_seam(client, context).await;
+    step.finish(if result.is_ok() {
+        TelemetryOutcome::Success
+    } else {
+        TelemetryOutcome::Failure
+    });
+    // The seam's own answer, from the reads it already made.
+    let owed = client.recovery_seam_owed.take();
+    result.is_err() || owed.unwrap_or_else(|| client.recovery_owed())
+}
+
+/// Advance post-join history collection for the worker's schedule, timed as
+/// `worker_maintenance_post_join`. Whether it still has work afterwards; a
+/// failure counts as work, so it retries (mdk#2923).
+async fn run_scheduled_post_join(
+    client: &mut AppClient,
+    context: EpochBackfillReportContext<'_>,
+) -> bool {
+    let step = context
+        .shared
+        .observer
+        .performance()
+        .observe(RuntimeOp::WorkerMaintenancePostJoin);
+    let post_join = client.advance_post_join_maintenance_subscriptions().await;
+    step.finish_app(&post_join);
+    let failed = post_join.is_err();
+    if let Err(err) = post_join {
+        publish_app_runtime_account_error(
+            Emit::Quiescent(client),
+            context.events,
+            context.account_id_hex,
+            context.account_label,
+            account_error_message("post-join maintenance subscription failed", &err),
+        );
+    }
+    failed || client.post_join_owed()
+}
+
+/// When the avatar pass next runs on its own: by the worker's clock, in 15 s
+/// after a failure or while the bootstrap still has rows; by wall time, at
+/// the earliest acquisition `due`, which the schedule turns into 15 s for one
+/// already due that waits for a free slot; otherwise only on a wake (mdk#2923
+/// step B).
+fn avatar_pass_next_at(client: &AppClient, failed: bool) -> (Option<TokioInstant>, Option<u64>) {
+    let retry = TokioInstant::now() + schedule::RETRY_WHILE_OWED;
+    let Ok((due, bootstrap)) = client
+        .app
+        .account_storage(&client.state.label)
+        .and_then(|storage| Ok(storage.app_storage().avatar_work_schedule()?))
+    else {
+        return (Some(retry), None);
+    };
+    if failed || bootstrap {
+        return (Some(retry), None);
+    }
+    // A wall-clock `due`; the schedule runs one already past in 15 s.
+    (None, due)
+}
+
+/// The watchdog's read: whether the avatar pass has work due now.
+fn avatar_pass_owed_now(client: &AppClient) -> bool {
+    client
+        .app
+        .account_storage(&client.state.label)
+        .and_then(|storage| Ok(storage.app_storage().avatar_work_schedule()?))
+        .map_or(true, |(due, bootstrap)| {
+            bootstrap || due.is_some_and(|at| at <= crate::unix_now_seconds())
+        })
+}
+
+/// When the presentation pass next runs on its own. It has no timed work:
+/// only rows it could not apply yet, or a failure, retry every 15 s, as the
+/// tick retried them (mdk#2923 step B).
+fn presentation_pass_next_at(client: &AppClient, failed: bool) -> Option<TokioInstant> {
+    (failed || presentation_pass_owed_now(client))
+        .then(|| TokioInstant::now() + schedule::RETRY_WHILE_OWED)
+}
+
+/// The watchdog's read: whether the presentation pass has rows left.
+fn presentation_pass_owed_now(client: &AppClient) -> bool {
+    client
+        .app
+        .account_storage(&client.state.label)
+        .and_then(|storage| Ok(storage.app_storage().chat_presentation_work_pending()?))
+        .unwrap_or(true)
+}
+
+/// The KeyPackage maintenance catch-up, capped at 15 s, and what it found.
+/// Moved off the maintenance tick unchanged; the worker's schedule runs it
+/// when it is due (mdk#2923 step B).
+async fn run_key_package_catch_up(
+    client: &mut AppClient,
+    shared: &RuntimeSharedServices,
+    scheduled_convergence: &mut ScheduledConvergence,
+    context: EpochBackfillReportContext<'_>,
+) {
+    let EpochBackfillReportContext {
+        events,
+        account_id_hex,
+        account_label,
+        ..
+    } = context;
+    let step = shared
+        .observer
+        .performance()
+        .observe(RuntimeOp::WorkerMaintenanceKeyPackageCatchUp);
+    let observation = shared.observer.product().begin(
+        crate::ProductFamily::Maintenance,
+        "catch_up",
+        crate::ProductUnit::Attempt,
+    );
+    let catch_up = timeout(
+        Duration::from_secs(15),
+        client.sync_automatically_with_partial_progress(),
+    )
+    .await;
+    let outcome = match &catch_up {
+        Ok(Ok(_)) => KeyPackageMaintenanceCatchUpOutcome::Completed,
+        Ok(Err(_)) => KeyPackageMaintenanceCatchUpOutcome::Failed,
+        Err(_) => KeyPackageMaintenanceCatchUpOutcome::TimedOut,
+    };
+    step.finish(match outcome {
+        KeyPackageMaintenanceCatchUpOutcome::Completed => TelemetryOutcome::Success,
+        KeyPackageMaintenanceCatchUpOutcome::Failed => TelemetryOutcome::Failure,
+        KeyPackageMaintenanceCatchUpOutcome::TimedOut => TelemetryOutcome::Timeout,
+    });
+    if let Some(observation) = observation {
+        observation.finish(outcome.as_str());
+    }
+    if client.device_unlinked() {
+        return;
+    }
+    match catch_up {
+        Ok(Ok(summary)) => {
+            publish_app_runtime_summary_with_v5(
+                client,
+                events,
+                account_id_hex,
+                account_label,
+                &summary,
+            );
+            start_post_join_history_after_visibility(
+                client,
+                &summary,
+                events,
+                account_id_hex,
+                account_label,
+            )
+            .await;
+            publish_client_pending_projection_updates(
+                client,
+                events,
+                account_id_hex,
+                account_label,
+            );
+            schedule_pending_convergence_groups(scheduled_convergence, client);
+        }
+        Ok(Err(failure)) => {
+            publish_sync_summary_with_audit(
+                client,
+                events,
+                account_id_hex,
+                account_label,
+                &failure.partial_summary,
+                shared,
+                "key_package_maintenance_catch_up",
+            );
+            start_post_join_history_after_visibility(
+                client,
+                &failure.partial_summary,
+                events,
+                account_id_hex,
+                account_label,
+            )
+            .await;
+            publish_app_runtime_account_error(
+                Emit::Quiescent(client),
+                events,
+                account_id_hex,
+                account_label,
+                account_error_message("key package maintenance catch-up failed", &failure.source),
+            );
+        }
+        Err(_) => {
+            tracing::warn!(
+                target: "marmot_app::runtime",
+                method = "key_package_maintenance_catch_up",
+                "key package maintenance catch-up reached its time cap"
+            );
+        }
+    }
+}
+
+/// What the watchdog's owed read needs besides the client: the due flags
+/// the worker keeps for its passes and local submissions, legacy
+/// promotion's state, and the attachment admission.
+struct WatchdogFlags<'a> {
+    attachment_due: bool,
+    avatar_due: bool,
+    presentation_due: bool,
+    local_submission_due: bool,
+    legacy_promotion_pending: bool,
+    relay_config_retry: bool,
+    admission: &'a attachments::Admission,
+}
+
+/// The watchdog's read of whether `job` has work due now (mdk#2923 step B).
+/// A pass or submission already set due is not owed: it runs on the next
+/// turn anyway.
+fn job_owed_now(job: schedule::Job, client: &AppClient, flags: &WatchdogFlags<'_>) -> bool {
+    match job {
+        schedule::Job::Recovery => client.recovery_owed(),
+        schedule::Job::PostJoin => client.post_join_owed(),
+        schedule::Job::AttachmentPass => {
+            !flags.attachment_due && attachments::pass_owed_now(client, flags.admission)
+        }
+        schedule::Job::AvatarPass => !flags.avatar_due && avatar_pass_owed_now(client),
+        schedule::Job::PresentationPass => {
+            !flags.presentation_due && presentation_pass_owed_now(client)
+        }
+        schedule::Job::LocalSubmission => {
+            !flags.local_submission_due && client.local_submission_pending()
+        }
+        schedule::Job::ContentBackfill => client.content_report_backfill_owed(),
+        schedule::Job::LegacyPromotion => flags.legacy_promotion_pending,
+        schedule::Job::DevicePairing => client.device_pairing_owed(),
+        schedule::Job::Housekeeping => attachments::housekeeping_owed_now(client, flags.admission),
+        schedule::Job::KeyPackageCatchUp => client.key_package_maintenance_requires_catch_up(),
+        schedule::Job::Push => client.push_timing_owed(),
+        schedule::Job::HistoryDispatch => client
+            .history_dispatch_next_at()
+            .is_some_and(|at| at <= crate::unix_now_seconds()),
+        schedule::Job::RelayConfig => flags.relay_config_retry,
+        // Its own check compares its plan with its due time (mdk#3265).
+        schedule::Job::SessionMaintenance => false,
+    }
+}
+
+/// How often the worker re-reads when session maintenance next has work, at
+/// most. A due time cannot move before now, so a later read delays work by
+/// at most this (mdk#3265).
+const MAINTENANCE_DUE_READ_SPACING: Duration = Duration::from_secs(1);
+
+/// When the last session maintenance run started: the wall second, which
+/// stored due times compare against, and the worker's clock, which spaces
+/// retries so a wall-clock step cannot stretch them (mdk#3265).
+#[derive(Clone, Copy, Debug)]
+struct MaintenanceRun {
+    wall: u64,
+    at: TokioInstant,
+}
+
+/// When session maintenance next runs (mdk#3265), from when it next has
+/// work (`due`), its last run and the time now: `at` by the worker's clock,
+/// `wall` a unix second the schedule reaches through
+/// [`schedule::wall_deadline`], and `planned_wall`, the wall second the plan
+/// aims at, for the watchdog.
+/// - A stored time after the last run started runs then by wall time, or at
+///   once if it has passed.
+/// - A stored time the last run already saw but could not act on (a held
+///   group, a pause, a gate), and work with no stored time, retry 15 s after
+///   that run by the worker's clock, as the tick did, or at once before the
+///   first run.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct MaintenancePlan {
+    at: Option<TokioInstant>,
+    wall: Option<u64>,
+    planned_wall: Option<u64>,
+}
+
+fn maintenance_plan(
+    due: marmot_session::MaintenanceDue,
+    last_run: Option<MaintenanceRun>,
+    now_wall: u64,
+    now: TokioInstant,
+) -> MaintenancePlan {
+    let retry = last_run.map_or((now, now_wall), |run| {
+        (
+            run.at + schedule::RETRY_WHILE_OWED,
+            run.wall
+                .saturating_add(schedule::RETRY_WHILE_OWED.as_secs()),
+        )
+    });
+    let mut by_clock = due.retry_while_owed.then_some(retry);
+    let mut wall = None;
+    if let Some(at) = due.at {
+        match last_run {
+            Some(run) if at.0 <= run.wall => by_clock = Some(retry),
+            _ if at.0 <= now_wall => by_clock = Some((now, at.0)),
+            _ => wall = Some(at.0),
+        }
+        if due.retry_while_owed && by_clock.is_some_and(|(clock, _)| clock > retry.0) {
+            by_clock = Some(retry);
+        }
+    }
+    // The wall second of whichever comes first by the worker's clock.
+    let by_wall = wall.map(|wall| (schedule::wall_deadline(wall, now_wall, now), wall));
+    MaintenancePlan {
+        at: by_clock.map(|(at, _)| at),
+        wall,
+        planned_wall: by_clock
+            .into_iter()
+            .chain(by_wall)
+            .min_by_key(|(at, _)| *at)
+            .map(|(_, planned)| planned),
+    }
+}
+
+/// The watchdog's check of session maintenance (mdk#3265), in wall seconds:
+/// a stored time passed after the last run started, yet the plan aims later
+/// than it, or there is owed work and no plan at all. Either means a change
+/// moved what maintenance owes without a re-read. A plan that aims at or
+/// before the due time is not late, even if its timer has not fired, as
+/// after the device was suspended.
+fn session_maintenance_late(
+    due: marmot_session::MaintenanceDue,
+    last_run_wall: Option<u64>,
+    planned_wall: Option<u64>,
+    now_wall: u64,
+) -> bool {
+    let timed = due.at.is_some_and(|at| {
+        at.0 < now_wall
+            && last_run_wall.is_none_or(|run| at.0 > run)
+            && planned_wall.is_none_or(|planned| planned > at.0)
+    });
+    let untimed = due.retry_while_owed && planned_wall.is_none();
+    timed || untimed
+}
+
+/// Serves [`AccountWorkerCommand::OverdueComponentRecheckForTest`].
+#[cfg(test)]
+async fn overdue_component_recheck_for_test(client: &mut AppClient) -> Result<(), AppError> {
+    /// The system's monotonic clock, an hour ahead.
+    #[derive(Debug, Default)]
+    struct HourAhead(marmot_session::SystemMonotonicClock);
+    impl marmot_session::MonotonicClock for HourAhead {
+        fn elapsed(&self) -> Duration {
+            self.0.elapsed() + Duration::from_secs(60 * 60)
+        }
+    }
+    client.run_due_maintenance().await?;
+    client
+        .runtime
+        .set_monotonic_clock_for_test(Arc::new(HourAhead::default()));
+    client.test_fail_epoch_gap_read = true;
+    Ok(())
+}
+
+#[cfg(test)]
+mod maintenance_change_tests {
+    use super::{AccountWorkerCommand, ReadReply};
+    use cgka_traits::GroupId;
+
+    /// A read that hydrates a group can make it live, which adds that group's
+    /// deadlines, so the worker re-reads the due time after it (mdk#3265).
+    #[test]
+    fn hydrating_reads_may_change_maintenance() {
+        let group_id = GroupId::new(vec![7; 32]);
+        let hydrating = [
+            AccountWorkerCommand::Members {
+                group_id: group_id.clone(),
+                respond: ReadReply::unobserved().0,
+            },
+            AccountWorkerCommand::MemberIdsPage {
+                group_ids: vec![group_id.clone()],
+                respond: ReadReply::unobserved().0,
+            },
+            AccountWorkerCommand::GroupMlsState {
+                group_id: group_id.clone(),
+                respond: ReadReply::unobserved().0,
+            },
+            AccountWorkerCommand::GroupRoster {
+                group_id: group_id.clone(),
+                respond: ReadReply::unobserved().0,
+            },
+            AccountWorkerCommand::GroupRecoveryStatus {
+                group_id: group_id.clone(),
+                respond: ReadReply::unobserved().0,
+            },
+            AccountWorkerCommand::GroupAppComponent {
+                group_id: group_id.clone(),
+                component_id: 1,
+                respond: ReadReply::unobserved().0,
+            },
+            AccountWorkerCommand::GroupPushDebugInfo {
+                group_id,
+                respond: ReadReply::unobserved().0,
+            },
+        ];
+        for (index, command) in hydrating.iter().enumerate() {
+            assert!(command.may_change_maintenance(), "hydrating read {index}");
+        }
+        // A read that hydrates nothing still changes nothing.
+        let quarantined = AccountWorkerCommand::QuarantinedGroups {
+            respond: ReadReply::unobserved().0,
+        };
+        assert!(!quarantined.may_change_maintenance());
+    }
+}
+
+#[cfg(test)]
+mod maintenance_plan_tests {
+    use super::{MaintenanceRun, maintenance_plan, schedule, session_maintenance_late};
+    use cgka_traits::Timestamp;
+    use marmot_session::MaintenanceDue;
+    use std::time::Duration;
+    use tokio::time::Instant;
+
+    fn due(at: Option<u64>, retry_while_owed: bool) -> MaintenanceDue {
+        MaintenanceDue {
+            at: at.map(Timestamp),
+            retry_while_owed,
+        }
+    }
+
+    /// When the plan runs, in seconds after `now`, as the schedule reaches
+    /// it, and the wall second it aims at.
+    fn plan(
+        due: MaintenanceDue,
+        last_run: Option<(u64, u64)>,
+        now_wall: u64,
+    ) -> Option<(u64, u64)> {
+        let now = Instant::now();
+        let last_run = last_run.map(|(wall, ago)| MaintenanceRun {
+            wall,
+            at: now - Duration::from_secs(ago),
+        });
+        let plan = maintenance_plan(due, last_run, now_wall, now);
+        let wall = plan
+            .wall
+            .map(|wall| schedule::wall_deadline(wall, now_wall, now));
+        let at = plan.at.into_iter().chain(wall).min()?;
+        Some((
+            at.saturating_duration_since(now).as_secs(),
+            plan.planned_wall.expect("a plan aims at a wall second"),
+        ))
+    }
+
+    /// A future stored time runs then; nothing owed waits for a wake; a far
+    /// one is read again within the longest sleep.
+    #[test]
+    fn a_stored_due_time_runs_at_that_time() {
+        assert_eq!(
+            plan(due(Some(1_100), false), Some((900, 100)), 1_000),
+            Some((100, 1_100))
+        );
+        assert_eq!(plan(due(None, false), Some((900, 100)), 1_000), None);
+        let far = 1_000 + 24 * 60 * 60;
+        assert_eq!(
+            plan(due(Some(far), false), Some((900, 100)), 1_000),
+            Some((schedule::LONGEST_WALL_SLEEP.as_secs(), far))
+        );
+    }
+
+    /// Work that came due after the last run started runs at once; work
+    /// that run already saw retries 15 s after it, so a gate that holds it
+    /// cannot spin the worker.
+    #[test]
+    fn past_due_work_runs_at_once_unless_the_last_run_saw_it() {
+        assert_eq!(
+            plan(due(Some(950), false), Some((900, 100)), 1_000),
+            Some((0, 950))
+        );
+        assert_eq!(plan(due(Some(950), false), None, 1_000), Some((0, 950)));
+        assert_eq!(
+            plan(due(Some(880), false), Some((900, 10)), 1_000),
+            Some((5, 915))
+        );
+    }
+
+    /// Work with no stored time retries 15 s after the last run by the
+    /// worker's clock, not the wall clock, and runs at once before the
+    /// first run. This is what stops a "due now" from re-running maintenance
+    /// on every read.
+    #[test]
+    fn untimed_work_retries_15_s_after_the_last_run() {
+        assert_eq!(
+            plan(due(None, true), Some((900, 10)), 1_000),
+            Some((5, 915))
+        );
+        assert_eq!(plan(due(None, true), None, 1_000), Some((0, 1_000)));
+        // The wall clock stepped back an hour: the retry still comes 15 s
+        // after the run by the worker's clock.
+        assert_eq!(
+            plan(due(None, true), Some((4_600, 10)), 1_000).map(|(at, _)| at),
+            Some(5)
+        );
+        assert_eq!(
+            plan(due(Some(1_003), true), Some((900, 10)), 1_000),
+            Some((3, 1_003))
+        );
+    }
+
+    /// A stored time that passed after the last run, with the plan aimed
+    /// later, is late; aimed at it, it is not, even if the timer has not
+    /// fired; owed work with no plan is late; work the last run saw is not.
+    #[test]
+    fn the_watchdog_counts_work_the_plan_does_not_reach() {
+        assert!(session_maintenance_late(
+            due(Some(950), false),
+            Some(900),
+            Some(1_500),
+            1_000
+        ));
+        assert!(!session_maintenance_late(
+            due(Some(950), false),
+            Some(900),
+            Some(950),
+            1_000
+        ));
+        assert!(!session_maintenance_late(
+            due(Some(880), false),
+            Some(900),
+            Some(915),
+            1_000
+        ));
+        assert!(session_maintenance_late(
+            due(None, true),
+            Some(900),
+            None,
+            1_000
+        ));
+        assert!(!session_maintenance_late(
+            due(None, true),
+            Some(900),
+            Some(915),
+            1_000
+        ));
+        assert!(!session_maintenance_late(
+            due(Some(1_100), false),
+            Some(900),
+            None,
+            1_000
+        ));
+    }
+}
+
+/// The runtime operation that counts `job`'s missed wakes.
+fn watchdog_missed_wake_op(job: schedule::Job) -> RuntimeOp {
+    use schedule::Job;
+    match job {
+        Job::Recovery => RuntimeOp::WatchdogMissedWakeRecovery,
+        Job::PostJoin => RuntimeOp::WatchdogMissedWakePostJoin,
+        Job::AttachmentPass => RuntimeOp::WatchdogMissedWakeAttachmentPass,
+        Job::AvatarPass => RuntimeOp::WatchdogMissedWakeAvatarPass,
+        Job::PresentationPass => RuntimeOp::WatchdogMissedWakePresentationPass,
+        Job::LocalSubmission => RuntimeOp::WatchdogMissedWakeLocalSubmission,
+        Job::ContentBackfill => RuntimeOp::WatchdogMissedWakeContentBackfill,
+        Job::LegacyPromotion => RuntimeOp::WatchdogMissedWakeLegacyPromotion,
+        Job::DevicePairing => RuntimeOp::WatchdogMissedWakeDevicePairing,
+        Job::Housekeeping => RuntimeOp::WatchdogMissedWakeHousekeeping,
+        Job::KeyPackageCatchUp => RuntimeOp::WatchdogMissedWakeKeyPackageCatchUp,
+        Job::Push => RuntimeOp::WatchdogMissedWakePush,
+        Job::HistoryDispatch => RuntimeOp::WatchdogMissedWakeHistoryDispatch,
+        Job::SessionMaintenance => RuntimeOp::WatchdogMissedWakeSessionMaintenance,
+        Job::RelayConfig => RuntimeOp::WatchdogMissedWakeRelayConfig,
+    }
+}
+
+/// Sleeps until the schedule's next job, or forever when every job rests.
+async fn sleep_until_scheduled(at: Option<TokioInstant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Session and app maintenance (`run_due_maintenance`), run when its due
+/// time comes on the worker's schedule (mdk#3265).
+async fn finish_periodic_maintenance(
     client: &mut AppClient,
     events: &broadcast::Sender<MarmotAppEvent>,
     account_id_hex: &str,
@@ -2997,22 +4069,11 @@ async fn finish_periodic_maintenance_after_recovery(
     scheduled_convergence: &mut ScheduledConvergence,
 ) {
     let telemetry = shared.observer.performance();
-    let step = telemetry.observe(RuntimeOp::WorkerMaintenancePostJoin);
-    let post_join = client.advance_post_join_maintenance_subscriptions().await;
-    step.finish_app(&post_join);
-    if let Err(err) = post_join {
-        publish_app_runtime_account_error(
-            Emit::Quiescent(client),
-            events,
-            account_id_hex,
-            account_label,
-            account_error_message("post-join maintenance subscription failed", &err),
-        );
-    }
     let backlog_permit = shared.observer.product().permit();
     let step = telemetry.observe(RuntimeOp::WorkerMaintenanceDue);
     let due = client.run_due_maintenance().await;
     step.finish_app(&due);
+    publish_settled_invitations(client, events, account_id_hex, account_label);
     match due {
         Ok(summary) => {
             if let Some(permit) = &backlog_permit {
@@ -3079,8 +4140,8 @@ struct AccountWorkerCatchUpContext<'a> {
 async fn handle_account_worker_catch_up(
     client: &mut AppClient,
     respond: oneshot::Sender<Result<(), AccountCatchUpFailure>>,
-    commands: &mut mpsc::Receiver<AccountWorkerCommand>,
-    pending: &mut VecDeque<AccountWorkerCommand>,
+    commands: &mut WorkerInbox,
+    pending: &mut VecDeque<QueuedCommand>,
     context: AccountWorkerCatchUpContext<'_>,
 ) {
     let _unit = context.unit.enter(WorkerUnit::CatchUp);
@@ -3128,10 +4189,13 @@ async fn handle_account_worker_catch_up(
             let Some(command) = command else {
                 continue;
             };
-            let Some(command) = acknowledge_from_published(command, published.as_ref()) else {
+            let Some(command) = command
+                .serve_or_keep(|command| acknowledge_from_published(command, published.as_ref()))
+            else {
                 continue;
             };
-            match command {
+            let deferring = !deferred.is_empty();
+            let Some(command) = command.serve_or_keep(|command| match command {
                 AccountWorkerCommand::CaptureConversation {
                     respond, queued, ..
                 } => {
@@ -3139,12 +4203,15 @@ async fn handle_account_worker_catch_up(
                         queued.finish(TelemetryOutcome::NotReady);
                     }
                     let _ = respond.send_not_ready(Err(ConversationWindowError::NotReady));
+                    None
                 }
                 AccountWorkerCommand::ConfirmGroupRejoin { respond, .. } => {
                     let _ = answer_off_quiescent(respond, Err(AppError::AccountWorkerBusy));
+                    None
                 }
                 AccountWorkerCommand::DeclineGroupRejoin { respond, .. } => {
                     let _ = answer_off_quiescent(respond, Err(AppError::AccountWorkerBusy));
+                    None
                 }
                 AccountWorkerCommand::AcceptGroupInvite { respond, .. } => {
                     // The pinned sync exclusively owns the live client. This
@@ -3152,6 +4219,7 @@ async fn handle_account_worker_catch_up(
                     // safely retry after catch-up rather than waiting behind
                     // an arbitrarily slow relay drain.
                     let _ = answer_off_quiescent(respond, Err(AppError::AccountWorkerBusy));
+                    None
                 }
                 AccountWorkerCommand::RetryRuntimeGroupSubscriptions { respond } => {
                     // This is worker-owned maintenance, not caller work. Keep
@@ -3159,17 +4227,22 @@ async fn handle_account_worker_catch_up(
                     // otherwise later catch-up requests could no longer
                     // coalesce onto this one.
                     let _ = answer_off_quiescent(respond, true);
+                    None
                 }
-                AccountWorkerCommand::CatchUp { respond } if deferred.is_empty() => {
+                AccountWorkerCommand::CatchUp { respond } if !deferring => {
                     telemetry.record_runtime(
                         RuntimeOp::CatchUpCoalesced,
                         Duration::ZERO,
                         TelemetryOutcome::Success,
                     );
                     catch_up_responders.push(respond);
+                    None
                 }
-                command => deferred.push_back(command),
-            }
+                command => Some(command),
+            }) else {
+                continue;
+            };
+            deferred.push_back(command);
         }
     };
     let result = match sync_result {
@@ -3330,7 +4403,7 @@ fn run_legacy_message_promotion_batch(
 }
 
 /// One promotion batch through `promote`: a failed batch is a failure,
-/// whether it retries next tick or halts the sweep, and a sweep that is
+/// whether it retries 15 s later or halts the sweep, and a sweep that is
 /// complete or halted has nothing to do.
 fn run_legacy_message_promotion_batch_with(
     schedule: &mut LegacyMessagePromotionSchedule,
@@ -3410,7 +4483,7 @@ fn run_legacy_message_promotion_batch_with(
 async fn run_startup_hydration_pipeline(
     app: &MarmotApp,
     client: &mut AppClient,
-    commands: &mut mpsc::Receiver<AccountWorkerCommand>,
+    commands: &mut WorkerInbox,
     deferred: &mut Vec<DeferredStartupCommand>,
     events: &broadcast::Sender<MarmotAppEvent>,
     account_id_hex: &str,
@@ -3648,7 +4721,7 @@ pub(crate) async fn drain_deferred_hydration(client: &mut AppClient) -> Result<(
 #[allow(clippy::too_many_arguments)]
 async fn handle_startup_hydration_command(
     client: &mut AppClient,
-    command: AccountWorkerCommand,
+    queued: QueuedCommand,
     deferred: &mut Vec<DeferredStartupCommand>,
     events: &broadcast::Sender<MarmotAppEvent>,
     account_id_hex: &str,
@@ -3656,6 +4729,9 @@ async fn handle_startup_hydration_command(
     shared: &RuntimeSharedServices,
     setup_key_package_result: &mut Option<Result<usize, AppError>>,
 ) {
+    // A mutation served here ends its wait as it starts; one deferred keeps
+    // it for the replay. Reads carry no mutation wait.
+    let (command, wait) = queued.into_parts();
     match command {
         AccountWorkerCommand::GroupRecoveryStatus {
             group_id,
@@ -3670,6 +4746,7 @@ async fn handle_startup_hydration_command(
             token,
             respond,
         } => {
+            wait.take_up();
             let result = client.confirm_group_rejoin(&welcome_id, &token).await;
             publish_client_pending_projection_updates(
                 client,
@@ -3684,6 +4761,7 @@ async fn handle_startup_hydration_command(
             welcome_id,
             respond,
         } => {
+            wait.take_up();
             let result = client.decline_group_rejoin(&welcome_id);
             publish_client_pending_projection_updates(
                 client,
@@ -3791,6 +4869,7 @@ async fn handle_startup_hydration_command(
         // done; the forget drops the group's buffered convergence request
         // with the rest of its state.
         AccountWorkerCommand::ForgetGroupLocal { group_id, respond } => {
+            wait.take_up();
             let storage_permit = shared.observer.product().permit();
             let result = client.forget_group_local(&group_id).await;
             if matches!(result, Ok(true)) {
@@ -3833,6 +4912,7 @@ async fn handle_startup_hydration_command(
             // need the remaining MLS groups to finish hydrating. Apply and
             // publish it immediately so a locally visible invite cannot be
             // held behind unrelated startup work.
+            wait.take_up();
             let result = client.accept_group_invite(&group_id);
             if result.is_ok() {
                 publish_app_runtime_group_state_updated(
@@ -3861,6 +4941,11 @@ async fn handle_startup_hydration_command(
             let _ = reply(respond, client.mark_device_unlinked(), client);
         }
         #[cfg(test)]
+        AccountWorkerCommand::OverdueComponentRecheckForTest { respond } => {
+            let result = overdue_component_recheck_for_test(client).await;
+            let _ = reply(respond, result, client);
+        }
+        #[cfg(test)]
         AccountWorkerCommand::SubscribeReadStateForTest { respond } => {
             let _ = reply(respond, client.subscribe_read_state(), client);
         }
@@ -3870,14 +4955,20 @@ async fn handle_startup_hydration_command(
         AccountWorkerCommand::PublishSetupKeyPackage { respond } => {
             match setup_key_package_result.take() {
                 Some(result) => {
+                    wait.take_up();
                     let _ = reply(respond, result, client);
                 }
                 None => deferred.push(DeferredStartupCommand::Command(Box::new(
-                    AccountWorkerCommand::PublishSetupKeyPackage { respond },
+                    QueuedCommand::from_parts(
+                        AccountWorkerCommand::PublishSetupKeyPackage { respond },
+                        wait,
+                    ),
                 ))),
             }
         }
-        other => deferred.push(DeferredStartupCommand::Command(Box::new(other))),
+        other => deferred.push(DeferredStartupCommand::Command(Box::new(
+            QueuedCommand::from_parts(other, wait),
+        ))),
     }
 }
 
@@ -3981,9 +5072,13 @@ fn dispatch_history_blobs(client: &mut AppClient, media_http: &MediaHttpContext)
 /// Admit new background backup work only under currently reported host
 /// facts. Once admitted, the whole pass and its settlement finish unchanged.
 fn dispatch_backup_pass(client: &mut AppClient, media_http: &MediaHttpContext) {
-    if !client.app.device_groups_enabled()
-        || !media_http.backup_background_conditions.borrow().allowed()
-    {
+    if !client.app.device_groups_enabled() {
+        return;
+    }
+    if !media_http.backup_background_conditions.borrow().allowed() {
+        // No pass now, but dispatch's deadline still needs to know whether
+        // backups are configured at all (mdk#2923).
+        client.refresh_backups_configured();
         return;
     }
     let permit = || {
@@ -4254,15 +5349,21 @@ fn spawn_media_http<T>(
     });
 }
 
+/// The first pending command that may run: media wait for capacity, and
+/// while a host sign-in check waits (`sign_in_held`), commands that name no
+/// group wait behind it.
 fn ready_command_index(
-    pending: &VecDeque<AccountWorkerCommand>,
+    pending: &VecDeque<QueuedCommand>,
     media_http: &MediaHttpContext,
+    sign_in_held: bool,
 ) -> Option<usize> {
     let has_capacity =
         !media_http.permits.is_closed() && media_http.permits.available_permits() != 0;
-    pending
-        .iter()
-        .position(|command| has_capacity || !command.needs_media_slot())
+    pending.iter().position(|queued| {
+        let command = queued.command();
+        (has_capacity || !command.needs_media_slot())
+            && !(sign_in_held && command.waits_behind_sign_in_check())
+    })
 }
 
 fn reserve_media_http(media_http: &MediaHttpContext) -> OwnedSemaphorePermit {
@@ -4308,12 +5409,16 @@ fn prepared_group_image_upload_is_in_flight(
         .unwrap_or(false)
 }
 
+/// Settle one media completion on the worker. Returns whether it was a
+/// history upload or fetch that failed without settling: its deferral was not
+/// written, so it is still due now, and the caller retries it later rather
+/// than at once (mdk#2923).
 async fn complete_media_http(
     client: &mut AppClient,
     done: MediaHttpDone,
     shared: &RuntimeSharedServices,
     media_http: &MediaHttpContext,
-) {
+) -> bool {
     let MediaHttpDone {
         permit,
         completion,
@@ -4330,12 +5435,12 @@ async fn complete_media_http(
                 .history_blobs
                 .upload
                 .store(false, std::sync::atomic::Ordering::Relaxed);
-            // A failure waits for the next maintenance pass, so a deferral
+            // A failure waits for the retry the caller arms, so a deferral
             // that could not be written never turns into a tight retry loop.
             if settled {
                 dispatch_history_blobs(client, media_http);
             }
-            return;
+            return !settled;
         }
         MediaHttpCompletion::HistoryFetch(outcome) => {
             let settled = client.finish_history_fetch(outcome);
@@ -4344,12 +5449,12 @@ async fn complete_media_http(
                 .history_blobs
                 .fetch
                 .store(false, std::sync::atomic::Ordering::Relaxed);
-            // A failure waits for the next maintenance pass, so a deferral
+            // A failure waits for the retry the caller arms, so a deferral
             // that could not be written never turns into a tight retry loop.
             if settled {
                 dispatch_history_blobs(client, media_http);
             }
-            return;
+            return !settled;
         }
         MediaHttpCompletion::BackupRestore(outcome) => {
             client.finish_backup_restore(outcome);
@@ -4359,7 +5464,7 @@ async fn complete_media_http(
                 .restore
                 .store(false, std::sync::atomic::Ordering::Relaxed);
             dispatch_backup_restore(client, media_http);
-            return;
+            return false;
         }
         MediaHttpCompletion::BackupPass(outcome) => {
             client.finish_backup_pass(outcome).await;
@@ -4368,7 +5473,7 @@ async fn complete_media_http(
             if let Some(completion) = completion {
                 completion.send_replace(true);
             }
-            return;
+            return false;
         }
         MediaHttpCompletion::Attachment {
             job,
@@ -4411,7 +5516,7 @@ async fn complete_media_http(
                         cancellation: None,
                     });
                 });
-                return;
+                return false;
             }
             if attachments::complete_acquired(client, &job, result).is_err() {
                 tracing::warn!(target: "marmot_app::runtime", method = "attachment_acquisition",
@@ -4449,7 +5554,7 @@ async fn complete_media_http(
                             cancellation: None,
                         });
                     });
-                    return;
+                    return false;
                 }
                 Err(error) => {
                     if let Ok(storage) = client.app.account_storage(&client.state.label) {
@@ -4566,6 +5671,7 @@ async fn complete_media_http(
         }
     }
     drop(permit);
+    false
 }
 
 /// Publish A before a long unit takes the client, and a receiver of what
@@ -4588,8 +5694,8 @@ fn publish_before_unit(
 async fn defer_commands_until<Fut>(
     published: Option<watch::Receiver<Arc<crate::client::read_state::ReadState>>>,
     work: Fut,
-    commands: &mut mpsc::Receiver<AccountWorkerCommand>,
-    pending: &mut VecDeque<AccountWorkerCommand>,
+    commands: &mut WorkerInbox,
+    pending: &mut VecDeque<QueuedCommand>,
     mut send_waiting: Option<oneshot::Sender<()>>,
 ) -> Fut::Output
 where
@@ -4621,7 +5727,7 @@ where
         // Keep mutation FIFO, but let optional relay retries finish early at
         // their safe boundary. Never drop the client-owning work future.
         if matches!(
-            command,
+            command.command(),
             AccountWorkerCommand::SendMessage { .. }
                 | AccountWorkerCommand::SendMessageDraft { .. }
                 | AccountWorkerCommand::SendAppEvent { .. }
@@ -4629,10 +5735,12 @@ where
         {
             let _ = waiting.send(());
         }
-        let Some(command) = acknowledge_from_published(command, published.as_ref()) else {
+        let Some(command) = command
+            .serve_or_keep(|command| acknowledge_from_published(command, published.as_ref()))
+        else {
             continue;
         };
-        match command {
+        let Some(command) = command.serve_or_keep(|command| match command {
             AccountWorkerCommand::CaptureConversation {
                 respond, queued, ..
             } => {
@@ -4640,16 +5748,23 @@ where
                     queued.finish(TelemetryOutcome::NotReady);
                 }
                 let _ = respond.send_not_ready(Err(ConversationWindowError::NotReady));
-            }
-            AccountWorkerCommand::CatchUp { .. } => {
-                catch_up_seen = true;
-                follow_up.push_back(command);
+                None
             }
             AccountWorkerCommand::RetryRuntimeGroupSubscriptions { respond } => {
                 let _ = answer_off_quiescent(respond, true);
+                None
             }
-            command if catch_up_seen => follow_up.push_back(command),
-            command => deferred.push_back(command),
+            command => Some(command),
+        }) else {
+            continue;
+        };
+        if matches!(command.command(), AccountWorkerCommand::CatchUp { .. }) {
+            catch_up_seen = true;
+            follow_up.push_back(command);
+        } else if catch_up_seen {
+            follow_up.push_back(command);
+        } else {
+            deferred.push_back(command);
         }
     };
     pending.append(&mut deferred);
@@ -4711,8 +5826,8 @@ fn acknowledge_hydration(
 }
 
 struct AccountWorkerCommandContext<'a> {
-    commands: &'a mut mpsc::Receiver<AccountWorkerCommand>,
-    pending: &'a mut VecDeque<AccountWorkerCommand>,
+    commands: &'a mut WorkerInbox,
+    pending: &'a mut VecDeque<QueuedCommand>,
     app: &'a MarmotApp,
     events: &'a broadcast::Sender<MarmotAppEvent>,
     account_id_hex: &'a str,
@@ -4724,6 +5839,24 @@ struct AccountWorkerCommandContext<'a> {
     /// it waits on it.
     recovery_runner: Option<&'a mut SpawnedRunner>,
     unit: &'a WorkerUnitGauge,
+}
+
+/// Publish what a sign-in check changed, and answer the host check it
+/// settled, as the `CheckSignIns` command answered when it ran inline.
+fn finish_sign_in_check(
+    client: &mut AppClient,
+    settled: sign_in_reads::Settled,
+    shared: &RuntimeSharedServices,
+    events: &broadcast::Sender<MarmotAppEvent>,
+    account_id_hex: &str,
+    account_label: &str,
+) {
+    publish_client_pending_applied_summary(client, events, account_id_hex, account_label);
+    publish_account_level_changes(client, events, account_id_hex, account_label);
+    if let sign_in_reads::Settled::Answer(respond, result) = settled {
+        let permit = shared.observer.product().permit();
+        let _ = respond_diagnosed(shared, permit.as_ref(), respond, result, client);
+    }
 }
 
 // Keep response ownership and error classification outside the large async dispatch
@@ -4763,21 +5896,22 @@ fn answer_off_quiescent<T>(respond: oneshot::Sender<T>, value: T) -> Result<(), 
 /// they read the live session.
 async fn handle_account_worker_command(
     client: &mut AppClient,
-    mut command: AccountWorkerCommand,
+    queued: QueuedCommand,
     context: AccountWorkerCommandContext<'_>,
 ) {
     if (context.media_http.permits.is_closed()
         || context.media_http.permits.available_permits() == 0)
-        && command.needs_media_slot()
+        && queued.command().needs_media_slot()
     {
         // Only newly received commands reach this gate; parked media keep their order.
-        context.pending.push_back(command);
+        context.pending.push_back(queued);
         return;
     }
     let events = context.events;
     let account_id_hex = context.account_id_hex;
     let account_label = context.account_label;
-    // A host read's wait on the worker ends here, before it runs.
+    // A command's wait on the worker ends here, before it runs.
+    let mut command = queued.take_up();
     command.read_dispatched();
     if account_worker_command_future(client, command, context).await {
         // One publication seam covers all successful dispatch completions. Early
@@ -4878,6 +6012,12 @@ fn account_worker_command_future<'a>(
         #[cfg(test)]
         AccountWorkerCommand::UnlinkDeviceForTest { respond } => Box::pin(async move {
             let _ = reply(respond, client.mark_device_unlinked(), client);
+            true
+        }),
+        #[cfg(test)]
+        AccountWorkerCommand::OverdueComponentRecheckForTest { respond } => Box::pin(async move {
+            let result = overdue_component_recheck_for_test(client).await;
+            let _ = reply(respond, result, client);
             true
         }),
         #[cfg(test)]
@@ -5126,6 +6266,13 @@ fn account_worker_command_future<'a>(
                 }
             };
             let response_handoff_started_at = Instant::now();
+            let created = result
+                .as_ref()
+                .is_ok_and(|result| result.operation.is_some());
+            // The wave counts before the host hears of the create, by event
+            // or reply, so a shutdown begun from either waits for it
+            // (mdk#3466 L3).
+            let wave_counted = created.then(|| client.count_welcome_wave());
             if let Ok(crate::GroupMemberResult {
                 operation: Some(created_group),
                 ..
@@ -5139,9 +6286,6 @@ fn account_worker_command_future<'a>(
                     created_group,
                 );
             }
-            let created = result
-                .as_ref()
-                .is_ok_and(|result| result.operation.is_some());
             let response_sent =
                 respond_diagnosed(shared, storage_permit.as_ref(), respond, result, client).is_ok();
             telemetry.record(
@@ -5156,20 +6300,26 @@ fn account_worker_command_future<'a>(
                 Box::pin(defer_commands_until(
                     published,
                     async {
-                        // An undelivered Welcome stays owed; the events below
+                        // The route sync and warm pass run here; the
+                        // publishes run beside the writer, and the worker
+                        // settles them, the push-share retry after (mdk#3466).
+                        // An undelivered Welcome stays owed; the events
                         // report it.
-                        let _ = client
-                            .drive_unpublished_welcome_delivery(Some(&telemetry))
+                        let running = client
+                            .start_unpublished_welcome_delivery(Some(&telemetry))
                             .await;
+                        drop(wave_counted);
                         publish_pending_welcome_delivery_events(
                             events,
                             account_id_hex,
                             account_label,
                             client,
                         );
-                        client
-                            .retry_pending_push_registration_shares_best_effort()
-                            .await;
+                        if !running {
+                            client
+                                .retry_pending_push_registration_shares_best_effort()
+                                .await;
+                        }
                     },
                     commands,
                     pending,
@@ -5627,6 +6777,10 @@ fn account_worker_command_future<'a>(
                     summary.accept_disposition == cgka_traits::SendAcceptDisposition::Published
                 })
             });
+            // The wave counts before the host hears of the invite, by event
+            // or reply, so a shutdown begun from either waits for it
+            // (mdk#3466 L3).
+            let wave_counted = canonical.then(|| client.count_welcome_wave());
             if canonical {
                 publish_client_pending_projection_updates(
                     client,
@@ -5647,18 +6801,19 @@ fn account_worker_command_future<'a>(
             if canonical {
                 let _unit = unit.enter(WorkerUnit::WelcomeFanout);
                 // Reply first so the inviter is not blocked on Welcome publish.
-                // Group reads answer from A, published after the commit,
-                // while fanout owns the live client.
-                // Later mutations stay queued FIFO behind this delivery.
+                // The publishes run beside the writer, and the worker settles
+                // them (mdk#3466). Group reads answer from A, published after
+                // the commit, while this unit owns the live client.
                 let published = publish_before_unit(client);
                 Box::pin(defer_commands_until(
                     published,
                     async {
-                        // An undelivered Welcome stays owed; the events below
+                        // An undelivered Welcome stays owed; the events
                         // report it.
                         let _ = client
-                            .drive_unpublished_welcome_delivery(Some(&telemetry))
+                            .start_unpublished_welcome_delivery(Some(&telemetry))
                             .await;
+                        drop(wave_counted);
                         publish_pending_welcome_delivery_events(
                             events,
                             account_id_hex,
@@ -5875,6 +7030,9 @@ fn account_worker_command_future<'a>(
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result, client);
             true
         }),
+        // The worker answers a host check through its sign-in reads before it
+        // dispatches a command (`sign_in_reads`), so no worker path reaches
+        // this arm; it keeps today's inline check for any that would.
         AccountWorkerCommand::CheckSignIns { respond } => Box::pin(async move {
             let result = client.check_sign_ins_now().await;
             publish_account_level_changes(client, events, account_id_hex, account_label);
@@ -6097,6 +7255,49 @@ fn account_worker_command_future<'a>(
                 storage_permit.as_ref(),
                 respond,
                 client.group_commit_delivery(&group_id),
+                client,
+            );
+            true
+        }),
+        AccountWorkerCommand::GroupChangesNotDelivered { group_id, respond } => {
+            Box::pin(async move {
+                // The records answer only for a live group. See the Members
+                // arm: on-demand promotion for pipeline-abort leftovers.
+                let _ = client.runtime.ensure_group_hydrated(&group_id);
+                let _ = respond_diagnosed(
+                    shared,
+                    storage_permit.as_ref(),
+                    respond,
+                    client.group_changes_not_delivered(&group_id),
+                    client,
+                );
+                true
+            })
+        }
+        AccountWorkerCommand::GroupPendingCommit { group_id, respond } => Box::pin(async move {
+            // See the Members arm: on-demand promotion for pipeline-abort
+            // leftovers.
+            let _ = client.runtime.ensure_group_hydrated(&group_id);
+            let _ = respond_diagnosed(
+                shared,
+                storage_permit.as_ref(),
+                respond,
+                client.group_pending_commit(&group_id),
+                client,
+            );
+            true
+        }),
+        AccountWorkerCommand::AcknowledgeChangeNotDelivered {
+            group_id,
+            commit_id_hex,
+            respond,
+        } => Box::pin(async move {
+            let _ = client.runtime.ensure_group_hydrated(&group_id);
+            let _ = respond_diagnosed(
+                shared,
+                storage_permit.as_ref(),
+                respond,
+                client.acknowledge_change_not_delivered(&group_id, &commit_id_hex),
                 client,
             );
             true
@@ -6656,52 +7857,6 @@ fn account_worker_command_future<'a>(
             let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result, client);
             true
         }),
-        AccountWorkerCommand::StartAgentTextStream {
-            group_id,
-            stream_id,
-            parent_message_id,
-            quic_candidates,
-            respond,
-        } => Box::pin(async move {
-            let result = client
-                .start_agent_text_stream_with_local_projection(
-                    &group_id,
-                    &stream_id,
-                    parent_message_id,
-                    quic_candidates,
-                    |update| {
-                        publish_app_runtime_projection_update(
-                            Emit::Unpublished(Unpublished::LocalEcho),
-                            events,
-                            account_id_hex,
-                            account_label,
-                            update,
-                        );
-                    },
-                )
-                .await;
-            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result, client);
-            true
-        }),
-        AccountWorkerCommand::FinishAgentTextStream {
-            group_id,
-            request,
-            respond,
-        } => Box::pin(async move {
-            let result = client
-                .finish_agent_text_stream_with_local_projection(&group_id, request, |update| {
-                    publish_app_runtime_projection_update(
-                        Emit::Unpublished(Unpublished::LocalEcho),
-                        events,
-                        account_id_hex,
-                        account_label,
-                        update,
-                    );
-                })
-                .await;
-            let _ = respond_diagnosed(shared, storage_permit.as_ref(), respond, result, client);
-            true
-        }),
         AccountWorkerCommand::RetryGroupConvergence { group_id, respond } => Box::pin(async move {
             let _unit = unit.enter(WorkerUnit::Convergence);
             let result = client.retry_group_convergence(&group_id).await;
@@ -6863,6 +8018,7 @@ fn account_worker_command_future<'a>(
         }),
         AccountWorkerCommand::RunDueMaintenance { respond } => Box::pin(async move {
             let result = client.run_due_maintenance().await;
+            publish_settled_invitations(client, events, account_id_hex, account_label);
             if result.is_ok() {
                 publish_client_pending_projection_updates(
                     client,
@@ -7025,8 +8181,17 @@ async fn publish_next_local_submission(
         let Ok(_admission) = gate.try_lock() else {
             return Some(Duration::from_millis(100));
         };
-        let storage = app.account_storage(account_label).ok()?;
-        let submission = storage.app_storage().next_local_submission().ok()??;
+        // A failed read retries in 15 s, as the maintenance tick retried it,
+        // rather than leaving the queue to the next wake (mdk#2923).
+        let read_failed = Some(schedule::RETRY_WHILE_OWED);
+        let Ok(storage) = app.account_storage(account_label) else {
+            return read_failed;
+        };
+        let submission = match storage.app_storage().next_local_submission() {
+            Ok(Some(submission)) => submission,
+            Ok(None) => return None,
+            Err(_) => return read_failed,
+        };
         let queued = shared
             .local_submission_queue
             .lock()
@@ -7261,7 +8426,7 @@ fn push_registration_retry_delay(attempt: u32) -> Duration {
 fn schedule_push_work_after_turn(
     client: &mut AppClient,
     scheduled: &mut ScheduledPushRegistrationRetry,
-    commands: &mpsc::Sender<AccountWorkerCommand>,
+    commands: &WorkerCommands,
 ) {
     client.retry_pending_member_add_push_shares();
     if client.take_queued_push_registration_share()
@@ -7290,7 +8455,7 @@ impl ScheduledPushRegistrationRetry {
             .is_some_and(|task| !task.is_finished())
     }
 
-    fn observe_pending(&mut self, pending: bool, commands: &mpsc::Sender<AccountWorkerCommand>) {
+    fn observe_pending(&mut self, pending: bool, commands: &WorkerCommands) {
         if !pending {
             self.disarm();
         } else if !self.is_armed() {
@@ -7298,11 +8463,7 @@ impl ScheduledPushRegistrationRetry {
         }
     }
 
-    fn schedule_after_attempt(
-        &mut self,
-        pending: bool,
-        commands: &mpsc::Sender<AccountWorkerCommand>,
-    ) {
+    fn schedule_after_attempt(&mut self, pending: bool, commands: &WorkerCommands) {
         if !pending {
             self.disarm();
             return;
@@ -7310,7 +8471,7 @@ impl ScheduledPushRegistrationRetry {
         self.arm(commands.clone(), 1);
     }
 
-    fn arm(&mut self, commands: mpsc::Sender<AccountWorkerCommand>, first_attempt: u32) {
+    fn arm(&mut self, commands: WorkerCommands, first_attempt: u32) {
         if let Some(task) = self.timer_task.take() {
             task.abort();
         }
@@ -7393,7 +8554,7 @@ impl ScheduledRuntimeGroupSubscriptionRefresh {
             .is_some_and(|task| !task.is_finished())
     }
 
-    fn observe_pending(&mut self, pending: bool, commands: &mpsc::Sender<AccountWorkerCommand>) {
+    fn observe_pending(&mut self, pending: bool, commands: &WorkerCommands) {
         if !pending {
             self.disarm();
         } else if !self.is_armed() {
@@ -7401,7 +8562,7 @@ impl ScheduledRuntimeGroupSubscriptionRefresh {
         }
     }
 
-    fn arm(&mut self, commands: mpsc::Sender<AccountWorkerCommand>) {
+    fn arm(&mut self, commands: WorkerCommands) {
         if let Some(task) = self.timer_task.take() {
             task.abort();
         }
@@ -7449,6 +8610,24 @@ const CONVERGENCE_RETRY_MAX_DELAY: Duration = Duration::from_secs(60);
 /// After this many unsettled re-arms, fall back to error-style backoff so a
 /// never-settling input cannot keep the worker waking every ~1.1s indefinitely.
 const CONVERGENCE_UNSETTLED_MAX_REARMS: u32 = 10;
+
+/// Why each housekeeping run started, per account, for the idle test's
+/// failure message: the trigger, and the held and real times since the
+/// worker opened.
+#[cfg(test)]
+pub(crate) static HOUSEKEEPING_RUNS: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<String, Vec<String>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+#[cfg(test)]
+fn record_housekeeping_run(account_id_hex: &str, run: String) {
+    HOUSEKEEPING_RUNS
+        .lock()
+        .unwrap()
+        .entry(account_id_hex.to_owned())
+        .or_default()
+        .push(run);
+}
 
 #[cfg(test)]
 pub(crate) static HELD_SCHEDULED_CONVERGENCE_ACCOUNTS: std::sync::LazyLock<Mutex<HashSet<String>>> =
@@ -7777,11 +8956,15 @@ struct ReplayAdmissionRetry {
 }
 
 impl ReplayAdmissionRetry {
-    async fn admit_native_turn(&mut self, client: &mut AppClient) -> Result<bool, AppError> {
+    async fn admit_native_turn(
+        &mut self,
+        client: &mut AppClient,
+        unit: &WorkerUnitGauge,
+    ) -> Result<bool, AppError> {
         if !self.ready() {
             return Ok(false);
         }
-        match client.admit_native_turn().await {
+        match client.admit_native_turn(Some(unit)).await {
             Ok(progress) => {
                 if progress {
                     self.reset();
@@ -7830,7 +9013,7 @@ struct ReceiveTailContext<'a> {
     account_label: &'a str,
     shared: &'a RuntimeSharedServices,
     scheduled_push_retry: &'a mut ScheduledPushRegistrationRetry,
-    command_tx: &'a mpsc::Sender<AccountWorkerCommand>,
+    command_tx: &'a WorkerCommands,
 }
 
 /// Forget the device-group copy and ask the runtime to deactivate the
@@ -7972,6 +9155,7 @@ impl KeyPackageMaintenanceCatchUpOutcome {
     }
 }
 
+#[derive(Clone, Copy)]
 struct EpochBackfillReportContext<'a> {
     events: &'a broadcast::Sender<MarmotAppEvent>,
     account_id_hex: &'a str,
@@ -8104,19 +9288,16 @@ fn publish_app_runtime_summary(
         });
     }
     for message in &summary.messages {
-        // Raw message subscribers get kind-1200 starts as a typed open-preview
-        // signal. The storage timeline still materializes the same start as a
-        // kind-1200 timeline row so timeline-only subscribers can discover and
-        // watch the live stream.
-        if let Some(event) = agent_stream_runtime_event(account_id_hex, account_label, message) {
-            send(event);
-        } else {
-            send(MarmotAppEvent::MessageReceived(RuntimeMessageReceived {
-                account_id_hex: account_id_hex.to_owned(),
-                account_label: account_label.to_owned(),
-                message: message.clone(),
-            }));
+        // The retired agent stream start reaches no subscriber, as it has no
+        // timeline row.
+        if message.kind == MARMOT_APP_EVENT_KIND_AGENT_STREAM_START {
+            continue;
         }
+        send(MarmotAppEvent::MessageReceived(RuntimeMessageReceived {
+            account_id_hex: account_id_hex.to_owned(),
+            account_label: account_label.to_owned(),
+            message: message.clone(),
+        }));
     }
     for update in &summary.projection_updates {
         send(MarmotAppEvent::ProjectionUpdated(RuntimeProjectionUpdate {
@@ -8272,6 +9453,26 @@ fn publish_created_group(
                     chat_list_trigger: ChatListUpdateTrigger::NewGroup,
                 },
             }),
+        );
+    }
+}
+
+/// Announce each chat whose invitation a decision settled outside a host
+/// command, as a host accept is announced: hosts drop the invitation once
+/// its chat reports its new state (mdk#3566).
+fn publish_settled_invitations(
+    client: &mut AppClient,
+    events: &broadcast::Sender<MarmotAppEvent>,
+    account_id_hex: &str,
+    account_label: &str,
+) {
+    for group_id in std::mem::take(&mut client.invitations_settled) {
+        publish_app_runtime_group_state_updated(
+            Emit::Quiescent(client),
+            events,
+            account_id_hex,
+            account_label,
+            &group_id,
         );
     }
 }
@@ -8562,25 +9763,6 @@ fn publish_pending_welcome_delivery_events(
     }
 }
 
-/// Emit a runtime `AgentStreamStarted` for a kind-1200 start event. Kind-9
-/// stream-final messages are normal timeline messages and do not fire here.
-fn agent_stream_runtime_event(
-    account_id_hex: &str,
-    account_label: &str,
-    message: &ReceivedMessage,
-) -> Option<MarmotAppEvent> {
-    if message.kind != MARMOT_APP_EVENT_KIND_AGENT_STREAM_START {
-        return None;
-    }
-    Some(MarmotAppEvent::AgentStreamStarted(
-        RuntimeAgentStreamMessage {
-            account_id_hex: account_id_hex.to_owned(),
-            account_label: account_label.to_owned(),
-            message: message.clone(),
-        },
-    ))
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SetupKeyPackagePriority {
     PublishExactDurableInitial,
@@ -8677,6 +9859,10 @@ pub(crate) enum Unpublished {
     /// A host call that wrote off the worker, such as a local send's
     /// admission: what it changed is not an input of A.
     OffWorker,
+    /// A reconnect whose reopened client did not drain its hydration: A
+    /// keeps the previous client's last version, and the reopened client
+    /// never publishes.
+    ReopenNotDrained,
 }
 
 /// Send one host event from the account worker, publishing A first at a
@@ -8707,7 +9893,11 @@ mod tests {
     mod resource_bounds_tests;
     pub(super) mod secondary_retry_scheduler_tests;
     mod selective_history_tests;
+    #[cfg(feature = "test-policy-overrides")]
+    mod sign_in_read_tests;
+    pub(super) mod welcome_wave_tests;
     mod worker_recovery_resume_tests;
+    mod writer_hold_tests;
 
     static BOUNDED_WORKER_FIXTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -8717,7 +9907,7 @@ mod tests {
     /// acknowledges a hydration request that needs no hydration at once,
     /// from A (mdk#3273 PR 4). The main loop answers it too, so it says
     /// nothing about whether a unit is held.
-    async fn held_unit_took_queued_commands(commands: &mpsc::Sender<AccountWorkerCommand>) {
+    async fn held_unit_took_queued_commands(commands: &WorkerCommands) {
         let (respond, ack) = ReadReply::unobserved();
         commands
             .send(AccountWorkerCommand::HydrateGroups {
@@ -8850,7 +10040,8 @@ mod tests {
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let client = publishing_client(&app).await;
         for published in [publish_before_unit(&client), None] {
-            let (commands, mut receiver) = mpsc::channel(8);
+            let (commands, receiver) = test_worker_queue(8);
+            let mut receiver = WorkerInbox::from(receiver);
             let (respond, response) = ReadReply::unobserved();
             commands
                 .try_send(AccountWorkerCommand::CaptureConversation {
@@ -8904,7 +10095,8 @@ mod tests {
             .unwrap();
         let published = publish_before_unit(&client);
         let version = published.as_ref().unwrap().borrow().version;
-        let (commands, mut receiver) = mpsc::channel(8);
+        let (commands, receiver) = test_worker_queue(8);
+        let mut receiver = WorkerInbox::from(receiver);
         let (respond, mut mutation) = oneshot::channel();
         commands
             .try_send(AccountWorkerCommand::ConnectivityRestored { respond })
@@ -8938,7 +10130,7 @@ mod tests {
         result.unwrap();
         assert_eq!(pending.len(), 1);
         assert!(matches!(
-            pending.pop_front(),
+            pending.pop_front().map(QueuedCommand::take_up),
             Some(AccountWorkerCommand::ConnectivityRestored { .. })
         ));
     }
@@ -8984,7 +10176,8 @@ mod tests {
                 .awaiting_hydration(std::slice::from_ref(&group)),
             std::slice::from_ref(&group)
         );
-        let (commands, mut receiver) = mpsc::channel(8);
+        let (commands, receiver) = test_worker_queue(8);
+        let mut receiver = WorkerInbox::from(receiver);
         let (respond, forgotten) = oneshot::channel();
         commands
             .try_send(AccountWorkerCommand::ForgetGroupLocal {
@@ -9018,14 +10211,15 @@ mod tests {
         };
         let (result, ()) = tokio::join!(serve, check);
         result.unwrap();
-        let Some(AccountWorkerCommand::ForgetGroupLocal { respond, .. }) = pending.pop_front()
+        let Some(AccountWorkerCommand::ForgetGroupLocal { respond, .. }) =
+            pending.pop_front().map(QueuedCommand::take_up)
         else {
             panic!("the forget runs first");
         };
         let Some(AccountWorkerCommand::HydrateGroups {
             group_ids,
             respond: ack_reply,
-        }) = pending.pop_front()
+        }) = pending.pop_front().map(QueuedCommand::take_up)
         else {
             panic!("the hydration request runs second");
         };
@@ -9052,12 +10246,17 @@ mod tests {
             .with_test_relay_client(Arc::new(ScriptedPushRelayClient::default()));
         let client = publishing_client(&app).await;
         let published = publish_before_unit(&client);
-        let (commands, mut receiver) = mpsc::channel(8);
+        let (commands, receiver) = test_worker_queue(8);
+        let mut receiver = WorkerInbox::from(receiver);
         let mut pending = VecDeque::new();
         let (respond, mut before) = oneshot::channel();
-        pending.push_back(AccountWorkerCommand::ConnectivityRestored { respond });
+        pending.push_back(QueuedCommand::unobserved(
+            AccountWorkerCommand::ConnectivityRestored { respond },
+        ));
         let (respond, mut catch_up) = oneshot::channel();
-        pending.push_back(AccountWorkerCommand::CatchUp { respond });
+        pending.push_back(QueuedCommand::unobserved(AccountWorkerCommand::CatchUp {
+            respond,
+        }));
         let (respond, mut after) = oneshot::channel();
         commands
             .try_send(AccountWorkerCommand::ConnectivityRestored { respond })
@@ -9106,19 +10305,19 @@ mod tests {
         let (result, ()) = tokio::join!(serve, check);
         result.unwrap();
         assert!(matches!(
-            pending.pop_front(),
+            pending.pop_front().map(QueuedCommand::take_up),
             Some(AccountWorkerCommand::ConnectivityRestored { .. })
         ));
         assert!(matches!(
-            pending.pop_front(),
+            pending.pop_front().map(QueuedCommand::take_up),
             Some(AccountWorkerCommand::CatchUp { .. })
         ));
         assert!(matches!(
-            pending.pop_front(),
+            pending.pop_front().map(QueuedCommand::take_up),
             Some(AccountWorkerCommand::ConnectivityRestored { .. })
         ));
         assert!(matches!(
-            pending.pop_front(),
+            pending.pop_front().map(QueuedCommand::take_up),
             Some(AccountWorkerCommand::Drain { .. })
         ));
         assert!(pending.is_empty());
@@ -9167,6 +10366,12 @@ mod tests {
             .unwrap()
             .operation
             .expect("eligible fixture members");
+        // The creates' Welcome waves run beside the worker (mdk#3466): Bob
+        // must hold each group before its commit reaches him.
+        timeout(Duration::from_secs(10), runtime.drain_in_flight_work())
+            .await
+            .expect("the creates' Welcome waves settle")
+            .unwrap();
         runtime.catch_up_accounts().await.unwrap();
         let commands = runtime.accounts().worker_commands("bob").await.unwrap();
         runtime
@@ -9367,6 +10572,7 @@ mod tests {
                 via_welcome: cgka_traits::MessageId::new(vec![1; 32]),
                 welcomer: None,
                 explicitly_confirmed: true,
+                forwarded: Default::default(),
             }],
             ..Default::default()
         };
@@ -9502,11 +10708,11 @@ mod tests {
         let (respond, mut confirm) = oneshot::channel();
         handle_startup_hydration_command(
             &mut client,
-            AccountWorkerCommand::ConfirmGroupRejoin {
+            QueuedCommand::unobserved(AccountWorkerCommand::ConfirmGroupRejoin {
                 welcome_id: id.clone(),
                 token: vec![0; 32],
                 respond,
-            },
+            }),
             &mut deferred,
             &events,
             "",
@@ -9524,10 +10730,10 @@ mod tests {
         let (respond, mut decline) = oneshot::channel();
         handle_startup_hydration_command(
             &mut client,
-            AccountWorkerCommand::DeclineGroupRejoin {
+            QueuedCommand::unobserved(AccountWorkerCommand::DeclineGroupRejoin {
                 welcome_id: id,
                 respond,
-            },
+            }),
             &mut deferred,
             &events,
             "",
@@ -9815,6 +11021,10 @@ mod tests {
         let _permit = reserve_media_http(&media_http);
     }
 
+    /// Hold 7 of step 3 of the runtime-concurrency pass, flipped by its PR 3
+    /// (the other holds are in `writer_hold_tests`): with every media transfer
+    /// permit taken, a media command parks in the writer's own queue, while
+    /// commands behind it are still served.
     // Pauses the clock, which needs the current-thread runtime.
     #[tokio::test(flavor = "current_thread")]
     async fn full_media_capacity_queues() {
@@ -9851,7 +11061,7 @@ mod tests {
         drop(client);
 
         // Fill the startup channel before spawning the real worker.
-        let (commands, receiver) = mpsc::channel(8);
+        let (commands, receiver) = test_worker_queue(8);
         let mut transfers = Vec::new();
         for _ in 0..MEDIA_HTTP_IN_FLIGHT_LIMIT {
             let (started, start) = oneshot::channel();
@@ -9899,7 +11109,6 @@ mod tests {
                 unit: Arc::default(),
                 read_state: read_state_tx,
             },
-            commands.clone(),
             receiver,
             ready,
             AccountStartupProgress::new(shared.observer.performance().clone(), Arc::default()),
@@ -10423,7 +11632,7 @@ mod tests {
             push_registration_retry_max_delay()
         );
 
-        let (commands, mut received_commands) = mpsc::channel(2);
+        let (commands, mut received_commands) = test_worker_channel(2);
         let mut scheduled = ScheduledPushRegistrationRetry::new();
         scheduled.observe_pending(true, &commands);
         assert!(scheduled.is_armed());
@@ -10470,7 +11679,7 @@ mod tests {
             app.record_group_push_snapshot_owed(&account.label, &group_hex, epoch)
                 .unwrap()
         );
-        let (commands, mut received) = mpsc::channel(2);
+        let (commands, mut received) = test_worker_channel(2);
         let mut scheduled = ScheduledPushRegistrationRetry::new();
         schedule_push_work_after_turn(&mut client, &mut scheduled, &commands);
         assert!(!scheduled.is_armed());
@@ -10527,7 +11736,7 @@ mod tests {
         client.test_push_device_can_fetch = Some(true);
         client.push_announce_timing.catch_up_settle = Duration::ZERO;
         client.advance_push_join_windows().await;
-        let (commands, mut received) = mpsc::channel(2);
+        let (commands, mut received) = test_worker_channel(2);
         let mut scheduled = ScheduledPushRegistrationRetry::new();
         schedule_push_work_after_turn(&mut client, &mut scheduled, &commands);
         assert!(!scheduled.is_armed(), "nothing is owed before a send");
@@ -10552,6 +11761,45 @@ mod tests {
                 .is_some()
         );
         assert!(!client.has_due_push_announce());
+    }
+
+    /// The watchdog reads push timing as owed while an announce is owed,
+    /// which the tick needs for timing that appears without a worker turn
+    /// (mdk#2923 step B).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_watchdog_reads_owed_push_timing() {
+        let dir = tempfile::tempdir().unwrap();
+        let account = AccountHome::open(dir.path())
+            .create_account("alice")
+            .unwrap();
+        let relay = Arc::new(ScriptedPushRelayClient::default());
+        let app =
+            MarmotApp::with_relay(dir.path(), "wss://relay.example").with_test_relay_client(relay);
+        let mut client = app.client(&account.label).await.unwrap();
+        let group = client
+            .create_group("push watchdog", &[])
+            .await
+            .unwrap()
+            .operation
+            .expect("no members to resolve");
+        let admission = attachments::Admission::default();
+        let flags = WatchdogFlags {
+            attachment_due: false,
+            avatar_due: false,
+            presentation_due: false,
+            local_submission_due: false,
+            legacy_promotion_pending: false,
+            relay_config_retry: false,
+            admission: &admission,
+        };
+        assert!(!job_owed_now(schedule::Job::Push, &client, &flags));
+        app.record_group_push_announce_owed(
+            &account.label,
+            &hex::encode(group.as_slice()),
+            crate::notifications::unix_now_ms(),
+        )
+        .unwrap();
+        assert!(job_owed_now(schedule::Job::Push, &client, &flags));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -10582,7 +11830,7 @@ mod tests {
         assert!(client.has_pending_push_registration_work());
         let shared = RuntimeSharedServices::default();
         let (events, _) = broadcast::channel(8);
-        let (commands, mut received) = mpsc::channel(2);
+        let (commands, mut received) = test_worker_channel(2);
         let mut scheduled = ScheduledPushRegistrationRetry::new();
         relay.block_next_publish();
         let responsive = {
@@ -10653,7 +11901,7 @@ mod tests {
             runtime_group_subscription_retry_max_delay()
         );
 
-        let (commands, mut received_commands) = mpsc::channel(2);
+        let (commands, mut received_commands) = test_worker_channel(2);
         let mut scheduled = ScheduledRuntimeGroupSubscriptionRefresh::new();
         scheduled.observe_pending(true, &commands);
         assert!(scheduled.is_armed());

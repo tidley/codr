@@ -3,22 +3,24 @@
 **codr** ships a dedicated `wn-agent` built from the MDK revision in [`connector.toml`](../connector.toml).
 The release workflow applies [`mdk-codr.patch`](mdk-codr.patch) before building it.
 
-The current pin is MDK 0.17.0 at `4df811aea99269b437a6023be9446a5141e93cbe`.
+The current pin is stable MDK 0.19.0 at `3fce95465cdea1edc8456dbd1c6691d1c8dc1f2e`.
 Both full releases and Linux previews build the connector from this source.
 The patch is rebased on that exact release. Founding-admin controls are now
 upstream; Codr retains its opt-in media-reference and graceful-host-shutdown extensions.
 
-Before the first 0.17 start, stop every process using the account and keep a private, device-local
-copy of the complete connector home, including database sidecars, media, configuration,
-and secret-store credentials. MDK advances the account schema on first open;
+Before the first 0.19 start, stop every process using the account and keep a private, device-local
+copy of the connector home, including database sidecars, encrypted media, configuration,
+and secret-store credentials, but excluding `accounts/*/handoff/` plaintext leases.
+MDK advances the account schema to 218 on first open;
 older binaries cannot open the upgraded data. Do not roll back only the executable or automatically
 restore an old account snapshot after new MLS traffic. See the upstream
-[migration guide](https://github.com/marmot-protocol/mdk/blob/v0.17.0/docs/integration/0.17.0.md#storage-upgrade)
-and its linked 0.15/0.16 guides when upgrading from Codr's previous 0.14 pin.
+[0.18 migration guide](https://github.com/marmot-protocol/mdk/blob/v0.19.0/docs/integration/0.18.0.md#storage-upgrade)
+and [0.19 guide](https://github.com/marmot-protocol/mdk/blob/v0.19.0/docs/integration/0.19.0.md).
+Upgrades from 0.14 must also account for the linked 0.15–0.17 guides.
 Keep the account directory out of cloud and device-sync backups.
 
 The release supports founding admin selection through `group_create_with_admins`; the patch retains the local `include_media`
-history-recovery extension. Existing `group_create` clients keep creator-only defaults. Non-member admins are refused
+history-recovery extension, including available parented thread messages. Existing `group_create` clients keep creator-only defaults. Non-member admins are refused
 before creation. The engine assigns the owner and creator roles in the founding state, including the initial Welcome.
 
 The bridge probes `group_create_capabilities` before recording creation intent, so an older connector can be upgraded

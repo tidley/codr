@@ -195,7 +195,7 @@ fn cursor(row: &Value) -> Result<(u64, String)> {
 
 fn eligible(row: &Value, phone: &str, group: &Group) -> bool {
     row["availability"] == "available"
-        && row["kind"] == 9
+        && crate::wire::is_chat_timeline_row(row)
         && row["sender"]["account_id_hex"] == phone
         && row["sender"]["is_self"] != true
         && row["message_id_hex"]
@@ -218,6 +218,33 @@ mod tests {
         io::{AsyncWriteExt, BufReader},
         net::UnixListener,
     };
+
+    #[test]
+    fn thread_recovery_keeps_owner_visibility_and_receipt_guards() {
+        let mut group = Group {
+            group: "group".into(),
+            seen: HashSet::new(),
+        };
+        let mut row = json!({"message_id_hex":"thread", "availability":"available", "kind":1111,
+            "reply_to_message_id_hex":"parent", "sender":{"account_id_hex":"owner"}});
+        assert!(eligible(&row, "owner", &group));
+        assert!(!eligible(&row, "participant", &group));
+        group.seen.insert("thread".into());
+        assert!(!eligible(&row, "owner", &group));
+        group.seen.clear();
+        row["availability"] = json!("deleted");
+        assert!(!eligible(&row, "owner", &group));
+        row["availability"] = json!("invalidated");
+        assert!(!eligible(&row, "owner", &group));
+        row["availability"] = json!("available");
+        row["sender"]["is_self"] = json!(true);
+        assert!(!eligible(&row, "owner", &group));
+        row["sender"]["is_self"] = json!(false);
+        row["reply_to_message_id_hex"] = Value::Null;
+        assert!(!eligible(&row, "owner", &group));
+        row["kind"] = json!(9);
+        assert!(eligible(&row, "owner", &group));
+    }
 
     #[tokio::test]
     async fn recovery_stream_obeys_backpressure_and_keeps_oldest_first() {

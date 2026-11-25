@@ -476,7 +476,7 @@ async fn combined_update_records_home_and_waits_for_messaging_readiness() {
         serde_json::from_slice(&std::fs::read(directory.join("request.json")).unwrap()).unwrap();
     assert_eq!(request["service"], "codr");
     assert_eq!(request["messaging_home"], home.to_str().unwrap());
-    assert_eq!(request["info"]["storage_cohort"], "mdk-0.17");
+    assert_eq!(request["info"]["storage_cohort"], "mdk-0.19");
     let socket = bridge.config.wn_agent_socket.clone();
     let account = bridge.config.account_id_hex.clone();
     let worker = tokio::spawn(async move { bridge.run(false).await });

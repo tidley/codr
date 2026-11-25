@@ -46,6 +46,7 @@ impl AppClient {
             Err(error) => Err(error),
         };
         if let Err(error) = result {
+            self.device_group_work_changed = true;
             tracing::warn!(
                 target: TRACE_TARGET,
                 method = "drive_small_state",
@@ -61,7 +62,7 @@ impl AppClient {
     /// out, and only if they still hold the value it carried; an update that
     /// reached no relay stops the pass, and its items stay owed. Sending one
     /// twice does no harm: every device merges it to the same winner.
-    async fn send_owed_small_state(&mut self) -> Result<(), AppError> {
+    pub(super) async fn send_owed_small_state(&mut self) -> Result<(), AppError> {
         if !self.app.device_groups_enabled() {
             return Ok(());
         }
@@ -298,7 +299,10 @@ impl AppClient {
         self.ensure_small_state_group(group_id)?;
         let items = decode_small_state_update(content)?;
         let invitations = decode_invitation_decisions(content)?;
-        self.app
+        // A sibling's winning decision is applied on the worker's next turn,
+        // not at the next maintenance pass (mdk#3566).
+        self.invitation_decisions_changed |= self
+            .app
             .account_storage(&self.state.label)?
             .app_storage()
             .merge_invitation_decisions(&invitations)?;
@@ -334,6 +338,12 @@ impl AppClient {
         match kind {
             KIND_SMALL_STATE_UPDATE => {
                 storage.owe_all_small_state_items()?;
+                // An answered invitation it carried goes out again on the
+                // worker's next turn, as the answer first did: a sibling
+                // still waits for it (mdk#3566).
+                if !storage.unsent_invitation_decisions()?.is_empty() {
+                    self.send_invitation_decisions_next_turn();
+                }
             }
             KIND_SMALL_STATE_BROADCAST_REQUEST => storage.owe_small_state_broadcast_request()?,
             _ => {}

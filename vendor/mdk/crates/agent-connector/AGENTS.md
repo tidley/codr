@@ -6,21 +6,21 @@ and control-plane security model: [`README.md`](README.md).
 ## Scope
 
 - Own `serve_socket`/`AgentConnector` and the `wn-agent` Unix-socket daemon that bridges the `agent-control` protocol
-  and `agent-stream-compose` previews to `MarmotApp`/`MarmotAppRuntime`.
+  to `MarmotApp`/`MarmotAppRuntime`.
 - Own `wn-agent bootstrap`, which creates or reuses a local agent account through the running control socket and prints
   phone invite details (`npub`, `nprofile`, optional terminal QR).
+- Own `wn-agent doctor`, which only reads: it never chmods, removes sockets, creates accounts, publishes KeyPackages or
+  writes relay lists, and prints no paths, identifiers, relay URLs or tokens.
 - Own connector socket binding and permission hardening (`bind_connector_socket`, `default_socket_path`).
-- Keep agent-facing wire types in `agent-control` and stream composition in `agent-stream-compose`; this crate is the
-  process glue, not the protocol or composition owner.
-- Publisher routing and TLS trust use `marmot-app` host-safety validation.
-  `allow_insecure_local_broker` remains an explicit dev-only opt-in.
+- Keep agent-facing wire types in `agent-control`; this crate is the process glue, not the protocol owner.
+- `wn-agent bootstrap` accepts the retired `--no-quic` flag as a hidden no-op because installers released before the
+  live-preview removal pass it; do not reintroduce other QUIC or broker flags.
 
 ## Invariants
 
 - The control plane is local-only: Unix socket, no TCP listener, restrictive default modes (`0700` dir, `0600`
   socket), same effective UID unless a bearer token is configured; reject world-readable/writable socket modes. The
   token is all-or-nothing full control; do not add implied scopes without designing them.
-- `stream_capability` values are bearer secrets: compare without data-dependent early exit; never log or persist them.
 - Logging stays privacy-safe: no account ids, group ids, message ids, relay URLs, pubkeys, payloads, ciphertext,
   plaintext, or key material. Use explicit `target`/`method` tracing fields.
 - Every invite policy fails closed without an authenticated welcomer. `--dev-allow-any-invites` requires
@@ -40,7 +40,8 @@ several files in the same crate); methods shared across those files are `pub(cra
 
 - `src/lib.rs` — `serve_socket`, `AgentConnectorConfig`, the `AgentConnector` struct, and its core lifecycle `impl`
   (`open`, `serve_once`, `start`, agent-account readiness, `configured_relay_endpoints`). Crate-internal constants live
-  here as `pub(crate)`.
+  here as `pub(crate)`. Readiness never publishes a relay list from the cache alone: it adopts the published lists and
+  publishes only a kind a complete read proved absent (mdk#2550).
 - `src/connection.rs` — `AgentConnector::handle_connection`, peer authorization, the `error_response` projection, and
   the `AgentControlRequest` → handler dispatch.
 - `src/account.rs` — account list/create, group creation, profile publishing, `local_account_for_account_id`, and welcomer-allowlist
@@ -50,10 +51,8 @@ several files in the same crate); methods shared across those files are `pub(cra
   (`apply_relay_edit` keeps every entry the request did not name, and a read that cannot be
   confirmed is refused rather than published as a partial replacement).
 - `src/messaging.rs` — final-message sends, agent activity/operation/group-system event handlers, and debug send
-  recording/inject helpers.
-- `src/stream.rs` — QUIC text-stream preview session lifecycle (begin/append/status/progress/finalize/cancel) and the
-  idle-session sweeper.
-- `src/inbound.rs` — `SubscribeInbound` drain loop and storage-backed `replay_missed_inbound` recovery after broadcast
+  recording/inject helpers (`DebugFinalSendStore`).
+- `src/inbound.rs` — `SubscribeInbound` drain loop and storage-backed `missed_inbound` recovery after broadcast
   lag.
 - `src/invite_policy.rs` — background reconciliation of pending group invites against the welcomer allowlist
   (worker spawn, reconcile, candidate enumeration, apply). Event- and retry-driven: `GroupJoined` events apply
@@ -70,13 +69,12 @@ several files in the same crate); methods shared across those files are `pub(cra
   aggregates, relay/replay/home observations) using no-start runtime reads.
 - `src/error.rs` — `ConnectorError` and its `code`/`client_message`/`retryable`/`privacy_safe_code` projections.
 - `src/socket.rs` — socket path/bind/hardening (`default_socket_path`, `bind_connector_socket*`, stale-socket recovery).
+  The connector's own refusals carry fixed, path-free `SocketRejection` text that startup prints.
 - `src/allowlist.rs` — `AllowlistStore`/`AllowlistRecord` per-account invite-policy and welcomer-allowlist persistence.
-- `src/stream_session.rs` — `StreamSessionStore`/`ActiveStreamSession`, the shared runtime publisher handles, and persisted
-  `SendIdempotencyStore` (`$MARMOT_HOME/dev/send-idempotency.json`, 1024-entry FIFO,
-  versioned SHA-256 request fingerprints, `stream_finalize_v2:` / `stream_finish_v1:` keys for durable finalized sends,
-  crash-safe atomic writes, plus bounded same-key/same-fingerprint in-flight gates whose followers
-  reuse a leader's successful result or receive `send_in_progress` when the gate wait expires), and
-  the `DebugFinalSendStore` recorder.
+- `src/send_idempotency.rs` — persisted `SendIdempotencyStore` (`$MARMOT_HOME/dev/send-idempotency.json`, 1024-entry
+  FIFO, versioned SHA-256 request fingerprints, crash-safe atomic writes, plus bounded same-key/same-fingerprint
+  in-flight gates whose followers reuse a leader's successful result or receive `send_in_progress` when the gate wait
+  expires). `acquire_strict` binds a key to its first fingerprint for media sends.
 - `src/media_temp.rs` — TTL sweep of decrypted inbound media temp dirs under
   `$TMPDIR/marmot-media/`.
 - `src/event_projection.rs` — runtime/debug event → control event projection, the `DeliveredInboundCursor`, and the
@@ -86,7 +84,10 @@ several files in the same crate); methods shared across those files are `pub(cra
   `AccountError`, which a failing pass could self-emit) resets the net and wakes a backed-off pass, never faster
   than the base cadence (mdk#1380). Subscription initial catch-ups stay prompt out-of-band requests.
 - `src/validation.rs` — control-plane/profile/hex validation helpers and the invite-policy retry-state holders.
-- `src/bootstrap.rs` — `wn-agent bootstrap` flow, default relays/QUIC candidate, and `MARMOT_*` env resolution.
+- `src/bootstrap.rs` — `wn-agent bootstrap` flow, default relays, and `MARMOT_*` env resolution,
+  including `resolve_relays`, the relay order `serve` and `bootstrap` share.
+- `src/doctor.rs` — read-only `wn-agent doctor`: local setup checks that evaluate the socket rules in `src/socket.rs`
+  without binding, plus one `diagnostic_status` request; output carries only counts, modes and statuses.
 - `src/identity.rs` — `wn-agent import-identity`: owner-only, single-link, size-bounded existing Nostr identity import.
 - `src/usage_diagnostics.rs` — `wn-agent usage-diagnostics` consent controls on a separate owner-only local socket,
   deliberately outside the agent-control protocol.
@@ -95,11 +96,12 @@ several files in the same crate); methods shared across those files are `pub(cra
 - `src/media_roots.rs` — `MediaAllowedRoots`, connector-enforced confinement for outbound plaintext media paths.
 - `src/agent_created_groups.rs` — per-account activation provenance store, independent of sender authorization.
 - `src/bin/wn-agent.rs` — the `wn-agent` binary entrypoint and clap CLI surface (`ServeArgs`, the `bootstrap`
-  subcommand and `BootstrapArgs`, octal socket-mode parsing, and terminal-QR rendering).
+  subcommand and `BootstrapArgs`, `doctor`, octal socket-mode parsing, and terminal-QR rendering).
 - `src/tests.rs` — white-box test suite exercising the above `pub(crate)` internals.
 - `src/test_support.rs` — test-only hooks and benchmark output (the file name is load-bearing for the workspace
   direct-output audit in `crates/cgka-conformance-simulator/tests/tracing_audit.rs`).
 - `tests/identity_security.rs` — black-box `import-identity` prompt/file security tests (Unix only).
+- `tests/doctor_cli.rs` — black-box `wn-agent doctor` exit code, JSON shape and redaction tests (Unix only).
 
 ## Verification
 
@@ -118,11 +120,13 @@ sender_hex="$(awk 'BEGIN { for (i = 0; i < 32; i++) printf "11" }')"
 bash scripts/install-codex-marmot.sh --dry-run --yes --allow-welcomer "$sender_hex" --codex-bin /bin/echo
 bash scripts/install-opencode-marmot.sh --dry-run --yes --allow-welcomer "$sender_hex" --opencode-bin /bin/echo
 bash scripts/install-pi-marmot.sh --dry-run --yes --allow-welcomer "$sender_hex" --pi-bin /bin/echo
+bash scripts/install-wn-agent.sh --dry-run --yes --bootstrap --allow-welcomer "$sender_hex"
 integrations/hermes/tests/marmot/test_dev_scripts.sh
 just claude-installer-test
 just codex-installer-test
 just opencode-installer-test
 just pi-installer-test
+just wn-agent-installer-test
 ```
 
 When editing `README.md`, run `just agent-install-docs-gate`.

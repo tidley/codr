@@ -37,8 +37,8 @@ class CombinedSetupTests(unittest.TestCase):
 
     def runner(self,args):
         self.calls.append([str(a) for a in args])
-        if "update-info" in args:return json.dumps({"runtimes":["external-connector","embedded-mdk"],"storage_cohort":"mdk-0.17","connector":{"version":"0.17.0"}})
-        if "--version" in args:return "wn-agent 0.17.0"
+        if "update-info" in args:return json.dumps({"runtimes":["external-connector","embedded-mdk"],"storage_cohort":"mdk-0.19","connector":{"version":"0.19.0"}})
+        if "--version" in args:return "wn-agent 0.19.0"
         if "--property=MainPID" in args:return "123" if self.active else "0"
         if "--property=ActiveState" in args:return "active" if self.active else "inactive"
         if "--property=UnitFileState" in args:return "enabled" if self.enabled else "disabled"
@@ -90,7 +90,7 @@ class CombinedSetupTests(unittest.TestCase):
         with self.assertRaises(setup.SetupError):self.invoke()
         self.backup.chmod(0o700)
         original=self.runner
-        for version in ["0.13.0", "0.14.0", "0.16.0"]:
+        for version in ["0.13.0", "0.14.0", "0.16.0", "0.17.0", "0.18.0"]:
             with self.subTest(version=version), patch.object(self,"runner",side_effect=lambda a:f"wn-agent {version}" if "--version" in a else original(a)):
                 with self.assertRaises(setup.SetupError):self.invoke()
         self.assertFalse(self.actions)

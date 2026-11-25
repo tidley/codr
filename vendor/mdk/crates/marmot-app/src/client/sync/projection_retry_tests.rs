@@ -1173,6 +1173,7 @@ async fn never_projected_terminal_group_does_not_stall_live_effects() {
                 via_welcome: cgka_traits::MessageId::new(vec![0x75; 32]),
                 welcomer: None,
                 explicitly_confirmed: true,
+                forwarded: Default::default(),
             },
             GroupEvent::GroupStateChanged {
                 group_id: terminal,
@@ -1398,7 +1399,11 @@ async fn accepted_source_finalization_rolls_back_when_revival_conversion_fails()
 /// including when either step has to finish on a later worker pass.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resumed_publication_wakes_after_revival_and_checkpoint() {
-    for kind in [MARMOT_APP_EVENT_KIND_CHAT, MARMOT_APP_EVENT_KIND_POLL] {
+    for kind in [
+        MARMOT_APP_EVENT_KIND_CHAT,
+        MARMOT_APP_EVENT_KIND_POLL,
+        cgka_traits::NIP22_COMMENT_KIND,
+    ] {
         for fault in [
             "none",
             "checkpoint",
@@ -1416,6 +1421,10 @@ async fn resumed_publication_wakes_after_revival_and_checkpoint() {
                 continue;
             }
             if fault == "direct_acknowledgement" && kind != MARMOT_APP_EVENT_KIND_CHAT {
+                continue;
+            }
+            // A thread message shares the kind-9 wake path past its kind check.
+            if kind == cgka_traits::NIP22_COMMENT_KIND && fault != "none" {
                 continue;
             }
             let dir = tempfile::tempdir().unwrap();
@@ -1486,6 +1495,11 @@ async fn resumed_publication_wakes_after_revival_and_checkpoint() {
                     None,
                 )
                 .unwrap()
+            } else if kind == cgka_traits::NIP22_COMMENT_KIND {
+                vec![
+                    vec!["e".into(), "aa".repeat(32)],
+                    vec!["k".into(), "9".into()],
+                ]
             } else {
                 vec![]
             };
@@ -1974,6 +1988,7 @@ fn deferral_skips_only_unprojected_events_of_deferred_groups() {
         via_welcome: cgka_traits::MessageId::new(vec![0x53; 32]),
         welcomer: None,
         explicitly_confirmed: false,
+        forwarded: Default::default(),
     };
     let quarantined = GroupEvent::GroupHydrationQuarantined {
         group_id: deferred.clone(),

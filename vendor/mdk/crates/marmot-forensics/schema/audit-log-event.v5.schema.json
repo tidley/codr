@@ -186,6 +186,75 @@
           }
         }
       }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "properties": {
+              "type": {
+                "const": "pending_commit_changed"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "group_ref": {
+            "$ref": "#/$defs/GroupRef"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "properties": {
+              "type": {
+                "const": "welcome_withdrawn"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "group_ref": {
+            "$ref": "#/$defs/GroupRef"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event": {
+            "properties": {
+              "type": {
+                "const": "welcome_event_size"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "group_ref": {
+            "$ref": "#/$defs/GroupRef"
+          }
+        }
+      }
     }
   ],
   "$defs": {
@@ -376,6 +445,27 @@
         "no_eligible_route",
         "route_resolution_failed",
         "retained_state_failed"
+      ]
+    },
+    "WithdrawalReason": {
+      "enum": [
+        "withdrawn",
+        "commit_superseded",
+        "expired",
+        "welcome_too_large",
+        "commit_too_large"
+      ]
+    },
+    "EventSizeClass": {
+      "enum": [
+        "under_64_kib",
+        "from_64_to_128_kib",
+        "from_128_to_256_kib",
+        "from_256_to_512_kib",
+        "from_512_kib_to_1_mib",
+        "from_1_to_2_mib",
+        "from_2_to_4_mib",
+        "over_4_mib"
       ]
     },
     "Acquisition": {
@@ -1350,6 +1440,100 @@
               "type": "null"
             }
           ]
+        }
+      }
+    },
+    "WelcomeWithdrawn": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "op_id",
+        "outer_event_ref",
+        "recipient_ref",
+        "reason",
+        "oversized_size_class"
+      ],
+      "properties": {
+        "type": {
+          "const": "welcome_withdrawn"
+        },
+        "op_id": {
+          "$ref": "#/$defs/LocalId"
+        },
+        "outer_event_ref": {
+          "$ref": "#/$defs/NostrEventRef"
+        },
+        "recipient_ref": {
+          "$ref": "#/$defs/MemberRef"
+        },
+        "reason": {
+          "$ref": "#/$defs/WithdrawalReason"
+        },
+        "oversized_size_class": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EventSizeClass"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "reason": {
+                "enum": [
+                  "welcome_too_large",
+                  "commit_too_large"
+                ]
+              }
+            },
+            "required": [
+              "reason"
+            ]
+          },
+          "then": {
+            "properties": {
+              "oversized_size_class": {
+                "$ref": "#/$defs/EventSizeClass"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "oversized_size_class": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "WelcomeEventSize": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "op_id",
+        "outer_event_ref",
+        "event_size_class"
+      ],
+      "properties": {
+        "type": {
+          "const": "welcome_event_size"
+        },
+        "op_id": {
+          "$ref": "#/$defs/LocalId"
+        },
+        "outer_event_ref": {
+          "$ref": "#/$defs/NostrEventRef"
+        },
+        "event_size_class": {
+          "$ref": "#/$defs/EventSizeClass"
         }
       }
     },
@@ -2407,6 +2591,12 @@
           "$ref": "#/$defs/WelcomePublishNotStarted"
         },
         {
+          "$ref": "#/$defs/WelcomeWithdrawn"
+        },
+        {
+          "$ref": "#/$defs/WelcomeEventSize"
+        },
+        {
           "$ref": "#/$defs/WelcomeObserved"
         },
         {
@@ -2588,6 +2778,9 @@
         },
         {
           "$ref": "#/$defs/OperationalEvent_recovery_runner_changed"
+        },
+        {
+          "$ref": "#/$defs/OperationalEvent_pending_commit_changed"
         }
       ]
     },
@@ -3379,6 +3572,14 @@
         "resumed",
         "remainder_parked",
         "remainder_widened"
+      ]
+    },
+    "Operational_pendingCommitChange": {
+      "enum": [
+        "stuck",
+        "read_back_confirmed",
+        "echo_confirmed",
+        "given_up"
       ]
     },
     "Operational_recoveryRunnerBreak": {
@@ -5470,6 +5671,33 @@
           "$ref": "#/$defs/Operational_u64"
         },
         "remainder_until_secs": {
+          "$ref": "#/$defs/Operational_u64"
+        },
+        "record_context": {
+          "$ref": "#/$defs/Operational_auditEventContext"
+        }
+      }
+    },
+    "OperationalEvent_pending_commit_changed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "change",
+        "message_ref",
+        "pending_secs"
+      ],
+      "properties": {
+        "type": {
+          "const": "pending_commit_changed"
+        },
+        "change": {
+          "$ref": "#/$defs/Operational_pendingCommitChange"
+        },
+        "message_ref": {
+          "$ref": "#/$defs/EngineMessageRef"
+        },
+        "pending_secs": {
           "$ref": "#/$defs/Operational_u64"
         },
         "record_context": {

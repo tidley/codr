@@ -1,8 +1,7 @@
 diff --git a/crates/agent-connector/src/connection.rs b/crates/agent-connector/src/connection.rs
-index e516aa25..d7a2d46e 100644
 --- a/crates/agent-connector/src/connection.rs
 +++ b/crates/agent-connector/src/connection.rs
-@@ -255,7 +255,13 @@ impl AgentConnector {
+@@ -251,7 +251,13 @@
                  account_id_hex,
                  group_id_hex,
                  message_id_hex,
@@ -18,10 +17,9 @@ index e516aa25..d7a2d46e 100644
                  account_id_hex,
                  group_id_hex,
 diff --git a/crates/agent-connector/src/lib.rs b/crates/agent-connector/src/lib.rs
-index 2ea941bc..676a59bb 100644
 --- a/crates/agent-connector/src/lib.rs
 +++ b/crates/agent-connector/src/lib.rs
-@@ -430,6 +430,14 @@ impl AgentConnector {
+@@ -405,6 +405,14 @@
  }
  
  pub async fn serve_socket(config: AgentConnectorConfig) -> Result<(), ConnectorError> {
@@ -36,7 +34,7 @@ index 2ea941bc..676a59bb 100644
      validate_control_plane_config(&config)?;
      // A relay the relay plane would refuse fails startup here, with a reason,
      // rather than failing every route that names it later.
-@@ -453,101 +461,115 @@ pub async fn serve_socket(config: AgentConnectorConfig) -> Result<(), ConnectorE
+@@ -428,101 +436,117 @@
      let max_connections = config.max_connections;
      let management_home = config.home.clone();
      let connector = AgentConnector::open(config)?;
@@ -103,55 +101,7 @@ index 2ea941bc..676a59bb 100644
 +            tokio::select! {
 +                res = connector.start() => res?,
 +                err = &mut link_loss => return Err(err),
-             }
--        };
--        // Bound concurrent per-connection tasks (and the subscriptions and
--        // cursors they hold), mirroring the broker's connection limiter:
--        // beyond the cap the connection is closed instead of served.
--        let Ok(permit) = Arc::clone(&connection_limiter).try_acquire_owned() else {
--            let connections_refused = connector
--                .connections_refused
--                .fetch_add(1, Ordering::Relaxed)
--                + 1;
--            tracing::warn!(
--                target: "agent_connector",
--                method = "serve_socket",
--                connections_refused,
--                error_code = "connection_limit_exceeded",
--                "refusing control connection beyond the concurrency cap"
--            );
--            let response = agent_control::AgentControlEnvelope::new(
--                None,
--                agent_control::AgentControlResponse::Error {
--                    code: "server_busy".to_owned(),
--                    message: "agent connector connection capacity is busy".to_owned(),
--                    // Admission happens before any request frame is read, so
--                    // this response cannot carry a request id. Do not promise
--                    // application-level retryability on an uncorrelated frame.
--                    retryable: false,
--                },
--            );
--            let _ = crate::connection::write_control_frame_with_timeout(
--                &mut stream,
--                &response,
--                CONTROL_BUSY_RESPONSE_TIMEOUT,
--            )
--            .await;
--            continue;
--        };
--        let connector = connector.clone();
--        tokio::spawn(async move {
--            let _permit = permit;
--            if let Err(err) = connector.handle_connection(stream).await {
--                let connection_error =
--                    connector.connection_errors.fetch_add(1, Ordering::Relaxed) + 1;
--                tracing::warn!(
--                    target: "agent_connector",
--                    method = "serve_socket",
--                    connection_error,
--                    error_code = err.privacy_safe_code(),
--                    "connection failed"
--                );
++            }
 +            let connection_limiter = Arc::new(Semaphore::new(max_connections));
 +            loop {
 +                let accepted = tokio::select! {
@@ -178,8 +128,8 @@ index 2ea941bc..676a59bb 100644
 +                    }
 +                };
 +                // Bound concurrent per-connection tasks (and the subscriptions and
-+                // cursors they hold), mirroring the broker's connection limiter:
-+                // beyond the cap the connection is closed instead of served.
++                // cursors they hold): beyond the cap the connection is closed instead
++                // of served.
 +                let Ok(permit) = Arc::clone(&connection_limiter).try_acquire_owned() else {
 +                    let connections_refused = connector
 +                        .connections_refused
@@ -228,9 +178,57 @@ index 2ea941bc..676a59bb 100644
 +                });
 +                while connections.try_join_next().is_some() {}
              }
+         };
+-        // Bound concurrent per-connection tasks (and the subscriptions and
+-        // cursors they hold): beyond the cap the connection is closed instead
+-        // of served.
+-        let Ok(permit) = Arc::clone(&connection_limiter).try_acquire_owned() else {
+-            let connections_refused = connector
+-                .connections_refused
+-                .fetch_add(1, Ordering::Relaxed)
+-                + 1;
+-            tracing::warn!(
+-                target: "agent_connector",
+-                method = "serve_socket",
+-                connections_refused,
+-                error_code = "connection_limit_exceeded",
+-                "refusing control connection beyond the concurrency cap"
+-            );
+-            let response = agent_control::AgentControlEnvelope::new(
+-                None,
+-                agent_control::AgentControlResponse::Error {
+-                    code: "server_busy".to_owned(),
+-                    message: "agent connector connection capacity is busy".to_owned(),
+-                    // Admission happens before any request frame is read, so
+-                    // this response cannot carry a request id. Do not promise
+-                    // application-level retryability on an uncorrelated frame.
+-                    retryable: false,
+-                },
+-            );
+-            let _ = crate::connection::write_control_frame_with_timeout(
+-                &mut stream,
+-                &response,
+-                CONTROL_BUSY_RESPONSE_TIMEOUT,
+-            )
+-            .await;
+-            continue;
+-        };
+-        let connector = connector.clone();
+-        tokio::spawn(async move {
+-            let _permit = permit;
+-            if let Err(err) = connector.handle_connection(stream).await {
+-                let connection_error =
+-                    connector.connection_errors.fetch_add(1, Ordering::Relaxed) + 1;
+-                tracing::warn!(
+-                    target: "agent_connector",
+-                    method = "serve_socket",
+-                    connection_error,
+-                    error_code = err.privacy_safe_code(),
+-                    "connection failed"
+-                );
+-            }
 -        });
 -    }
-+        };
 +        tokio::pin!(serving);
 +        tokio::pin!(shutdown);
 +        tokio::select! {
@@ -238,16 +236,17 @@ index 2ea941bc..676a59bb 100644
 +            () = &mut shutdown => Ok(()),
 +        }
 +    };
++    // Drop the serving future first: its JoinSets cancel connection and diagnostics
++    // tasks before the terminal close releases the host's account/storage lease.
 +    connector.runtime.shutdown_and_close().await?;
 +    result
  }
  
  async fn wait_control_socket_link_loss(
 diff --git a/crates/agent-connector/src/tests.rs b/crates/agent-connector/src/tests.rs
-index bd38cb12..2cd10de1 100644
 --- a/crates/agent-connector/src/tests.rs
 +++ b/crates/agent-connector/src/tests.rs
-@@ -1959,6 +1959,7 @@ async fn connector_edit_message_replaces_own_text_and_reports_refusals() {
+@@ -1767,6 +1767,7 @@
              account_id_hex: account_id_hex.clone(),
              group_id_hex: group_id_hex.clone(),
              message_id_hex: status_id.clone(),
@@ -256,7 +255,6 @@ index bd38cb12..2cd10de1 100644
      )
      .await;
 diff --git a/crates/agent-connector/src/timeline.rs b/crates/agent-connector/src/timeline.rs
-index baf00cb7..020d37ed 100644
 --- a/crates/agent-connector/src/timeline.rs
 +++ b/crates/agent-connector/src/timeline.rs
 @@ -3,7 +3,7 @@
@@ -268,7 +266,7 @@ index baf00cb7..020d37ed 100644
      AgentControlTimelineMessage, AgentControlTimelineMessageAvailability,
      AgentControlTimelineReaction, MAX_AGENT_CONTROL_FRAME_BYTES,
  };
-@@ -11,7 +11,9 @@ use marmot_app::{TimelineMessageQuery, TimelineMessageRecord, TimelinePagination
+@@ -11,7 +11,9 @@
  
  use crate::AgentConnector;
  use crate::error::ConnectorError;
@@ -279,7 +277,7 @@ index baf00cb7..020d37ed 100644
  use crate::validation::normalize_hex;
  
  const TIMELINE_ATTACHMENT_FIELD_MAX_CHARS: usize = 512;
-@@ -23,19 +25,25 @@ impl AgentConnector {
+@@ -23,19 +25,25 @@
          account_id_hex: &str,
          group_id_hex: &str,
          message_id_hex: &str,
@@ -309,12 +307,16 @@ index baf00cb7..020d37ed 100644
          })
      }
  
-@@ -138,6 +146,13 @@ fn normalize_cursor(
+@@ -138,6 +146,17 @@
      Ok(cursor)
  }
  
 +fn timeline_media(record: &TimelineMessageRecord, include: bool) -> Vec<AgentControlMediaRef> {
-+    if !include || record.deleted || record.invalidation_status.is_some() || record.kind != 9 {
++    if !include
++        || record.deleted
++        || record.invalidation_status.is_some()
++        || !cgka_traits::is_chat_message(record.kind, &record.tags)
++    {
 +        return Vec::new();
 +    }
 +    media_refs_from_tags(&record.tags, record.source_epoch.unwrap_or_default())
@@ -323,11 +325,10 @@ index baf00cb7..020d37ed 100644
  fn timeline_message(
      record: TimelineMessageRecord,
      self_account_id_hex: &str,
-@@ -294,6 +309,35 @@ mod tests {
-         );
+@@ -295,6 +314,44 @@
      }
  
-+    #[test]
+     #[test]
 +    fn full_media_recovery_is_opt_in_and_excludes_deleted_or_invalidated_records() {
 +        let mut stored = record();
 +        stored.source_epoch = Some(7);
@@ -349,6 +350,15 @@ index baf00cb7..020d37ed 100644
 +        assert_eq!(media.len(), 1);
 +        assert_eq!(media[0].source_epoch, 7);
 +        assert_eq!(media[0].plaintext_sha256, "ab".repeat(32));
++        stored.kind = 1111;
++        // Only a parented comment is chat upstream. Numeric `k` or a body quote
++        // alone must not expose full media references through this extension.
++        assert!(timeline_media(&stored, true).is_empty());
++        stored.tags.push(vec!["k".into(), "9".into()]);
++        stored.tags.push(vec!["q".into(), "quote".into()]);
++        assert!(timeline_media(&stored, true).is_empty());
++        stored.tags.push(vec!["e".into(), "parent".into()]);
++        assert_eq!(timeline_media(&stored, true).len(), 1);
 +        stored.deleted = true;
 +        assert!(timeline_media(&stored, true).is_empty());
 +        stored.deleted = false;
@@ -356,35 +366,36 @@ index baf00cb7..020d37ed 100644
 +        assert!(timeline_media(&stored, true).is_empty());
 +    }
 +
-     #[test]
++    #[test]
      fn deleted_and_invalidated_timeline_messages_never_expose_content() {
          let mut deleted = record();
+         deleted.deleted = true;
 diff --git a/crates/agent-control/README.md b/crates/agent-control/README.md
-index d6e88613..ffce5c1f 100644
 --- a/crates/agent-control/README.md
 +++ b/crates/agent-control/README.md
-@@ -6,6 +6,16 @@ This crate defines the `marmot.agent-control.v2` request/response/event types an
+@@ -5,6 +5,18 @@
+ This crate defines the `marmot.agent-control.v2` request/response/event types and the frame codec used over the
  `wn-agent` Unix socket. The Hermes and OpenClaw plugins (and other host integrations) are thin clients of this
  protocol; `agent-connector` is the server.
- 
++
 +## Codr media-reference extension
 +
 +`timeline_message_get` accepts optional `include_media: true` to return the
 +non-secret download references used by live inbound messages. The response adds
 +`media`; missing, deleted, invalidated and non-chat records return no media.
++Chat includes parent-linked kind-1111 thread messages, as in MDK's live inbound
++projection; unparented custom rows remain excluded.
 +Without the flag, lookups and timeline pages keep their summary-only projection.
 +Content keys stay inside MDK. This does not provide quoted-message handling:
 +historical attachment clients should use the native `attachment_get` and
 +`download_attachment` source-validation and acquisition controls described below.
-+
+ 
  ## What this crate does
  
- - Owns `AgentControlEnvelope` and the typed control DTOs (bootstrap, send, subscribe, timeline history, invite policy,
 diff --git a/crates/agent-control/src/lib.rs b/crates/agent-control/src/lib.rs
-index 5b709e2a..c2b8ee59 100644
 --- a/crates/agent-control/src/lib.rs
 +++ b/crates/agent-control/src/lib.rs
-@@ -235,6 +235,10 @@ pub enum AgentControlRequest {
+@@ -234,6 +234,10 @@
          account_id_hex: String,
          group_id_hex: String,
          message_id_hex: String,
@@ -395,7 +406,7 @@ index 5b709e2a..c2b8ee59 100644
      },
      /// Page through the materialized, user-visible timeline in stable
      /// `(recorded_at, message_id_hex)` order. `before` and `after` are mutually
-@@ -700,6 +704,9 @@ pub enum AgentControlResponse {
+@@ -626,6 +630,9 @@
          message_id_hex: String,
          #[serde(default, skip_serializing_if = "Option::is_none")]
          message: Option<AgentControlTimelineMessage>,
@@ -405,11 +416,10 @@ index 5b709e2a..c2b8ee59 100644
      },
      TimelinePage {
          account_id_hex: String,
-@@ -1487,6 +1494,29 @@ mod tests {
-         );
+@@ -1394,6 +1401,29 @@
      }
  
-+    #[test]
+     #[test]
 +    fn group_creation_with_admins_round_trips_without_changing_legacy_defaults() {
 +        let value = serde_json::json!({"type":"group_create_with_admins","account_id_hex":"11".repeat(32),"name":"Team","members":["22".repeat(32)],"admins":["22".repeat(32)]});
 +        let request: AgentControlRequest = serde_json::from_value(value).unwrap();
@@ -432,10 +442,11 @@ index 5b709e2a..c2b8ee59 100644
 +        assert!(matches!(legacy, AgentControlRequest::GroupCreate { .. }));
 +    }
 +
-     #[test]
++    #[test]
      fn group_create_frames_round_trip_with_optional_fields() {
          for optional in [false, true] {
-@@ -2132,6 +2162,7 @@ mod tests {
+             let request = AgentControlEnvelope::request(
+@@ -1914,6 +1944,7 @@
                      account_id_hex: account(),
                      group_id_hex: group(),
                      message_id_hex: message(),
@@ -443,10 +454,12 @@ index 5b709e2a..c2b8ee59 100644
                  },
                  "timeline_message_get",
              ),
-@@ -2510,6 +2541,26 @@ mod tests {
+@@ -2225,6 +2256,26 @@
+             let value = serde_json::to_value(request).unwrap();
+             assert_eq!(value["type"], expected_type);
          }
-     }
- 
++    }
++
 +    #[test]
 +    fn legacy_timeline_lookup_keeps_media_opt_in_and_decodes_summary_only_responses() {
 +        let request: AgentControlRequest = serde_json::from_value(serde_json::json!({
@@ -465,8 +478,6 @@ index 5b709e2a..c2b8ee59 100644
 +        assert!(
 +            matches!(response, AgentControlResponse::TimelineMessage { media, .. } if media.is_empty())
 +        );
-+    }
-+
+     }
+ 
      #[test]
-     fn account_profile_lookup_has_typed_found_absent_and_indeterminate_outcomes() {
-         let request = AgentControlRequest::AccountProfileLookup {

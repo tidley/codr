@@ -445,10 +445,10 @@ impl TailSource {
 struct Tails(BTreeMap<UnitKey, u64>);
 
 impl LiveTailRead for Tails {
-    fn owed_until(&self, route: &Route, relay: &str, now: u64) -> u64 {
+    fn history_end(&self, route: &Route, relay: &str) -> Option<u64> {
         self.0
             .get(&unit_key(route, relay))
-            .map_or(now, |from| from.saturating_sub(1).min(now))
+            .map(|from| from.saturating_sub(1))
     }
 }
 
@@ -1018,7 +1018,7 @@ struct TestHost {
     /// Audit rows the runner's turns recorded, each with its group.
     audited: Mutex<Vec<(Option<Vec<u8>>, AuditEventKind)>>,
     /// What the last survey found catching up.
-    catching_up: Mutex<Option<BTreeSet<UnitKey>>>,
+    catching_up: Mutex<Option<BTreeSet<Route>>>,
 }
 
 impl TestHost {
@@ -1125,7 +1125,7 @@ impl TestHost {
     }
 
     async fn survey(&self, policy: RecoveryRunnerPolicy) -> Survey {
-        self.debt_turn(move |turn| survey(turn, &policy, &Stalled::default()))
+        self.debt_turn(move |turn| survey(turn, &policy, &Stalled::default(), None))
             .await
             .unwrap()
             .unwrap()
@@ -1403,7 +1403,7 @@ impl RunnerHost for TestHost {
         Some(self.connections.subscribe())
     }
 
-    fn surveyed(&self, catching_up: BTreeSet<UnitKey>) {
+    fn surveyed(&self, catching_up: BTreeSet<Route>) {
         *self.catching_up.lock().unwrap() = Some(catching_up);
     }
 }
@@ -1723,6 +1723,88 @@ async fn recovery_runner_owes_a_broken_generation_tail_until_a_reconnect_or_a_pr
     assert!(relay.refetches().is_empty());
 }
 
+/// Eight quiet relays owe a route with no live tail and no epoch gap, and
+/// answer in turn while the wall clock moves (mdk#3538). Each background
+/// drain fetches through when it first saw a unit, so the next second never
+/// keeps the drain going; a wake starts the next one from then.
+// A paused clock (current-thread only) moves only when the test advances it.
+#[tokio::test(start_paused = true)]
+async fn recovery_runner_empty_sweeps_without_a_tail_finish_as_the_clock_advances() {
+    let account = account();
+    let clock = Clock::new();
+    let route = group(1);
+    let start = clock.now();
+    account.goal(&route, start - 100);
+    let endpoints = [
+        RELAY,
+        OTHER_RELAY,
+        "wss://c.example",
+        "wss://d.example",
+        "wss://e.example",
+        "wss://f.example",
+        "wss://g.example",
+        "wss://h.example",
+    ];
+    let relays = endpoints.map(|url| ModelRelay::new(url, caps(500, false)).build());
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![shared(&route, &endpoints)],
+        &relays.each_ref(),
+    );
+    let (mut runner, handle) = runner(&host, test_policy());
+    for _ in &relays {
+        assert_eq!(ran(runner.step().await).outcome, Outcome::Advanced);
+        clock.advance(1);
+    }
+    assert_eq!(idle(runner.step().await), None);
+    for relay in &relays {
+        let queries = relay.queries();
+        assert_eq!(queries.len(), 1);
+        assert_eq!(queries[0].until, start);
+    }
+
+    // A wake is new evidence: the next drain owes each relay through now.
+    clock.advance(60);
+    handle.bump();
+    run_until_idle(&mut runner, relays.len() + 1).await;
+    for relay in &relays {
+        let queries = relay.queries();
+        assert_eq!(queries.len(), 2);
+        assert_eq!(queries[1].since, start + 1);
+    }
+}
+
+/// Hosts read only which groups and whether the inbox are catching up, so a
+/// survey publishes routes: one relay of a route catching up while another
+/// still owes changes nothing a host can see, and owes it no
+/// `RecoveryStatusChanged` (mdk#3538).
+// A paused clock (current-thread only) keeps every step in the same second.
+#[tokio::test(start_paused = true)]
+async fn recovery_runner_publishes_what_is_catching_up_by_route() {
+    let account = account();
+    let clock = Clock::new();
+    let route = group(1);
+    account.goal(&route, clock.now() - 100);
+    let relays = [RELAY, OTHER_RELAY].map(|url| ModelRelay::new(url, caps(500, false)).build());
+    let host = TestHost::new(
+        &account,
+        &clock,
+        vec![required(&route, &[RELAY, OTHER_RELAY])],
+        &relays.each_ref(),
+    );
+    let published = || host.catching_up.lock().unwrap().clone();
+    let (mut runner, _handle) = runner(&host, test_policy());
+
+    assert_eq!(ran(runner.step().await).outcome, Outcome::Advanced);
+    let both_owe = published();
+    assert_eq!(both_owe, Some(BTreeSet::from([route.clone()])));
+    assert_eq!(ran(runner.step().await).outcome, Outcome::Advanced);
+    assert_eq!(published(), both_owe, "the route is still catching up");
+    assert_eq!(idle(runner.step().await), None);
+    assert_eq!(published(), Some(BTreeSet::new()));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recovery_runner_begins_on_tails_read_after_its_credit_wait() {
     let account = account();
@@ -1918,8 +2000,9 @@ async fn recovery_runner_serves_held_groups_first_then_small_debts_and_every_gro
     routes[1].best_effort = vec![OTHER_RELAY.to_owned()];
     let host = TestHost::new(&account, &clock, routes, &[&relay, &other]);
     // The held group's tail stands, so its first quantum ends its debt. No
-    // other tail stands: the large and small groups owe their newest seconds
-    // again after every quantum, so the small debt never runs out.
+    // other tail stands, and new evidence wakes the runner before every step:
+    // each wake owes the large and small groups their newest seconds again,
+    // so the small debt never runs out.
     host.tails.stand(&held, RELAY, t0);
     let (mut runner, handle) = runner(&host, test_policy());
     handle.set_hints(PriorityHints {
@@ -1934,6 +2017,7 @@ async fn recovery_runner_serves_held_groups_first_then_small_debts_and_every_gro
     };
     let mut served = Vec::new();
     for _ in 0..6 {
+        handle.bump();
         let summary = ran(runner.step().await);
         assert_eq!(summary.outcome, Outcome::Advanced);
         assert_eq!(summary.key.relay, RELAY);
@@ -1971,12 +2055,19 @@ async fn recovery_runner_serves_an_open_conversation_before_smaller_debts() {
     ];
     let host = TestHost::new(&account, &clock, routes, &[&relay]);
     for route in [&open, &closed] {
-        host.tails.stand(route, RELAY, t0);
+        host.tails.stand(route, RELAY, t0 + 1);
     }
-    let (mut runner, _handle) = runner(&host, test_policy());
+    let (mut runner, handle) = runner(&host, test_policy());
 
     // Without the window the hour would go first, as the smaller debt.
     assert_eq!(ran(runner.step().await).key.route, open);
+    // New evidence for the open conversation arrives after this background
+    // window began, while the closed conversation still has work queued.
+    clock.advance(5);
+    host.tails.lapse(&open, RELAY);
+    handle.bump();
+    assert_eq!(ran(runner.step().await).key.route, open);
+    assert_eq!(account.covered_through(&open, RELAY), clock.now());
     assert_eq!(ran(runner.step().await).key.route, closed);
 }
 
@@ -2904,6 +2995,7 @@ fn recovery_runner_sizes_a_route_last_seen_empty_by_its_span() {
         key: unit_key(route, RELAY),
         group_id: None,
         best_effort: false,
+        fetch_until: None,
         owed_seconds,
         position: 0,
         last_served_at: None,
@@ -4900,7 +4992,15 @@ async fn recovery_runner_suspends_an_unrecoverable_groups_route() {
     let policy = test_policy();
     assert!(
         host.debt_turn(move |turn| {
-            select::begin(turn, &key, false, Some(caps(500, true)), true, &policy)
+            select::begin(
+                turn,
+                &key,
+                false,
+                Some(caps(500, true)),
+                true,
+                &policy,
+                None,
+            )
         })
         .await
         .unwrap()

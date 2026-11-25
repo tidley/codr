@@ -681,8 +681,27 @@ impl MarmotApp {
 impl AppClient {
     /// The account's recovery key and whether this device writes under it:
     /// the trusted roster's account entry, or with no device group the key
-    /// this device keeps. None while backups are off.
+    /// this device keeps. None while backups are off. Remembers the answer
+    /// for history dispatch's deadline (mdk#2923).
     fn backup_role(&mut self) -> Result<Option<BackupRole>, AppError> {
+        let eligibility = self.backup_eligibility();
+        let role = self.read_backup_role()?;
+        if let Some(eligibility) = eligibility {
+            self.backups_configured = Some((eligibility, role.is_some()));
+        }
+        Ok(role)
+    }
+
+    /// Reads whether backups are configured, for history dispatch's
+    /// deadline, when no pass may start now. A failed read leaves the last
+    /// answer (mdk#2923).
+    pub(crate) fn refresh_backups_configured(&mut self) {
+        if !self.runtime.maintenance_is_paused() {
+            let _ = self.backup_role();
+        }
+    }
+
+    fn read_backup_role(&mut self) -> Result<Option<BackupRole>, AppError> {
         let Some((_, roster)) = self.trusted_device_roster()? else {
             let kept = self
                 .app
@@ -1008,6 +1027,7 @@ impl AppClient {
     /// names, for the quiet-writer check a pass makes.
     pub(crate) async fn drive_backup_takeover(&mut self) {
         if let Err(error) = self.take_over_from_a_gone_writer().await {
+            self.device_group_work_changed = true;
             tracing::warn!(
                 target: TRACE_TARGET,
                 method = "drive_backup_takeover",

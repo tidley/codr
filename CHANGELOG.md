@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased — MDK upgrade (#31)
+
+- Pin embedded messaging and the dedicated connector patch together to stable MDK
+  0.19.0 (`3fce95465cdea1edc8456dbd1c6691d1c8dc1f2e`), retaining security/storage
+  backports, media-reference recovery and graceful host shutdown.
+- Remove upstream's retired stream/QUIC implementation; keep durable sends and
+  recognize parented thread messages during timeline/media recovery.
+- Resolve `url` 2.5.9 for RUSTSEC-2026-0592. Declare the separate `mdk-0.19`
+  storage cohort; old accounts need an inspected, separately approved cold-backup
+  migration. No installation or account migration is performed by this change.
+- Keep Codr version 0.12.2 and release channels unchanged. See the
+  [source and local-handover record](docs/MDK-0.19.md) for qualification limits.
+
 ## [0.12.2] - Release candidate
 
 Not yet published. Prepared on merged `master` source
