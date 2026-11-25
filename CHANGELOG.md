@@ -1,17 +1,31 @@
 # Changelog
 
-## [0.12.0] - Release candidate
+## [0.12.1] - Release candidate
 
-Not yet published. See the [release notes and contributor credits](docs/releases/0.12.0.md)
-and [packaging evidence and release handoff](docs/releases/0.12.0-readiness.md).
+Not yet published. Prepared on merged `master` source `31adb78d638918921eda16620615bb3199754216`
+(PR #27). See the [release notes and contributor credits](docs/releases/0.12.1.md)
+and [release handoff](docs/releases/0.12.1-readiness.md). Fresh Linux x86_64/ARM64
+and macOS Intel/Apple Silicon package qualification is pending. No installation
+or MDK migration is implied; unfinished Teem progress feature #26 is excluded.
 
 ### Fixed
 
-- Follow-up repair (not in the immutable `v0.12.0` tag): suppress the musl GCC
+- Repair (merged in PR #27, not in the immutable `v0.12.0` tag): suppress the musl GCC
   runtime interpreter for Linux x86_64 static PIE in release and preview builds.
   Preserve PIE and the static-loader/version/help smokes; reproduce the startup
-  fault with a dependency-free fixture. Release recovery needs a new qualified
-  source identity, not replacement of the published tag.
+  fault with a dependency-free fixture. Release recovery uses a newly qualified
+  0.12.1 source identity, not replacement of the published tag or relabelled artifacts.
+
+## [0.12.0] - Source tag only; release build failed
+
+The immutable `v0.12.0` tag remains at `ff0ead28fbdfe9245de59bc719a25e2233d582a6`.
+Its Linux x86_64 startup smoke exited 139; publication was skipped. No GitHub
+release was published. The following changes are retained in the 0.12.1 candidate.
+See the [original notes](docs/releases/0.12.0.md) and
+[historical packaging evidence](docs/releases/0.12.0-readiness.md).
+
+### Fixed
+
 - Select the native `musl-gcc` linker for Linux x86_64 and ARM64 release and
   preview packages. MDK Markdown's math dependency must not link glibc's static
   `libm` into Rust's musl executable. Keep the static-loader and package checks.

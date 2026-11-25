@@ -1,6 +1,6 @@
 # Combined codr daemon
 
-The unpublished 0.12.0 release candidate hosts the bridge and MDK 0.17.0 messaging runtime in one process.
+The unpublished 0.12.1 release candidate hosts the bridge and MDK 0.17.0 messaging runtime in one process.
 It does not spawn `wn-agent`. MDK keeps ownership of keys, account storage,
 cryptography, relay transport, and invitations. The existing private
 `marmot.agent-control.v2` socket remains available to local setup tools.
@@ -36,6 +36,14 @@ as Cargo's target linker (`CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER` or
 runners for both architectures. Host `cc` can select glibc's static `libm` for
 MDK Markdown, which cannot be mixed with Rust's musl CRT. This does not change
 the standalone compatibility connector's GNU target or macOS linker.
+
+For x86_64 musl, also set
+`CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="-C link-arg=-Wl,--no-dynamic-linker"`.
+The native musl GCC specs otherwise inject a runtime interpreter into Rust's
+self-relocating static PIE, causing the demonstrated pre-main startup crash.
+Keep PIE and the version/help/static-loader smokes. This repair is merged on
+`master`, not in the immutable `v0.12.0` tag; fresh four-platform 0.12.1 package
+qualification remains pending. See the [release handoff](releases/0.12.1-readiness.md).
 
 ## MDK 0.17 storage boundary
 
