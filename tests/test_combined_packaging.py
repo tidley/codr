@@ -3,6 +3,19 @@ import unittest
 
 
 class CombinedPackagingTests(unittest.TestCase):
+    def test_full_linux_container_installs_zstd_before_upstream_policy_checks(self):
+        workflow = (Path(__file__).resolve().parents[1] / ".github/workflows/build.yml").read_text()
+        job = workflow.split("  binaries:\n", 1)[1].split("  linux-preview:\n", 1)[0]
+        self.assertIn("container: ${{ matrix.os == 'linux' && 'ubuntu:22.04' || '' }}", job)
+        tools = job.split("- name: Install native build tools\n", 1)[1].split("- uses:", 1)[0]
+        self.assertIn("if: runner.os == 'Linux'", tools)
+        # The pinned MDK fast-ci archive fixtures invoke zstd, which is not
+        # supplied by the host runner inside the Ubuntu 22.04 container.
+        packages = tools.split("apt-get install -y ", 1)[1].splitlines()[0].split()
+        self.assertIn("zstd", packages)
+        self.assertIn("run: just fast-ci", job)
+        self.assertLess(job.index("- name: Install native build tools"), job.index("run: just fast-ci"))
+
     def test_x64_musl_static_pie_does_not_acquire_a_runtime_interpreter(self):
         workflow = (Path(__file__).resolve().parents[1] / ".github/workflows/build.yml").read_text()
         for name, end in (("binaries", "linux-preview"), ("linux-preview", "publish-linux-preview")):
