@@ -23,7 +23,7 @@ The current setup code uses **👾** as the public name and display name when it
 
 ## Install
 
-The unpublished 0.12.0 release candidate updates MDK to 0.17.0. Its account-storage migration
+The unpublished 0.12.1 release candidate retains the MDK 0.17.0 update. Its account-storage migration
 is not an automatic update from the released 0.14 cohort. Keep the running
 installation unchanged until a separately approved, backed-up migration; see the
 [combined-runtime storage boundary](docs/COMBINED.md#mdk-017-storage-boundary).
@@ -48,7 +48,7 @@ Or give your coding agent this prompt, with your own public key:
 
 [Full installation and upgrade guide →](docs/INSTALL.md)
 
-### In the 0.12.0 release candidate (unpublished)
+### In the 0.12.1 release candidate (unpublished)
 
 - OpenCode V2 phone prompts use the configured authenticated local API, with a
   saved message ID and native acceptance receipt. Uncertain submissions reconcile
@@ -61,11 +61,18 @@ Or give your coding agent this prompt, with your own public key:
 - An exited or panicked embedded messaging worker stops the combined service so
   the existing supervisor can recover it.
 - Linux packaging selects the musl linker for MDK Markdown's math dependency.
-  All four platform package lanes still need to qualify the repaired source.
+  PR #27, now merged on `master`, also suppresses the musl runtime interpreter
+  for x86_64 static PIE, fixing the demonstrated startup crash mechanism.
+  All four platform package lanes still need to qualify the 0.12.1 source.
 
-See the [0.12.0 notes](docs/releases/0.12.0.md) for credits and the MDK storage
-boundary, and the [release handoff](docs/releases/0.12.0-readiness.md) for evidence
-and outstanding checks. These are source changes, not an installed update.
+The immutable `v0.12.0` source tag is unchanged: its Linux x86_64 startup smoke
+exited 139 and release publication was skipped. Its artifacts cannot become
+0.12.1 packages. Fresh builds are required; unfinished Teem progress feature #26
+is not included.
+
+See the [0.12.1 notes](docs/releases/0.12.1.md) for credits and the MDK storage
+boundary, and the [release handoff](docs/releases/0.12.1-readiness.md) for evidence
+and outstanding checks. These are source changes, not a published or installed update.
 
 ### Released in 0.11.2
 
