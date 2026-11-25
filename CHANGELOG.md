@@ -7,6 +7,11 @@ and [packaging evidence and release handoff](docs/releases/0.12.0-readiness.md).
 
 ### Fixed
 
+- Follow-up repair (not in the immutable `v0.12.0` tag): suppress the musl GCC
+  runtime interpreter for Linux x86_64 static PIE in release and preview builds.
+  Preserve PIE and the static-loader/version/help smokes; reproduce the startup
+  fault with a dependency-free fixture. Release recovery needs a new qualified
+  source identity, not replacement of the published tag.
 - Select the native `musl-gcc` linker for Linux x86_64 and ARM64 release and
   preview packages. MDK Markdown's math dependency must not link glibc's static
   `libm` into Rust's musl executable. Keep the static-loader and package checks.

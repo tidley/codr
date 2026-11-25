@@ -115,6 +115,9 @@ jobs:
       # libm (used by MDK Markdown) with Rust's musl CRT. Darwin is unaffected.
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
       CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+      # musl-gcc's specs inject an interpreter even for Rust's static PIE.
+      # Keep PIE, but let the static CRT relocate without a musl interpreter.
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: "-C link-arg=-Wl,--no-dynamic-linker"
     steps:
       - name: Install native build tools
         if: runner.os == 'Linux'
@@ -272,6 +275,8 @@ jobs:
       # Use the native musl wrapper, not host cc and its glibc libm.
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
       CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+      # Rust's x64 static PIE must self-relocate, without musl-gcc's interpreter.
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: "-C link-arg=-Wl,--no-dynamic-linker"
     steps:
       - name: Install native build tools
         run: apt-get update && apt-get install -y build-essential musl-tools pkg-config libssl-dev git curl ca-certificates python3 unzip

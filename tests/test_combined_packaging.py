@@ -3,6 +3,22 @@ import unittest
 
 
 class CombinedPackagingTests(unittest.TestCase):
+    def test_x64_musl_static_pie_does_not_acquire_a_runtime_interpreter(self):
+        workflow = (Path(__file__).resolve().parents[1] / ".github/workflows/build.yml").read_text()
+        for name, end in (("binaries", "linux-preview"), ("linux-preview", "publish-linux-preview")):
+            job = workflow.split(f"  {name}:\n", 1)[1].split(f"  {end}:\n", 1)[0]
+            job_env = job.split("\n    env:\n", 1)[1].split("    steps:\n", 1)[0]
+            # musl-gcc's specs add an interpreter even for Rust's -static-pie.
+            # Keep PIE, but let the static CRT relocate itself without a loader.
+            self.assertIn(
+                '      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: "-C link-arg=-Wl,--no-dynamic-linker"\n',
+                job_env,
+            )
+            self.assertIn('readelf -l ', job)
+            self.assertIn('grep -q INTERP', job)
+            self.assertIn('--version', job)
+            self.assertIn('--help > /dev/null', job)
+
     def test_linux_packages_link_native_math_against_musl_not_host_glibc(self):
         workflow = (Path(__file__).resolve().parents[1] / ".github/workflows/build.yml").read_text()
         # MDK Markdown links libm. Host cc selects glibc's static libm even
