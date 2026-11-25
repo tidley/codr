@@ -121,7 +121,8 @@ jobs:
     steps:
       - name: Install native build tools
         if: runner.os == 'Linux'
-        run: apt-get update && apt-get install -y build-essential musl-tools pkg-config libssl-dev git curl ca-certificates python3 unzip ripgrep
+        # Pinned MDK fast-ci policy tests create zstd archives inside this container.
+        run: apt-get update && apt-get install -y build-essential musl-tools pkg-config libssl-dev git curl ca-certificates python3 unzip ripgrep zstd
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.source_ref || github.ref }}
