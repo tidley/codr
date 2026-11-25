@@ -5,14 +5,17 @@ the supported 0.9.0 setup. For an existing account, use the explicit
 [combined-service handover](COMBINED.md), not the legacy two-service setup flow.
 Fresh identity creation still uses local 0.9 setup before that handover.
 
-**0.12.1 is an unpublished release candidate, not an automatic upgrade.** Its
+**0.12.2 is an unpublished release candidate, not an automatic upgrade.** Its
 MDK 0.17 storage cohort differs from the released MDK 0.14 cohort. The older
 bootstrap/handover instructions below do not authorize that migration. Keep the
 running installation unchanged until separate approval and a verified stopped
 backup; see the [storage boundary](COMBINED.md#mdk-017-storage-boundary) and
-[release qualification record](releases/0.12.1-readiness.md). The immutable
-`v0.12.0` tag is unchanged after its Linux x86_64 startup failure; the repair is
-merged on `master`, but fresh four-platform 0.12.1 packaging remains pending.
+[release qualification record](releases/0.12.2-readiness.md). The immutable
+`v0.12.0` and `v0.12.1` tags remain unchanged. PR #27 fixed the 0.12.0 Linux
+x86_64 startup crash; 0.12.1 passed startup smokes but failed later upstream
+policy fixtures because `zstd` was missing. PR #29 installs the prerequisite
+on `master` without skipping gates. Fresh four-platform 0.12.2 packaging remains
+pending; old artifacts cannot be relabelled or treated as this update.
 
 The 0.9 **codr** plugin uses two per-user services: the Rust bridge and MDK transport.
 The 0.10 and 0.11 combined runtimes use one executable and one service after an

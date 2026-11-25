@@ -1,6 +1,6 @@
 # Combined codr daemon
 
-The unpublished 0.12.1 release candidate hosts the bridge and MDK 0.17.0 messaging runtime in one process.
+The unpublished 0.12.2 release candidate hosts the bridge and MDK 0.17.0 messaging runtime in one process.
 It does not spawn `wn-agent`. MDK keeps ownership of keys, account storage,
 cryptography, relay transport, and invitations. The existing private
 `marmot.agent-control.v2` socket remains available to local setup tools.
@@ -42,8 +42,11 @@ For x86_64 musl, also set
 The native musl GCC specs otherwise inject a runtime interpreter into Rust's
 self-relocating static PIE, causing the demonstrated pre-main startup crash.
 Keep PIE and the version/help/static-loader smokes. This repair is merged on
-`master`, not in the immutable `v0.12.0` tag; fresh four-platform 0.12.1 package
-qualification remains pending. See the [release handoff](releases/0.12.1-readiness.md).
+`master`, not in the immutable `v0.12.0` tag. The 0.12.1 tag build passed startup
+smokes, but Linux x86_64 upstream policy fixtures needed the missing `zstd` tool.
+PR #29 now provisions it in the Linux packaging container without skipping gates.
+Both old tags remain immutable; fresh four-platform 0.12.2 package qualification
+remains pending. See the [release handoff](releases/0.12.2-readiness.md).
 
 ## MDK 0.17 storage boundary
 

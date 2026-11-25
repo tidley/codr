@@ -1,11 +1,40 @@
 # Changelog
 
-## [0.12.1] - Release candidate
+## [0.12.2] - Release candidate
 
-Not yet published. Prepared on merged `master` source `31adb78d638918921eda16620615bb3199754216`
+Not yet published. Prepared on merged `master` source
+`c32d24f4e0d424d3c4f40f2510e00eb7a2d67cca` (PR #29), with coordinated package,
+plugin and root lockfile metadata only; dependencies are unchanged. See the
+[release notes and contributor credits](docs/releases/0.12.2.md) and
+[release handoff](docs/releases/0.12.2-readiness.md). Fresh Linux x86_64/ARM64
+and macOS Intel/Apple Silicon packages remain required. No release, installation,
+MDK migration or verified mirror is claimed; unfinished feature #26 is excluded.
+
+### Fixed
+
+- Retain PR #27's musl static-PIE interpreter repair for the 0.12.0 x86_64
+  startup exit 139. The 0.12.1 tag build passed startup smokes and three platform
+  package lanes, but x86_64 upstream policy fixtures failed on missing `zstd`.
+- Retain merged PR #29's `zstd` prerequisite in the Linux packaging container;
+  no upstream checks or release gates are skipped. This metadata preparation
+  changes no runtime, workflow, dependency, channel or artifact contract.
+- Leave immutable `v0.12.0` and `v0.12.1` unchanged. Prior artifacts remain tied
+  to their original source/version; the existing tag workflow requires fresh
+  four-platform 0.12.2 builds, not relabelling or promotion of the failed matrices.
+
+## [0.12.1] - Source tag only; release build failed
+
+Historical preparation below. Immutable `v0.12.1` points to
+`29a44106ebbd022cca952d558557258aad251fc1`. Run `45587845551` passed startup
+smokes and three platform package lanes, then failed x86_64 upstream policy
+fixtures on missing `zstd`; publication was skipped. Recovery now targets 0.12.2.
+
+### Original preparation
+
+Prepared on merged `master` source `31adb78d638918921eda16620615bb3199754216`
 (PR #27). See the [release notes and contributor credits](docs/releases/0.12.1.md)
-and [release handoff](docs/releases/0.12.1-readiness.md). Fresh Linux x86_64/ARM64
-and macOS Intel/Apple Silicon package qualification is pending. No installation
+and [historical release handoff](docs/releases/0.12.1-readiness.md). Fresh Linux x86_64/ARM64
+and macOS Intel/Apple Silicon package qualification was pending at preparation. No installation
 or MDK migration is implied; unfinished Teem progress feature #26 is excluded.
 
 ### Fixed
