@@ -44,6 +44,17 @@ pub(crate) struct Check {
     pub task: tokio::task::JoinHandle<Result<Option<Release>>>,
 }
 
+fn release_is_newer(release: &str, running: &str) -> Result<bool> {
+    let release = semver::Version::parse(release)?;
+    let running = semver::Version::parse(running)?;
+    // Understanding the running preview must not opt stable updates into previews.
+    ensure!(
+        release.pre.is_empty(),
+        "Preview releases require opt-in installation"
+    );
+    Ok(release.cmp_precedence(&running).is_gt())
+}
+
 pub fn info() -> Result<Value> {
     let connector: toml::Value = toml::from_str(include_str!("../connector.toml"))?;
     Ok(json!({
@@ -228,14 +239,6 @@ pub fn prepare(
         now() < offer.expires_at,
         "The update offer expired. Send /update to check again"
     );
-    let numeric = |version: &str| -> Result<Vec<u64>> {
-        let parts = version
-            .split('.')
-            .map(str::parse)
-            .collect::<std::result::Result<Vec<u64>, _>>()?;
-        ensure!(parts.len() == 3, "Invalid update version");
-        Ok(parts)
-    };
     let version = if offer.handover {
         ensure!(
             offer.release.is_none() && bridge.update_messaging_home.is_none(),
@@ -248,7 +251,7 @@ pub fn prepare(
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Missing update release"))?;
         ensure!(
-            numeric(&release.version)? > numeric(env!("CARGO_PKG_VERSION"))?,
+            release_is_newer(&release.version, env!("CARGO_PKG_VERSION"))?,
             "This release is no longer newer than the running bridge. Send /update again"
         );
         release.version.clone()
@@ -599,6 +602,23 @@ pub async fn poll(bridge: &mut Bridge) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stable_release_comparison_accepts_a_running_preview() {
+        assert!(release_is_newer("0.13.0", "0.13.0-preview.1").unwrap());
+        assert!(release_is_newer("0.14.0", "0.13.0-preview.1").unwrap());
+        assert!(!release_is_newer("0.12.2", "0.13.0-preview.1").unwrap());
+        assert!(!release_is_newer("0.13.0", "0.13.0+build.1").unwrap());
+    }
+
+    #[test]
+    fn stable_release_comparison_preserves_channel_and_version_guards() {
+        assert!(release_is_newer("0.13.0", "0.12.2").unwrap());
+        assert!(!release_is_newer("0.12.2", "0.12.2").unwrap());
+        assert!(release_is_newer("0.14.0-preview.1", "0.12.2").is_err());
+        assert!(release_is_newer("not-a-version", "0.12.2").is_err());
+        assert!(release_is_newer("0.13.0", "not-a-version").is_err());
+    }
     use bech32::ToBase32;
 
     #[tokio::test]
