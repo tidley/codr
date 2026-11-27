@@ -14,6 +14,7 @@ use std::{
         fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     },
     path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 const MAX_CLAIM: u64 = 16 * 1024;
@@ -23,6 +24,7 @@ const MAX_CLAIM: u64 = 16 * 1024;
 enum Purpose {
     Room,
     Private,
+    PendingRoom,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,6 +55,20 @@ pub(crate) fn identity(agent: &Agent) -> Result<[String; 3]> {
 }
 
 impl Claim {
+    fn pending(config: &BridgeConfig, native: [String; 3], group: &str) -> Result<Self> {
+        Ok(Self {
+            version: 1,
+            purpose: Purpose::PendingRoom,
+            native,
+            state: fs::canonicalize(&config.state_path)?,
+            owner: phone_hex(&config.phone_npub)?,
+            transport: config.account_id_hex.clone(),
+            group: group.into(),
+            key: String::new(),
+            terminal: String::new(),
+            pane: String::new(),
+        })
+    }
     pub(crate) fn new(config: &BridgeConfig, agent: &Agent, group: &str) -> Result<Self> {
         Ok(Self {
             version: 1,
@@ -211,6 +227,7 @@ pub(crate) struct Guard {
     path: PathBuf,
     root: PathBuf,
     native: [String; 3],
+    setup_reserved_here: AtomicBool,
 }
 
 pub(crate) fn guard(config: &BridgeConfig, native: [String; 3]) -> Result<Guard> {
@@ -232,10 +249,57 @@ pub(crate) fn guard(config: &BridgeConfig, native: [String; 3]) -> Result<Guard>
         path: path.with_extension("json"),
         root,
         native,
+        setup_reserved_here: AtomicBool::new(false),
     })
 }
 
 impl Guard {
+    /// Reserve before native creation, not just agent discovery. A crash or lost
+    /// creation acknowledgement leaves a permanent, non-adoptable room hold.
+    pub(crate) fn reserve_setup(&self, config: &BridgeConfig, group: &str) -> Result<()> {
+        self.reserve(&Claim::pending(config, self.native.clone(), group)?)?;
+        self.setup_reserved_here.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    pub(crate) fn verify_setup(
+        &self,
+        config: &BridgeConfig,
+        native: &[String; 3],
+        group: &str,
+    ) -> Result<()> {
+        ensure!(
+            self.setup_reserved_here.load(Ordering::Acquire),
+            "Setup reservation is not owned by this live guard"
+        );
+        ensure!(*native == self.native, "Setup native identity differs");
+        self.verify(&Claim::pending(config, native.clone(), group)?)
+    }
+
+    /// The only claim transition is this same-process pending-to-bound step.
+    /// The caller retains the original guard through creation and attachment;
+    /// normal attachment and restarted setup never adopt a retained reservation.
+    pub(crate) fn finish_setup(&self, config: &BridgeConfig, claim: &Claim) -> Result<()> {
+        ensure!(
+            claim.purpose == Purpose::Room && claim.belongs_to(config)?,
+            "Setup claim provenance differs"
+        );
+        self.verify_setup(config, &claim.native, &claim.group)?;
+        let bytes = serde_json::to_vec(claim)?;
+        ensure!(
+            bytes.len() as u64 <= MAX_CLAIM,
+            "Native claim exceeds limit"
+        );
+        let mut staged = tempfile::NamedTempFile::new_in(&self.root)?;
+        staged.write_all(&bytes)?;
+        staged.as_file().sync_all()?;
+        // Atomic replacement never exposes a gap or a partial claim. Either the
+        // pending hold or the final room claim survives an interrupted setup.
+        staged.persist(&self.path)?;
+        File::open(&self.root)?.sync_all()?;
+        self.setup_reserved_here.store(false, Ordering::Release);
+        Ok(())
+    }
     /// Private native admission also needs durable provenance before POST: a
     /// lost HTTP acknowledgement must not leave the session apparently free for
     /// a room attachment while the original input can still arrive later.
@@ -355,6 +419,60 @@ mod tests {
         let agent = serde_json::from_value(json!({"pane_id":"w1:p1","terminal_id":"term1","agent":"opencode","agent_status":"idle",
             "agent_session":{"agent":"opencode","kind":"id","source":"herdr:opencode","value":"ses_fixture"}})).unwrap();
         (config, agent)
+    }
+
+    #[test]
+    fn setup_reservation_survives_process_loss_before_discovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let (config, agent) = fixture(temp.path(), "setup.json");
+        let (other, _) = fixture(temp.path(), "other.json");
+        let native = identity(&agent).unwrap();
+        let held = guard(&config, native.clone()).unwrap();
+        held.reserve_setup(&config, "room").unwrap();
+        // Simulate losing the setup process immediately after native creation or
+        // agent.start. The operating-system lock is gone, not the reservation.
+        drop(held);
+        assert!(claimed(&config, &native).unwrap());
+        assert!(binding_conflict(&config, &agent, None, false).unwrap());
+        assert!(binding_conflict(&other, &agent, None, false).unwrap());
+        let same_owner = guard(&config, native.clone()).unwrap();
+        assert!(
+            same_owner.verify_setup(&config, &native, "room").is_err(),
+            "Restart cannot adopt its own uncertain reservation"
+        );
+        drop(same_owner);
+        let restarted = guard(&other, native).unwrap();
+        assert!(restarted.allow(&other).is_err());
+        assert!(
+            restarted
+                .reserve(&Claim::new(&other, &agent, "private").unwrap())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn setup_claim_transition_is_same_owner_group_identity_and_one_shot() {
+        let temp = tempfile::tempdir().unwrap();
+        let (config, agent) = fixture(temp.path(), "setup.json");
+        let (other, _) = fixture(temp.path(), "other.json");
+        let held = guard(&config, identity(&agent).unwrap()).unwrap();
+        held.reserve_setup(&config, "room").unwrap();
+        assert!(
+            held.verify_setup(&other, &identity(&agent).unwrap(), "room")
+                .is_err()
+        );
+        assert!(
+            held.finish_setup(&config, &Claim::new(&config, &agent, "other-room").unwrap())
+                .is_err()
+        );
+        let claim = Claim::new(&config, &agent, "room").unwrap();
+        held.finish_setup(&config, &claim).unwrap();
+        held.verify(&claim).unwrap();
+        assert!(held.finish_setup(&config, &claim).is_err());
+        drop(held);
+        assert!(!binding_conflict(&config, &agent, Some("room"), true).unwrap());
+        assert!(binding_conflict(&config, &agent, Some("room"), false).unwrap());
+        assert!(binding_conflict(&other, &agent, Some("room"), true).unwrap());
     }
 
     #[test]

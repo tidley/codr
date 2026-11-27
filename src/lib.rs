@@ -28,4 +28,5 @@ pub mod messaging;
 mod native_rooms;
 pub mod porter;
 pub mod prompt;
+pub mod room_setup;
 pub mod rooms;

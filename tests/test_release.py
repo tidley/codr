@@ -7,7 +7,24 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 
+def version_core(version):
+    # These checks select the legacy setup path by API generation, not release
+    # precedence. Cargo validates SemVer; preview/build labels do not change it.
+    return tuple(map(int, version.split("+", 1)[0].split("-", 1)[0].split(".")))
+
+
 class ReleasePreparationTests(unittest.TestCase):
+    def test_setup_generation_accepts_prerelease_and_build_labels(self):
+        for version, expected in [
+            ("0.9.0", (0, 9, 0)),
+            ("0.10.0-preview.1", (0, 10, 0)),
+            ("0.13.0-preview.1", (0, 13, 0)),
+            ("0.13.0+build.2", (0, 13, 0)),
+            ("0.13.0-preview.1+build.2", (0, 13, 0)),
+        ]:
+            with self.subTest(version=version):
+                self.assertEqual(version_core(version), expected)
+
     def test_package_plugin_lockfile_and_notes_agree(self):
         package = tomllib.loads((ROOT / "Cargo.toml").read_text())["package"]
         plugin = tomllib.loads((ROOT / "herdr-plugin.toml").read_text())
@@ -31,9 +48,9 @@ class ReleasePreparationTests(unittest.TestCase):
 
     def test_fresh_install_examples_select_the_supported_setup_release(self):
         version = tomllib.loads((ROOT / "Cargo.toml").read_text())["package"]["version"]
-        # The combined MVP reuses existing accounts. Its CLI deliberately refuses
-        # legacy identity creation, so fresh accounts must bootstrap on 0.9.
-        combined = tuple(map(int, version.split("."))) >= (0, 10, 0)
+        # The stable combined MVP reuses existing accounts. These legacy plugin
+        # examples still bootstrap on 0.9; opt-in room setup has its own guide.
+        combined = version_core(version) >= (0, 10, 0)
         setup_version = "0.9.0" if combined else version
         for name in ["README.md", "docs/INSTALL.md"]:
             with self.subTest(path=name):
@@ -47,7 +64,7 @@ class ReleasePreparationTests(unittest.TestCase):
 
     def test_source_identity_setup_uses_the_same_supported_release(self):
         version = tomllib.loads((ROOT / "Cargo.toml").read_text())["package"]["version"]
-        if tuple(map(int, version.split("."))) >= (0, 10, 0):
+        if version_core(version) >= (0, 10, 0):
             text = (ROOT / "docs/INSTALL.md").read_text().split("## Build from source", 1)[1]
             self.assertIn("git checkout v0.9.0", text)
             self.assertNotIn("git checkout master", text)

@@ -14,6 +14,11 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Action {
+    /// Fresh-only room onboarding; never starts discovery before a strict binding.
+    RoomSetup {
+        #[command(subcommand)]
+        action: herdr_white_noise_bridge::room_setup::Action,
+    },
     /// Publish a desktop instruction as Codr, then admit it to the explicit room agent.
     /// Never reads typed native terminal input. Requires a running Porter endpoint.
     RoomSend {
@@ -128,6 +133,9 @@ enum ForwardingMode {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    if let Some(Action::RoomSetup { action }) = &args.command {
+        return herdr_white_noise_bridge::room_setup::execute(action).await;
+    }
     if let Some(Action::UpdateInfo { full }) = &args.command {
         let mut info = herdr_white_noise_bridge::update::info()?;
         if !full {
@@ -146,6 +154,9 @@ async fn main() -> Result<()> {
         root.join("herdr-white-noise-bridge/config.toml")
     });
     let config = BridgeConfig::load(&config_path)?;
+    if args.command.is_none() || matches!(args.command, Some(Action::Run { .. })) {
+        herdr_white_noise_bridge::room_setup::validate_run(&config_path, &config)?;
+    }
     if let Some(Action::RoomSend {
         key,
         terminal_id,
@@ -277,7 +288,10 @@ async fn main() -> Result<()> {
             }
             result
         }
-        Action::Porter { .. } | Action::UpdateInfo { .. } | Action::RoomSend { .. } => {
+        Action::Porter { .. }
+        | Action::UpdateInfo { .. }
+        | Action::RoomSend { .. }
+        | Action::RoomSetup { .. } => {
             unreachable!()
         }
         Action::Notify { text, group } => {

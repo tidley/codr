@@ -1,12 +1,19 @@
 # Install **codr**
 
+**Fresh shared-room preview:** give your coding agent the single OS-neutral
+instruction in [AGENT-INSTALL.md](AGENT-INSTALL.md). The opt-in
+`0.13.0-preview.1` candidate adds a fresh macOS path; it is not yet a published or
+runtime-verified release. Do not use the legacy Setup/Start actions below for
+shared rooms, reuse private history, or install over retained MDK storage.
+The historical stable/private-chat instructions below remain separate.
+
 **The released 0.11.2 targets existing accounts.** Fresh-account examples use
 the supported 0.9.0 setup. For an existing account, use the explicit
 [combined-service handover](COMBINED.md), not the legacy two-service setup flow.
 Fresh identity creation still uses local 0.9 setup before that handover.
 
-**Issue #31's working source is not an automatic upgrade.** It keeps the Codr
-version at 0.12.2 but changes messaging to the MDK 0.19 storage cohort, incompatible
+**Issue #31's working source was not an automatic upgrade.** Its Codr
+0.12.2 candidate changed messaging to the MDK 0.19 storage cohort, incompatible
 with the earlier 0.14 and 0.17 cohorts. The older
 bootstrap/handover instructions below do not authorize that migration. Keep the
 running installation unchanged until separate approval and a verified stopped

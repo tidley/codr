@@ -66,8 +66,10 @@ class CombinedPackagingTests(unittest.TestCase):
 
     def test_both_worker_packaging_paths_include_embedded_dependency_licenses(self):
         workflow = (Path(__file__).resolve().parents[1] / ".github/workflows/build.yml").read_text()
-        self.assertEqual(workflow.count('-C "$GITHUB_WORKSPACE/vendor/mdk" LICENSE README.codr.md'), 2)
-        self.assertEqual(workflow.count('LICENSE README.codr.md LICENSE-MPL-2.0 NOTICE.codr'), 2)
+        self.assertEqual(workflow.count('python3 scripts/package_evidence.py "target/$TARGET/release/herdr-white-noise-bridge" "dist/$asset"'), 2)
+        packaging = (Path(__file__).resolve().parents[1] / "scripts/package_evidence.py").read_text()
+        for license in ('LICENSE', 'README.codr.md', 'LICENSE-MPL-2.0', 'NOTICE.codr'):
+            self.assertIn(f'"{license}"', packaging)
         self.assertNotIn('vendor/mdk/vendor/hpke-rs-libcrux', workflow)
 
     def test_every_rust_build_job_installs_the_pinned_odin_compiler(self):

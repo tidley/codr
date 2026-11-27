@@ -4617,6 +4617,17 @@ impl Bridge {
         group: &str,
         profiles: Vec<String>,
     ) -> Result<Mapping> {
+        self.prepare_chat_attachment_with_setup(key, group, profiles, None)
+            .await
+    }
+
+    async fn prepare_chat_attachment_with_setup(
+        &mut self,
+        key: &str,
+        group: &str,
+        profiles: Vec<String>,
+        setup: Option<&crate::native_rooms::Guard>,
+    ) -> Result<Mapping> {
         ensure!(
             !self
                 .state
@@ -4642,10 +4653,15 @@ impl Bridge {
         let matches: Vec<_> = agents.iter().filter(|agent| agent.key() == key).collect();
         ensure!(matches.len() == 1, "Native session must exist exactly once");
         let agent = matches[0].clone();
-        ensure!(
-            !crate::native_rooms::claimed(&self.config, &crate::native_rooms::identity(&agent)?)?,
-            "Native conversation belongs to another room transport"
-        );
+        let native = crate::native_rooms::identity(&agent)?;
+        if let Some(guard) = setup {
+            guard.verify_setup(&self.config, &native, group)?;
+        } else {
+            ensure!(
+                !crate::native_rooms::claimed(&self.config, &native)?,
+                "Native conversation belongs to another room transport"
+            );
+        }
         ensure!(agent.settled(), "Attach only an idle native session");
         let session = agent
             .agent_session
