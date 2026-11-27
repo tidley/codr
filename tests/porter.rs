@@ -3,11 +3,20 @@ use herdr_white_noise_bridge::{
     BridgeConfig, bridge::Bridge, herdr::Agent, porter, state::Mapping, wire::read_line,
 };
 use serde_json::{Value, json};
-use std::{os::unix::fs::PermissionsExt, path::Path};
+use sha2::{Digest, Sha256};
+use std::{
+    os::unix::fs::{DirBuilderExt, PermissionsExt},
+    path::Path,
+};
 use tokio::{
     io::{AsyncWriteExt, BufReader},
     net::UnixListener,
 };
+
+// These fixtures share Porter's process-wide four-reader limit. Serialize only
+// successful spawned-read tests so unrelated parallel tests cannot spend their
+// capacity. Each still verifies that slow I/O leaves the bridge loop immediately.
+static SPAWNED_READ_FIXTURE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn config(dir: &Path) -> BridgeConfig {
     let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
@@ -18,6 +27,7 @@ fn config(dir: &Path) -> BridgeConfig {
         wn_agent_socket: dir.join("wn.sock"),
         account_id_hex: "aa".repeat(32),
         state_path: dir.join("state.json"),
+        native_claims_fixture_root: Some(dir.join("native-claims")),
         launch_root: dir.join("projects"),
         portr_enabled: false,
         control_chat: false,
@@ -235,6 +245,7 @@ async fn oversized_socket_request_is_rejected_before_state_changes() {
 
 #[tokio::test]
 async fn slow_snapshot_does_not_block_the_bridge_event_loop() {
+    let _fixture = SPAWNED_READ_FIXTURE.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let listener = UnixListener::bind(dir.path().join("herdr.sock")).unwrap();
     let peer = tokio::spawn(async move {
@@ -277,6 +288,7 @@ async fn slow_snapshot_does_not_block_the_bridge_event_loop() {
 
 #[tokio::test]
 async fn slow_history_does_not_block_the_bridge_event_loop() {
+    let _fixture = SPAWNED_READ_FIXTURE.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let peer = host(dir.path()).await;
     let mut bridge = bridge(dir.path());
@@ -316,8 +328,177 @@ async fn slow_history_does_not_block_the_bridge_event_loop() {
     peer.abort();
 }
 
+fn history_request() -> Value {
+    json!({"version":1,"method":"history","bridge_account":"aa".repeat(32),
+        "session_key":agent().key(),"terminal_id":"term1","id":"history-boundary"})
+}
+
+fn history_export(bridge: &Bridge, slow: bool) {
+    let parent = bridge.config.state_path.parent().unwrap();
+    let wait = if slow {
+        format!(
+            "touch '{}'\nn=0; while [ ! -f '{}' ] && [ \"$n\" -lt 500 ]; do sleep 0.01; n=$((n+1)); done\n",
+            parent.join("read-started").display(),
+            parent.join("release-read").display()
+        )
+    } else {
+        String::new()
+    };
+    std::fs::write(&bridge.config.opencode_bin,format!("#!/bin/sh\n{wait}printf '%s' '{{\"messages\":[{{\"info\":{{\"id\":\"room-input\",\"role\":\"user\"}},\"parts\":[{{\"type\":\"text\",\"text\":\"ROOM_HISTORY_SECRET\"}}]}}]}}'\n")).unwrap();
+    std::fs::set_permissions(
+        &bridge.config.opencode_bin,
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+}
+
+fn other_transport_room_claim(bridge: &Bridge) {
+    let mut other = bridge.config.clone();
+    other.state_path = bridge.config.state_path.with_file_name("room-state.json");
+    other.account_id_hex = "bb".repeat(32);
+    let other = Bridge::open(other).unwrap();
+    let root = other.config.native_claims_fixture_root.as_ref().unwrap();
+    std::fs::DirBuilder::new().mode(0o700).create(root).unwrap();
+    let native = ["opencode", "id", "ses_1"];
+    let name = hex::encode(Sha256::digest(serde_json::to_vec(&native).unwrap()));
+    // Exact durable-record fixture in a temporary shared root, not a user claim
+    // or an account/session provisioning operation.
+    let claim = json!({"version":1,"purpose":"room","native":native,
+        "state":other.config.state_path.canonicalize().unwrap(),"owner":"11".repeat(32),
+        "transport":other.config.account_id_hex,"group":"cc".repeat(16),
+        "key":agent().key(),"terminal":"term1","pane":"w1:p1"});
+    let path = root.join(format!("{name}.json"));
+    std::fs::write(&path, serde_json::to_vec(&claim).unwrap()).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+#[tokio::test]
+async fn history_rejects_another_transports_room_claim_and_quarantined_binding() {
+    let dir = tempfile::tempdir().unwrap();
+    let peer = host(dir.path()).await;
+    let mut bridge = bridge(dir.path());
+    history_export(&bridge, false);
+    other_transport_room_claim(&bridge);
+    assert!(
+        porter::handle(&mut bridge, history_request())
+            .await
+            .is_err(),
+        "An old private desktop must not expose the other transport's room history"
+    );
+    bridge
+        .state
+        .mappings
+        .get_mut(&agent().key())
+        .unwrap()
+        .room_quarantined = Some("native_room_owned_elsewhere".into());
+    bridge.save().unwrap();
+    assert!(
+        porter::handle(&mut bridge, history_request())
+            .await
+            .is_err()
+    );
+    peer.abort();
+}
+
+#[tokio::test]
+async fn history_rejects_captured_in_memory_quarantine_without_waiting_for_save() {
+    let dir = tempfile::tempdir().unwrap();
+    let peer = host(dir.path()).await;
+    let mut bridge = bridge(dir.path());
+    history_export(&bridge, false);
+    bridge
+        .state
+        .mappings
+        .get_mut(&agent().key())
+        .unwrap()
+        .room_quarantined = Some("already_held".into());
+    assert!(
+        porter::handle(&mut bridge, history_request())
+            .await
+            .is_err()
+    );
+    let (server, mut client) = tokio::net::UnixStream::pair().unwrap();
+    client
+        .write_all(format!("{}\n", history_request()).as_bytes())
+        .await
+        .unwrap();
+    assert!(porter::serve(&mut bridge, server).await.is_err());
+    peer.abort();
+}
+
+async fn spawned_history_change_during_read(claim: bool) {
+    let _fixture = SPAWNED_READ_FIXTURE.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let peer = host(dir.path()).await;
+    let mut bridge = bridge(dir.path());
+    history_export(&bridge, true);
+    let (server, mut client) = tokio::net::UnixStream::pair().unwrap();
+    client
+        .write_all(format!("{}\n", history_request()).as_bytes())
+        .await
+        .unwrap();
+    porter::serve(&mut bridge, server).await.unwrap();
+    let started = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while !dir.path().join("read-started").exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    if started.is_ok() {
+        if claim {
+            other_transport_room_claim(&bridge);
+        } else {
+            bridge
+                .state
+                .mappings
+                .get_mut(&agent().key())
+                .unwrap()
+                .room_quarantined = Some("held_during_read".into());
+            bridge.save().unwrap();
+        }
+    }
+    std::fs::write(dir.path().join("release-read"), b"").unwrap();
+    started.expect("fixture reader must reach the slow-read boundary");
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        read_line(&mut BufReader::new(client)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(response["error"]["code"], "porter_request_rejected");
+    assert!(!response.to_string().contains("ROOM_HISTORY_SECRET"));
+    peer.abort();
+}
+
+#[tokio::test]
+async fn spawned_history_rechecks_native_claim_after_slow_read() {
+    spawned_history_change_during_read(true).await;
+}
+
+#[tokio::test]
+async fn spawned_history_rechecks_quarantine_after_slow_read() {
+    spawned_history_change_during_read(false).await;
+}
+
+#[tokio::test]
+async fn unmapped_private_history_without_a_room_claim_remains_available() {
+    let dir = tempfile::tempdir().unwrap();
+    let peer = host(dir.path()).await;
+    let mut bridge = bridge(dir.path());
+    bridge.state.mappings.clear();
+    bridge.save().unwrap();
+    history_export(&bridge, false);
+    let response = porter::handle(&mut bridge, history_request())
+        .await
+        .unwrap();
+    assert!(response.to_string().contains("ROOM_HISTORY_SECRET"));
+    peer.abort();
+}
+
 #[tokio::test]
 async fn socket_errors_are_bounded_and_do_not_disclose_reader_paths() {
+    let _fixture = SPAWNED_READ_FIXTURE.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let peer = host(dir.path()).await;
     let mut bridge = bridge(dir.path());

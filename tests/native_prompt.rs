@@ -14,7 +14,9 @@ fn config(root: &std::path::Path, url: &str) -> BridgeConfig {
         "opencode_service_file".into(),
         file.to_string_lossy().to_string().into(),
     );
-    value.try_into().unwrap()
+    let mut config: BridgeConfig = value.try_into().unwrap();
+    config.native_claims_fixture_root = Some(root.canonicalize().unwrap().join("native-claims"));
+    config
 }
 
 fn request(socket: &mut std::net::TcpStream) -> (String, Value) {

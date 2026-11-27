@@ -225,6 +225,27 @@ pub struct AgentControlRelayLists {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentControlRequest {
+    /// Authenticated account roster and optional immutable inner-event context.
+    /// This is distinct from legacy display/leaf-count and plaintext mention hints.
+    RoomContext {
+        account_id_hex: String,
+        group_id_hex: String,
+        message_id_hex: Option<String>,
+    },
+    HumanAccountRegister {
+        account_id_hex: String,
+        signer_socket: String,
+    },
+    HumanAccountLogin {
+        account_id_hex: String,
+        signer_socket: String,
+    },
+    HumanAccountSend {
+        account_id_hex: String,
+        group_id_hex: String,
+        text: String,
+        addressed_accounts: Vec<String>,
+    },
     SubscribeInbound {
         account_id_hex: Option<String>,
         group_id_hex: Option<String>,
@@ -612,6 +633,12 @@ pub struct AgentControlMediaRef {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentControlResponse {
+    RoomContext {
+        account_id_hex: String,
+        group_id_hex: String,
+        members: Vec<String>,
+        message: Option<AgentControlRoomMessage>,
+    },
     Ack,
     Error {
         code: String,
@@ -864,6 +891,17 @@ pub struct AgentControlActor {
     pub display_name: Option<String>,
     #[serde(default)]
     pub is_self: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentControlRoomMessage {
+    pub message_id_hex: String,
+    pub sender_account_id_hex: String,
+    pub text: String,
+    pub recorded_at: u64,
+    /// Only signed inner-event p-tags. Never the legacy plaintext mention scan.
+    pub addressed_accounts: Vec<String>,
+    pub unsupported_media: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

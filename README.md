@@ -16,7 +16,16 @@ The current setup code uses **👾** as the public name and display name when it
 - Supported OpenCode questions accept a number or option label as a reply. V2 questions with custom input also accept text answers, such as a version number.
 - For OpenCode V2 permission cards, send `1` to allow once or `2` to deny as a normal chat message. No quoted reply or approval code is needed.
 - OpenCode V2 multi-part forms show one question at a time. Saved answers survive restart; the final answer submits the complete form together.
-- New groups make your configured account an admin, so you can invite participants and rename the group. Only the owner can prompt the agent. [Group setup](docs/REFERENCE.md#shared-chats-and-owner-only-control)
+- New groups make your configured account an admin, so you can invite participants and rename the group. By default, only the owner can prompt the agent. [Group setup](docs/REFERENCE.md#shared-chats-and-owner-only-control)
+- An additional app identity can be explicitly authorised for one existing chat
+  attached to a dedicated native session, without replacing the phone owner.
+  Membership alone grants no control. [Attachment and local fixture tests](docs/MULTI-PROFILE.md).
+- Local source builds add [shared groups with named agents](docs/SHARED_CHATS.md)
+  (#34, superseding #33): default-empty human/agent grants, authenticated account
+  addressing, finite agent budgets and fresh dedicated OpenCode sessions.
+  Private chats stay unchanged. Incoming shared media is
+  text-only; native tool permissions remain local-human-only. Source support is
+  not an installed update or live-group validation.
 - In automatic sync mode, local prompts mute all chats and an owner phone message resumes them. `/sync on` or `/sync off` keeps your explicit choice across restarts; `/unmute` restores automatic mode.
 - Phone history commands collect in the background without holding the worker's
   input loop. Pending requests survive restart and reuse the native history cache.

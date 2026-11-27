@@ -78,6 +78,25 @@ fn inbox_input(value: &Value, session: &str, id: &str) -> Option<UserInput> {
 }
 
 pub async fn send(config: &BridgeConfig, session: &str, id: &str, text: &str) -> Result<UserInput> {
+    let reservation =
+        crate::native_rooms::guard(config, ["opencode".into(), "id".into(), session.into()])
+            .map_err(|_| anyhow::Error::new(crate::wire::NotSubmitted))?;
+    reservation
+        .allow(config)
+        .map_err(|_| anyhow::Error::new(crate::wire::NotSubmitted))?;
+    let result = send_reserved(config, session, id, text).await;
+    drop(reservation);
+    result
+}
+
+/// Room callers already hold the matching native guard through their durable
+/// policy/submission update. This seam must not be exposed as a host operation.
+pub(crate) async fn send_reserved(
+    config: &BridgeConfig,
+    session: &str,
+    id: &str,
+    text: &str,
+) -> Result<UserInput> {
     // Only setup errors are proven pre-submission. Once send() starts, every
     // failure remains uncertain and must be resolved by readback, never retry.
     let client = Client::new(config, session, id)

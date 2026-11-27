@@ -245,6 +245,100 @@ impl AgentConnector {
         request_id: Option<&str>,
         request: AgentControlRequest,
     ) -> Result<AgentControlResponse, ConnectorError> {
+        if let AgentControlRequest::RoomContext {
+            account_id_hex,
+            group_id_hex,
+            message_id_hex,
+        } = &request
+        {
+            return self
+                .room_context_response(account_id_hex, group_id_hex, message_id_hex.as_deref())
+                .await;
+        }
+        if let AgentControlRequest::HumanAccountRegister {
+            account_id_hex,
+            signer_socket,
+        } = &request
+        {
+            let account = self.local_account_for_account_id(account_id_hex)?;
+            if account.local_signing || !account.external_signing {
+                return Err(ConnectorError::Unauthorized);
+            }
+            let key = nostr::prelude::PublicKey::from_hex(&account.account_id_hex)
+                .map_err(|_| ConnectorError::Unauthorized)?;
+            // MDK verifies both external-account lifecycle and pinned identity;
+            // registering a transport signer cannot import or expose a human key.
+            self.runtime
+                .register_external_signer(
+                    &account.label,
+                    crate::external_signer::ExternalSigner::new(signer_socket.into(), key),
+                )
+                .await?;
+            return Ok(AgentControlResponse::Ack);
+        }
+        if let AgentControlRequest::HumanAccountLogin {
+            account_id_hex,
+            signer_socket,
+        } = &request
+        {
+            let id = crate::validation::normalize_hex(account_id_hex)?;
+            let key = nostr::prelude::PublicKey::from_hex(&id)
+                .map_err(|_| ConnectorError::Unauthorized)?;
+            // Explicit owner action only. MDK owns external-account setup,
+            // identity proof and rollback; default options publish no metadata
+            // or initial KeyPackage and never import local human key material.
+            self.runtime
+                .login_external_signer(
+                    id,
+                    crate::external_signer::ExternalSigner::new(signer_socket.into(), key),
+                    marmot_app::AccountSetupRequest::default(),
+                )
+                .await?;
+            return Ok(AgentControlResponse::Ack);
+        }
+        if let AgentControlRequest::HumanAccountSend {
+            account_id_hex,
+            group_id_hex,
+            text,
+            addressed_accounts,
+        } = &request
+        {
+            let account = self.local_account_for_account_id(account_id_hex)?;
+            if account.local_signing
+                || !account.external_signing
+                || text.is_empty()
+                || text.len() > 30000
+            {
+                return Err(ConnectorError::Unauthorized);
+            }
+            let group = crate::validation::normalize_hex(group_id_hex)?;
+            let group_id = cgka_traits::GroupId::new(hex::decode(&group)?);
+            let members = self
+                .runtime
+                .group_member_ids_page(&account.label, std::slice::from_ref(&group_id))
+                .await?;
+            if !addressed_accounts.iter().all(|id| {
+                id.len() == 64 && members.iter().any(|row| row.member_ids_hex.contains(id))
+            }) {
+                return Err(ConnectorError::Unauthorized);
+            }
+            let tags = addressed_accounts
+                .iter()
+                .map(|id| vec!["p".into(), id.clone()])
+                .collect();
+            // This is an encrypted MDK send under the external HUMAN account.
+            // It never delegates to send_final under the configured bridge key.
+            let sent = self
+                .runtime
+                .send_tagged_text(&account.label, &group_id, text.clone(), tags)
+                .await?;
+            return Ok(AgentControlResponse::FinalSent {
+                message_ids_hex: sent.message_ids,
+                maintenance_disposition: crate::maintenance::agent_maintenance_disposition(
+                    sent.maintenance_disposition,
+                ),
+            });
+        }
         match request {
             AgentControlRequest::AccountList => self.account_list_response(),
             AgentControlRequest::TimelineMessageGet {

@@ -12,6 +12,7 @@ use tokio::{
 pub(crate) struct Group {
     pub group: String,
     pub seen: HashSet<String>,
+    pub profiles: Vec<String>,
 }
 
 #[derive(Default)]
@@ -196,7 +197,10 @@ fn cursor(row: &Value) -> Result<(u64, String)> {
 fn eligible(row: &Value, phone: &str, group: &Group) -> bool {
     row["availability"] == "available"
         && crate::wire::is_chat_timeline_row(row)
-        && row["sender"]["account_id_hex"] == phone
+        && (row["sender"]["account_id_hex"] == phone
+            || row["sender"]["account_id_hex"]
+                .as_str()
+                .is_some_and(|sender| group.profiles.iter().any(|profile| profile == sender)))
         && row["sender"]["is_self"] != true
         && row["message_id_hex"]
             .as_str()
@@ -224,6 +228,7 @@ mod tests {
         let mut group = Group {
             group: "group".into(),
             seen: HashSet::new(),
+            profiles: Vec::new(),
         };
         let mut row = json!({"message_id_hex":"thread", "availability":"available", "kind":1111,
             "reply_to_message_id_hex":"parent", "sender":{"account_id_hex":"owner"}});
@@ -244,6 +249,12 @@ mod tests {
         assert!(!eligible(&row, "owner", &group));
         row["kind"] = json!(9);
         assert!(eligible(&row, "owner", &group));
+        row["sender"]["account_id_hex"] = json!("app");
+        assert!(!eligible(&row, "owner", &group));
+        group.profiles.push("app".into());
+        assert!(eligible(&row, "owner", &group));
+        row["sender"]["account_id_hex"] = json!("other-app");
+        assert!(!eligible(&row, "owner", &group));
     }
 
     #[tokio::test]
@@ -301,6 +312,7 @@ mod tests {
                 &Group {
                     group: "group".into(),
                     seen: HashSet::new(),
+                    profiles: Vec::new(),
                 },
                 &tx,
                 &Notify::new(),

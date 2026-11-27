@@ -73,12 +73,14 @@ fn launch_root_ancestors_cannot_be_symlinks() {
 fn config(root: &Path) -> BridgeConfig {
     // tempfile's macOS root sits behind the /var symlink; launch roots must be real paths.
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    serde_json::from_value(json!({
+    let mut config: BridgeConfig = serde_json::from_value(json!({
         "phone_npub":bech32::encode("npub",[0x11u8;32].to_base32(),bech32::Variant::Bech32).unwrap(),
         "account_id_hex":"aa".repeat(32),"herdr_socket":root.join("herdr.sock"),
         "wn_agent_socket":root.join("wn.sock"),"state_path":root.join("state.json"),
         "launch_root":root.join("projects"),"auto_forwarding":false
-    })).unwrap()
+    })).unwrap();
+    config.native_claims_fixture_root = Some(root.join("native-claims"));
+    config
 }
 fn inbound(id: &str, text: &str) -> Value {
     json!({"marmot_agent_control":"marmot.agent-control.v2","type":"inbound_message",

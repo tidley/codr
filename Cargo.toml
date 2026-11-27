@@ -15,6 +15,7 @@ hex = "0.4"
 tokio = { version = "1", features = ["full"] }
 tempfile = "3"
 fs2 = "0.4"
+libc = "0.2"
 uuid = { version = "1", features = ["v4", "serde"] }
 unicode-width = "0.2"
 rusqlite = { version = "=0.40.1", default-features = false, features = ["bundled-sqlcipher-vendored-openssl", "limits"] }

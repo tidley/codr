@@ -365,7 +365,7 @@ pub(crate) fn reply(
     }
     bridge
         .state
-        .enqueue_manual(group, text, &format!("launch:{group}:{id}"));
+        .enqueue_agent_manual(key, group, text, &format!("launch:{group}:{id}"));
     bridge.save()
 }
 

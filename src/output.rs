@@ -492,6 +492,10 @@ struct MessageV2 {
     kind: String,
     #[serde(default)]
     id: String,
+    /// Preserve an explicit native parent when available. Steering can put a
+    /// newer user input before the final reply to an earlier native message.
+    #[serde(default, rename = "parentID")]
+    parent_id: Option<String>,
     #[serde(default)]
     text: Option<String>,
     #[serde(default)]
@@ -574,7 +578,7 @@ fn from_v2(export: ExportV2) -> Export {
                     finish,
                     error: message.error,
                     summary: Value::Bool(false),
-                    parent_id: None,
+                    parent_id: message.parent_id,
                 },
                 parts,
             })

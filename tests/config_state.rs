@@ -34,7 +34,7 @@ fn repeated_question_resumes_preserve_cleanup_and_finish_the_original_progress()
         "Retired pending edits must not overwrite completion"
     );
     assert!(state.outbox.iter().any(|item| {
-        item.text == "> Done."
+        item.text == "> Agent turn finished"
             && item.response.as_ref().is_some_and(|delivery| {
                 delivery.target.as_deref() == Some("original-progress") && delivery.finished
             })
@@ -163,7 +163,29 @@ fn completed_progress_keeps_tasks_from_current_and_previous_working_labels() {
         );
         state.outbox[0].response.as_mut().unwrap().target = Some("sent-progress".into());
         state.complete_progress("session");
-        assert_eq!(state.outbox[0].text, "> Done.\n\n✓ Keep this task");
+        assert_eq!(
+            state.outbox[0].text,
+            "> Agent turn finished\n\n✓ Keep this task"
+        );
+    }
+}
+
+#[test]
+fn completed_progress_preserves_installed_agent_turn_label_for_private_and_shared() {
+    for alias in [None, Some("builder")] {
+        let group = "ab".repeat(16);
+        let mut state = BridgeState::with_mapping("session", group.clone());
+        state.forwarding_enabled = true;
+        state.mappings.get_mut("session").unwrap().shared_alias = alias.map(str::to_owned);
+        state.update_response("session", &group, "> Working...", false);
+        state.outbox[0].response.as_mut().unwrap().target = Some("sent-progress".into());
+        state.complete_progress("session");
+        let expected = alias.map_or_else(
+            || "> Agent turn finished".to_owned(),
+            |alias| format!("**@{alias}**\n> Agent turn finished"),
+        );
+        assert_eq!(state.outbox[0].text, expected);
+        assert!(state.outbox[0].response.as_ref().unwrap().finished);
     }
 }
 

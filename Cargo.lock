@@ -76,6 +76,7 @@ dependencies = [
  "libc",
  "marmot-account",
  "marmot-app",
+ "nostr 0.45.5",
  "rand 0.8.8",
  "serde",
  "serde_json",
@@ -83,7 +84,9 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "transport-nostr-peeler",
  "url",
+ "uuid",
  "zeroize",
 ]
 
@@ -1829,6 +1832,7 @@ dependencies = [
  "clap",
  "fs2",
  "hex",
+ "libc",
  "libsqlite3-sys",
  "pulldown-cmark",
  "reqwest",

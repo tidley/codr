@@ -15,9 +15,12 @@ shutdown future, cancels connection tasks, and calls MDK's
 `shutdown_and_close` before returning. Existing standalone `serve_socket`
 retains its API and delegates with a never-completing shutdown future.
 
-Founding-admin controls and their validation are now upstream. The remaining
-local protocol extension is opt-in media references on timeline-message lookup.
-The patch includes its wire/default and deleted-message regressions.
+Founding-admin controls and their validation are now upstream. Local extensions
+include opt-in media references on timeline-message lookup, authenticated room
+account/message context, and external-only human account lifecycle and sends.
+The external signer pins the human identity and validates signed events without
+importing secrets or falling back to local keys. The patch includes the same
+crate-source changes; the revision and storage cohort are unchanged.
 
 The declared storage cohort is `mdk-0.19`. First opening an older account upgrades
 its schema; downgrade is unsupported. Opening real account data requires explicit

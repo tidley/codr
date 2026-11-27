@@ -39,7 +39,38 @@ pub struct QueueFlight {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Mapping {
+    /// Strict room policy is separate from legacy single-chat invocation grants.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room: Option<crate::rooms::RoomPolicy>,
+    /// Durable isolation hold; native input outside accepted room admissions or
+    /// an identity change must never be treated as a global mute/wake cycle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room_quarantined: Option<String>,
     pub group_id_hex: Option<String>,
+    /// Stable operator-selected alias. Several dedicated native mappings may
+    /// share a group, but never a session, response slot or acceptance receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_alias: Option<String>,
+    /// Group input ID -> exact native message ID, retained after acceptance.
+    /// The mapping owns group/session/alias; `submissions` owns uncertainty.
+    /// This audit correlation and `seen_messages` must survive clear-prompt.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub shared_admissions: BTreeMap<String, String>,
+    /// Native room IDs remain bound to their accepted text after receipts clear.
+    #[serde(default)]
+    pub room_input_fingerprints: BTreeMap<String, String>,
+    /// Native final ID -> group input ID through the reader's native turn ID.
+    /// Missing turns remain uncorrelated; reply text and wall time are not used.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub shared_reply_inputs: BTreeMap<String, String>,
+    /// Explicit chat-local controllers, in addition to the unchanged phone owner.
+    /// Group membership and display names never populate this allowlist.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub authorized_profiles: Vec<String>,
+    /// Attachment boundary in host seconds. Missing/older timestamps fail closed;
+    /// the captured seen IDs also exclude history with misleading future dates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attached_after: Option<u64>,
     #[serde(default)]
     pub group_description: Option<String>,
     /// Last title this bridge applied or adopted for the group.
@@ -179,6 +210,14 @@ pub struct Outgoing {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BridgeState {
+    /// Same-user human operations: retain intent before invoking a signer/MDK.
+    /// None is uncertain and is never automatically replayed after restart.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub human_operations: BTreeMap<String, HumanOperation>,
+    /// Local desktop relay intent. Missing results are uncertain, never retryable.
+    /// Separate from human-signed operations: these publish as the Codr account.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub desktop_operations: BTreeMap<String, DesktopOperation>,
     pub version: u32,
     pub account: Option<String>,
     pub phone: Option<String>,
@@ -220,6 +259,8 @@ fn forwarding_default() -> bool {
 impl Default for BridgeState {
     fn default() -> Self {
         Self {
+            human_operations: BTreeMap::new(),
+            desktop_operations: BTreeMap::new(),
             version: 1,
             account: None,
             phone: None,
@@ -239,7 +280,47 @@ impl Default for BridgeState {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HumanOperation {
+    pub fingerprint: String,
+    pub result: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DesktopOperation {
+    pub fingerprint: String,
+    pub result: Option<serde_json::Value>,
+}
+
 impl BridgeState {
+    pub(crate) fn agent_text(&self, key: &str, text: &str) -> String {
+        self.mappings[key]
+            .shared_alias
+            .as_ref()
+            .map_or_else(|| text.to_owned(), |alias| format!("**@{alias}**\n{text}"))
+    }
+
+    pub(crate) fn enqueue_agent(&mut self, key: &str, group: &str, text: &str) {
+        let text = self.agent_text(key, text);
+        self.enqueue(group, &text);
+    }
+
+    pub(crate) fn enqueue_agent_manual(
+        &mut self,
+        key: &str,
+        group: &str,
+        text: &str,
+        request: &str,
+    ) {
+        let text = self.agent_text(key, text);
+        let request = if self.mappings[key].shared_alias.is_some() {
+            format!("{request}:{key}")
+        } else {
+            request.to_owned()
+        };
+        self.enqueue_manual(group, &text, &request);
+    }
+
     pub fn with_mapping(key: &str, group: String) -> Self {
         let mut s = Self::default();
         s.mappings.insert(
@@ -450,7 +531,7 @@ impl BridgeState {
         self.outbox.push(Outgoing {
             id: id.clone(),
             group: group.into(),
-            text: "> Working...".into(),
+            text: self.agent_text(key, "> Working..."),
             working_notice: false,
             attachments: vec![],
             response: Some(ResponseDelivery::default()),
@@ -523,6 +604,8 @@ impl BridgeState {
         if !self.forwarding_enabled {
             return;
         }
+        let labelled = self.agent_text(key, text);
+        let text = labelled.as_str();
         self.begin_response(key, group);
         let id = self.mappings[key].response_id.as_ref().unwrap();
         let item = self.outbox.iter_mut().find(|item| &item.id == id).unwrap();
@@ -544,6 +627,7 @@ impl BridgeState {
     }
 
     pub fn complete_progress(&mut self, key: &str) {
+        let alias = self.mappings[key].shared_alias.clone();
         self.mappings
             .get_mut(key)
             .unwrap()
@@ -570,18 +654,26 @@ impl BridgeState {
             self.outbox.retain(|item| item.id != id);
             return;
         }
-        item.text = if let Some(tasks) = item
-            .text
+        let text = alias
+            .as_ref()
+            .and_then(|alias| item.text.strip_prefix(&format!("**@{alias}**\n")))
+            .unwrap_or(&item.text);
+        // A completed native turn does not establish completion of the issue or
+        // task. Preserve the installed status wording, including shared labels.
+        item.text = if let Some(tasks) = text
             .strip_prefix("> Working...\n")
-            .or_else(|| item.text.strip_prefix("> Working.\n"))
-            .or_else(|| item.text.strip_prefix("> working...\n"))
-            .or_else(|| item.text.strip_prefix("> working\n"))
+            .or_else(|| text.strip_prefix("> Working.\n"))
+            .or_else(|| text.strip_prefix("> working...\n"))
+            .or_else(|| text.strip_prefix("> working\n"))
         {
-            format!("> Done.\n{tasks}")
+            format!("> Agent turn finished\n{tasks}")
         } else {
-            "> Done.".into()
+            "> Agent turn finished".into()
         };
         delivery.finished = true;
+        if let Some(alias) = alias {
+            item.text = format!("**@{alias}**\n{}", item.text);
+        }
         if let Some(target) = inherited {
             let group = item.group.clone();
             // One owner per edit target: an older pending blocked edit must

@@ -12,6 +12,9 @@ opencode_bin = "/absolute/path/to/opencode"
 # Recommended for V2: read the existing local server without starting/recovering it.
 # This takes precedence over opencode_db; a failed read retries, with no CLI fallback.
 # opencode_service_file = "/home/YOUR_USER/.local/state/opencode/service.json"
+# Shared-group @alias admission requires this existing V2 service registration.
+# Bind dedicated sessions with local attach-shared-chat, not names/config aliases.
+# See docs/SHARED_CHATS.md. Membership never grants invocation or tool approval.
 # Optional transcript roots. Defaults use CODEX_HOME / CLAUDE_CONFIG_DIR, or these home directories.
 codex_home = "/home/YOUR_USER/.codex"
 claude_home = "/home/YOUR_USER/.claude"

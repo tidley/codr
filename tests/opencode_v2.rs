@@ -1,6 +1,18 @@
 use herdr_white_noise_bridge::output::final_messages_v2;
 use serde_json::json;
 
+#[test]
+fn v2_explicit_parent_preserves_an_earlier_turn_during_steering() {
+    let export = json!({"messages":[
+        {"type":"user","id":"msg_first","text":"first"},
+        {"type":"user","id":"msg_second","text":"second"},
+        {"type":"assistant","id":"msg_answer","parentID":"msg_first","finish":"stop",
+            "time":{"completed":3},"content":[{"type":"text","text":"First answer"}]}
+    ]});
+    let replies = final_messages_v2(&export).unwrap();
+    assert_eq!(replies[0].turn.as_deref(), Some("opencode:msg_first"));
+}
+
 #[tokio::test]
 async fn v2_pending_question_is_read_from_live_forms_not_the_completed_export() {
     use herdr_white_noise_bridge::{BridgeConfig, herdr::Session, output};

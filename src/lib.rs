@@ -25,5 +25,7 @@ pub use config::BridgeConfig;
 pub use state::BridgeState;
 pub mod forwarding;
 pub mod messaging;
+mod native_rooms;
 pub mod porter;
 pub mod prompt;
+pub mod rooms;

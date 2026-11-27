@@ -14,6 +14,26 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Action {
+    /// Publish a desktop instruction as Codr, then admit it to the explicit room agent.
+    /// Never reads typed native terminal input. Requires a running Porter endpoint.
+    RoomSend {
+        key: String,
+        #[arg(long)]
+        terminal_id: String,
+        /// Keep this UUID and reuse it only to inspect the same operation's receipt.
+        #[arg(long)]
+        request_id: uuid::Uuid,
+        text: String,
+    },
+    /// Bind an existing authenticated room using unused dedicated transport state
+    /// and a fresh native session. Does not provision accounts/groups/sessions.
+    AttachRoom {
+        key: String,
+        #[arg(long)]
+        group: String,
+        #[arg(long)]
+        alias: String,
+    },
     /// Print the worker's version and update compatibility cohort without opening state.
     UpdateInfo {
         /// Include combined-runtime capabilities for 0.10 and newer helpers.
@@ -68,6 +88,33 @@ enum Action {
     ClearPrompt { key: String },
     /// Update mapped group names and workspace/agent descriptions.
     RenameGroups,
+    /// Attach an unbound existing chat to an unmapped native session. Stop the worker first.
+    AttachChat {
+        key: String,
+        #[arg(long)]
+        group: String,
+        /// Additional app identity authorised only in this chat (npub).
+        #[arg(long)]
+        profile: String,
+        /// Temporarily host this binary's MDK connector using the existing account
+        /// home. Requires the same stopped-service/backup gates as run.
+        #[arg(long)]
+        messaging_home: Option<PathBuf>,
+    },
+    /// Bind an existing group to dedicated native OpenCode sessions. Stop the worker first.
+    AttachSharedChat {
+        #[arg(long)]
+        group: String,
+        /// Explicit human npub; repeat for each authorised sender.
+        #[arg(long, required = true)]
+        human: Vec<String>,
+        /// Stable lowercase alias=authoritative-native-key; repeat per agent.
+        #[arg(long, required = true)]
+        agent: Vec<String>,
+        /// Temporarily host the existing connector; stopped-service/backup gates apply.
+        #[arg(long)]
+        messaging_home: Option<PathBuf>,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -99,6 +146,35 @@ async fn main() -> Result<()> {
         root.join("herdr-white-noise-bridge/config.toml")
     });
     let config = BridgeConfig::load(&config_path)?;
+    if let Some(Action::RoomSend {
+        key,
+        terminal_id,
+        request_id,
+        text,
+    }) = &args.command
+    {
+        let response = herdr_white_noise_bridge::wire::Socket {
+            path: herdr_white_noise_bridge::porter::socket_path(&config.state_path),
+        }
+        .exchange(
+            serde_json::json!({"version":1,"id":request_id.to_string(),
+            "request_id":request_id.to_string(),"method":"room.desktop_send",
+            "bridge_account":config.account_id_hex,"session_key":key,
+            "terminal_id":terminal_id,"text":text}),
+            false,
+        )
+        .await?;
+        println!("{response}");
+        anyhow::ensure!(
+            response["error"].is_null(),
+            "Desktop relay rejected or uncertain; inspect before sending again"
+        );
+        anyhow::ensure!(
+            response["result"]["native_admission"] == "accepted",
+            "Desktop instruction was published but native admission is uncertain; do not resend"
+        );
+        return Ok(());
+    }
     if let Some(Action::Porter { stream }) = &args.command {
         return if *stream {
             herdr_white_noise_bridge::porter::forward_stream(&config.state_path).await
@@ -144,7 +220,7 @@ async fn main() -> Result<()> {
         for (key, m) in s.mappings {
             println!(
                 "{}",
-                serde_json::json!({"session":key,"group":m.group_id_hex,"control":m.control,"creating_uncertain":m.creating,"active":m.active,"state":m.last_agent_status,"session_change_from":m.session_change_from,"pending_prompt":m.pending_prompt,"queued_prompts":m.prompt_queue.len(),"queue_submission_uncertain":m.queue_flight.as_ref().is_some_and(|flight| !flight.confirmed),"native_acceptance_pending":m.submissions.len(),"native_acceptance_overdue":m.submissions.iter().filter(|submission| submission.overdue(herdr_white_noise_bridge::bridge::now())).count(),"unresolved_progress":s.outbox.iter().filter(|item| Some(&item.group)==m.group_id_hex.as_ref() && item.response.as_ref().is_some_and(|delivery| delivery.finished && delivery.target.is_none() && delivery.initial_text.is_some() && !delivery.durable)).count(),"forwarding_enabled":forwarding_enabled,"forwarding_resume_pending":resume_pending})
+                serde_json::json!({"session":key,"group":m.group_id_hex,"shared_alias":m.shared_alias,"control":m.control,"creating_uncertain":m.creating,"active":m.active,"state":m.last_agent_status,"session_change_from":m.session_change_from,"pending_prompt":m.pending_prompt,"queued_prompts":m.prompt_queue.len(),"queue_submission_uncertain":m.queue_flight.as_ref().is_some_and(|flight| !flight.confirmed),"native_acceptance_pending":m.submissions.len(),"native_acceptance_overdue":m.submissions.iter().filter(|submission| submission.overdue(herdr_white_noise_bridge::bridge::now())).count(),"unresolved_progress":s.outbox.iter().filter(|item| Some(&item.group)==m.group_id_hex.as_ref() && item.response.as_ref().is_some_and(|delivery| delivery.finished && delivery.target.is_none() && delivery.initial_text.is_some() && !delivery.durable)).count(),"forwarding_enabled":forwarding_enabled,"forwarding_resume_pending":resume_pending})
             );
         }
         return Ok(());
@@ -201,13 +277,15 @@ async fn main() -> Result<()> {
             }
             result
         }
-        Action::Porter { .. } | Action::UpdateInfo { .. } => unreachable!(),
+        Action::Porter { .. } | Action::UpdateInfo { .. } | Action::RoomSend { .. } => {
+            unreachable!()
+        }
         Action::Notify { text, group } => {
             anyhow::ensure!(
                 bridge.state.forwarding_enabled,
                 "Forwarding is At desk; switch to Away before sending a notice"
             );
-            let groups: Vec<_> = bridge
+            let groups: std::collections::BTreeSet<_> = bridge
                 .state
                 .mappings
                 .values()
@@ -277,10 +355,113 @@ async fn main() -> Result<()> {
         }
         Action::ConfirmSessionChange { key } => bridge.confirm_session_change(&key).await,
         Action::RenameGroups => bridge.rename_groups().await,
+        Action::AttachRoom { key, group, alias } => bridge.attach_room(&key, &group, &alias).await,
+        Action::AttachSharedChat {
+            group,
+            human,
+            agent,
+            messaging_home,
+        } => {
+            let agents = agent
+                .iter()
+                .map(|entry| {
+                    entry
+                        .split_once('=')
+                        .map(|(alias, key)| (alias.to_owned(), key.to_owned()))
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("Use --agent alias=authoritative-native-key")
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let mut messaging = match messaging_home {
+                Some(home) => {
+                    anyhow::ensure!(home.is_absolute(), "Messaging home must be absolute");
+                    Some(
+                        herdr_white_noise_bridge::messaging::EmbeddedMessaging::start(
+                            &bridge.config,
+                            std::fs::canonicalize(home)?,
+                        )
+                        .await?,
+                    )
+                }
+                None => None,
+            };
+            let result = async {
+                if let Some(messaging) = messaging.as_mut() {
+                    tokio::select! {
+                        result = wait_messaging_socket(&bridge.config.wn_agent_socket) => result?,
+                        result = messaging.wait_for_exit() => result?,
+                    }
+                }
+                bridge.attach_shared_chat(&group, &human, &agents).await
+            }
+            .await;
+            if let Some(messaging) = messaging {
+                messaging.shutdown().await?;
+            }
+            result
+        }
+        Action::AttachChat {
+            key,
+            group,
+            profile,
+            messaging_home,
+        } => {
+            let mut messaging = match messaging_home {
+                Some(home) => {
+                    anyhow::ensure!(home.is_absolute(), "Messaging home must be absolute");
+                    Some(
+                        herdr_white_noise_bridge::messaging::EmbeddedMessaging::start(
+                            &bridge.config,
+                            std::fs::canonicalize(home)?,
+                        )
+                        .await?,
+                    )
+                }
+                None => None,
+            };
+            let result = async {
+                if let Some(messaging) = messaging.as_mut() {
+                    // Startup is asynchronous. Wait only for this connector's
+                    // local socket, never retry an attachment or open another reader.
+                    tokio::select! {
+                        result = wait_messaging_socket(&bridge.config.wn_agent_socket) => result?,
+                        result = messaging.wait_for_exit() => result?,
+                    }
+                }
+                bridge.attach_chat(&key, &group, &profile).await
+            }
+            .await;
+            if let Some(messaging) = messaging {
+                messaging.shutdown().await?;
+            }
+            result
+        }
         Action::Status => unreachable!(),
         Action::CheckReaders => unreachable!(),
         Action::Forwarding { .. } => unreachable!(),
     }
+}
+
+async fn wait_messaging_socket(path: &std::path::Path) -> Result<()> {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            match tokio::net::UnixStream::connect(path).await {
+                Ok(_) => return Ok(()),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                    ) =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("Messaging connector startup timed out"))?
 }
 
 async fn terminate_signal() -> Result<()> {
@@ -340,4 +521,59 @@ async fn check_readers(config: BridgeConfig) -> Result<usize> {
         return Err(error);
     }
     Ok(checked)
+}
+
+#[cfg(test)]
+mod attachment_cli_tests {
+    use super::*;
+
+    #[test]
+    fn desktop_room_send_requires_explicit_identity_and_durable_request_id() {
+        assert!(Args::try_parse_from(["worker", "room-send", "native-key", "hello"]).is_err());
+        let args = Args::try_parse_from([
+            "worker",
+            "room-send",
+            "native-key",
+            "--terminal-id",
+            "term1",
+            "--request-id",
+            "e27d199c-f268-4161-8cc1-dd5d5b4b1f04",
+            "hello",
+        ])
+        .unwrap();
+        assert!(args.command.is_some());
+    }
+
+    #[test]
+    fn attachment_accepts_explicit_existing_messaging_home() {
+        let args = Args::try_parse_from([
+            "worker",
+            "attach-chat",
+            "native-key",
+            "--group",
+            "bb",
+            "--profile",
+            "npub-placeholder",
+            "--messaging-home",
+            "/existing/home",
+        ])
+        .unwrap();
+        assert!(matches!(args.command,
+            Some(Action::AttachChat { messaging_home: Some(home), .. })
+                if home.as_path() == std::path::Path::new("/existing/home")));
+    }
+
+    #[tokio::test]
+    async fn connector_readiness_wait_uses_only_a_private_fixture_socket() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("connector.sock");
+        let ready = wait_messaging_socket(&path);
+        let bind = async {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            listener.accept().await.unwrap();
+        };
+        let (result, ()) = tokio::join!(ready, bind);
+        result.unwrap();
+    }
 }

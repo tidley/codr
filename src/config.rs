@@ -11,6 +11,11 @@ pub struct BridgeConfig {
     pub wn_agent_socket: PathBuf,
     pub account_id_hex: String,
     pub state_path: PathBuf,
+    /// Isolated in-process fixture storage, never accepted from a config file.
+    /// Production callers leave this unset to use the UID's fixed home directory.
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub native_claims_fixture_root: Option<PathBuf>,
     /// Owner-confirmed workspace launches are restricted to this directory.
     #[serde(default = "default_launch_root")]
     pub launch_root: PathBuf,

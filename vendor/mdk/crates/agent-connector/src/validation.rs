@@ -125,6 +125,10 @@ pub(crate) fn unsupported_request_message(request: &AgentControlRequest) -> &'st
 
 pub(crate) fn agent_control_request_type(request: &AgentControlRequest) -> &'static str {
     match request {
+        AgentControlRequest::RoomContext { .. } => "room_context",
+        AgentControlRequest::HumanAccountRegister { .. } => "human_account_register",
+        AgentControlRequest::HumanAccountLogin { .. } => "human_account_login",
+        AgentControlRequest::HumanAccountSend { .. } => "human_account_send",
         AgentControlRequest::SubscribeInbound { .. } => "subscribe_inbound",
         AgentControlRequest::TimelineMessageGet { .. } => "timeline_message_get",
         AgentControlRequest::TimelineList { .. } => "timeline_list",

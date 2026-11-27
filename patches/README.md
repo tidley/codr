@@ -7,6 +7,9 @@ The current pin is stable MDK 0.19.0 at `3fce95465cdea1edc8456dbd1c6691d1c8dc1f2
 Both full releases and Linux previews build the connector from this source.
 The patch is rebased on that exact release. Founding-admin controls are now
 upstream; Codr retains its opt-in media-reference and graceful-host-shutdown extensions.
+The patch also adds authenticated room account/message context and external-only
+human account login, signer registration and encrypted sends. These use the same
+MDK revision and storage cohort. See [shared-room boundaries](../docs/SHARED_CHATS.md).
 
 Before the first 0.19 start, stop every process using the account and keep a private, device-local
 copy of the connector home, including database sidecars, encrypted media, configuration,

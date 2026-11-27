@@ -1,7 +1,152 @@
+diff --git a/Cargo.lock b/Cargo.lock
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -76,6 +76,7 @@
+  "libc",
+  "marmot-account",
+  "marmot-app",
++ "nostr 0.45.5",
+  "nostr-relay-builder",
+  "rand 0.8.6",
+  "serde",
+@@ -86,7 +87,9 @@
+  "thiserror 2.0.18",
+  "tokio",
+  "tracing",
++ "transport-nostr-peeler",
+  "url",
++ "uuid",
+  "zeroize",
+ ]
+ 
+diff --git a/crates/agent-connector/Cargo.toml b/crates/agent-connector/Cargo.toml
+--- a/crates/agent-connector/Cargo.toml
++++ b/crates/agent-connector/Cargo.toml
+@@ -27,6 +27,9 @@
+ tracing.workspace = true
+ url.workspace = true
+ zeroize.workspace = true
++nostr.workspace = true
++transport-nostr-peeler.workspace = true
++uuid.workspace = true
+ 
+ [dev-dependencies]
+ storage-sqlite = { workspace = true, features = ["test-support"] }
+diff --git a/crates/agent-connector/src/bootstrap.rs b/crates/agent-connector/src/bootstrap.rs
+--- a/crates/agent-connector/src/bootstrap.rs
++++ b/crates/agent-connector/src/bootstrap.rs
+@@ -518,6 +518,7 @@
+         AgentControlResponse::GroupCreated { .. } => "group_created",
+         AgentControlResponse::GroupCreateCapabilities { .. } => "group_create_capabilities",
+         AgentControlResponse::GroupInfo { .. } => "group_info",
++        AgentControlResponse::RoomContext { .. } => "room_context",
+         AgentControlResponse::GroupAdminStatus { .. } => "group_admin_status",
+         AgentControlResponse::GroupProfileUpdated { .. } => "group_profile_updated",
+         AgentControlResponse::MaintenanceStatus { .. } => "maintenance_status",
 diff --git a/crates/agent-connector/src/connection.rs b/crates/agent-connector/src/connection.rs
 --- a/crates/agent-connector/src/connection.rs
 +++ b/crates/agent-connector/src/connection.rs
-@@ -251,7 +251,13 @@
+@@ -245,13 +245,113 @@
+         request_id: Option<&str>,
+         request: AgentControlRequest,
+     ) -> Result<AgentControlResponse, ConnectorError> {
++        if let AgentControlRequest::RoomContext {
++            account_id_hex,
++            group_id_hex,
++            message_id_hex,
++        } = &request
++        {
++            return self
++                .room_context_response(account_id_hex, group_id_hex, message_id_hex.as_deref())
++                .await;
++        }
++        if let AgentControlRequest::HumanAccountRegister {
++            account_id_hex,
++            signer_socket,
++        } = &request
++        {
++            let account = self.local_account_for_account_id(account_id_hex)?;
++            if account.local_signing || !account.external_signing {
++                return Err(ConnectorError::Unauthorized);
++            }
++            let key = nostr::prelude::PublicKey::from_hex(&account.account_id_hex)
++                .map_err(|_| ConnectorError::Unauthorized)?;
++            // MDK verifies both external-account lifecycle and pinned identity;
++            // registering a transport signer cannot import or expose a human key.
++            self.runtime
++                .register_external_signer(
++                    &account.label,
++                    crate::external_signer::ExternalSigner::new(signer_socket.into(), key),
++                )
++                .await?;
++            return Ok(AgentControlResponse::Ack);
++        }
++        if let AgentControlRequest::HumanAccountLogin {
++            account_id_hex,
++            signer_socket,
++        } = &request
++        {
++            let id = crate::validation::normalize_hex(account_id_hex)?;
++            let key = nostr::prelude::PublicKey::from_hex(&id)
++                .map_err(|_| ConnectorError::Unauthorized)?;
++            // Explicit owner action only. MDK owns external-account setup,
++            // identity proof and rollback; default options publish no metadata
++            // or initial KeyPackage and never import local human key material.
++            self.runtime
++                .login_external_signer(
++                    id,
++                    crate::external_signer::ExternalSigner::new(signer_socket.into(), key),
++                    marmot_app::AccountSetupRequest::default(),
++                )
++                .await?;
++            return Ok(AgentControlResponse::Ack);
++        }
++        if let AgentControlRequest::HumanAccountSend {
++            account_id_hex,
++            group_id_hex,
++            text,
++            addressed_accounts,
++        } = &request
++        {
++            let account = self.local_account_for_account_id(account_id_hex)?;
++            if account.local_signing
++                || !account.external_signing
++                || text.is_empty()
++                || text.len() > 30000
++            {
++                return Err(ConnectorError::Unauthorized);
++            }
++            let group = crate::validation::normalize_hex(group_id_hex)?;
++            let group_id = cgka_traits::GroupId::new(hex::decode(&group)?);
++            let members = self
++                .runtime
++                .group_member_ids_page(&account.label, std::slice::from_ref(&group_id))
++                .await?;
++            if !addressed_accounts.iter().all(|id| {
++                id.len() == 64 && members.iter().any(|row| row.member_ids_hex.contains(id))
++            }) {
++                return Err(ConnectorError::Unauthorized);
++            }
++            let tags = addressed_accounts
++                .iter()
++                .map(|id| vec!["p".into(), id.clone()])
++                .collect();
++            // This is an encrypted MDK send under the external HUMAN account.
++            // It never delegates to send_final under the configured bridge key.
++            let sent = self
++                .runtime
++                .send_tagged_text(&account.label, &group_id, text.clone(), tags)
++                .await?;
++            return Ok(AgentControlResponse::FinalSent {
++                message_ids_hex: sent.message_ids,
++                maintenance_disposition: crate::maintenance::agent_maintenance_disposition(
++                    sent.maintenance_disposition,
++                ),
++            });
++        }
+         match request {
+             AgentControlRequest::AccountList => self.account_list_response(),
+             AgentControlRequest::TimelineMessageGet {
                  account_id_hex,
                  group_id_hex,
                  message_id_hex,
@@ -16,10 +161,211 @@ diff --git a/crates/agent-connector/src/connection.rs b/crates/agent-connector/s
              AgentControlRequest::TimelineList {
                  account_id_hex,
                  group_id_hex,
+diff --git a/crates/agent-connector/src/external_signer.rs b/crates/agent-connector/src/external_signer.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/agent-connector/src/external_signer.rs
+@@ -0,0 +1,182 @@
++//! Pinned external human identity. No secret import/export or local-key fallback.
++use marmot_app::{AccountIdentityProofRequest, AccountIdentityProofSigner};
++use nostr::prelude::{Event, PublicKey, UnsignedEvent};
++use serde_json::{Value, json};
++use std::{
++    os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
++    path::PathBuf,
++    time::Duration,
++};
++use tokio::{
++    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
++    net::UnixStream,
++};
++use transport_nostr_peeler::{MarmotNostrSigner, MarmotSignerError, SignerFuture};
++
++#[derive(Clone)]
++pub struct ExternalSigner {
++    socket: PathBuf,
++    public_key: PublicKey,
++}
++impl std::fmt::Debug for ExternalSigner {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.write_str("ExternalSigner(..)")
++    }
++}
++impl ExternalSigner {
++    pub fn new(socket: PathBuf, public_key: PublicKey) -> Self {
++        Self { socket, public_key }
++    }
++    async fn request(&self, method: &str, params: Value) -> Result<Value, MarmotSignerError> {
++        // Do not return signer payloads, paths, plaintext or pairing credentials
++        // in errors. Cancellation/refusal never retries a signing request.
++        tokio::time::timeout(Duration::from_secs(120), async {
++            if !self.socket.is_absolute() {
++                return Err(());
++            }
++            let parent =
++                std::fs::symlink_metadata(self.socket.parent().ok_or(())?).map_err(|_| ())?;
++            let node = std::fs::symlink_metadata(&self.socket).map_err(|_| ())?;
++            // The same-user host is the local approval boundary, not room membership.
++            let uid = unsafe { libc::geteuid() };
++            if !parent.is_dir()
++                || parent.file_type().is_symlink()
++                || parent.uid() != uid
++                || parent.permissions().mode() & 0o077 != 0
++                || !node.file_type().is_socket()
++                || node.uid() != uid
++                || node.permissions().mode() & 0o077 != 0
++            {
++                return Err(());
++            }
++            let mut stream = UnixStream::connect(&self.socket).await.map_err(|_| ())?;
++            if stream.peer_cred().map_err(|_| ())?.uid() != uid {
++                return Err(());
++            }
++            let id = uuid::Uuid::new_v4().to_string();
++            let bytes =
++                serde_json::to_vec(&json!({"version":1,"id":id,"method":method,"params":params}))
++                    .map_err(|_| ())?;
++            if bytes.len() >= agent_control::MAX_AGENT_CONTROL_FRAME_BYTES {
++                return Err(());
++            }
++            stream.write_all(&bytes).await.map_err(|_| ())?;
++            stream.write_all(b"\n").await.map_err(|_| ())?;
++            let mut response = Vec::new();
++            BufReader::new(stream)
++                .take(agent_control::MAX_AGENT_CONTROL_FRAME_BYTES as u64 + 1)
++                .read_until(b'\n', &mut response)
++                .await
++                .map_err(|_| ())?;
++            if response.len() > agent_control::MAX_AGENT_CONTROL_FRAME_BYTES
++                || !response.ends_with(b"\n")
++            {
++                return Err(());
++            }
++            let value: Value = serde_json::from_slice(&response).map_err(|_| ())?;
++            if value["version"] != 1 || value["id"] != id || value.get("error").is_some() {
++                return Err(());
++            }
++            value.get("result").cloned().ok_or(())
++        })
++        .await
++        .map_err(|_| MarmotSignerError::from("External signer timed out"))?
++        .map_err(|_| MarmotSignerError::from("External signer unavailable, refused or invalid"))
++    }
++    async fn text(
++        &self,
++        method: &str,
++        key: &PublicKey,
++        content: &str,
++    ) -> Result<String, MarmotSignerError> {
++        self.request(method, json!([key.to_hex(), content]))
++            .await?
++            .as_str()
++            .map(str::to_owned)
++            .ok_or_else(|| MarmotSignerError::from("Invalid external signer response"))
++    }
++}
++impl MarmotNostrSigner for ExternalSigner {
++    fn get_public_key(&self) -> SignerFuture<'_, Result<PublicKey, MarmotSignerError>> {
++        Box::pin(async move {
++            if self.request("get_public_key", json!([])).await?.as_str()
++                != Some(self.public_key.to_hex().as_str())
++            {
++                return Err(MarmotSignerError::from("External signer identity changed"));
++            }
++            Ok(self.public_key)
++        })
++    }
++    fn sign_event(
++        &self,
++        unsigned: UnsignedEvent,
++    ) -> SignerFuture<'_, Result<Event, MarmotSignerError>> {
++        Box::pin(async move {
++            if unsigned.pubkey != self.public_key || unsigned.verify_id().is_err() {
++                return Err(MarmotSignerError::from("Invalid external signing request"));
++            }
++            let expected = unsigned.compute_id();
++            let event: Event =
++                serde_json::from_value(self.request("sign_event", json!([unsigned])).await?)
++                    .map_err(|_| MarmotSignerError::from("Invalid external signed event"))?;
++            if event.pubkey != self.public_key || event.id != expected || event.verify().is_err() {
++                return Err(MarmotSignerError::from(
++                    "External signer returned a different or invalid event",
++                ));
++            }
++            Ok(event)
++        })
++    }
++    fn nip04_encrypt<'a>(
++        &'a self,
++        key: &'a PublicKey,
++        content: &'a str,
++    ) -> SignerFuture<'a, Result<String, MarmotSignerError>> {
++        Box::pin(self.text("nip04_encrypt", key, content))
++    }
++    fn nip04_decrypt<'a>(
++        &'a self,
++        key: &'a PublicKey,
++        content: &'a str,
++    ) -> SignerFuture<'a, Result<String, MarmotSignerError>> {
++        Box::pin(self.text("nip04_decrypt", key, content))
++    }
++    fn nip44_encrypt<'a>(
++        &'a self,
++        key: &'a PublicKey,
++        content: &'a str,
++    ) -> SignerFuture<'a, Result<String, MarmotSignerError>> {
++        Box::pin(self.text("nip44_encrypt", key, content))
++    }
++    fn nip44_decrypt<'a>(
++        &'a self,
++        key: &'a PublicKey,
++        content: &'a str,
++    ) -> SignerFuture<'a, Result<String, MarmotSignerError>> {
++        Box::pin(self.text("nip44_decrypt", key, content))
++    }
++}
++impl AccountIdentityProofSigner for ExternalSigner {
++    fn sign_account_identity_proof(
++        &self,
++        request: &AccountIdentityProofRequest,
++    ) -> Result<[u8; 64], String> {
++        if request.account_identity.as_slice() != self.public_key.to_bytes() {
++            return Err("External signer proof identity mismatch".into());
++        }
++        let unsigned = request.proof_event()?;
++        let signer = self.clone();
++        let event = std::thread::spawn(move || {
++            let runtime = tokio::runtime::Builder::new_current_thread()
++                .enable_all()
++                .build()
++                .map_err(|_| "Signer runtime unavailable".to_owned())?;
++            runtime
++                .block_on(signer.sign_event(unsigned))
++                .map_err(|_| "External signer proof not confirmed".to_owned())
++        })
++        .join()
++        .map_err(|_| "Signer worker unavailable".to_owned())??;
++        request.signature_from_signed_event(event)
++    }
++}
 diff --git a/crates/agent-connector/src/lib.rs b/crates/agent-connector/src/lib.rs
 --- a/crates/agent-connector/src/lib.rs
 +++ b/crates/agent-connector/src/lib.rs
-@@ -405,6 +405,14 @@
+@@ -12,9 +12,13 @@
+ mod doctor;
+ mod error;
+ mod event_projection;
++pub mod external_signer;
+ mod group_profile_tool;
+ mod identity;
+ mod inbound;
++mod room_context;
++pub use nostr;
++pub use transport_nostr_peeler::MarmotNostrSigner;
+ mod invite_policy;
+ mod maintenance;
+ mod media_roots;
+@@ -405,6 +409,14 @@
  }
  
  pub async fn serve_socket(config: AgentConnectorConfig) -> Result<(), ConnectorError> {
@@ -34,7 +380,7 @@ diff --git a/crates/agent-connector/src/lib.rs b/crates/agent-connector/src/lib.
      validate_control_plane_config(&config)?;
      // A relay the relay plane would refuse fails startup here, with a reason,
      // rather than failing every route that names it later.
-@@ -428,101 +436,117 @@
+@@ -428,101 +440,117 @@
      let max_connections = config.max_connections;
      let management_home = config.home.clone();
      let connector = AgentConnector::open(config)?;
@@ -243,6 +589,101 @@ diff --git a/crates/agent-connector/src/lib.rs b/crates/agent-connector/src/lib.
  }
  
  async fn wait_control_socket_link_loss(
+diff --git a/crates/agent-connector/src/room_context.rs b/crates/agent-connector/src/room_context.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/agent-connector/src/room_context.rs
+@@ -0,0 +1,90 @@
++//! Read authenticated account identities and addressing without parsing text.
++use crate::{AgentConnector, error::ConnectorError, validation::normalize_hex};
++use agent_control::{AgentControlResponse, AgentControlRoomMessage};
++
++fn addressed_accounts(tags: &[Vec<String>]) -> Vec<String> {
++    tags.iter()
++        .filter(|tag| tag.first().is_some_and(|name| name == "p"))
++        .filter_map(|tag| tag.get(1))
++        .filter_map(|id| normalize_hex(id).ok())
++        .filter(|id| id.len() == 64)
++        .collect::<std::collections::BTreeSet<_>>()
++        .into_iter()
++        .collect()
++}
++
++impl AgentConnector {
++    pub(crate) async fn room_context_response(
++        &self,
++        account: &str,
++        group: &str,
++        message: Option<&str>,
++    ) -> Result<AgentControlResponse, ConnectorError> {
++        let account = self.local_account_for_account_id(account)?;
++        let group = normalize_hex(group)?;
++        let group_id = cgka_traits::GroupId::new(hex::decode(&group)?);
++        // Runtime account projections group authenticated MLS leaves by account.
++        // A total member/leaf count or a display profile cannot substitute here.
++        let rosters = self
++            .runtime
++            .group_member_ids_page(&account.label, std::slice::from_ref(&group_id))
++            .await?;
++        let members = rosters
++            .into_iter()
++            .find(|row| row.group_id_hex == group)
++            .ok_or(ConnectorError::MemberResolutionFailed)?
++            .member_ids_hex;
++        let message = match message {
++            None => None,
++            Some(id) => self
++                .runtime
++                .timeline_message(&account.label, &group, &normalize_hex(id)?)?
++                .filter(|row| {
++                    !row.deleted
++                        && row.invalidation_status.is_none()
++                        && cgka_traits::is_chat_message(row.kind, &row.tags)
++                })
++                .map(|row| AgentControlRoomMessage {
++                    message_id_hex: row.message_id_hex,
++                    sender_account_id_hex: row.sender,
++                    addressed_accounts: addressed_accounts(&row.tags),
++                    unsupported_media: row.plaintext.len() > 30000
++                        || row
++                            .tags
++                            .iter()
++                            .any(|tag| tag.first().is_some_and(|name| name == "imeta")),
++                    text: if row.plaintext.len() <= 30000 {
++                        row.plaintext
++                    } else {
++                        String::new()
++                    },
++                    recorded_at: row.timeline_at,
++                }),
++        };
++        Ok(AgentControlResponse::RoomContext {
++            account_id_hex: account.account_id_hex,
++            group_id_hex: group,
++            members,
++            message,
++        })
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn authenticated_addresses_are_only_canonical_inner_p_tags() {
++        assert!(addressed_accounts(&[]).is_empty());
++        assert!(
++            addressed_accounts(&[vec!["text".into(), format!("@{}", "aa".repeat(32))]]).is_empty()
++        );
++        assert_eq!(
++            addressed_accounts(&[
++                vec!["p".into(), "AA".repeat(32)],
++                vec!["p".into(), "aa".repeat(32)]
++            ]),
++            vec!["aa".repeat(32)]
++        );
++    }
++}
 diff --git a/crates/agent-connector/src/tests.rs b/crates/agent-connector/src/tests.rs
 --- a/crates/agent-connector/src/tests.rs
 +++ b/crates/agent-connector/src/tests.rs
@@ -370,6 +811,20 @@ diff --git a/crates/agent-connector/src/timeline.rs b/crates/agent-connector/src
      fn deleted_and_invalidated_timeline_messages_never_expose_content() {
          let mut deleted = record();
          deleted.deleted = true;
+diff --git a/crates/agent-connector/src/validation.rs b/crates/agent-connector/src/validation.rs
+--- a/crates/agent-connector/src/validation.rs
++++ b/crates/agent-connector/src/validation.rs
+@@ -125,6 +125,10 @@
+ 
+ pub(crate) fn agent_control_request_type(request: &AgentControlRequest) -> &'static str {
+     match request {
++        AgentControlRequest::RoomContext { .. } => "room_context",
++        AgentControlRequest::HumanAccountRegister { .. } => "human_account_register",
++        AgentControlRequest::HumanAccountLogin { .. } => "human_account_login",
++        AgentControlRequest::HumanAccountSend { .. } => "human_account_send",
+         AgentControlRequest::SubscribeInbound { .. } => "subscribe_inbound",
+         AgentControlRequest::TimelineMessageGet { .. } => "timeline_message_get",
+         AgentControlRequest::TimelineList { .. } => "timeline_list",
 diff --git a/crates/agent-control/README.md b/crates/agent-control/README.md
 --- a/crates/agent-control/README.md
 +++ b/crates/agent-control/README.md
@@ -395,7 +850,35 @@ diff --git a/crates/agent-control/README.md b/crates/agent-control/README.md
 diff --git a/crates/agent-control/src/lib.rs b/crates/agent-control/src/lib.rs
 --- a/crates/agent-control/src/lib.rs
 +++ b/crates/agent-control/src/lib.rs
-@@ -234,6 +234,10 @@
+@@ -225,6 +225,27 @@
+ #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+ #[serde(tag = "type", rename_all = "snake_case")]
+ pub enum AgentControlRequest {
++    /// Authenticated account roster and optional immutable inner-event context.
++    /// This is distinct from legacy display/leaf-count and plaintext mention hints.
++    RoomContext {
++        account_id_hex: String,
++        group_id_hex: String,
++        message_id_hex: Option<String>,
++    },
++    HumanAccountRegister {
++        account_id_hex: String,
++        signer_socket: String,
++    },
++    HumanAccountLogin {
++        account_id_hex: String,
++        signer_socket: String,
++    },
++    HumanAccountSend {
++        account_id_hex: String,
++        group_id_hex: String,
++        text: String,
++        addressed_accounts: Vec<String>,
++    },
+     SubscribeInbound {
+         account_id_hex: Option<String>,
+         group_id_hex: Option<String>,
+@@ -234,6 +255,10 @@
          account_id_hex: String,
          group_id_hex: String,
          message_id_hex: String,
@@ -406,7 +889,20 @@ diff --git a/crates/agent-control/src/lib.rs b/crates/agent-control/src/lib.rs
      },
      /// Page through the materialized, user-visible timeline in stable
      /// `(recorded_at, message_id_hex)` order. `before` and `after` are mutually
-@@ -626,6 +630,9 @@
+@@ -608,6 +633,12 @@
+ #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+ #[serde(tag = "type", rename_all = "snake_case")]
+ pub enum AgentControlResponse {
++    RoomContext {
++        account_id_hex: String,
++        group_id_hex: String,
++        members: Vec<String>,
++        message: Option<AgentControlRoomMessage>,
++    },
+     Ack,
+     Error {
+         code: String,
+@@ -626,6 +657,9 @@
          message_id_hex: String,
          #[serde(default, skip_serializing_if = "Option::is_none")]
          message: Option<AgentControlTimelineMessage>,
@@ -416,7 +912,25 @@ diff --git a/crates/agent-control/src/lib.rs b/crates/agent-control/src/lib.rs
      },
      TimelinePage {
          account_id_hex: String,
-@@ -1394,6 +1401,29 @@
+@@ -857,6 +891,17 @@
+     pub display_name: Option<String>,
+     #[serde(default)]
+     pub is_self: bool,
++}
++
++#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
++pub struct AgentControlRoomMessage {
++    pub message_id_hex: String,
++    pub sender_account_id_hex: String,
++    pub text: String,
++    pub recorded_at: u64,
++    /// Only signed inner-event p-tags. Never the legacy plaintext mention scan.
++    pub addressed_accounts: Vec<String>,
++    pub unsupported_media: bool,
+ }
+ 
+ #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+@@ -1394,6 +1439,29 @@
      }
  
      #[test]
@@ -446,7 +960,7 @@ diff --git a/crates/agent-control/src/lib.rs b/crates/agent-control/src/lib.rs
      fn group_create_frames_round_trip_with_optional_fields() {
          for optional in [false, true] {
              let request = AgentControlEnvelope::request(
-@@ -1914,6 +1944,7 @@
+@@ -1914,6 +1982,7 @@
                      account_id_hex: account(),
                      group_id_hex: group(),
                      message_id_hex: message(),
@@ -454,7 +968,7 @@ diff --git a/crates/agent-control/src/lib.rs b/crates/agent-control/src/lib.rs
                  },
                  "timeline_message_get",
              ),
-@@ -2225,6 +2256,26 @@
+@@ -2225,6 +2294,26 @@
              let value = serde_json::to_value(request).unwrap();
              assert_eq!(value["type"], expected_type);
          }

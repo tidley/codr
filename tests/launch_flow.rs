@@ -13,7 +13,9 @@ use tokio::{io::AsyncWriteExt, net::UnixListener};
 fn config(root: &Path) -> BridgeConfig {
     // tempfile's macOS root sits behind the /var symlink; launch roots must be real paths.
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    serde_json::from_value(json!({"phone_npub":bech32::encode("npub",[0x11u8;32].to_base32(),bech32::Variant::Bech32).unwrap(),"account_id_hex":"aa".repeat(32),"herdr_socket":root.join("h.sock"),"wn_agent_socket":root.join("w.sock"),"state_path":root.join("state.json"),"launch_root":root.join("projects"),"opencode_bin":root.join("opencode"),"codex_home":root.join("codex"),"auto_forwarding":false})).unwrap()
+    let mut config: BridgeConfig = serde_json::from_value(json!({"phone_npub":bech32::encode("npub",[0x11u8;32].to_base32(),bech32::Variant::Bech32).unwrap(),"account_id_hex":"aa".repeat(32),"herdr_socket":root.join("h.sock"),"wn_agent_socket":root.join("w.sock"),"state_path":root.join("state.json"),"launch_root":root.join("projects"),"opencode_bin":root.join("opencode"),"codex_home":root.join("codex"),"auto_forwarding":false})).unwrap();
+    config.native_claims_fixture_root = Some(root.join("native-claims"));
+    config
 }
 fn event(id: &str, text: &str) -> Value {
     json!({"marmot_agent_control":"marmot.agent-control.v2","type":"inbound_message","account_id_hex":"aa".repeat(32),"group_id_hex":"bb".repeat(16),"message":{"message_id_hex":id,"sender":{"account_id_hex":"11".repeat(32)},"text":text}})

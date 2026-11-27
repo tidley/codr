@@ -3,7 +3,7 @@ use crate::{
     BridgeConfig,
     bridge::Bridge,
     herdr, output,
-    state::QueuedPrompt,
+    state::{Mapping, QueuedPrompt},
     wire::{MAX_FRAME, Socket, read_line},
 };
 use anyhow::{Result, ensure};
@@ -220,13 +220,14 @@ pub async fn serve(bridge: &mut Bridge, stream: UnixStream) -> Result<()> {
         return Ok(());
     }
     if request["method"] == "history" {
+        let binding = capture_history_binding(bridge, &request)?;
         let permit = READ_SLOTS.clone().try_acquire_owned()?;
         let config = bridge.config.clone();
         let reader = bridge.native_reader();
         // Slow native transcript I/O must not hold the phone/queue event loop.
         tokio::spawn(async move {
             let _permit = permit;
-            let result = history(&config, &request, reader).await;
+            let result = history(&config, &request, reader, binding).await;
             let _ = reply(&mut stream, &request, result).await;
         });
         return Ok(());
@@ -263,6 +264,22 @@ async fn reply(
 pub async fn handle(bridge: &mut Bridge, request: Value) -> Result<Value> {
     ensure!(request["version"] == 1, "Unsupported Porter version");
     let method = request["method"].as_str().unwrap_or("");
+    if method.starts_with("room.") {
+        return bridge.room_control(&request).await;
+    }
+    if method.starts_with("human.") {
+        return bridge.human_control(&request).await;
+    }
+    if let Some(key) = request["session_key"].as_str() {
+        ensure!(
+            bridge
+                .state
+                .mappings
+                .get(key)
+                .is_none_or(|m| m.room.is_none()),
+            "Room sessions cannot use private desktop commands or history"
+        );
+    }
     ensure!(
         matches!(method, "snapshot" | "history" | "enqueue" | "receipt"),
         "Unsupported Porter method"
@@ -274,7 +291,8 @@ pub async fn handle(bridge: &mut Bridge, request: Value) -> Result<Value> {
         );
     }
     if method == "history" {
-        return history(&bridge.config, &request, bridge.native_reader()).await;
+        let binding = capture_history_binding(bridge, &request)?;
+        return history(&bridge.config, &request, bridge.native_reader(), binding).await;
     }
     if method == "snapshot" {
         let (metadata, forwarding) = snapshot_metadata(bridge);
@@ -409,10 +427,83 @@ async fn snapshot(
         "forwarding_enabled":control.enabled && forwarding, "sessions":sessions}))
 }
 
+fn capture_history_binding(bridge: &Bridge, request: &Value) -> Result<Option<Mapping>> {
+    let binding = request["session_key"]
+        .as_str()
+        .and_then(|key| bridge.state.mappings.get(key));
+    // Capture an already-known hold before spawning: an older on-disk snapshot
+    // must not loosen an in-memory quarantine whose save has not completed.
+    ensure!(
+        binding.is_none_or(|m| m.room.is_none() && m.room_quarantined.is_none()),
+        "Room or quarantined history cannot use the private endpoint"
+    );
+    Ok(binding.cloned())
+}
+
+async fn validate_history_binding(
+    config: &BridgeConfig,
+    key: &str,
+    agent: &herdr::Agent,
+    captured: Option<&Mapping>,
+) -> Result<()> {
+    let check = |binding: Option<&Mapping>| -> Result<()> {
+        if let Some(binding) = binding {
+            ensure!(
+                binding.room.is_none() && binding.room_quarantined.is_none(),
+                "Private history binding is held"
+            );
+            if let Some(retained) = &binding.agent_record {
+                ensure!(
+                    retained.key() == agent.key()
+                        && retained.terminal_id == agent.terminal_id
+                        && retained.pane_id == agent.pane_id,
+                    "Private history native identity changed"
+                );
+            }
+        }
+        Ok(())
+    };
+    check(captured)?;
+    // The history task runs outside &mut Bridge. Read its atomically saved state
+    // before AND after slow transcript I/O to observe concurrent quarantine or
+    // rebinding; missing/corrupt state is not an empty, permissive mapping.
+    let state: crate::BridgeState =
+        serde_json::from_slice(&tokio::fs::read(&config.state_path).await?)?;
+    ensure!(
+        state.version == 1
+            && state.account.as_deref() == Some(config.account_id_hex.as_str())
+            && state.phone.as_deref()
+                == Some(crate::config::phone_hex(&config.phone_npub)?.as_str()),
+        "Private history state identity changed"
+    );
+    let current = state.mappings.get(key);
+    if let Some(before) = captured {
+        ensure!(
+            current.is_some_and(|now| now.group_id_hex == before.group_id_hex),
+            "Private history binding changed"
+        );
+    }
+    check(current)?;
+    // A live native transcript is not permission to expose a room through an
+    // old private desktop. Claims are authoritative even before reconciliation
+    // notices the other transport, and all lookup errors fail closed.
+    ensure!(
+        !crate::native_rooms::binding_conflict(
+            config,
+            agent,
+            current.and_then(|m| m.group_id_hex.as_deref()),
+            false
+        )?,
+        "Native history belongs to another binding"
+    );
+    Ok(())
+}
+
 async fn history(
     config: &crate::BridgeConfig,
     request: &Value,
     reader: crate::reads::Reader,
+    binding: Option<Mapping>,
 ) -> Result<Value> {
     ensure!(request["version"] == 1, "Unsupported Porter version");
     ensure!(
@@ -435,9 +526,15 @@ async fn history(
         .as_ref()
         .filter(|session| output::supported(&session.agent))
         .ok_or_else(|| anyhow::anyhow!("Unsupported session reader"))?;
+    validate_history_binding(config, key, agent, binding.as_ref()).await?;
     let history = reader.read(config, session).await?.history;
     // Recheck after slow transcript I/O; never attribute history to a replaced terminal.
-    herdr::get(&socket, agent).await?;
+    let current = herdr::get(&socket, agent).await?;
+    ensure!(
+        current.pane_id == agent.pane_id,
+        "Native history pane changed"
+    );
+    validate_history_binding(config, key, agent, binding.as_ref()).await?;
     let messages: Vec<_> = history.recent_messages.iter().map(|message| {
         let mut end = message.text.len().min(64000);
         while !message.text.is_char_boundary(end) { end -= 1; }

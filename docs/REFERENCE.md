@@ -485,7 +485,19 @@ With editable progress enabled, the status says `Waiting for your permission...`
 
 ## Shared chats and owner-only control
 
-Group members can discuss a project and read the agent's replies. Only messages from the phone public key in **codr**'s configuration become agent prompts. Other participants' messages are not added to the agent's context. The owner can relay a suggestion in a new prompt.
+For the local #34 multi-human/multi-agent MVP, use
+[shared groups with named agents](SHARED_CHATS.md). It supersedes the #33 design
+direction without removing the single-session attachment compatibility below.
+Strict room mode uses authenticated account addressing, independent default-empty
+human/agent grants and finite agent budgets. Raw `@alias` text is not authority.
+Tool permissions remain native-human-only. Legacy alias bindings are quarantined;
+the defaults below still apply to normal private mappings.
+
+Group members can discuss a project and read the agent's replies. By default, only messages from the phone public key in **codr**'s configuration become agent prompts. Other participants' messages are not added to the agent's context. The owner can relay a suggestion in a new prompt.
+
+Local source builds also support an explicitly authorised additional app key in
+one attached existing chat. This does not grant other members control or replace
+the phone owner; see [multi-profile attachment and fixture setup](MULTI-PROFILE.md).
 
 New groups make both the configured phone owner and the bridge identity admins in the founding group state. The owner can invite participants and edit the group profile as soon as the invitation is accepted. Admin rights do not grant other participants permission to prompt the agent.
 

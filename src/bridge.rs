@@ -16,6 +16,11 @@ use std::{
 
 const CONTROL_KEY: &str = "control";
 
+mod room_access;
+mod room_controls;
+mod room_desktop;
+mod shared;
+
 pub struct Bridge {
     pub config: BridgeConfig,
     pub state: BridgeState,
@@ -428,6 +433,23 @@ impl Bridge {
         // Durable replies and their continuations precede best-effort progress.
         outbox.sort_by_key(|item| (item.working_notice, !item.manual, item.response.is_some()));
         for item in outbox {
+            let keys: Vec<_> = self
+                .state
+                .mappings
+                .iter()
+                .filter(|(_, m)| m.group_id_hex.as_deref() == Some(&item.group))
+                .map(|(key, _)| key.clone())
+                .collect();
+            for key in keys {
+                if self.native_room_conflict(&key).unwrap_or(true) {
+                    self.quarantine_room(&key, "native_room_owned_elsewhere")?;
+                }
+            }
+            if self.state.mappings.values().any(|m| {
+                m.room_quarantined.is_some() && m.group_id_hex.as_deref() == Some(&item.group)
+            }) {
+                continue;
+            }
             self.refresh_forwarding()?;
             if item.recent
                 && (chrono::Utc::now().timestamp_millis() < self.state.recent_after
@@ -776,13 +798,70 @@ impl Bridge {
 
     pub async fn reconcile(&mut self, agents: Vec<Agent>) -> Result<()> {
         let mut identities = HashSet::new();
+        let mut shared_native_ids = HashSet::new();
+        let mut uncertain_shared_ids = HashSet::new();
         for agent in &agents {
+            if let Ok(native) = crate::native_rooms::identity(agent)
+                && {
+                    let mapping = self.state.mappings.get(&agent.key());
+                    crate::native_rooms::binding_conflict(
+                        &self.config,
+                        agent,
+                        mapping.and_then(|m| m.group_id_hex.as_deref()),
+                        mapping.is_some_and(|m| m.room.is_some()),
+                    )
+                    .unwrap_or(true)
+                }
+            {
+                let identity = (native[0].clone(), native[1].clone(), native[2].clone());
+                let keys: Vec<_> = self
+                    .state
+                    .mappings
+                    .iter()
+                    .filter(|(key, mapping)| shared::owns_native_identity(key, mapping, &identity))
+                    .map(|(key, _)| key.clone())
+                    .collect();
+                for key in keys {
+                    self.quarantine_room(&key, "native_room_owned_elsewhere")?;
+                }
+                uncertain_shared_ids.insert(identity);
+            }
             if agent.agent_session.is_some() {
                 ensure!(
                     identities.insert(agent.key()),
                     "Two live agents report the same session identity"
                 );
             }
+            if let Some(session) = shared::native_identity(agent)
+                && let Some((key, _)) = self.state.mappings.iter().find(|(key, mapping)| {
+                    mapping.shared_alias.is_some()
+                        && shared::owns_native_identity(key, mapping, &session)
+                })
+            {
+                // Check authoritative agent/kind/value before outer-label
+                // normalisation and regardless of V2 delivery eligibility.
+                // Preserve the binding on source drift or duplicate ownership;
+                // neither a config change nor missing display metadata may
+                // expose this conversation through ordinary private discovery.
+                if agent.key() != *key || !shared_native_ids.insert(session.clone()) {
+                    uncertain_shared_ids.insert(session);
+                }
+            }
+        }
+        let quarantines: Vec<_> = self
+            .state
+            .mappings
+            .iter()
+            .filter(|(key, mapping)| {
+                mapping.room.is_some()
+                    && uncertain_shared_ids
+                        .iter()
+                        .any(|identity| shared::owns_native_identity(key, mapping, identity))
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in quarantines {
+            self.quarantine_room(&key, "native_identity_changed")?;
         }
         self.refresh_forwarding()?;
         self.ensure_control_group().await;
@@ -790,6 +869,19 @@ impl Bridge {
         let mut current = BTreeMap::new();
         let mut uncertain_terminals = HashSet::new();
         for mut agent in agents {
+            if self.state.mappings.values().any(|m| m.room.is_some())
+                && !self.state.mappings.contains_key(&agent.key())
+            {
+                // A dedicated room transport must not auto-invite unrelated
+                // native sessions into newly discovered private conversations.
+                continue;
+            }
+            if shared::native_identity(&agent)
+                .is_some_and(|session| uncertain_shared_ids.contains(&session))
+            {
+                uncertain_terminals.insert(agent.terminal_id.clone());
+                continue;
+            }
             // Never attach a group to a location that a replacement session can reuse.
             let Some(session) = agent.agent_session.as_ref() else {
                 uncertain_terminals.insert(agent.terminal_id.clone());
@@ -917,7 +1009,7 @@ impl Bridge {
                     );
                 }
                 if !baselining {
-                    self.state.enqueue(&group, "> Ended. This group retains its history. A restored native session will reconnect here.");
+                    self.state.enqueue_agent(&key, &group, "> Ended. This group retains its history. A restored native session will reconnect here.");
                 }
             }
             if self.config.auto_forwarding && self.state.mappings[&key].activity.unresolved() {
@@ -988,6 +1080,13 @@ impl Bridge {
     }
 
     async fn collect_finals(&mut self, key: &str, agent: &Agent, group: &str) -> Result<()> {
+        if self.native_room_conflict(key).unwrap_or(true) {
+            self.quarantine_room(key, "native_room_owned_elsewhere")?;
+        }
+        ensure!(
+            self.state.mappings[key].room_quarantined.is_none(),
+            "Quarantined room output is disabled"
+        );
         if self.baseline_forwarding(key, agent).await? {
             return Ok(());
         }
@@ -1017,6 +1116,22 @@ impl Bridge {
             let known: HashSet<_> = self.state.mappings[key].final_ids.iter().cloned().collect();
             for reply in &history.finals {
                 if !known.contains(&reply.id) {
+                    if let Some(turn) = reply
+                        .turn
+                        .as_deref()
+                        .and_then(|turn| turn.strip_prefix("opencode:"))
+                    {
+                        let mapping = self.state.mappings.get_mut(key).unwrap();
+                        if let Some((input, _)) = mapping
+                            .shared_admissions
+                            .iter()
+                            .find(|(_, native)| native.as_str() == turn)
+                        {
+                            mapping
+                                .shared_reply_inputs
+                                .insert(reply.id.clone(), input.clone());
+                        }
+                    }
                     self.state.mappings.get_mut(key).unwrap().last_received_at = now();
                     if self.config.edit_responses {
                         if agent.agent_status == "working"
@@ -1046,7 +1161,11 @@ impl Bridge {
                         .as_ref()
                         .is_none_or(|turn| !self.state.mappings[key].muted_turns.contains(turn))
                     {
-                        let source = output::message_key("Agent", &reply.id, &reply.text);
+                        let speaker = self.state.mappings[key].shared_alias.as_ref().map_or_else(
+                            || "Agent".to_owned(),
+                            |alias| format!("Agent:{key}:{alias}"),
+                        );
+                        let source = output::message_key(&speaker, &reply.id, &reply.text);
                         if self.state.forwarding_enabled && !self.state.source_known(group, &source)
                         {
                             let text = reply.text.clone();
@@ -1058,7 +1177,7 @@ impl Bridge {
                             .await??;
                             self.state.enqueue_images(
                                 group,
-                                &prepared.text,
+                                &self.state.agent_text(key, &prepared.text),
                                 prepared.attachments,
                                 vec![source],
                             );
@@ -1078,6 +1197,38 @@ impl Bridge {
     }
 
     async fn reconcile_agent(&mut self, key: &str, agent: &Agent) -> Result<()> {
+        if self
+            .state
+            .mappings
+            .get(key)
+            .is_some_and(|m| m.shared_alias.is_some() && m.room.is_none())
+        {
+            self.quarantine_room(key, "legacy_alias_mode_requires_fresh_strict_room")?;
+            return Ok(());
+        }
+        if self
+            .state
+            .mappings
+            .get(key)
+            .is_some_and(|m| m.room.is_some())
+        {
+            if self.room_reservation(key).is_err() {
+                self.quarantine_room(key, "native_room_ownership_unverified")?;
+                return Ok(());
+            }
+            let retained = self.state.mappings[key].agent_record.as_ref().unwrap();
+            if retained.key() != agent.key()
+                || retained.terminal_id != agent.terminal_id
+                || retained.pane_id != agent.pane_id
+            {
+                self.quarantine_room(key, "native_identity_changed")?;
+            }
+            if self.state.mappings[key].room_quarantined.is_some() {
+                return Ok(());
+            }
+            let history = self.read_history(agent).await?;
+            self.observe_activity(key, &history)?;
+        }
         if self.reads.background
             && agent
                 .agent_session
@@ -1198,6 +1349,13 @@ impl Bridge {
         let m = &self.state.mappings[key];
         // Muting suppresses messages, not group invitations or metadata updates.
         if m.group_id_hex.is_none() && !m.creating {
+            // Reserve only a conversation actually selected for a new private
+            // chat, not every visible native session. Hold admission through
+            // group creation and the durable binding so a room cannot win the
+            // empty-history window before the first private prompt.
+            let reservation =
+                crate::native_rooms::guard(&self.config, crate::native_rooms::identity(agent)?)?;
+            reservation.allow(&self.config)?;
             let capabilities = self
                 .marmot
                 .marmot(json!({"type":"group_create_capabilities"}))
@@ -1215,6 +1373,7 @@ impl Bridge {
                     Ok(response) => {
                         ensure!(response["type"] == "group_created", "Unexpected group creation response");
                         let group = response["group_id_hex"].as_str().filter(|s| !s.is_empty()).ok_or_else(|| anyhow::anyhow!("Missing group ID"))?.to_owned();
+                        reservation.bind_private(&self.config, &crate::native_rooms::Claim::private(&self.config, agent, &group)?)?;
                         let m = self.state.mappings.get_mut(key).unwrap(); m.group_id_hex = Some(group.clone()); m.creating = false;
                         m.group_name = Some(name.clone()); m.group_description = Some(description.clone());
                         self.state.enqueue(&group, &format!("Hi! This is your chat with {name}.\n\nSend /help in any Codr chat to see available commands."));
@@ -1274,7 +1433,8 @@ impl Bridge {
             }
         } else if previous.last_agent_status != agent.agent_status && agent.agent_status != "done" {
             let status = herdr::status_label(&agent.agent_status);
-            self.state.enqueue(&group, &format!("> {status}"));
+            self.state
+                .enqueue_agent(key, &group, &format!("> {status}"));
         }
         let m = self.state.mappings.get_mut(key).unwrap();
         m.last_agent_status = agent.agent_status.clone();
@@ -1355,7 +1515,7 @@ impl Bridge {
                         if self.config.edit_responses {
                             self.state.update_response(key, &group, notice, false);
                         } else {
-                            self.state.enqueue(&group, notice);
+                            self.state.enqueue_agent(key, &group, notice);
                         }
                     }
                     _ => {}
@@ -1383,7 +1543,7 @@ impl Bridge {
                 if self.config.edit_responses {
                     self.state.update_response(key, &group, &text, false);
                 } else {
-                    self.state.enqueue(&group, &text);
+                    self.state.enqueue_agent(key, &group, &text);
                 }
             }
             self.state
@@ -1482,8 +1642,12 @@ impl Bridge {
             .any(|submission| submission.overdue(now()));
         let notice = "Native acceptance is unconfirmed. Prompt submission was attempted, but no matching native receipt was observed. No automatic retry will run. Inspect the agent before using local clear-prompt; new submissions in this chat are paused.";
         for receipt in warnings {
-            self.state
-                .enqueue_manual(&group, notice, &format!("acceptance:{group}:{receipt}"));
+            self.state.enqueue_agent_manual(
+                key,
+                &group,
+                notice,
+                &format!("acceptance:{group}:{receipt}"),
+            );
         }
         if overdue && agent.settled() && self.state.mappings[key].response_id.is_some() {
             self.state.update_response(
@@ -1546,7 +1710,7 @@ impl Bridge {
                 .retain(|item| !item.id.starts_with(&prefix));
             // A queued warning may already be visible after a lost acknowledgement.
             // Always confirm late acceptance, even if its warning remains queued.
-            self.state.enqueue_manual(&group, if paused {
+            self.state.enqueue_agent_manual(key, &group, if paused {
                     "The agent has now received one earlier message. Another message is still unconfirmed, so this chat remains paused."
                 } else {
                     "The agent has now received your earlier message. This chat's delivery pause is cleared."
@@ -1555,6 +1719,23 @@ impl Bridge {
     }
 
     fn observe_activity(&mut self, key: &str, history: &output::SessionHistory) -> Result<()> {
+        if self.state.mappings[key].room.is_some() {
+            let mapping = &self.state.mappings[key];
+            // An accepted ID alone is insufficient: a native edit must not turn
+            // an authenticated room prompt into private input under that ID.
+            let outside = history.user_inputs.iter().any(|input| {
+                input.id.strip_prefix("opencode:").is_none_or(|id| {
+                    mapping
+                        .room_input_fingerprints
+                        .get(id)
+                        .is_none_or(|expected| input.fingerprint.as_ref() != Some(expected))
+                })
+            });
+            if outside {
+                self.quarantine_room(key, "native_input_outside_room_stream")?;
+                anyhow::bail!("Room quarantined after unexpected native input");
+            }
+        }
         self.observe_submission_acceptances(key, &history.user_inputs);
         if !self.config.auto_forwarding {
             return self.save();
@@ -1657,6 +1838,15 @@ impl Bridge {
     }
 
     pub async fn inbound(&mut self, event: &Value) -> Result<()> {
+        if self.room_inbound(event).await? {
+            return Ok(());
+        }
+        if self.state.mappings.values().any(|m| m.room.is_some()) {
+            return Ok(());
+        }
+        if self.shared_inbound(event).await? {
+            return Ok(());
+        }
         self.route_inbound(event, false, false).await
     }
 
@@ -1745,8 +1935,15 @@ impl Bridge {
                 self.reads.finish(&key);
                 continue;
             }
+            // Legacy text queues were owner-only. Media retains the actual
+            // authorised sender so preparing an app image cannot acquire owner powers.
+            let sender = prompt
+                .media
+                .as_ref()
+                .and_then(|message| message["sender"]["account_id_hex"].as_str())
+                .unwrap_or(&self.phone);
             let event = json!({"marmot_agent_control":PROTOCOL,"type":"inbound_message","account_id_hex":self.config.account_id_hex,
-                "group_id_hex":prompt.group,"message":{"message_id_hex":prompt.id,"sender":{"account_id_hex":self.phone},"text":prompt.prompt_text()}});
+                "group_id_hex":prompt.group,"message":{"message_id_hex":prompt.id,"sender":{"account_id_hex":sender},"text":prompt.prompt_text()}});
             if let Err(error) =
                 Box::pin(self.route_inbound(&event, prompt.media.is_some(), true)).await
                 && !error.is::<crate::reads::Pending>()
@@ -1773,6 +1970,11 @@ impl Bridge {
             .mappings
             .iter()
             .filter_map(|(mapping_key, mapping)| {
+                // Shared groups start at their attachment boundary. The MVP
+                // deliberately has no cross-chat historical backfill command.
+                if mapping.shared_alias.is_some() {
+                    return None;
+                }
                 if matches!(kind, crate::history::Kind::Last(_)) && mapping_key != key {
                     return None;
                 }
@@ -1805,6 +2007,7 @@ impl Bridge {
                 .state
                 .mappings
                 .values()
+                .filter(|m| m.shared_alias.is_none())
                 .filter_map(|m| m.group_id_hex.clone())
                 .collect(),
         }
@@ -2273,6 +2476,16 @@ impl Bridge {
     }
 
     async fn route_inbound(&mut self, event: &Value, prepared: bool, queued: bool) -> Result<()> {
+        self.route_inbound_for(event, prepared, queued, None).await
+    }
+
+    async fn route_inbound_for(
+        &mut self,
+        event: &Value,
+        prepared: bool,
+        queued: bool,
+        selected: Option<&str>,
+    ) -> Result<()> {
         ensure!(
             event["marmot_agent_control"] == PROTOCOL,
             "MDK event protocol mismatch"
@@ -2283,7 +2496,7 @@ impl Bridge {
             return Ok(());
         }
         let msg = &event["message"];
-        if msg["sender"]["account_id_hex"] != self.phone || msg["sender"]["is_self"] == true {
+        if msg["sender"]["is_self"] == true {
             return Ok(());
         }
         let Some(group) = event["group_id_hex"].as_str() else {
@@ -2293,11 +2506,39 @@ impl Bridge {
             .state
             .mappings
             .iter()
-            .find(|(_, m)| m.group_id_hex.as_deref() == Some(group))
+            .find(|(key, m)| {
+                m.group_id_hex.as_deref() == Some(group)
+                    && selected.map_or(m.shared_alias.is_none(), |selected| {
+                        key.as_str() == selected
+                    })
+            })
             .map(|(k, _)| k.clone())
         else {
             return Ok(());
         };
+        let Some(sender) = msg["sender"]["account_id_hex"].as_str() else {
+            return Ok(());
+        };
+        // A retained private mapping in another config must not answer native
+        // forms, read history or dispatch through a cached terminal after a room
+        // reserves that conversation. The claim is independent of V2 setup.
+        if self.native_room_conflict(&key).unwrap_or(true) {
+            self.quarantine_room(&key, "native_room_owned_elsewhere")?;
+            return Ok(());
+        }
+        let additional_profile = sender != self.phone;
+        let mapping = &self.state.mappings[&key];
+        let shared = mapping.shared_alias.is_some();
+        if additional_profile && !mapping.authorized_profiles.iter().any(|p| p == sender) {
+            return Ok(());
+        }
+        if !queued
+            && mapping
+                .attached_after
+                .is_some_and(|boundary| msg["recorded_at"].as_u64().is_none_or(|at| at <= boundary))
+        {
+            return Ok(());
+        }
         let Some(id) = msg["message_id_hex"].as_str() else {
             return Ok(());
         };
@@ -2377,6 +2618,18 @@ impl Bridge {
             return Ok(());
         }
         let raw_text = msg["text"].as_str().unwrap_or("");
+        // An app controller is not the global phone owner. Reject command syntax
+        // before normalization, serial commands, launch menus or update handling.
+        // Native numeric/form answers still follow the existing chat-local path.
+        if additional_profile && !prepared && !queued && raw_text.trim_start().starts_with('/') {
+            return crate::launch::reply(
+                self,
+                &key,
+                group,
+                id,
+                "This profile can send prompts, media and native decision replies in this chat only. Bridge commands require the configured phone owner.",
+            );
+        }
         let control = self.state.mappings[&key].control;
         let menu_open = self.state.mappings[&key]
             .launch_draft
@@ -2397,6 +2650,7 @@ impl Bridge {
             && msg["media"].as_array().is_none_or(|items| items.is_empty());
         if plain_command
             && !queued
+            && !shared
             && let Some(sequence) = crate::commands::sequence(raw_text)
         {
             let commands = match sequence {
@@ -2433,7 +2687,7 @@ impl Bridge {
             }
             return Ok(());
         }
-        let normalized = if plain_command && !queued {
+        let normalized = if plain_command && !queued && !shared {
             crate::commands::normalize(raw_text, control, menu_open)
         } else {
             crate::commands::Normalized::Text(raw_text.to_owned())
@@ -2568,7 +2822,8 @@ impl Bridge {
                 ),
             );
         }
-        if plain_command
+        if !additional_profile
+            && plain_command
             && (text.trim().eq_ignore_ascii_case("/unmute")
                 || text.trim().eq_ignore_ascii_case("unmute"))
         {
@@ -2588,6 +2843,17 @@ impl Bridge {
                     .as_ref()
                     .is_some_and(|draft| crate::launch_flow::short_reply(draft, text).is_some()))
         {
+            // A phone-opened setup menu is still owner-only: bare numbers and
+            // confirmation words must not let an app launch or reconfigure agents.
+            if additional_profile {
+                return crate::launch::reply(
+                    self,
+                    &key,
+                    group,
+                    id,
+                    "This setup menu requires the configured phone owner. No setup action or prompt was sent.",
+                );
+            }
             self.refresh_forwarding()?;
             return crate::launch_flow::handle(self, &key, group, id, text, plain_command).await;
         }
@@ -2609,6 +2875,9 @@ impl Bridge {
                         }),
             )
         {
+            if shared {
+                return self.permission_notice(&key, group, id, "Shared-chat permission approval is terminal-only. The native human must inspect and answer the native permission card; no reply was sent.");
+            }
             ensure!(!queued, "Permission replies cannot be queued");
             return self
                 .reply_permission(
@@ -2717,7 +2986,24 @@ impl Bridge {
             return self.control_message(&key, group, id, text).await;
         }
         self.refresh_forwarding()?;
-        if !queued {
+        if additional_profile
+            && (!self.state.forwarding_enabled || self.state.forwarding_resume_pending)
+        {
+            // New input can receive a refusal receipt. Already accepted media
+            // must remain pending, rather than being marked seen and discarded.
+            ensure!(
+                !prepared && !queued,
+                "Accepted app delivery paused by forwarding controls"
+            );
+            return crate::launch::reply(
+                self,
+                &key,
+                group,
+                id,
+                "Forwarding is paused. Ask the configured phone owner to resume it; no prompt was sent.",
+            );
+        }
+        if !queued && !additional_profile {
             forwarding::wake(&self.config.state_path, group, id)?;
         }
         self.refresh_forwarding()?;
@@ -2731,12 +3017,15 @@ impl Bridge {
             self.herdr_available,
             "herdr unavailable; inbound message deferred until recovery"
         );
-        self.activate_forwarding().await?;
+        if !additional_profile {
+            self.activate_forwarding().await?;
+        }
         ensure!(
             !self.state.forwarding_resume_pending,
             "Forwarding resume awaits its current history checkpoint"
         );
-        if !prepared
+        if !additional_profile
+            && !prepared
             && (text.trim().eq_ignore_ascii_case("unmute")
                 || text.trim().eq_ignore_ascii_case("/unmute"))
             && msg["text_truncated"] != true
@@ -2790,7 +3079,7 @@ impl Bridge {
             && self.state.mappings[&key]
                 .submissions
                 .iter()
-                .any(|submission| submission.overdue(now()))
+                .any(|submission| shared || submission.overdue(now()))
         {
             ensure!(
                 !queued && !prepared,
@@ -2874,6 +3163,18 @@ impl Bridge {
             pending["group_id_hex"] == group
                 && !(prepared && pending["message"]["message_id_hex"] == id)
         });
+        if additional_profile
+            && crate::media::audio(msg)
+            && self.config.transcribe_command.is_empty()
+        {
+            return crate::launch::reply(
+                self,
+                &key,
+                group,
+                id,
+                "Audio transcription is not configured. No prompt was sent. Ask the local operator to configure transcribe_command before sending new audio.",
+            );
+        }
         if !status_command
             && msg["text_truncated"] != true
             && msg["attachments_truncated"] != true
@@ -2949,6 +3250,10 @@ impl Bridge {
         } else {
             None
         };
+        ensure!(
+            !shared || acceptance_history.is_some(),
+            "Shared native history is unavailable; input deferred without submission"
+        );
         if !status_command
             && msg["text_truncated"] != true
             && msg["attachments_truncated"] != true
@@ -3043,6 +3348,24 @@ impl Bridge {
                 Some("Send a non-empty text message.".into())
             } else {
                 let before_submission = self.state.clone();
+                // This lock and durable owner claim cover both V2 and legacy
+                // terminal delivery. An uncertain private admission must not
+                // become an apparently fresh room session in another config.
+                let admission = if agent
+                    .agent_session
+                    .as_ref()
+                    .is_some_and(|s| s.agent == "opencode" && s.kind == "id")
+                {
+                    let guard = crate::native_rooms::guard(
+                        &self.config,
+                        crate::native_rooms::identity(&agent)?,
+                    )?;
+                    let claim = crate::native_rooms::Claim::private(&self.config, &agent, group)?;
+                    guard.bind_private(&self.config, &claim)?;
+                    Some(guard)
+                } else {
+                    None
+                };
                 if let Some(history) = &acceptance_history {
                     self.observe_submission_acceptances(&key, &history.user_inputs);
                 }
@@ -3075,6 +3398,11 @@ impl Bridge {
                     if crate::prompt::native_session(&self.config, &agent).is_some() {
                         submission.native_message_id =
                             Some(format!("msg_codr_{}", uuid::Uuid::new_v4().simple()));
+                        if shared {
+                            mapping
+                                .shared_admissions
+                                .insert(id.into(), submission.native_message_id.clone().unwrap());
+                        }
                     }
                     mapping.submissions.push(submission);
                 }
@@ -3095,7 +3423,7 @@ impl Bridge {
                 let delivery = if let Some(native_id) = native_id {
                     let session = crate::prompt::native_session(&self.config, &agent)
                         .expect("Native receipt requires a configured OpenCode session");
-                    crate::prompt::send(&self.config, session, &native_id, text)
+                    crate::prompt::send_reserved(&self.config, session, &native_id, text)
                         .await
                         .map(Some)
                 } else {
@@ -3107,6 +3435,7 @@ impl Bridge {
                         Err(error) => Err(error),
                     }
                 };
+                drop(admission);
                 match delivery {
                     Ok(accepted) => {
                         if let Some(input) = accepted {
@@ -3181,7 +3510,7 @@ impl Bridge {
             Some("This session has ended. No prompt was sent.".into())
         };
         if let Some(text) = response {
-            self.state.enqueue(group, &text);
+            self.state.enqueue_agent(&key, group, &text);
         }
         self.save()
     }
@@ -3446,6 +3775,19 @@ impl Bridge {
         mut permission: output::permission::Permission,
     ) -> Result<()> {
         self.state.mappings.get_mut(key).unwrap().decision = None;
+        if self.state.mappings[key].shared_alias.is_some() {
+            // Membership and invocation authority never grant tool approval.
+            // Keep the native card human-only; no shared transport card is minted.
+            if self.state.mappings[key]
+                .permission
+                .as_ref()
+                .is_none_or(|old| old.request != permission.request)
+            {
+                self.state.enqueue_agent(key, group, "> Native permission required. The native human must inspect and answer the permission card locally. Shared-chat replies cannot approve tools.");
+            }
+            self.state.mappings.get_mut(key).unwrap().permission = Some(permission);
+            return self.save();
+        }
         if let Some(previous) = self.state.mappings[key].permission.as_ref() {
             if previous.request == permission.request {
                 permission = previous.clone();
@@ -3496,7 +3838,7 @@ impl Bridge {
             .seen_messages
             .push(id.into());
         self.state
-            .enqueue_manual(group, text, &format!("permission:{group}:{id}"));
+            .enqueue_agent_manual(key, group, text, &format!("permission:{group}:{id}"));
         if let Err(error) = self.save() {
             self.state = before;
             return Err(error);
@@ -3675,7 +4017,7 @@ impl Bridge {
             }
         }
         if !decision.announced && self.state.forwarding_enabled {
-            self.state.enqueue(group, &decision.text());
+            self.state.enqueue_agent(key, group, &decision.text());
             decision.announced = true;
             if self.config.edit_responses {
                 self.state.update_response(
@@ -3697,7 +4039,7 @@ impl Bridge {
             .unwrap()
             .seen_messages
             .push(id.into());
-        self.state.enqueue(group, text);
+        self.state.enqueue_agent(key, group, text);
         self.save()?;
         Ok(true)
     }
@@ -3805,8 +4147,12 @@ impl Bridge {
             pending.answers.push(value);
             let next = pending.text();
             mapping.seen_messages.push(id.into());
-            self.state
-                .enqueue_manual(group, &next, &format!("question-part:{group}:{id}"));
+            self.state.enqueue_agent_manual(
+                key,
+                group,
+                &next,
+                &format!("question-part:{group}:{id}"),
+            );
             if let Err(error) = self.save() {
                 self.state = before;
                 return Err(error);
@@ -3868,7 +4214,7 @@ impl Bridge {
                     output::decision::Answer::Choice(choice) => format!("Sent choice {choice}: {}.", decision.questions[0].options[choice-1].label),
                     output::decision::Answer::Custom(_) => "Sent your custom answer to the current question.".into(),
                 }};
-                self.state.enqueue(group, &message);
+                self.state.enqueue_agent(key, group, &message);
             }
             Err(error) if error.downcast_ref::<crate::wire::NotSubmitted>().is_some() => {
                 let mapping = self.state.mappings.get_mut(key).unwrap();
@@ -3879,7 +4225,7 @@ impl Bridge {
                 self.save()?;
                 return Err(error);
             }
-            Err(_) => self.state.enqueue(group, "The decision answer could not be confirmed. It will not be retried automatically. Inspect the terminal before using clear-prompt and sending a new answer."),
+            Err(_) => self.state.enqueue_agent(key, group, "The decision answer could not be confirmed. It will not be retried automatically. Inspect the terminal before using clear-prompt and sending a new answer."),
         }
         self.save()?;
         Ok(true)
@@ -3939,7 +4285,8 @@ impl Bridge {
     }
 
     fn recovery_groups(&self) -> Vec<crate::recovery::Group> {
-        self.state
+        let groups: Vec<_> = self
+            .state
             .mappings
             .values()
             .filter_map(|mapping| {
@@ -3958,9 +4305,33 @@ impl Bridge {
                         seen.remove(id);
                     }
                 }
-                Some(crate::recovery::Group { group, seen })
+                Some(crate::recovery::Group {
+                    group,
+                    seen,
+                    profiles: mapping.room.as_ref().map_or_else(
+                        || mapping.authorized_profiles.clone(),
+                        |policy| policy.accounts(),
+                    ),
+                })
             })
-            .collect()
+            .collect();
+        let mut merged: BTreeMap<String, crate::recovery::Group> = BTreeMap::new();
+        for group in groups {
+            if let Some(existing) = merged.get_mut(&group.group) {
+                // A multi-agent message is recovered until EVERY peer consumed
+                // it. One unavailable agent must not lose its input because a
+                // different peer accepted; routing still deduplicates per agent.
+                existing.seen.retain(|id| group.seen.contains(id));
+                for profile in group.profiles {
+                    if !existing.profiles.contains(&profile) {
+                        existing.profiles.push(profile);
+                    }
+                }
+            } else {
+                merged.insert(group.group.clone(), group);
+            }
+        }
+        merged.into_values().collect()
     }
 
     pub async fn process_recovery(&mut self) -> Result<()> {
@@ -4011,7 +4382,7 @@ impl Bridge {
         let keys: Vec<_> = self.state.mappings.keys().cloned().collect();
         for key in keys {
             let mapping = &self.state.mappings[&key];
-            if mapping.control {
+            if mapping.control || mapping.shared_alias.is_some() {
                 continue;
             }
             let Some(group) = mapping.group_id_hex.clone() else {
@@ -4093,7 +4464,7 @@ impl Bridge {
     /// Keep a live group's title and description in step with herdr. A title the
     /// user changed is never overwritten, and an uncertain profile update is never retried.
     async fn sync_group_profile(&mut self, key: &str, agent: &Agent, group: &str) {
-        if self.state.mappings[key].control {
+        if self.state.mappings[key].control || self.state.mappings[key].shared_alias.is_some() {
             return;
         }
         let desired_name = self.group_name_for(key, agent, &self.agents);
@@ -4202,6 +4573,195 @@ impl Bridge {
                 );
             }
         }
+    }
+
+    /// Local operator-only attachment; the CLI holds the ordinary worker lock.
+    /// External operations are read-only. Native ownership is reserved after
+    /// validation and before reporting success; failed saves retain that claim.
+    pub async fn attach_chat(&mut self, key: &str, group: &str, profile: &str) -> Result<()> {
+        let profile = phone_hex(profile)?;
+        ensure!(
+            profile != self.config.account_id_hex && profile != self.phone,
+            "Choose an additional app identity, not the bridge or existing phone"
+        );
+        // Take the same lock as room attachment before either history baseline.
+        // prepare_chat_attachment revalidates the snapshot while this guard is
+        // held. The durable claim survives a failed mapping save: no takeover.
+        let agents = herdr::snapshot(&self.herdr).await?;
+        let agent = agents
+            .iter()
+            .find(|agent| agent.key() == key)
+            .ok_or_else(|| anyhow::anyhow!("Native session unavailable"))?;
+        let reservation =
+            crate::native_rooms::guard(&self.config, crate::native_rooms::identity(agent)?)?;
+        let mapping = self
+            .prepare_chat_attachment(key, group, vec![profile])
+            .await?;
+        let claim = crate::native_rooms::Claim::private(
+            &self.config,
+            mapping.agent_record.as_ref().unwrap(),
+            group,
+        )?;
+        reservation.bind_private(&self.config, &claim)?;
+        self.state.mappings.insert(key.into(), mapping);
+        if let Err(error) = self.save() {
+            self.state.mappings.remove(key);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn prepare_chat_attachment(
+        &mut self,
+        key: &str,
+        group: &str,
+        profiles: Vec<String>,
+    ) -> Result<Mapping> {
+        ensure!(
+            !self
+                .state
+                .mappings
+                .values()
+                .any(|mapping| mapping.room.is_some()),
+            "A dedicated room transport cannot acquire private or additional shared bindings"
+        );
+        ensure!(
+            !group.is_empty() && hex::decode(group).is_ok() && group == group.to_ascii_lowercase(),
+            "Group ID must be nonempty lowercase hex"
+        );
+        ensure!(
+            !self.state.mappings.contains_key(key)
+                && !self
+                    .state
+                    .mappings
+                    .values()
+                    .any(|m| m.group_id_hex.as_deref() == Some(group)),
+            "Attachment requires an unmapped native session and an unmapped chat"
+        );
+        let agents = herdr::snapshot(&self.herdr).await?;
+        let matches: Vec<_> = agents.iter().filter(|agent| agent.key() == key).collect();
+        ensure!(matches.len() == 1, "Native session must exist exactly once");
+        let agent = matches[0].clone();
+        ensure!(
+            !crate::native_rooms::claimed(&self.config, &crate::native_rooms::identity(&agent)?)?,
+            "Native conversation belongs to another room transport"
+        );
+        ensure!(agent.settled(), "Attach only an idle native session");
+        let session = agent
+            .agent_session
+            .as_ref()
+            .filter(|s| output::supported(&s.agent))
+            .ok_or_else(|| anyhow::anyhow!("Attachment requires a supported native session"))?;
+        // A source/terminal move changes the routing key, not ownership of its
+        // native conversation. Both attachment commands share this check before
+        // any group/history read or state write, so neither can create a private
+        // mirror of a shared session (or share a retained private transcript).
+        let identity = shared::native_identity(&agent).unwrap();
+        ensure!(
+            !self
+                .state
+                .mappings
+                .iter()
+                .any(|(key, mapping)| shared::owns_native_identity(key, mapping, &identity)),
+            "Native session already belongs to a retained binding"
+        );
+        // Never reuse a terminal retained by another mapping, even if its native
+        // identity has changed. That recovery requires the existing explicit flow.
+        ensure!(
+            !self.state.mappings.values().any(|m| m
+                .agent_record
+                .as_ref()
+                .is_some_and(|a| a.terminal_id == agent.terminal_id)),
+            "Native terminal already belongs to a retained mapping"
+        );
+        let info = self.group_info(group).await?;
+        ensure!(
+            info["account_id_hex"] == self.config.account_id_hex
+                && info["group_id_hex"] == group
+                && info["member_count"]
+                    .as_u64()
+                    .is_some_and(|count| count >= 2),
+            "Existing chat identity or membership could not be validated"
+        );
+        // Capture every row, not just available owner messages: richer media or
+        // delayed availability must not make pre-attachment audio executable.
+        let mut seen = HashSet::new();
+        let mut cursors = HashSet::new();
+        let mut before: Option<Value> = None;
+        loop {
+            let mut request = json!({"type":"timeline_list","account_id_hex":self.config.account_id_hex,"group_id_hex":group,"limit":50});
+            if let Some(cursor) = &before {
+                request["before"] = cursor.clone();
+            }
+            let page = self.marmot.marmot(request).await?;
+            ensure!(
+                page["type"] == "timeline_page"
+                    && page["account_id_hex"] == self.config.account_id_hex
+                    && page["group_id_hex"] == group,
+                "Invalid attachment timeline response"
+            );
+            let rows = page["messages"]
+                .as_array()
+                .ok_or_else(|| anyhow::anyhow!("Missing timeline messages"))?;
+            for row in rows {
+                let id = row["message_id_hex"]
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("Missing timeline identity"))?;
+                seen.insert(id.to_owned());
+            }
+            let more = page["has_more_before"]
+                .as_bool()
+                .ok_or_else(|| anyhow::anyhow!("Missing timeline boundary"))?;
+            if !more {
+                break;
+            }
+            let first = rows
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("Empty unfinished timeline"))?;
+            let id = first["message_id_hex"].as_str().unwrap();
+            let at = first["recorded_at"]
+                .as_u64()
+                .ok_or_else(|| anyhow::anyhow!("Missing timeline cursor time"))?;
+            ensure!(
+                cursors.insert(id.to_owned()),
+                "Attachment timeline did not advance"
+            );
+            before = Some(json!({"recorded_at":at,"message_id_hex":id}));
+        }
+        let history = self.reads.fresh(&self.config, session).await?.history;
+        let current = herdr::get(&self.herdr, &agent).await?;
+        ensure!(
+            current.key() == key
+                && current.terminal_id == agent.terminal_id
+                && current.state_change_seq == agent.state_change_seq
+                && current.settled(),
+            "Native session changed during attachment"
+        );
+        let boundary = now();
+        let mut mapping = Mapping {
+            group_id_hex: Some(group.into()),
+            authorized_profiles: profiles,
+            attached_after: Some(boundary),
+            group_name: info["subject"].as_str().map(str::to_owned),
+            group_name_locked: true,
+            joined_at: boundary,
+            active: true,
+            agent_record: Some(current.clone()),
+            last_agent_status: current.agent_status.clone(),
+            last_state_change_seq: current.state_change_seq,
+            seen_messages: seen.into_iter().collect(),
+            final_ids: history
+                .finals
+                .iter()
+                .map(|reply| reply.id.clone())
+                .collect(),
+            output_initialised: true,
+            ..Mapping::default()
+        };
+        mapping.seen_messages.sort();
+        mapping.activity.baseline(&history.user_inputs);
+        Ok(mapping)
     }
 
     async fn group_info(&self, group: &str) -> Result<Value> {
