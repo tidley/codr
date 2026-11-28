@@ -20,6 +20,14 @@ pub(crate) fn is_chat_timeline_row(row: &Value) -> bool {
 #[error("Socket unavailable before request submission")]
 pub struct NotSubmitted;
 
+#[derive(Debug, thiserror::Error)]
+#[error("Remote method not found")]
+pub struct MethodNotFound;
+
+#[derive(Debug, thiserror::Error)]
+#[error("Remote request envelope rejected")]
+pub struct InvalidRequest;
+
 pub async fn read_line<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<Value> {
     let mut bytes = vec![];
     let size = reader
@@ -63,6 +71,29 @@ impl Socket {
                 );
             }
             if response.get("error").is_some() || response["type"] == "error" {
+                // Typed protocol errors permit backend fallback. An ambiguous
+                // reply (even result:null) is not evidence for that decision.
+                ensure!(
+                    response.get("result").is_none(),
+                    "Malformed socket reply: both result and error"
+                );
+                if !marmot && matches!(response["error"]["code"].as_i64(), Some(-32601 | -32600)) {
+                    // Old TUI replies omit jsonrpc. An explicit wrong version or
+                    // incomplete error is not a capability proof, even if a later
+                    // snapshot would succeed; never use it to enable creation.
+                    ensure!(
+                        response.get("jsonrpc").is_none() || response["jsonrpc"] == "2.0",
+                        "Malformed protocol error version"
+                    );
+                    ensure!(
+                        response["error"]["message"].is_string(),
+                        "Malformed protocol error"
+                    );
+                    if response["error"]["code"] == -32601 {
+                        return Err(MethodNotFound.into());
+                    }
+                    return Err(InvalidRequest.into());
+                }
                 // Remote messages can contain private data. Expose only the bounded error code.
                 let raw = response["error"]["code"]
                     .as_str()
@@ -84,6 +115,21 @@ impl Socket {
     pub async fn herdr(&self, method: &str, params: Value) -> Result<Value> {
         self.exchange(json!({"method":method,"params":params}), false)
             .await
+    }
+    pub async fn core(&self, method: &str, params: Value) -> Result<Value> {
+        // Keep the old TUI envelope unchanged in herdr(); only Core calls
+        // require the JSON-RPC marker on both sides.
+        let response = self
+            .exchange(
+                json!({"jsonrpc":"2.0","method":method,"params":params}),
+                false,
+            )
+            .await?;
+        ensure!(
+            response["jsonrpc"] == "2.0" && response.get("result").is_some(),
+            "Malformed Core JSON-RPC reply"
+        );
+        Ok(response["result"].clone())
     }
     pub async fn marmot(&self, value: Value) -> Result<Value> {
         self.exchange(value, true).await

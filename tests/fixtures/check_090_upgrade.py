@@ -21,7 +21,7 @@ job = root/"legacy-job"
 job.mkdir(mode=0o700)
 request = {"job_id":"legacy-job","info":old,"installed_path":str(installed),
            "config_path":str(root/"config.toml"),"state_path":str(root/"state.json"),
-           "release":{"version":metadata["version"],"event_id":"ab"*32,
+            "release":{"version":metadata["version"],"event_id":"ab"*32,
                       "asset":{"url":"https://blossom.example/archive","sha256":"cd"*32},
                       "checksum":{"url":"https://blossom.example/checksum"}}}
 calls = []
@@ -35,6 +35,18 @@ def stage(url, name, destination, **kwargs):
 with patch.object(legacy,"ngit",return_value={}),patch.object(legacy,"validate_view"),patch.object(legacy.install,"install_bundle",side_effect=stage):
     result=legacy.perform(job,request,controller)
 assert result["status"]=="failed",result
+if "-" in metadata["version"]:
+    # The frozen updater rejects previews before staging. Keep that contract,
+    # then independently exercise its cohort check with a synthetic stable
+    # version on the real binary's metadata. Do not claim a version mismatch
+    # alone proves that the MDK cohort was refused.
+    assert calls==[],calls
+    assert not (job/"candidate").exists()
+    stable = metadata["version"].split("-",1)[0]
+    request["release"]["version"] = stable
+    with patch.object(legacy,"ngit",return_value={}),patch.object(legacy,"validate_view"),patch.object(legacy.install,"install_bundle",side_effect=stage),patch.object(legacy,"probe",return_value={**metadata,"version":stable}):
+        result=legacy.perform(job,request,controller)
+    assert result["status"]=="failed",result
 assert calls==["validate"],calls
 assert installed.read_bytes()==b"previous 0.9 worker"
 assert not (job/"previous").exists()

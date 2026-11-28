@@ -221,11 +221,7 @@ impl Bridge {
             .await?
             .history;
         self.observe_activity(key, &history)?;
-        let response = self
-            .herdr
-            .herdr("agent.get", json!({"target":retained.pane_id}))
-            .await?;
-        let live: Agent = serde_json::from_value(response["result"]["agent"].clone())?;
+        let live = herdr::current(&self.herdr, retained).await?;
         if live.key() != key
             || live.terminal_id != retained.terminal_id
             || live.pane_id != retained.pane_id
@@ -237,7 +233,10 @@ impl Bridge {
         // for admission. Prepared input is queued by the hook; it is not a second
         // native POST and must not depend on optimistic terminal idle detection.
         ensure!(
-            (prepared_id.is_some() || live.settled()) && live.agent_status != "blocked",
+            (prepared_id.is_some() || live.settled())
+                && live.agent_status != "blocked"
+                && (!herdr::is_core(&live)
+                    || matches!(live.agent_status.as_str(), "idle" | "done" | "working")),
             "Room agent is not ready"
         );
         ensure!(

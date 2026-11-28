@@ -4,6 +4,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 
+mod core;
+pub(crate) use core::launch as launch_core;
+pub use core::{Backend, preflight};
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Workspace {
     pub workspace_id: String,
@@ -253,6 +257,24 @@ fn group_title(label: &str, workspace: Option<&str>, suffix: Option<&str>) -> St
 }
 
 pub async fn snapshot(socket: &Socket) -> Result<Vec<Agent>> {
+    // Preserve the legacy wire envelope and mapping keys. Core can explicitly
+    // reject that envelope (-32600) or the absent method (-32601); neither
+    // selects Core without a separate capability/identity proof.
+    match legacy_snapshot(socket).await {
+        Err(error)
+            if error.is::<crate::wire::MethodNotFound>()
+                || error.is::<crate::wire::InvalidRequest>() =>
+        {
+            let Backend::Core { id } = preflight(socket).await? else {
+                anyhow::bail!("Inconsistent Herdr endpoint")
+            };
+            core::snapshot(socket, &id).await
+        }
+        result => result,
+    }
+}
+
+async fn legacy_snapshot(socket: &Socket) -> Result<Vec<Agent>> {
     let response = socket.herdr("session.snapshot", json!({})).await?;
     let agents = &response["result"]["snapshot"]["agents"];
     ensure!(agents.is_array(), "herdr did not return a session snapshot");
@@ -288,10 +310,7 @@ pub async fn snapshot(socket: &Socket) -> Result<Vec<Agent>> {
 }
 
 pub async fn get(socket: &Socket, agent: &Agent) -> Result<Agent> {
-    let response = socket
-        .herdr("agent.get", json!({"target":agent.pane_id}))
-        .await?;
-    let current: Agent = serde_json::from_value(response["result"]["agent"].clone())?;
+    let current = current(socket, agent).await?;
     ensure!(
         current.key() == agent.key() && current.terminal_id == agent.terminal_id,
         "herdr agent changed"
@@ -299,13 +318,40 @@ pub async fn get(socket: &Socket, agent: &Agent) -> Result<Agent> {
     Ok(current)
 }
 
+pub fn is_core(agent: &Agent) -> bool {
+    agent
+        .agent_session
+        .as_ref()
+        .is_some_and(|s| s.source.starts_with("hc:"))
+}
+
+/// Raw current identity lets strict rooms quarantine drift before forwarding.
+pub async fn current(socket: &Socket, agent: &Agent) -> Result<Agent> {
+    if is_core(agent) {
+        return core::current(socket, agent).await;
+    }
+    let response = socket
+        .herdr("agent.get", json!({"target":agent.pane_id}))
+        .await?;
+    let current: Agent = serde_json::from_value(response["result"]["agent"].clone())?;
+    Ok(current)
+}
+
 pub async fn prompt(socket: &Socket, agent: &Agent, text: &str) -> Result<Value> {
+    ensure!(
+        !is_core(agent),
+        "Core input requires native OpenCode admission; terminal input is disabled"
+    );
     socket
         .herdr("agent.prompt", json!({"target":agent.pane_id,"text":text}))
         .await
 }
 
 pub async fn choose(socket: &Socket, agent: &Agent, choice: usize) -> Result<()> {
+    ensure!(
+        !is_core(agent),
+        "Core terminal permission answers are unsupported; answer in the native UI"
+    );
     ensure!((1..=9).contains(&choice), "Invalid decision shortcut");
     let response = socket
         .herdr(

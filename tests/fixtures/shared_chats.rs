@@ -189,6 +189,44 @@ impl Fixture {
                 let mut reader = tokio::io::BufReader::new(stream);
                 let request = read_line(&mut reader).await.unwrap();
                 seen.lock().unwrap().push(request.clone());
+                let core = observed.lock().unwrap().first().is_some_and(herdr::is_core);
+                if core {
+                    let result = match request["method"].as_str().unwrap() {
+                        "session.snapshot" => None,
+                        "rpc.discover" => Some(
+                            serde_json::from_str(include_str!("herdr-core-0.1.22/schema.json"))
+                                .unwrap(),
+                        ),
+                        "hello" => Some(
+                            json!({"core":{"id":"fixture-core","name":"desktop"},"version":"0.1.22","generation":1,"framed":false,
+                            "features":[],"methods":["hello","server.status","terminal.run","terminal.list","terminal.get"]}),
+                        ),
+                        "terminal.list" => Some(
+                            json!({"terminals":observed.lock().unwrap().iter().map(core_terminal).collect::<Vec<_>>(),"hidden_finished":0,"machines":[]}),
+                        ),
+                        "terminal.get" => Some(core_terminal(
+                            observed
+                                .lock()
+                                .unwrap()
+                                .iter()
+                                .find(|a| request["params"]["terminal"] == a.pane_id)
+                                .unwrap(),
+                        )),
+                        method => panic!("Unexpected Core mutation {method}"),
+                    };
+                    let response = match result {
+                        Some(result) => json!({"jsonrpc":"2.0","id":request["id"],"result":result}),
+                        None => {
+                            json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":-32601,"message":"method not found"}})
+                        }
+                    };
+                    reader
+                        .get_mut()
+                        .write_all(format!("{response}\n").as_bytes())
+                        .await
+                        .unwrap();
+                    continue;
+                }
                 let response = match request["method"].as_str().unwrap() {
                     "session.snapshot" => {
                         json!({"result":{"snapshot":{"agents":*observed.lock().unwrap(),"tabs":[]}}})
@@ -269,6 +307,12 @@ impl Fixture {
     fn snapshot(&self) -> Vec<Agent> {
         self.agents.lock().unwrap().clone()
     }
+}
+
+fn core_terminal(agent: &Agent) -> Value {
+    json!({"address":agent.pane_id,"argv":["/fixture/opencode","--session",agent.agent_session.as_ref().unwrap().value],
+        "cwd":"/fixture/project","created_ms":1234,"state":"live","screen":"exact","cols":200,"rows":120,
+        "labels":{"codr.opencode-session":agent.agent_session.as_ref().unwrap().value},"status":{"state":agent.agent_status},"reported":true})
 }
 
 fn message(sender: &str, id: &str, text: &str) -> Value {

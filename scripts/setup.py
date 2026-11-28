@@ -709,7 +709,7 @@ def main():
                 raise SetupError("Use --combined-home with --backup, --previous-connector and --approve-handover; do not combine it with other setup changes")
             print(json.dumps(configure_combined(config, args.combined_home, args.backup, args.previous_connector, args.approve_handover), indent=2))
             return 0
-        if not args.check and tuple(map(int, version().split("."))) >= (0, 10, 0):
+        if not args.check and tuple(map(int, version().split("-", 1)[0].split("."))) >= (0, 10, 0):
             raise SetupError("0.10 uses one combined service. For an existing account, use the approved --combined-home handover. Fresh identity setup remains available through 0.9 local setup before handover.")
         report = configure(args.npub, args.herdr_socket, check=args.check, enable_audio=args.enable_audio, enable_portr=args.enable_portr)
         print(json.dumps(report, indent=2))

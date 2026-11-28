@@ -59,6 +59,9 @@ pub fn info() -> Result<Value> {
     let connector: toml::Value = toml::from_str(include_str!("../connector.toml"))?;
     Ok(json!({
         "version":env!("CARGO_PKG_VERSION"), "state_version":1,
+        "source_commit":env!("CODR_SOURCE_COMMIT"),
+        "source_dirty":env!("CODR_SOURCE_DIRTY") != "false",
+        "target":env!("CODR_BUILD_TARGET"),
         "runtimes":["external-connector", "embedded-mdk"],
         "storage_cohort":connector["storage_cohort"].as_str().ok_or_else(|| anyhow::anyhow!("Missing messaging storage cohort"))?,
         "protocol":crate::wire::PROTOCOL,

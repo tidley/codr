@@ -2,11 +2,13 @@
 """Install the binary matching this plugin checkout's release version."""
 
 import hashlib
+import json
 import os
 from pathlib import Path
 import platform
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tarfile
@@ -54,9 +56,128 @@ def version():
         if not found:
             raise InstallError("The checkout does not declare a package version")
         value = found.group(1)
-    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", value):
-        raise InstallError("The checkout does not select a numeric release")
+    if not valid_version(value):
+        raise InstallError("The checkout does not select a valid release")
     return value
+
+
+def valid_version(value):
+    core = r"(?:0|[1-9][0-9]*)"
+    identifier = r"(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
+    return isinstance(value, str) and re.fullmatch(
+        rf"{core}\.{core}\.{core}(?:-{identifier}(?:\.{identifier})*)?", value) is not None
+
+
+TARGETS = {
+    "linux-x86_64": "x86_64-unknown-linux-musl",
+    "linux-aarch64": "aarch64-unknown-linux-musl",
+    "macos-x86_64": "x86_64-apple-darwin",
+    "macos-aarch64": "aarch64-apple-darwin",
+}
+
+
+def binary_platform(path):
+    """Check object headers before executing downloaded release bytes."""
+    with Path(path).open("rb") as source:
+        header = source.read(64)
+    if len(header) < 64:
+        raise InstallError("Preview executable header is missing")
+    if header[:6] == b"\x7fELF\x02\x01":
+        kind, cpu = struct.unpack_from("<HH", header, 16)
+        if kind in (2, 3) and cpu in (62, 183):
+            return "linux-" + ("x86_64" if cpu == 62 else "aarch64")
+    if header[:4] == b"\xcf\xfa\xed\xfe":
+        cpu = struct.unpack_from("<I", header, 4)[0]
+        kind = struct.unpack_from("<I", header, 12)[0]
+        if kind == 2 and cpu in (0x01000007, 0x0100000c):
+            return "macos-" + ("x86_64" if cpu == 0x01000007 else "aarch64")
+    raise InstallError("Preview payload is not a supported native executable")
+
+
+def probe_binary(path):
+    try:
+        result = subprocess.run([str(path), "update-info", "--full"], capture_output=True, timeout=15, check=True)
+        if len(result.stdout) > 64 * 1024:
+            raise InstallError("Preview executable identity exceeds limit")
+        return json.loads(result.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        raise InstallError("Preview executable identity could not be verified") from error
+
+
+def executable_identity(path, revision):
+    host = platform_name()
+    if binary_platform(path) != host:
+        raise InstallError("Preview executable platform differs from this host")
+    verify_signature(path)
+    info = probe_binary(path)
+    if (not isinstance(info, dict) or info.get("version") != version()
+            or info.get("source_commit") != revision or info.get("source_dirty") is not False
+            or info.get("target") != TARGETS[host]):
+        raise InstallError("Preview executable version, target or source identity differs")
+    return {"sha256": sha256(path), "version": info["version"],
+            "source_commit": revision, "target": info["target"], "platform": host}
+
+
+def install_preview(url, destination, downloader=None):
+    """Install an immutable opt-in package, checking every shipped source file.
+
+    Never replaces the stable executable, account data or an existing package.
+    The checkout supplies the expected source hashes; the downloaded archive's
+    checksum alone is not proof that its adapter matches the reviewed checkout.
+    """
+    if destination.exists() or destination.is_symlink():
+        raise InstallError("Preview package already exists; preserve it and inspect before reinstalling")
+    fetch = downloader or download
+    with tempfile.TemporaryDirectory(prefix="codr-preview-") as temporary:
+        archive, checksum = Path(temporary) / "package.tar.gz", Path(temporary) / "checksum"
+        fetch(url, archive)
+        fetch(url + ".sha256", checksum)
+        fields = checksum.read_text().split()
+        if not fields or not re.fullmatch(r"[a-fA-F0-9]{64}", fields[0]) or sha256(archive) != fields[0].lower():
+            raise InstallError("Preview checksum mismatch")
+        from package_evidence import source_files
+        expected = {name: sha256(ROOT / name) for name in source_files()}
+        # Compatibility copies at the archive root must be the same exact
+        # license/notice bytes as the evidence-covered vendored originals.
+        licenses = {name: expected["vendor/mdk/" + name]
+                    for name in ("LICENSE", "LICENSE-MPL-2.0", "NOTICE.codr", "README.codr.md")}
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=".codr-stage-", dir=destination.parent) as stage:
+            stage = Path(stage)
+            with tarfile.open(archive, "r:gz") as bundle:
+                entries = bundle.getmembers()
+                names = [entry.name for entry in entries]
+                required = set(expected) | {"herdr-white-noise-bridge", "CODR-SOURCE.json", "LICENSE", "LICENSE-MPL-2.0", "NOTICE.codr", "README.codr.md"}
+                if len(names) != len(set(names)) or set(names) != required or any(not entry.isfile() or not 0 < entry.size <= MAX_DOWNLOAD for entry in entries):
+                    raise InstallError("Unexpected preview package contents")
+                evidence = json.load(bundle.extractfile("CODR-SOURCE.json"))
+                revision = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+                if not isinstance(evidence, dict) or evidence.get("version") != version() or evidence.get("source_commit") != revision or evidence.get("files") != expected:
+                    raise InstallError("Preview source evidence differs from checkout")
+                for entry in entries:
+                    output = stage / entry.name
+                    output.parent.mkdir(parents=True, exist_ok=True)
+                    with bundle.extractfile(entry) as source, output.open("wb") as target:
+                        shutil.copyfileobj(source, target)
+                    digest = expected.get(entry.name, licenses.get(entry.name))
+                    if digest is not None and sha256(output) != digest:
+                        raise InstallError("Preview source file checksum mismatch")
+            binary = stage / "herdr-white-noise-bridge"
+            expected_binary = evidence.get("executable")
+            if (not isinstance(expected_binary, dict)
+                    or expected_binary.get("sha256") != sha256(binary)
+                    or expected_binary.get("platform") != platform_name()
+                    or binary_platform(binary) != platform_name()):
+                raise InstallError("Preview executable checksum or platform differs")
+            binary.chmod(0o755)
+            if executable_identity(binary, revision) != expected_binary:
+                raise InstallError("Preview executable identity differs from release evidence")
+            # rename of the complete staged directory is the only activation;
+            # a crash before it leaves no usable half-installed package.
+            if destination.exists() or destination.is_symlink():
+                raise InstallError("Preview destination appeared during installation")
+            os.rename(stage, destination)
+        return destination / "herdr-white-noise-bridge"
 
 
 def sha256(path):
@@ -149,6 +270,12 @@ def main():
         release = version()
         asset = f"codr-v{release}-{platform_name()}.tar.gz"
         url = f"https://github.com/tidley/codr/releases/download/v{release}/{asset}"
+        if "-" in release:
+            destination = Path.home() / f".local/share/codr/packages/v{release}"
+            binary = install_preview(url, destination)
+            print(f"Installed opt-in codr {release}: {binary}")
+            print("Stable command and services unchanged. Follow docs/AGENT-INSTALL.md; do not invoke legacy Setup/Start.")
+            return 0
         destination = Path.home() / ".local/bin/herdr-white-noise-bridge"
         combined = tuple(map(int, release.split("."))) >= (0, 10, 0)
         connector = None if combined else install_connector(release)
@@ -163,7 +290,7 @@ def main():
             print("Existing accounts require the explicit stopped-backup combined-service handover; installation does not migrate services.")
             print("Next: follow docs/COMBINED.md for the approved local handover, not the legacy Setup action.")
             print("Fresh accounts require 0.9 setup before handover. Do not start the combined runtime on unapproved storage.")
-    except (InstallError, OSError, tarfile.TarError) as error:
+    except (InstallError, OSError, ValueError, subprocess.SubprocessError, tarfile.TarError) as error:
         print(f"codr install: {error}", file=sys.stderr)
         return 1
     return 0

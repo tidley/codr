@@ -347,7 +347,34 @@ async fn desktop_relay_failed_publish_or_late_roster_change_never_admits_or_repl
 }
 
 pub(super) async fn room() -> (Fixture, Bridge) {
+    room_backend(false).await
+}
+
+async fn room_backend(core: bool) -> (Fixture, Bridge) {
     let fixture = Fixture::new().await;
+    if core {
+        for (index, agent) in fixture.agents.lock().unwrap().iter_mut().enumerate() {
+            agent.pane_id = format!("t{}", index + 1);
+            let source = format!(
+                "hc:{}",
+                json!([
+                    "fixture-core",
+                    agent.pane_id,
+                    1234,
+                    "/fixture/opencode",
+                    "/fixture/project"
+                ])
+            );
+            agent.terminal_id = source.clone();
+            agent.agent_session.as_mut().unwrap().source = source;
+        }
+        let discovered = herdr::snapshot(&Socket {
+            path: fixture.config.herdr_socket.clone(),
+        })
+        .await
+        .unwrap();
+        *fixture.agents.lock().unwrap() = discovered;
+    }
     fixture
         .histories
         .lock()
@@ -360,7 +387,7 @@ pub(super) async fn room() -> (Fixture, Bridge) {
         json!([HEX, "22".repeat(32), "33".repeat(32), "aa".repeat(32)]);
     let mut bridge = Bridge::open(fixture.config.clone()).unwrap();
     bridge
-        .attach_room(&agent().key(), &"bb".repeat(16), "builder")
+        .attach_room(&fixture.snapshot()[0].key(), &"bb".repeat(16), "builder")
         .await
         .unwrap();
     bridge.reconcile(fixture.snapshot()).await.unwrap();
@@ -376,8 +403,118 @@ async fn control(bridge: &mut Bridge, method: &str, mut fields: Value) -> anyhow
     fields["version"] = json!(1);
     fields["bridge_account"] = json!(bridge.config.account_id_hex);
     fields["method"] = json!(method);
-    fields["session_key"] = json!(agent().key());
+    fields["session_key"] = json!(
+        bridge
+            .state
+            .mappings
+            .iter()
+            .find(|(_, m)| m.room.is_some())
+            .map(|(key, _)| key.clone())
+            .unwrap_or_else(|| agent().key())
+    );
     porter::handle(bridge, fields).await
+}
+
+#[tokio::test]
+async fn core_room_preserves_native_hook_attribution_defaults_privacy_and_no_duplicate_admission() {
+    let (fixture, mut bridge) = room_backend(true).await;
+    let retained = fixture.snapshot()[0].clone();
+    let key = retained.key();
+    classify(&mut bridge).await;
+    let request = json!({"request_id":uuid::Uuid::new_v4().to_string(),"terminal_id":retained.terminal_id,
+        "native_message_id":"msg_desktop_core","text":"Normal Core desktop input"});
+    assert!(
+        control(&mut bridge, "room.desktop_prepare", request.clone())
+            .await
+            .is_err(),
+        "No implicit owner invocation grant"
+    );
+    grant(&mut bridge, HEX, "human").await;
+    bridge
+        .inbound(&event(&fixture, 4100, HEX, "ordinary conversation", false))
+        .await
+        .unwrap();
+    assert!(fixture.posts.lock().unwrap().is_empty());
+    fixture.agents.lock().unwrap()[0].agent_status = "unknown".into();
+    bridge
+        .inbound(&event(
+            &fixture,
+            4099,
+            HEX,
+            "unknown status must not invoke",
+            true,
+        ))
+        .await
+        .unwrap();
+    assert!(fixture.posts.lock().unwrap().is_empty());
+    assert!(
+        control(&mut bridge, "room.desktop_prepare", request.clone())
+            .await
+            .is_err()
+    );
+    fixture.agents.lock().unwrap()[0].agent_status = "idle".into();
+    let receipt = control(&mut bridge, "room.desktop_prepare", request.clone())
+        .await
+        .unwrap();
+    assert_eq!(receipt["native_admission"], "prepared");
+    assert_eq!(
+        control(&mut bridge, "room.desktop_prepare", request)
+            .await
+            .unwrap(),
+        receipt
+    );
+    assert!(
+        fixture.posts.lock().unwrap().is_empty(),
+        "Normal Enter is admitted by OpenCode, not a second Codr POST"
+    );
+    assert_eq!(
+        fixture
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c["type"] == "send_final"
+                && c["text"]
+                    .as_str()
+                    .is_some_and(|s| s.starts_with("Desktop via Codr\n\n")))
+            .count(),
+        1
+    );
+    {
+        let mut histories = fixture.histories.lock().unwrap();
+        let history = histories.get_mut("ses_1").unwrap();
+        history.push(
+            json!({"id":"msg_desktop_core","type":"user","text":"Normal Core desktop input"}),
+        );
+        let mut reply = final_message("core-final", "Core native reply");
+        reply["parentID"] = json!("msg_desktop_core");
+        history.push(reply);
+    }
+    bridge.reconcile(fixture.snapshot()).await.unwrap();
+    assert!(bridge.state.mappings[&key].room_quarantined.is_none());
+    assert!(
+        bridge
+            .state
+            .outbox
+            .iter()
+            .any(|item| item.text == "**@builder**\nCore native reply")
+    );
+    // A disconnected/uncertain native admission remains one effect on reconnect.
+    fixture.lose.lock().unwrap().push("ses_1".into());
+    let message = event(&fixture, 4101, HEX, "addressed native input", true);
+    bridge.inbound(&message).await.unwrap();
+    assert_eq!(fixture.posts.lock().unwrap().len(), 1);
+    drop(bridge);
+    let mut reopened = Bridge::open(fixture.config.clone()).unwrap();
+    reopened.reconcile(fixture.snapshot()).await.unwrap();
+    reopened.inbound(&message).await.unwrap();
+    assert_eq!(fixture.posts.lock().unwrap().len(), 1);
+    assert!(fixture.calls.lock().unwrap().iter().all(|c| !matches!(
+        c["method"].as_str(),
+        Some(
+            "terminal.run" | "terminal.send" | "terminal.keys" | "agent.prompt" | "agent.send_keys"
+        )
+    )));
 }
 
 pub(super) async fn grant(bridge: &mut Bridge, id: &str, role: &str) {

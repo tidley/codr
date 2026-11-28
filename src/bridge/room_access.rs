@@ -117,6 +117,27 @@ impl Bridge {
     /// One dedicated transport configuration owns one fresh room session. No
     /// existing private state/history is converted into a shared transport.
     pub async fn attach_room(&mut self, key: &str, group: &str, alias: &str) -> Result<()> {
+        self.attach_room_with_setup(key, group, alias, None).await
+    }
+
+    pub(crate) async fn attach_reserved_room(
+        &mut self,
+        key: &str,
+        group: &str,
+        alias: &str,
+        setup: &crate::native_rooms::Guard,
+    ) -> Result<()> {
+        self.attach_room_with_setup(key, group, alias, Some(setup))
+            .await
+    }
+
+    async fn attach_room_with_setup(
+        &mut self,
+        key: &str,
+        group: &str,
+        alias: &str,
+        setup: Option<&crate::native_rooms::Guard>,
+    ) -> Result<()> {
         ensure!(
             self.state.mappings.is_empty()
                 && !alias.is_empty()
@@ -132,7 +153,9 @@ impl Bridge {
             members.contains(&self.phone) && members.contains(&self.config.account_id_hex),
             "Owner and agent must be authenticated room members"
         );
-        let mut mapping = self.prepare_chat_attachment(key, group, vec![]).await?;
+        let mut mapping = self
+            .prepare_chat_attachment_with_setup(key, group, vec![], setup)
+            .await?;
         let agent = mapping.agent_record.as_ref().unwrap();
         ensure!(
             crate::prompt::native_session(&self.config, agent).is_some(),
@@ -141,8 +164,15 @@ impl Bridge {
         // Serialize the empty-history check with every native POST, including
         // private transports. The persistent claim itself has no lease/expiry.
         let claim = crate::native_rooms::Claim::new(&self.config, agent, group)?;
-        let reservation =
-            crate::native_rooms::guard(&self.config, crate::native_rooms::identity(agent)?)?;
+        let owned = if setup.is_none() {
+            Some(crate::native_rooms::guard(
+                &self.config,
+                crate::native_rooms::identity(agent)?,
+            )?)
+        } else {
+            None
+        };
+        let reservation = setup.or(owned.as_ref()).unwrap();
         let history = self
             .reads
             .fresh(&self.config, agent.agent_session.as_ref().unwrap())
@@ -155,7 +185,11 @@ impl Bridge {
                 && history.recent_messages.is_empty(),
             "Room requires a fresh empty native conversation"
         );
-        reservation.reserve(&claim)?;
+        if setup.is_some() {
+            reservation.finish_setup(&self.config, &claim)?;
+        } else {
+            reservation.reserve(&claim)?;
+        }
         mapping.shared_alias = Some(alias.into());
         mapping.room = Some(RoomPolicy::new(
             self.phone.clone(),
@@ -343,11 +377,7 @@ impl Bridge {
         self.observe_activity(&key, &history)?;
         // Read the raw authoritative record here: the private get helper turns
         // identity drift into a generic error before room quarantine can persist.
-        let response = self
-            .herdr
-            .herdr("agent.get", json!({"target":current.pane_id}))
-            .await?;
-        let live: Agent = serde_json::from_value(response["result"]["agent"].clone())?;
+        let live = herdr::current(&self.herdr, &current).await?;
         if live.key() != key
             || live.terminal_id != retained.terminal_id
             || live.pane_id != retained.pane_id
@@ -386,6 +416,9 @@ impl Bridge {
             && !text.trim().is_empty()
             && !text.trim_start().starts_with('/')
             && live.agent_status != "blocked"
+            // Core does not infer status. Missing/error reports must not make a
+            // terminal look available while its native permission state is unknown.
+            && (!herdr::is_core(&live) || matches!(live.agent_status.as_str(), "idle" | "done" | "working"))
             && mapping.submissions.is_empty();
         // Refused controls/media are consumed without private commands or tool
         // approvals, and without renewing a finite agent interaction cycle.

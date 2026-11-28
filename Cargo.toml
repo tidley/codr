@@ -1,6 +1,6 @@
 [package]
 name = "herdr-white-noise-bridge"
-version = "0.12.2"
+version = "0.13.0-preview.1"
 edition = "2024"
 
 [dependencies]

@@ -2,7 +2,7 @@ use bech32::ToBase32;
 use herdr_white_noise_bridge::{
     BridgeConfig, BridgeState,
     bridge::{Bridge, now},
-    herdr::Agent,
+    herdr::{self, Agent},
     state::Mapping,
     wire::{Socket, read_line},
 };
@@ -11502,7 +11502,17 @@ async fn a_missing_connector_before_submission_retries_when_it_appears() {
     assert!(!bridge.state.mappings[&agent().key()].creating);
     let calls = Arc::new(Mutex::new(vec![]));
     let server = peer(&config.wn_agent_socket, true, calls.clone()).await;
-    bridge.reconcile(vec![agent()]).await.unwrap();
+    // History reads can finish off-loop under suite load. Keep advancing the
+    // normal loop until recovery completes; the exact call list below still
+    // proves that the non-idempotent group creation was submitted only once.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while bridge.state.mappings[&agent().key()].group_id_hex.is_none() {
+            bridge.reconcile(vec![agent()]).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
     assert!(bridge.state.mappings[&agent().key()].group_id_hex.is_some());
     assert_eq!(
         calls

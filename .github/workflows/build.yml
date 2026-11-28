@@ -63,6 +63,10 @@ jobs:
       - run: cargo test --locked --tests
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: python3 -m unittest discover -s tests -p 'test_*.py' -v
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.3.3'
+      - run: bun test adapters/opencode-room-input
 
   checks-macos:
     if: ${{ !inputs.linux_preview }}
@@ -83,6 +87,10 @@ jobs:
           python-version: '3.11'
       - run: cargo test --locked --tests
       - run: python3 -m unittest discover -s tests -p 'test_*.py' -v
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.3.3'
+      - run: bun test adapters/opencode-room-input
 
   binaries:
     needs: [checks, checks-macos]
@@ -168,12 +176,11 @@ jobs:
             codesign --verify --strict "target/$TARGET/release/herdr-white-noise-bridge"
           fi
           asset="codr-v$version-$OS_NAME-$ARCH.tar.gz"
-          tar -czf "dist/$asset" -C "target/$TARGET/release" herdr-white-noise-bridge \
-            -C "$GITHUB_WORKSPACE/vendor/mdk" LICENSE README.codr.md LICENSE-MPL-2.0 NOTICE.codr
+          python3 scripts/package_evidence.py "target/$TARGET/release/herdr-white-noise-bridge" "dist/$asset"
           if [ "$OS_NAME" = macos ]; then
-            shasum -a 256 "dist/$asset" > "dist/$asset.sha256"
+            (cd dist && shasum -a 256 "$asset" > "$asset.sha256")
           else
-            sha256sum "dist/$asset" > "dist/$asset.sha256"
+            (cd dist && sha256sum "$asset" > "$asset.sha256")
           fi
       - name: Read connector source pin
         id: connector
@@ -322,8 +329,7 @@ jobs:
           fi
           mkdir -p dist
           asset="codr-v$version-linux-$ARCH.tar.gz"
-          tar -czf "dist/$asset" -C "target/$TARGET/release" herdr-white-noise-bridge \
-            -C "$GITHUB_WORKSPACE/vendor/mdk" LICENSE README.codr.md LICENSE-MPL-2.0 NOTICE.codr
+          python3 scripts/package_evidence.py "target/$TARGET/release/herdr-white-noise-bridge" "dist/$asset"
           (cd dist && sha256sum "$asset" > "$asset.sha256")
       - name: Read connector source pin
         id: connector
@@ -420,4 +426,10 @@ jobs:
         run: |
           notes="docs/releases/${GITHUB_REF_NAME#v}.md"
           test -s "$notes"
-          gh release create "$GITHUB_REF_NAME" dist/* --title "codr $GITHUB_REF_NAME" --notes-file "$notes" --verify-tag
+          flags=()
+          # A preview tag is opt-in and must never move the stable/latest channel.
+          if [[ "${GITHUB_REF_NAME#v}" == *-* ]]; then
+            flags+=(--prerelease --latest=false)
+          fi
+          (cd dist && sha256sum -c *.sha256)
+          gh release create "$GITHUB_REF_NAME" dist/* --title "codr $GITHUB_REF_NAME" --notes-file "$notes" --verify-tag "${flags[@]}"
